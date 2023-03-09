@@ -982,6 +982,7 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
         }
       
         } else if (p.type() == Type::photon) {
+          // *This* is the photon heating tracklength estimator (TLE). In fact it is a helper function to get the XS mt=525 kerma
           // Calculate photon heating cross section on-the-fly
           if (i_nuclide >= 0) {
             // Find the element corresponding to the nuclide
