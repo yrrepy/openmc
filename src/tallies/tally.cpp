@@ -492,9 +492,16 @@ void Tally::set_scores(const vector<std::string>& scores)
         fatal_error("Cannot tally currents without surface type filters");
       }
       break;
+
+    // Commented-out to re-enable tracklength estimators
+    // case HEATING:
+    //   if (settings::photon_transport)
+    //     estimator_ = TallyEstimator::COLLISION;
+    //   break;
     }
 
     scores_.push_back(score);
+
   }
 
   // Make sure that no duplicate scores exist.
