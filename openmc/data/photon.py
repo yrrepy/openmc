@@ -555,7 +555,7 @@ class IncidentPhoton(EqualityMixin):
 
         # Read each reaction
         data = cls(Z)
-        for mt in (502, 504, 515, 522, 525):
+        for mt in (501, 502, 504, 515, 522, 525):
             data.reactions[mt] = PhotonReaction.from_ace(ace, mt)
 
         # Get heating cross sections [eV-barn] from factors [eV per collision]
