@@ -635,9 +635,6 @@ class IncidentPhoton(EqualityMixin):
         # Add bremsstrahlung DCS data
         data._add_bremsstrahlung()
         
-        # Add heating cross sections
-        data._compute_heating()
-        
         return data
 
     @classmethod
@@ -699,6 +696,9 @@ class IncidentPhoton(EqualityMixin):
 
         # Add bremsstrahlung DCS data
         data._add_bremsstrahlung()
+                        
+        # Add heating cross sections
+        data._compute_heating()
 
         return data
 
