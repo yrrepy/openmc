@@ -962,31 +962,9 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
       if (p.type() == Type::neutron) {
         score = score_neutron_heating(
           p, tally, flux, HEATING, i_nuclide, atom_density);
-      } else if (tally.estimator_ == TallyEstimator::ANALOG) {
-        if (i_nuclide == -1 || i_nuclide == p.event_nuclide()) {
-          // The energy deposited is the difference between the pre-collision
-          // and post-collision energy...
-          score = E - p.E();
-
-          // ...less the energy of any secondary particles since they will be
-          // transported individually later
-          const auto& bank = p.secondary_bank();
-          for (auto it = bank.end() - p.n_bank_second(); it < bank.end();
-               ++it) {
-            score -= it->E;
-          }
-
-          score *= p.wgt_last();
-        } else {
-          score = 0.0;
-        }
-      
-        } else if (p.type() == Type::photon) {
-
+      } else if (p.type() == Type::photon && tally.estimator_ == TallyEstimator::TRACKLENGTH) {
           // Calculate photon heating cross section on-the-fly
-         
-         // This is the photon heating tracklength estimator (TLE). In fact it is a helper function to get the XS mt=525 kerma
-          
+          // This is the photon heating tracklength estimator (TLE). In fact it is a helper function to get the XS mt=525 kerma
           if (i_nuclide >= 0) {
             // Find the element corresponding to the nuclide
             auto name = data::nuclides[i_nuclide]->name_;
@@ -1011,8 +989,30 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
               }
             }
           }
-      }
+      } else {
+        if (i_nuclide == -1 || i_nuclide == p.event_nuclide()) {
+          // The energy deposited is the difference between the pre-collision
+          // and post-collision energy...
+          score = E - p.E();
+
+          // ...less the energy of any secondary particles since they will be
+          // transported individually later
+          const auto& bank = p.secondary_bank();
+          for (auto it = bank.end() - p.n_bank_second(); it < bank.end();
+               ++it) {
+            score -= it->E;
+          }
+
+          score *= p.wgt_last();
+        } else {
+          score = 0.0;
+        }
+      
+        }
       break;
+
+    default:
+    default_case:
 
     default:
     default_case:
