@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
+from scipy.integrate import quad
 
 import openmc.checkvalue as cv
 from openmc.mixin import EqualityMixin
@@ -975,10 +976,8 @@ class IncidentPhoton(EqualityMixin):
                 return Eout * dsigma_dmu(mu, E)
 
             def eout_average(E):
-                integral_sigma = quad(dsigma_dmu, -1.0, 1.0,
-                                      args=(E,), epsabs=0.0, epsrel=1e-3)[0]
-                integral_sigma_e = quad(eout_dsigma_dmu, -1.0, 1.0,
-                                        args=(E,), epsabs=0.0, epsrel=1e-3)[0]
+                integral_sigma = quad(dsigma_dmu, -1.0, 1.0, args=(E,), epsabs=0.0, epsrel=1e-3)[0]
+                integral_sigma_e = quad(eout_dsigma_dmu, -1.0, 1.0, args=(E,), epsabs=0.0, epsrel=1e-3)[0]
                 return integral_sigma_e / integral_sigma
 
             e_out = np.vectorize(eout_average)(energy)
