@@ -1014,9 +1014,6 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
     default:
     default_case:
 
-    default:
-    default_case:
-
       // The default block is really only meant for redundant neutron reactions
       // (e.g. 444, 901)
       if (p.type() != Type::neutron)
