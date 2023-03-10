@@ -826,7 +826,7 @@ class IncidentPhoton(EqualityMixin):
             designators = []
             for mt, rx in self.reactions.items():
                 name, key = _REACTION_NAME[mt]
-                if mt in (502, 504, 515, 517, 522, 525):
+                if mt in (501, 502, 504, 515, 517, 522, 525):
                     sub_group = group.create_group(key)
                 elif mt >= 534 and mt <= 572:
                     # Subshell
