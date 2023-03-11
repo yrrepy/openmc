@@ -2,7 +2,7 @@ from collections import OrderedDict
 from collections.abc import Mapping, Callable
 from copy import deepcopy
 from io import StringIO
-from math import pi
+from math import pi, sqrt
 from numbers import Integral, Real
 import os
 
@@ -85,7 +85,8 @@ _REACTION_NAME = {
     569: ('P11 (6h11/2) subshell photoelectric', 'P11'),
     570: ('Q1 (7s1/2) subshell photoelectric', 'Q1'),
     571: ('Q2 (7p1/2) subshell photoelectric', 'Q2'),
-    572: ('Q3 (7p3/2) subshell photoelectric', 'Q3')
+    572: ('Q3 (7p3/2) subshell photoelectric', 'Q3'),
+    301: ('Average Photon Heating Number', 'photon_heating_number')             # This should be removed from any official release, mt301 is sometimes eV.Barn, sometimes eV/coll. Here it is eV/coll (525 is eV.barn)
 }
 
 # Compton profiles are read from a pre-generated HDF5 file when they are first
@@ -555,13 +556,23 @@ class IncidentPhoton(EqualityMixin):
 
         # Read each reaction
         data = cls(Z)
-        for mt in (501, 502, 504, 515, 522, 525):
+        for mt in (502, 504, 515, 522, 525):
             data.reactions[mt] = PhotonReaction.from_ace(ace, mt)
+
+        # Total Photon Interaction cross section
+        data.reactions[501] = PhotonReaction.from_ace(ace, 502)
+        data.reactions[501].xs.y  = sum([data.reactions[mt].xs.y for mt in
+                                         (502, 504, 515, 522)])
+
+        # Average Photon Heating Number                                         # This should be removed from any official release, mt301 is sometimes eV.Barn, sometimes eV/coll. Here it is eV/coll (525 is eV.barn)
+        data.reactions[301] = PhotonReaction.from_ace(ace, 525)                 # This should be removed from any official release, mt301 is sometimes eV.Barn, sometimes eV/coll. Here it is eV/coll (525 is eV.barn)
+
 
         # Get heating cross sections [eV-barn] from factors [eV per collision]
         # by multiplying with total xs
         data.reactions[525].xs.y *= sum([data.reactions[mt].xs.y for mt in
                                          (502, 504, 515, 522)])
+
 
         # Compton profiles
         n_shell = ace.nxs[5]
@@ -827,7 +838,7 @@ class IncidentPhoton(EqualityMixin):
             designators = []
             for mt, rx in self.reactions.items():
                 name, key = _REACTION_NAME[mt]
-                if mt in (501, 502, 504, 515, 517, 522, 525):
+                if mt in (501, 502, 504, 515, 517, 522, 525, 301):              # This should be removed from any official release, mt301 is sometimes eV.Barn, sometimes eV/coll. Here it is eV/coll (525 is eV.barn)
                     sub_group = group.create_group(key)
                 elif mt >= 534 and mt <= 572:
                     # Subshell
