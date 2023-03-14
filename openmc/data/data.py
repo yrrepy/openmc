@@ -12,7 +12,6 @@ from warnings import warn
 # This is NIST standard 03/2023 (https://physics.nist.gov/cgi-bin/Compositions/stand_alone.pl?ele=)
 # Note that the abundances are given as atomic fractions!
 NATURAL_ABUNDANCE = {
-ATURAL_ABUNDANCE = {
     'H1': 0.999885, 'H2': 0.000115,
     'He3': 1.34e-06, 'He4': 0.99999866,
     'Li6': 0.0759, 'Li7': 0.9241,
