@@ -335,8 +335,8 @@ void print_usage()
 void print_version()
 {
   if (mpi::master) {
-    fmt::print("OpenMC version {}.{}.{}\n", VERSION_MAJOR, VERSION_MINOR,
-      VERSION_RELEASE);
+    fmt::print("OpenMC version {}.{}.{}{}\n", VERSION_MAJOR, VERSION_MINOR,
+      VERSION_RELEASE, VERSION_DEV ? "-dev-tlx" : "");
 #ifdef GIT_SHA1
     fmt::print("Git SHA1: {}\n", GIT_SHA1);
 #endif
