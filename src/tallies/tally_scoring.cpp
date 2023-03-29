@@ -962,6 +962,33 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
       if (p.type() == Type::neutron) {
         score = score_neutron_heating(
           p, tally, flux, HEATING, i_nuclide, atom_density);
+      } else if (p.type() == Type::photon && tally.estimator_ == TallyEstimator::TRACKLENGTH) {
+          // Calculate photon heating cross section on-the-fly
+          // This is the photon heating tracklength estimator (TLE). In fact it is a helper function to get the XS mt=525 kerma
+          if (i_nuclide >= 0) {
+            // Find the element corresponding to the nuclide
+            auto name = data::nuclides[i_nuclide]->name_;
+            std::string element = to_element(name);
+            int i_element = data::element_map[element];
+            auto& heating {data::elements[i_element]->heating_};
+            auto i_grid = p.photon_xs(i_element).index_grid;
+            auto f = p.photon_xs(i_element).interp_factor;
+            score = std::exp(heating(i_grid) + f * (heating(i_grid+1) -
+              heating(i_grid))) * atom_density * flux;
+          } else {
+            if (p.material() != MATERIAL_VOID) {
+              const Material& material {*model::materials[p.material()]};
+              for (auto i = 0; i < material.nuclide_.size(); ++i) {
+                auto i_element = material.element_[i];
+                auto atom_density = material.atom_density_(i);
+                auto& heating {data::elements[i_element]->heating_};
+                auto i_grid = p.photon_xs(i_element).index_grid;
+                auto f = p.photon_xs(i_element).interp_factor;
+                score += std::exp(heating(i_grid) + f * (heating(i_grid+1) -
+                  heating(i_grid))) * atom_density * flux;
+              }
+            }
+          }
       } else {
         if (i_nuclide == -1 || i_nuclide == p.event_nuclide()) {
           // The energy deposited is the difference between the pre-collision
@@ -980,7 +1007,8 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
         } else {
           score = 0.0;
         }
-      }
+      
+        }
       break;
 
     default:
