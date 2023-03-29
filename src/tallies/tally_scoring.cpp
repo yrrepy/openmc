@@ -962,9 +962,11 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
       if (p.type() == Type::neutron) {
         score = score_neutron_heating(
           p, tally, flux, HEATING, i_nuclide, atom_density);
+          //  } else if (p.type() == Type::photon && tally.estimator_ == TallyEstimator::TRACKLENGTH && settings::electron_treatment == ElectronTreatment::LED) {  // this is logic that could be used in a formal pull-request, if the TTB double energy counting is not resolved. It it a sort of quick-fix, though preventing photon heating TLE. For now left out to allow continued testing with TTB on
       } else if (p.type() == Type::photon && tally.estimator_ == TallyEstimator::TRACKLENGTH) {
           // Calculate photon heating cross section on-the-fly
-          // This is the photon heating tracklength estimator (TLE). In fact it is a helper function to get the XS mt=525 kerma
+          // This is the photon heating tracklength estimator (TLE). In fact it is a helper function to get the XS mt=525 photon kerma
+          // in the longer term, to be converted into a helper function as it was for the neutron heating TLE
           if (i_nuclide >= 0) {
             // Find the element corresponding to the nuclide
             auto name = data::nuclides[i_nuclide]->name_;
