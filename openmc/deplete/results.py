@@ -54,11 +54,11 @@ class Results(list):
 
     Parameters
     ----------
-    filename : str
+    filename : str, optional
         Path to depletion result file
 
     """
-    def __init__(self, filename=None):
+    def __init__(self, filename='depletion_results.h5'):
         data = []
         if filename is not None:
             with h5py.File(str(filename), "r") as fh:
@@ -397,6 +397,8 @@ class Results(list):
             nuclides from openmc.config['cross_sections'] will be used.
         path : PathLike
             Path to materials XML file to read. Defaults to 'materials.xml'.
+
+            .. versionadded:: 0.13.3
 
         Returns
         -------
