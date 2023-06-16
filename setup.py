@@ -4,9 +4,19 @@ import glob
 import sys
 import numpy as np
 
-from setuptools import setup, find_packages
+from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
+ext_modules = [
+    Extension(
+        "data_wrapper",
+        sources=["data_wrapper.pyx", "material.cpp"],
+        language="c++"
+    )
+]
+
+#Bridge for version input to data.py
+setup(name="data_wrapper", ext_modules=cythonize("data_wrapper.pyx"))
 
 # Determine shared library suffix
 if sys.platform == 'darwin':

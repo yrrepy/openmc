@@ -110,7 +110,7 @@ class Material(IDManagerMixin):
     next_id = 1
     used_ids = set()
 
-    def __init__(self, material_id=None, name='', temperature=None):
+    def __init__(self, material_id=None, name='', temperature=None, version=2013):
         # Initialize class attributes
         self.id = material_id
         self.name = name
@@ -124,6 +124,7 @@ class Material(IDManagerMixin):
         self._atoms = {}
         self._isotropic = []
         self._ncrystal_cfg = None
+        self._version = version
 
         # A list of tuples (nuclide, percent, percent type)
         self._nuclides = []
@@ -234,6 +235,10 @@ class Material(IDManagerMixin):
     def ncrystal_cfg(self) -> Optional[str]:
         return self._ncrystal_cfg
 
+    @property
+    def version(self) -> Optional[int]:
+        return self._version
+
     @name.setter
     def name(self, name: Optional[str]):
         if name is not None:
@@ -266,7 +271,15 @@ class Material(IDManagerMixin):
         cv.check_iterable_type('Isotropic scattering nuclides', isotropic,
                                str)
         self._isotropic = list(isotropic)
-
+    
+    @version.setter
+    def version(self, version: Optional[int]):
+        if version is 2009:
+            cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
+            self._version = version
+        else:
+            self._version = 2013
+    
     @property
     def fissionable_mass(self) -> float:
         if self.volume is None:
