@@ -292,6 +292,18 @@ class Material(IDManagerMixin):
                 probs.append(num_atoms)
         return openmc.data.combine_distributions(dists, probs) if dists else None
 
+    @property
+    def version(self) -> Optional[int]:
+        return self._version
+    
+    @version.setter
+    def version(self, version: Optional[int]):
+        if version is 2009:
+            cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
+            self._version = version
+        else:
+            self._version = 2013
+    
     @classmethod
     def from_hdf5(cls, group: h5py.Group) -> Material:
         """Create material from HDF5 group
