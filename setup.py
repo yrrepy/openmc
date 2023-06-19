@@ -7,13 +7,12 @@ import numpy as np
 from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
-ext_modules = [
-    Extension(
-        "data_wrapper",
-        sources=["data_wrapper.pyx", "material.cpp"],
-        language="c++"
-    )
-]
+ext_modules = cythonize([
+    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp"],
+              language="c++",
+              include_dirs=[np.get_include()]),
+    "openmc/data/*.pyx"
+])
 
 #Bridge for version input to data.py
 setup(name="data_wrapper", ext_modules=cythonize("openmc/data/data_wrapper.pyx"))
@@ -34,6 +33,7 @@ kwargs = {
     'version': version,
     'packages': find_packages(exclude=['tests*']),
     'scripts': glob.glob('scripts/openmc-*'),
+    'ext_modules': ext_modules,
 
     # Data files and libraries
     'package_data': {
