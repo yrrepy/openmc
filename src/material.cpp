@@ -117,8 +117,8 @@ Material::Material(pugi::xml_node node)
       "elements into their natural nuclides.");
   }
 
-  if (check_for_node(material_node, "version")) {
-    this->set_version(std::stoi(get_node_value(material_node, "version")));
+  if (check_for_node(node, "version")) {
+    this->set_version(std::stoi(get_node_value(node, "version")));
     }
   
   // =======================================================================
