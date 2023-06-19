@@ -14,9 +14,6 @@ ext_modules = cythonize([
     "openmc/data/*.pyx"
 ])
 
-#Bridge for version input to data.py
-setup(name="data_wrapper", ext_modules=cythonize("openmc/data/data_wrapper.pyx"))
-
 # Determine shared library suffix
 if sys.platform == 'darwin':
     suffix = 'dylib'
@@ -83,10 +80,7 @@ kwargs = {
                  'sphinxcontrib-svg2pdfconverter', 'sphinx-rtd-theme'],
         'test': ['pytest', 'pytest-cov', 'colorama'],
         'vtk': ['vtk'],
-    },
-    # Cython is used to add resonance reconstruction and fast float_endf
-    'ext_modules': cythonize('openmc/data/*.pyx'),
-    'include_dirs': [np.get_include()]
+    }
 }
 
 setup(**kwargs)
