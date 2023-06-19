@@ -1,4 +1,4 @@
-cdef extern from "src/material.cpp":
+cdef extern from "openmc/material.h":
     cdef int version()
     cdef void set_version(int version)
 
