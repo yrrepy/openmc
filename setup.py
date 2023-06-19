@@ -16,7 +16,7 @@ ext_modules = [
 ]
 
 #Bridge for version input to data.py
-setup(name="data_wrapper", ext_modules=cythonize("data_wrapper.pyx"))
+setup(name="data_wrapper", ext_modules=cythonize("openmc/data/data_wrapper.pyx"))
 
 # Determine shared library suffix
 if sys.platform == 'darwin':
