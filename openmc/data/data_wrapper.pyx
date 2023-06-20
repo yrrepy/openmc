@@ -1,3 +1,5 @@
+# cython: language_level=3
+
 cdef extern from "openmc/material.h" namespace "openmc":
     cdef cppclass Material:
         Material() except +
@@ -5,10 +7,10 @@ cdef extern from "openmc/material.h" namespace "openmc":
         int version() const
 
 cdef class PyMaterial:
-    cdef openmc::Material* thisptr  # hold a C++ instance which we're wrapping
+    cdef Material* thisptr  # hold a C++ instance which we're wrapping
 
     def __cinit__(self):
-        self.thisptr = new openmc::Material()
+        self.thisptr = new Material()
 
     def __dealloc__(self):
         del self.thisptr
