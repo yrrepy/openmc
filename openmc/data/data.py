@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from math import sqrt, log
 from warnings import warn
-from data_wrapper import DataWrapper
+from data_wrapper import PyMaterial
 from typing import Dict
 
 # Isotopic abundances from Meija J, Coplen T B, et al, "Isotopic compositions
@@ -214,8 +214,8 @@ NATURAL_ABUNDANCE_2009 = {
     'U234': 0.000054, 'U-235': 0.007204, 'U-238': 0.992742
 }
 
-material = DataWrapper()
-version_value = material.getVersion()
+material = PyMaterial()
+version_value = material.get_version()
 if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
 else:
