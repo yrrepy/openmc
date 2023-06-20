@@ -1121,14 +1121,6 @@ void Material::to_hdf5(hid_t group) const
   close_group(material_group);
 }
 
-int Material::version() const {
-    return version_;
-}
-
-void Material::set_version(int version) {
-    version_ = version;
-}
-
 void Material::export_properties_hdf5(hid_t group) const
 {
   hid_t material_group = create_group(group, "material " + std::to_string(id_));
