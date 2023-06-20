@@ -10,7 +10,7 @@ from Cython.Build import cythonize
 ext_modules = cythonize([
     Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp"],
               language="c++",
-              include_dirs=[np.get_include(), 'include']),
+              include_dirs=[np.get_include(), 'include', '/']),
     "openmc/data/*.pyx"
 ])
 
