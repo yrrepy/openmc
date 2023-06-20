@@ -1,3 +1,4 @@
+from openmc.data import data_wrapper
 import data_wrapper
 import itertools
 import json
