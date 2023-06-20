@@ -1,4 +1,4 @@
-#include "openmc/include/openmc/material.h"
+#include "openmc/material.h"
 
 #include <algorithm> // for min, max, sort, fill
 #include <cmath>
