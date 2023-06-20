@@ -216,7 +216,7 @@ NATURAL_ABUNDANCE_2009 = {
 
 material = DataWrapper()
 version_value = material.getVersion()
-if version_value = 2009:
+if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
 else:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
