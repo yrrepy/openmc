@@ -8,9 +8,9 @@ from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
 ext_modules = cythonize([
-    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","include/openmc/material.h"],
+    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp"],
               language="c++",
-              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial']),
+              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']),
     "openmc/data/*.pyx"
 ])
 
