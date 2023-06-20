@@ -1,5 +1,3 @@
-from openmc.data import data_wrapper
-import data_wrapper
 import itertools
 import json
 import os
@@ -7,7 +5,7 @@ import re
 from pathlib import Path
 from math import sqrt, log
 from warnings import warn
-from data_wrapper import PyMaterial
+from openmc.data.data_wrapper import PyMaterial
 from typing import Dict
 
 # Isotopic abundances from Meija J, Coplen T B, et al, "Isotopic compositions
