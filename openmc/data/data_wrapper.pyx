@@ -1,4 +1,4 @@
-cdef extern from "openmc/Material.h":
+cdef extern from "openmc/material.h":
     cdef cppclass Material:
         Material() except +
         void set_version(int)
