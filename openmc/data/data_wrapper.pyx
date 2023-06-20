@@ -1,4 +1,4 @@
-cdef extern from "openmc/Material.h" namespace "openmc":
+cdef extern from "openmc/Material.h":
     cdef cppclass Material:
         Material() except +
         void set_version(int)
@@ -13,10 +13,10 @@ cdef class PyMaterial:
     def __dealloc__(self):
         del self.thisptr
 
-    cdef set_version(self, int version):
+    cpdef set_version(self, int version):
         self.thisptr.set_version(version)
 
-    cdef int get_version(self):
+    cpdef int get_version(self):
         return self.thisptr.version()
 
     property version:
@@ -26,4 +26,4 @@ cdef class PyMaterial:
             self.set_version(version)
 
     def __init__(self, int initial_version):
-        self.version = initial_version
+        self.version = initial_version 
