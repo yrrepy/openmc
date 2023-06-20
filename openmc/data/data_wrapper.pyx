@@ -1,14 +1,14 @@
-cdef extern from "openmc/material.h":
+cdef extern from "openmc/material.h" namespace "openmc":
     cdef cppclass Material:
         Material() except +
         void set_version(int)
         int version() const
 
 cdef class PyMaterial:
-    cdef Material* thisptr  # hold a C++ instance which we're wrapping
+    cdef openmc::Material* thisptr  # hold a C++ instance which we're wrapping
 
     def __cinit__(self):
-        self.thisptr = new Material()
+        self.thisptr = new openmc::Material()
 
     def __dealloc__(self):
         del self.thisptr
