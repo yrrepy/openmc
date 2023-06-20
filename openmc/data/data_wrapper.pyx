@@ -1,6 +1,3 @@
-# distutils: language = c++
-# distutils: sources = Material.cpp
-
 cdef extern from "openmc/Material.h" namespace "openmc":
     cdef cppclass Material:
         Material() except +
@@ -19,11 +16,14 @@ cdef class PyMaterial:
     cdef set_version(self, int version):
         self.thisptr.set_version(version)
 
-    cdef int version(self):
+    cdef int get_version(self):
         return self.thisptr.version()
 
     property version:
         def __get__(self):
-            return self.version()
+            return self.get_version()
         def __set__(self, int version):
             self.set_version(version)
+
+    def __init__(self, int initial_version):
+        self.version = initial_version
