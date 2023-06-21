@@ -7,9 +7,8 @@ import numpy as np
 from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
-cpp_files = glob.glob('/src/*.cpp')
 ext_modules = cythonize([
-    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx"] + cpp_files, 
+    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp","src/message_passing.cpp","src/settings.cpp","src/error.cpp","src/distribution.cpp","src/thermal.cpp","src/simulation.cpp","src/event.cpp","src/timer.cpp","src/photon.cpp"],
               language="c++",
               include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']),
     "openmc/data/*.pyx"
