@@ -14,7 +14,7 @@ ext_modules = cythonize([
               "src/particle_restart.cpp","src/tallies/tally.cpp","src/tallies/filter_delayedgroup.cpp","src/tallies/filter.cpp",
               "src/tallies/filter_universe.cpp","src/tallies/filter_mu.cpp","src/tallies/filter_polar.cpp","src/tallies/filter_cellfrom.cpp",
               "src/tallies/filter_cell.cpp","src/tallies/filter_energy.cpp","src/tallies/filter_particle.cpp","src/tallies/filter_time.cpp",
-              "src/tallies/filter_energyfunc.cpp","src/tallies/filter_meshsurface.cpp"],
+              "src/tallies/filter_energyfunc.cpp","src/tallies/filter_meshsurface.cpp","src/tallies/filter_mesh.cpp"],
               language="c++",
               include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']),
     "openmc/data/*.pyx"
