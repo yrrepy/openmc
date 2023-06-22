@@ -8,12 +8,14 @@ import os
 from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
-hdf5_dir = os.environ.get('HDF5_DIR') or os.environ.get('HDF5_HOME')
+source_files = ["openmc/data/data_wrapper.pyx"]
+source_files.extend(glob.glob("src/*.cpp"))
 
 ext_modules = cythonize([
-    Extension("openmc.data.data_wrapper",["openmc/data/data_wrapper.pyx"],
+    Extension("openmc.data.data_wrapper", source_files, 
               language="c++",
-              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']), 
+              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
+    ), 
     "openmc/data/*.pyx"
 ])
 
