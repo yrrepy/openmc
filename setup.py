@@ -20,11 +20,10 @@ ext_modules = cythonize([
               "src/tallies/filter_energyfunc.cpp","src/tallies/filter_meshsurface.cpp","src/tallies/filter_mesh.cpp","src/tallies/filter_legendre.cpp",
               "src/tallies/filter_zernike.cpp","src/tallies/filter_azimuthal.cpp","src/tallies/filter_collision.cpp","src/cross_sections.cpp",
               "src/mgxs_interface.cpp","src/finalize.cpp","src/endf.cpp","src/tallies/filter_cellborn.cpp","src/geometry_aux.cpp","src/surface.cpp",
-              "src/boundary_condition.cpp","src/tallies/derivative.cpp","src/universe.cpp","src/tallies/filter_sptl_legendre.cpp","src/hdf5_interface.cpp"],
+              "src/boundary_condition.cpp","src/tallies/derivative.cpp","src/universe.cpp","src/tallies/filter_sptl_legendre.cpp","src/hdf5_interface.cpp"
+              ,"src/state_point.cpp"],
               language="c++",
-              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
-              library_dirs=[hdf5_dir],  # And this line (change to your hdf5 lib dir)
-              ), 
+              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']), 
     "openmc/data/*.pyx"
 ])
 
