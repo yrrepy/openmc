@@ -3,9 +3,12 @@
 import glob
 import sys
 import numpy as np
+import os
 
 from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
+
+hdf5_dir = os.environ.get('HDF5_DIR') or os.environ.get('HDF5_HOME')
 
 ext_modules = cythonize([
     Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp",
@@ -18,8 +21,12 @@ ext_modules = cythonize([
               "src/tallies/filter_zernike.cpp","src/tallies/filter_azimuthal.cpp","src/tallies/filter_collision.cpp","src/cross_sections.cpp",
               "src/mgxs_interface.cpp","src/finalize.cpp","src/endf.cpp","src/tallies/filter_cellborn.cpp","src/geometry_aux.cpp","src/surface.cpp",
               "src/boundary_condition.cpp","src/tallies/derivative.cpp","src/universe.cpp","src/tallies/filter_sptl_legendre.cpp","src/hdf5_interface.cpp"],
-            language="c++",
-            include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']), 
+              language="c++",
+              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']
+              library_dirs=[hdf5_dir],  # And this line (change to your hdf5 lib dir)
+              extra_compile_args=["-std=c++11", "-O3", "-w"],  # Add necessary compiler flags here
+              extra_link_args=["-lhdf5"]  # Add necessary linker flags here
+              ), 
     "openmc/data/*.pyx"
 ])
 
