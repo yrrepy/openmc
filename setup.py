@@ -22,7 +22,7 @@ ext_modules = cythonize([
               "src/mgxs_interface.cpp","src/finalize.cpp","src/endf.cpp","src/tallies/filter_cellborn.cpp","src/geometry_aux.cpp","src/surface.cpp",
               "src/boundary_condition.cpp","src/tallies/derivative.cpp","src/universe.cpp","src/tallies/filter_sptl_legendre.cpp","src/hdf5_interface.cpp"],
               language="c++",
-              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']
+              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
               library_dirs=[hdf5_dir],  # And this line (change to your hdf5 lib dir)
               extra_compile_args=["-std=c++11", "-O3", "-w"],  # Add necessary compiler flags here
               extra_link_args=["-lhdf5"]  # Add necessary linker flags here
