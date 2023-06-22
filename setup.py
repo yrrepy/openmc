@@ -21,7 +21,8 @@ ext_modules = cythonize([
               "src/boundary_condition.cpp","src/tallies/derivative.cpp","src/universe.cpp","src/tallies/filter_sptl_legendre.cpp","src/hdf5_interface.cpp"
               ,"src/state_point.cpp"],
               language="c++",
-              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']), 
+              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
+              libraries=['hdf5']), 
     "openmc/data/*.pyx"
 ])
 
