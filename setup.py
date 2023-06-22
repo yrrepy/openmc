@@ -8,7 +8,12 @@ from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
 ext_modules = cythonize([
-    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp","src/message_passing.cpp","src/settings.cpp","src/error.cpp","src/distribution.cpp","src/thermal.cpp","src/simulation.cpp","src/event.cpp","src/timer.cpp","src/photon.cpp","src/physics_mg.cpp","src/particle.cpp","src/particle_restart.cpp","src/tallies/tally.cpp","src/tallies/filter_delayedgroup.cpp","src/tallies/filter.cpp","src/tallies/filter_universe.cpp","src/tallies/filter_mu.cpp","src/tallies/filter_polar.cpp","src/tallies/filter_cellfrom.cpp","src/tallies/filter_cell.cpp","src/tallies/filter_energy.cpp","src/tallies/filter_particle.cpp","src/tallies/filter_time.cpp"],
+    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp",
+              "src/message_passing.cpp","src/settings.cpp","src/error.cpp","src/distribution.cpp","src/thermal.cpp",
+              "src/simulation.cpp","src/event.cpp","src/timer.cpp","src/photon.cpp","src/physics_mg.cpp","src/particle.cpp",
+              "src/particle_restart.cpp","src/tallies/tally.cpp","src/tallies/filter_delayedgroup.cpp","src/tallies/filter.cpp",
+              "src/tallies/filter_universe.cpp","src/tallies/filter_mu.cpp","src/tallies/filter_polar.cpp","src/tallies/filter_cellfrom.cpp",
+              "src/tallies/filter_cell.cpp","src/tallies/filter_energy.cpp","src/tallies/filter_particle.cpp","src/tallies/filter_time.cpp","src/tallies/filter_energyfunc.cpp"],
               language="c++",
               include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc']),
     "openmc/data/*.pyx"
