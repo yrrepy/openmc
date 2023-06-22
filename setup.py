@@ -8,6 +8,8 @@ import os
 from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
+hdf5_dir = os.environ.get('HDF5_DIR') or os.environ.get('HDF5_HOME')
+
 ext_modules = cythonize([
     Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp",
               "src/message_passing.cpp","src/settings.cpp","src/error.cpp","src/distribution.cpp","src/thermal.cpp",
@@ -22,7 +24,9 @@ ext_modules = cythonize([
               ,"src/state_point.cpp"],
               language="c++",
               include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
-              libraries=['hdf5']), 
+              libraries=[hdf5_dir],
+              extra_compile_args=["-std=c++11", "-O3", "-w"],  # Add necessary compiler flags here
+              extra_link_args=["-lhdf5"]), 
     "openmc/data/*.pyx"
 ])
 
