@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from math import sqrt, log
 from warnings import warn
-from openmc.settings import get_setting_instance
+from openmc.geometry import get_geometry_instance
 
 # Isotopic abundances from Meija J, Coplen T B, et al, "Isotopic compositions
 # of the elements 2013 (IUPAC Technical Report)", Pure. Appl. Chem. 88 (3),
