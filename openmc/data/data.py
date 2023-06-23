@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from math import sqrt, log
 from warnings import warn
+from typing import Dict
 from openmc.geometry import get_geometry_instance
 
 # Isotopic abundances from Meija J, Coplen T B, et al, "Isotopic compositions
