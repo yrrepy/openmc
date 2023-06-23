@@ -8,7 +8,7 @@ import os
 from setuptools import setup, Extension, find_packages
 from Cython.Build import cythonize
 
-hdf5_dir = os.environ.get('HDF5_DIR') or os.environ.get('HDF5_HOME')
+hdf5_dir = os.environ.get('HDF5_DIR') or os.environ.get('HDF5_HOME') or os.environ.get('HDF5_ROOT')
 
 ext_modules = cythonize([
     Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp",
