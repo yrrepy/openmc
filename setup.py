@@ -24,7 +24,8 @@ ext_modules = cythonize([
               ,"src/state_point.cpp"],
               language="c++",
               include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
-              libraries=[hdf5_dir],
+              library_dirs=[hdf5_dir],
+              libraries=["hdf5"],
               extra_compile_args=["-std=c++11", "-O3", "-w"],  # Add necessary compiler flags here
               extra_link_args=["-lhdf5"]), 
     "openmc/data/*.pyx"
