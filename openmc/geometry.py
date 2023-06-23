@@ -39,12 +39,12 @@ class Geometry:
 
     """
 
-    def __init__(self, version=2013, root=None):
+    def __init__(self, root=None):
         self._root_universe = None
         self._offsets = {}
         self.merge_surfaces = False
         self.surface_precision = 10
-        self._version = version
+        self._version = None
         if root is not None:
             if isinstance(root, openmc.UniverseBase):
                 self.root_universe = root
