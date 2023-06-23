@@ -39,11 +39,12 @@ class Geometry:
 
     """
 
-    def __init__(self, root=None):
+    def __init__(self, version=2013, root=None):
         self._root_universe = None
         self._offsets = {}
         self.merge_surfaces = False
         self.surface_precision = 10
+        self._version = version
         if root is not None:
             if isinstance(root, openmc.UniverseBase):
                 self.root_universe = root
@@ -85,7 +86,19 @@ class Geometry:
         check_less_than('surface_precision', surface_precision, 16)
         check_greater_than('surface_precision', surface_precision, 0)
         self._surface_precision = surface_precision
-
+    
+    @property
+    def version(self) -> Optional[int]:
+        return self._version
+    
+    @version.setter
+    def version(self, version: Optional[int]):
+        if version is 2009:
+            cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
+            self._version = version
+        else:
+            self._version = 2013
+    
     def add_volume_information(self, volume_calc):
         """Add volume information from a stochastic volume calculation.
 
@@ -729,3 +742,8 @@ class Geometry:
         clone = deepcopy(self)
         clone.root_universe = self.root_universe.clone()
         return clone
+
+def get_geometry_instance() -> Geometry:
+        # Here you initialize your Material object as you need
+        geometry = Geometry()
+        return geometry
