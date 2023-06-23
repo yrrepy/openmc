@@ -214,7 +214,7 @@ NATURAL_ABUNDANCE_2009 = {
 }
 
 geometry_instance = get_geometry_instance()
-version_value = setting_geometry.version
+version_value = geometry_instance.version
 if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
 elif version_value == 2013:
