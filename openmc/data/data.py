@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from math import sqrt, log
 from warnings import warn
-from openmc.material import get_material_instance
+from openmc.settings import get_setting_instance
 
 # Isotopic abundances from Meija J, Coplen T B, et al, "Isotopic compositions
 # of the elements 2013 (IUPAC Technical Report)", Pure. Appl. Chem. 88 (3),
@@ -213,8 +213,8 @@ NATURAL_ABUNDANCE_2009 = {
     'U234': 0.000054, 'U-235': 0.007204, 'U-238': 0.992742
 }
 
-material_instance = get_material_instance()
-version_value = material_instance.version
+setting_instance = get_setting_instance()
+version_value = setting_instance.version
 if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
 elif version_value == 2013:

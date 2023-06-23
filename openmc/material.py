@@ -124,7 +124,6 @@ class Material(IDManagerMixin):
         self._atoms = {}
         self._isotropic = []
         self._ncrystal_cfg = None
-        self._version = version
 
         # A list of tuples (nuclide, percent, percent type)
         self._nuclides = []
@@ -291,18 +290,6 @@ class Material(IDManagerMixin):
                 dists.append(source_per_atom)
                 probs.append(num_atoms)
         return openmc.data.combine_distributions(dists, probs) if dists else None
-
-    @property
-    def version(self) -> Optional[int]:
-        return self._version
-    
-    @version.setter
-    def version(self, version: Optional[int]):
-        if version is 2009:
-            cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
-            self._version = version
-        else:
-            self._version = 2013
     
     @classmethod
     def from_hdf5(cls, group: h5py.Group) -> Material:
@@ -1697,8 +1684,3 @@ class Materials(cv.CheckedList):
         root = tree.getroot()
 
         return cls.from_xml_element(root)
-        
-def get_material_instance() -> Material:
-        # Here you initialize your Material object as you need
-        material = Material()
-        return material

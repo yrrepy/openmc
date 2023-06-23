@@ -250,7 +250,7 @@ class Settings:
         Indicate whether to write the initial source distribution to file
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, version=2013, **kwargs):
         self._run_mode = RunMode.EIGENVALUE
         self._batches = None
         self._generations_per_batch = None
@@ -327,6 +327,7 @@ class Settings:
         self._weight_windows_file = None
         self._max_splits = None
         self._max_tracks = None
+        self._version = version
 
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -969,7 +970,19 @@ class Settings:
         if not isinstance(wwgs, MutableSequence):
             wwgs = [wwgs]
         self._weight_window_generators = cv.CheckedList(WeightWindowGenerator, 'weight window generators', wwgs)
-        
+
+    @property
+    def version(self) -> Optional[int]:
+        return self._version
+    
+    @version.setter
+    def version(self, version: Optional[int]):
+        if version is 2009:
+            cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
+            self._version = version
+        else:
+            self._version = 2013
+
     def _create_run_mode_subelement(self, root):
         elem = ET.SubElement(root, "run_mode")
         elem.text = self._run_mode.value
@@ -1853,3 +1866,8 @@ class Settings:
         root = tree.getroot()
         meshes = _read_meshes(root)
         return cls.from_xml_element(root, meshes)
+
+def get_setting_instance() -> Settings:
+        # Here you initialize your Material object as you need
+        settings = Settings()
+        return settings
