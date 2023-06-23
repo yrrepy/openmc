@@ -162,14 +162,6 @@ public:
   //! \return Pointer to NCrystal material object
   const NCrystalMat& ncrystal_mat() const { return ncrystal_mat_; };
 
-    //! Get the version of the abundance data
-  //! \return version of the abundance data
-  int version() const { return version_; }
-
-  //! Set the version of the abundance data
-  //! \param[in] version version of the abundance data
-  void set_version(int version) { version_ = version; }
-
   //----------------------------------------------------------------------------
   // Data
   int32_t id_ {C_NONE};                 //!< Unique ID
@@ -210,16 +202,14 @@ private:
 
   //! Normalize density
   void normalize_density();
-  
+
   void calculate_neutron_xs(Particle& p) const;
   void calculate_photon_xs(Particle& p) const;
 
   //----------------------------------------------------------------------------
   // Private data members
   gsl::index index_;
-  
-  //verions for abundance data
-  int version_;
+
   //! \brief Default temperature for cells containing this material.
   //!
   //! A negative value indicates no default temperature was specified.

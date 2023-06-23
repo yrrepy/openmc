@@ -3,28 +3,10 @@
 import glob
 import sys
 import numpy as np
-import os
 
-from setuptools import setup, Extension, find_packages
+from setuptools import setup, find_packages
 from Cython.Build import cythonize
 
-
-ext_modules = cythonize([
-    Extension("openmc.data.data_wrapper", ["openmc/data/data_wrapper.pyx", "src/material.cpp","src/nuclide.cpp",
-              "src/message_passing.cpp","src/settings.cpp","src/error.cpp","src/distribution.cpp","src/thermal.cpp",
-              "src/simulation.cpp","src/event.cpp","src/timer.cpp","src/photon.cpp","src/physics_mg.cpp","src/particle.cpp",
-              "src/particle_restart.cpp","src/tallies/tally.cpp","src/tallies/filter_delayedgroup.cpp","src/tallies/filter.cpp",
-              "src/tallies/filter_universe.cpp","src/tallies/filter_mu.cpp","src/tallies/filter_polar.cpp","src/tallies/filter_cellfrom.cpp",
-              "src/tallies/filter_cell.cpp","src/tallies/filter_energy.cpp","src/tallies/filter_particle.cpp","src/tallies/filter_time.cpp",
-              "src/tallies/filter_energyfunc.cpp","src/tallies/filter_meshsurface.cpp","src/tallies/filter_mesh.cpp","src/tallies/filter_legendre.cpp",
-              "src/tallies/filter_zernike.cpp","src/tallies/filter_azimuthal.cpp","src/tallies/filter_collision.cpp","src/cross_sections.cpp",
-              "src/mgxs_interface.cpp","src/finalize.cpp","src/endf.cpp","src/tallies/filter_cellborn.cpp","src/geometry_aux.cpp","src/surface.cpp",
-              "src/boundary_condition.cpp","src/tallies/derivative.cpp","src/universe.cpp","src/tallies/filter_sptl_legendre.cpp","src/hdf5_interface.cpp"
-              ,"src/state_point.cpp"],
-              language="c++",
-              include_dirs=[np.get_include(), 'include', '/usr/include/hdf5/serial','include/openmc'],
-    "openmc/data/*.pyx"
-])
 
 # Determine shared library suffix
 if sys.platform == 'darwin':
@@ -42,7 +24,6 @@ kwargs = {
     'version': version,
     'packages': find_packages(exclude=['tests*']),
     'scripts': glob.glob('scripts/openmc-*'),
-    'ext_modules': ext_modules,
 
     # Data files and libraries
     'package_data': {
@@ -92,7 +73,10 @@ kwargs = {
                  'sphinxcontrib-svg2pdfconverter', 'sphinx-rtd-theme'],
         'test': ['pytest', 'pytest-cov', 'colorama'],
         'vtk': ['vtk'],
-    }
+    },
+    # Cython is used to add resonance reconstruction and fast float_endf
+    'ext_modules': cythonize('openmc/data/*.pyx'),
+    'include_dirs': [np.get_include()]
 }
 
 setup(**kwargs)

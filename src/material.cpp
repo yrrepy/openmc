@@ -117,10 +117,6 @@ Material::Material(pugi::xml_node node)
       "elements into their natural nuclides.");
   }
 
-  if (check_for_node(node, "version")) {
-    this->set_version(std::stoi(get_node_value(node, "version")));
-    }
-  
   // =======================================================================
   // READ AND PARSE <nuclide> TAGS
 
@@ -376,7 +372,6 @@ Material& Material::clone()
   mat->mat_nuclide_index_ = mat_nuclide_index_;
   mat->thermal_tables_ = thermal_tables_;
   mat->temperature_ = temperature_;
-  mat->version_ = version_;
 
   if (ttb_)
     mat->ttb_ = std::make_unique<Bremsstrahlung>(*ttb_);
