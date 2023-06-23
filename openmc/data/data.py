@@ -217,7 +217,7 @@ material_instance = get_material_instance()
 version_value = material_instance.version
 if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
-else if version_value == 2013:
+elif version_value == 2013:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
 else:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
