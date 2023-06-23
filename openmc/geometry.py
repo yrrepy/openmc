@@ -93,11 +93,11 @@ class Geometry:
     
     @version.setter
     def version(self, version: Optional[int]):
-        if version is 2009:
+        if version is None:
+            self._version = 2013
+        else:
             cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
             self._version = version
-        else:
-            self._version = 2013
     
     def add_volume_information(self, volume_calc):
         """Add volume information from a stochastic volume calculation.
