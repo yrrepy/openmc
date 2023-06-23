@@ -1504,10 +1504,6 @@ class Material(IDManagerMixin):
 
         return mat
 
-def get_material_instance() -> Material:
-        # Here you initialize your Material object as you need
-        material = Material()
-        return material
 
 class Materials(cv.CheckedList):
     """Collection of Materials used for an OpenMC simulation.
@@ -1701,3 +1697,8 @@ class Materials(cv.CheckedList):
         root = tree.getroot()
 
         return cls.from_xml_element(root)
+        
+def get_material_instance() -> Material:
+        # Here you initialize your Material object as you need
+        material = Material()
+        return material
