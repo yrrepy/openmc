@@ -213,8 +213,8 @@ NATURAL_ABUNDANCE_2009 = {
     'U234': 0.000054, 'U-235': 0.007204, 'U-238': 0.992742
 }
 
-setting_instance = get_setting_instance()
-version_value = setting_instance.version
+geometry_instance = get_geometery_instance()
+version_value = setting_geometry.version
 if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
 elif version_value == 2013:
