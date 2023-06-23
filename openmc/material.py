@@ -419,11 +419,6 @@ class Material(IDManagerMixin):
 
         return material
 
-    def get_material_instance() -> Material:
-        # Here you initialize your Material object as you need
-        material = Material()
-        return material
-
     def add_volume_information(self, volume_calc):
         """Add volume information to a material.
 
@@ -1509,6 +1504,10 @@ class Material(IDManagerMixin):
 
         return mat
 
+def get_material_instance() -> Material:
+        # Here you initialize your Material object as you need
+        material = Material()
+        return material
 
 class Materials(cv.CheckedList):
     """Collection of Materials used for an OpenMC simulation.
