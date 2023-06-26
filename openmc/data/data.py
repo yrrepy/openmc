@@ -214,8 +214,10 @@ NATURAL_ABUNDANCE_2009 = {
     'U234': 0.000054, 'U-235': 0.007204, 'U-238': 0.992742
 }
 
-version_value = input("Please enter the IUPAC abundance data you want (2009 or 2013): ")
-print(version_value)
+version_value = os.getenv("IUPAC_VERSION")
+if not version_value:
+    version_value = input("Please enter the IUPAC abundance data you want (2009 or 2013): ")
+
 if version_value == '2009':
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
 elif version_value == '2013':
@@ -223,7 +225,7 @@ elif version_value == '2013':
 else:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
     print("The value you entered is not either IUPAC 2013 or 2009, defaulted to IUPAC 2013")
-print(NATURAL_ABUNDANCE)
+
 # Dictionary to give element symbols from IUPAC names
 # (and some common mispellings)
 ELEMENT_SYMBOL = {'neutron': 'n', 'hydrogen': 'H', 'helium': 'He',
