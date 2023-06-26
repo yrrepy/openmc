@@ -223,7 +223,7 @@ elif version_value == 2013:
 else:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
     print("The value you entered is not either IUPAC 2013 or 2009, defaulted to IUPAC 2013")
-
+print(NATURAL_ABUNDANCE)
 # Dictionary to give element symbols from IUPAC names
 # (and some common mispellings)
 ELEMENT_SYMBOL = {'neutron': 'n', 'hydrogen': 'H', 'helium': 'He',
