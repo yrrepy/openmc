@@ -13,7 +13,7 @@ import numpy as np
 import openmc
 import openmc._xml as xml
 from .checkvalue import check_type, check_less_than, check_greater_than, PathLike
-
+from typing import Optional
 
 class Geometry:
     """Geometry representing a collection of surfaces, cells, and universes.
@@ -96,7 +96,7 @@ class Geometry:
         if version is None:
             self._version = 2013
         else:
-            cv.check_type('version for Material ID="{}"'.format(self._id), version, int)
+            check_type('version for Material ID="{}"'.format(self._id), version, int)
             self._version = version
     
     def add_volume_information(self, volume_calc):
