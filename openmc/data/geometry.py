@@ -12,7 +12,7 @@ import numpy as np
 
 import openmc
 import openmc._xml as xml
-from .checkvalue import check_type, check_less_than, check_greater_than, PathLike
+from openmc.checkvalue import check_type, check_less_than, check_greater_than, PathLike
 
 
 class Geometry:
