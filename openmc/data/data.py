@@ -214,8 +214,7 @@ NATURAL_ABUNDANCE_2009 = {
     'U234': 0.000054, 'U-235': 0.007204, 'U-238': 0.992742
 }
 
-geometry_instance = get_geometry_instance()
-version_value = geometry_instance.version
+version_value = input("Please enter the IUPAC abundance data you want (2009 or 2013): ")
 print(version_value)
 if version_value == 2009:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
