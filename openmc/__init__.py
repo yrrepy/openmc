@@ -1,3 +1,4 @@
+from openmc.geometry import *
 from openmc.arithmetic import *
 from openmc.bounding_box import *
 from openmc.cell import *
