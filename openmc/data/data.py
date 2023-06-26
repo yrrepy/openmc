@@ -216,9 +216,9 @@ NATURAL_ABUNDANCE_2009 = {
 
 version_value = input("Please enter the IUPAC abundance data you want (2009 or 2013): ")
 print(version_value)
-if version_value == 2009:
+if version_value == '2009':
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)
-elif version_value == 2013:
+elif version_value == '2013':
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
 else:
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2013)
