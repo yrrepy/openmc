@@ -24,7 +24,7 @@ import numpy as np
 
 import openmc.checkvalue as cv
 from openmc.mixin import EqualityMixin
-from .data import ATOMIC_SYMBOL, gnds_name, EV_PER_MEV, K_BOLTZMANN
+from openmc.data import ATOMIC_SYMBOL, gnds_name, EV_PER_MEV, K_BOLTZMANN
 from .endf import ENDF_FLOAT_RE
 
 
