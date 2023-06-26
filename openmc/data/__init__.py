@@ -8,7 +8,7 @@ WMP_VERSION_MAJOR = 1
 WMP_VERSION_MINOR = 1
 WMP_VERSION = (WMP_VERSION_MAJOR, WMP_VERSION_MINOR)
 
-
+from .geometry import *
 from .data import *
 from .neutron import *
 from .photon import *
