@@ -216,7 +216,7 @@ NATURAL_ABUNDANCE_2009 = {
 
 version_value = os.getenv("IUPAC_VERSION")
 if not version_value:
-    version_value = input("Please enter the IUPAC abundance data you want (2009 or 2013): ")
+    version_value = '2013'
 
 if version_value == '2009':
     NATURAL_ABUNDANCE.update(NATURAL_ABUNDANCE_2009)

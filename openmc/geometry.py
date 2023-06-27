@@ -13,7 +13,7 @@ import numpy as np
 import openmc
 import openmc._xml as xml
 from .checkvalue import check_type, check_less_than, check_greater_than, PathLike
-from typing import Optional
+
 
 class Geometry:
     """Geometry representing a collection of surfaces, cells, and universes.
@@ -44,7 +44,6 @@ class Geometry:
         self._offsets = {}
         self.merge_surfaces = False
         self.surface_precision = 10
-        self._version = None
         if root is not None:
             if isinstance(root, openmc.UniverseBase):
                 self.root_universe = root
@@ -58,11 +57,6 @@ class Geometry:
     def root_universe(self) -> openmc.UniverseBase:
         return self._root_universe
 
-    @root_universe.setter
-    def root_universe(self, root_universe):
-        check_type('root universe', root_universe, openmc.UniverseBase)
-        self._root_universe = root_universe
-
     @property
     def bounding_box(self) -> np.ndarray:
         return self.root_universe.bounding_box
@@ -71,14 +65,19 @@ class Geometry:
     def merge_surfaces(self) -> bool:
         return self._merge_surfaces
 
+    @property
+    def surface_precision(self) -> int:
+        return self._surface_precision
+
+    @root_universe.setter
+    def root_universe(self, root_universe):
+        check_type('root universe', root_universe, openmc.UniverseBase)
+        self._root_universe = root_universe
+
     @merge_surfaces.setter
     def merge_surfaces(self, merge_surfaces):
         check_type('merge surfaces', merge_surfaces, bool)
         self._merge_surfaces = merge_surfaces
-
-    @property
-    def surface_precision(self) -> int:
-        return self._surface_precision
 
     @surface_precision.setter
     def surface_precision(self, surface_precision):
@@ -86,19 +85,7 @@ class Geometry:
         check_less_than('surface_precision', surface_precision, 16)
         check_greater_than('surface_precision', surface_precision, 0)
         self._surface_precision = surface_precision
-    
-    @property
-    def version(self) -> Optional[int]:
-        return self._version
-    
-    @version.setter
-    def version(self, version: Optional[int]):
-        if version is None:
-            self._version = 2013
-        else:
-            check_type('version for Material ID="{}"'.format(self._id), version, int)
-            self._version = version
-    
+
     def add_volume_information(self, volume_calc):
         """Add volume information from a stochastic volume calculation.
 
@@ -742,8 +729,3 @@ class Geometry:
         clone = deepcopy(self)
         clone.root_universe = self.root_universe.clone()
         return clone
-
-def get_geometry_instance() -> Geometry:
-        # Here you initialize your Material object as you need
-        geometry = Geometry()
-        return geometry
