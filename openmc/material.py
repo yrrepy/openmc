@@ -110,7 +110,7 @@ class Material(IDManagerMixin):
     next_id = 1
     used_ids = set()
 
-    def __init__(self, material_id=None, name='', temperature=None, version=2013):
+    def __init__(self, material_id=None, name='', temperature=None):
         # Initialize class attributes
         self.id = material_id
         self.name = name
