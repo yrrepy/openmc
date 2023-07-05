@@ -136,6 +136,8 @@ void write_mcpl_source_bank(mcpl_outfile_t file_id,
           mpi::intracomm, MPI_STATUS_IGNORE);
 #endif
       // now write the source_bank data again.
+      int count = 0;
+      int sum = 0;
       for (const auto& site : source_bank) {
         // particle is now at the iterator
         // write it to the mcpl-file
@@ -171,6 +173,8 @@ void write_mcpl_source_bank(mcpl_outfile_t file_id,
         }
 
         mcpl_add_particle(file_id, &p);
+        count +=1;
+        sum +=site.wgt;
       }
     }
 #ifdef OPENMC_MPI
