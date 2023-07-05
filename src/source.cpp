@@ -180,7 +180,6 @@ SourceSite IndependentSource::sample(uint64_t* seed) const
 {
   SourceSite site;
   site.particle = particle_;
-  std::cout<<site.wgt<<std::endl;
 
   // Repeat sampling source location until a good site has been found
   bool found = false;
@@ -322,7 +321,8 @@ FileSource::FileSource(std::string path)
 
 SourceSite FileSource::sample(uint64_t* seed) const
 {
-  size_t i_site = sites_.size() * prn(seed);;
+  size_t i_site = sites_.size() * prn(seed);
+    std::cout<<sites_.wgt<<std::endl;
   return sites_[i_site];
 }
 
