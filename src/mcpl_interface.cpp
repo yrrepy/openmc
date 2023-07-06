@@ -91,7 +91,7 @@ vector<SourceSite> mcpl_source_sites(std::string path)
 
     // Convert to source site and add to vector
     sites.push_back(mcpl_particle_to_site(particle));
-    total_weight += site.wgt;
+    total_weight += particle->wgt;
   }
 
   // Check that some sites were read
