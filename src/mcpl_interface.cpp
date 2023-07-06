@@ -176,6 +176,8 @@ void write_mcpl_source_bank(mcpl_outfile_t file_id,
         count1 +=1;
         summation += (double) site.wgt;
       }
+      weight_average = summation/(double)count1;
+      std::cout<<weight_average<<std::endl;
     }
 #ifdef OPENMC_MPI
     // Restore state of source bank
