@@ -137,7 +137,7 @@ void write_mcpl_source_bank(mcpl_outfile_t file_id,
 #endif
       // now write the source_bank data again.
       int count = 0;
-      int sum = 0;
+      int summation = 0;
       for (const auto& site : source_bank) {
         // particle is now at the iterator
         // write it to the mcpl-file
