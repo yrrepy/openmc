@@ -3,6 +3,7 @@
 #include <cmath>  // for ceil, pow
 #include <limits> // for numeric_limits
 #include <string>
+#include <filesystem>
 
 #include <fmt/core.h>
 #ifdef _OPENMP
@@ -508,7 +509,8 @@ void read_settings_xml(pugi::xml_node root)
   if (check_for_node(root, "cutoff")) {
     xml_node node_cutoff = root.child("cutoff");
     if (check_for_node(node_cutoff, "weight")) {
-      vector<SourceSite> site1 = mcpl_source_sites("surface_source.mcpl");
+      std::string mcpl_path = find_first_mcpl();
+      vector<SourceSite> site1 = mcpl_source_sites(mcpl_path);
       weight_cutoff = std::stod(get_node_value(node_cutoff, "weight"));
     }
     if (check_for_node(node_cutoff, "weight_avg")) {
@@ -1009,3 +1011,12 @@ extern "C" int openmc_get_n_batches(int* n_batches, bool get_max_batches)
 }
 
 } // namespace openmc
+
+std::string find_first_mcpl() {
+  for (const auto &entry : std::filesystem::directory_iterator(".")) {
+    if (entry.path().extension() == ".mcpl") {
+      return entry.path();
+    }
+  }
+  throw std::runtime_error("No MCPL file found in the current directory.");
+}
