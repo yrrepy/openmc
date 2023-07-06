@@ -508,7 +508,7 @@ void read_settings_xml(pugi::xml_node root)
   if (check_for_node(root, "cutoff")) {
     xml_node node_cutoff = root.child("cutoff");
     if (check_for_node(node_cutoff, "weight")) {
-      vector<SourceSite> site1 = mcpl_source_sites(".");
+      vector<SourceSite> site1 = mcpl_source_sites(".mcpl");
       weight_cutoff = std::stod(get_node_value(node_cutoff, "weight"));
     }
     if (check_for_node(node_cutoff, "weight_avg")) {
