@@ -1010,9 +1010,7 @@ extern "C" int openmc_get_n_batches(int* n_batches, bool get_max_batches)
   return 0;
 }
 
-} // namespace openmc
-
-std::string find_first_mcpl() {
+string find_first_mcpl() {
   for (const auto &entry : std::filesystem::directory_iterator(".")) {
     if (entry.path().extension() == ".mcpl") {
       return entry.path();
@@ -1020,3 +1018,5 @@ std::string find_first_mcpl() {
   }
   throw std::runtime_error("No MCPL file found in the current directory.");
 }
+
+} // namespace openmc
