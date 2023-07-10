@@ -355,6 +355,7 @@ def atomic_mass(isotope):
             _ATOMIC_MASS[isotope_zero] = 0.
             for iso, abundance in isotopes(element):
                 _ATOMIC_MASS[isotope_zero] += abundance * _ATOMIC_MASS[iso.lower()]
+            print(_ATOMIC_MASS[isotope_zero])
 
     # Get rid of metastable information
     if '_' in isotope:
@@ -637,3 +638,5 @@ def zam(name):
 
     metastable = int(state[2:]) if state else 0
     return (ATOMIC_NUMBER[symbol], int(A), metastable)
+
+print(atomic_weight(isotope("C")))
