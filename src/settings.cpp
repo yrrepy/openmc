@@ -509,8 +509,7 @@ void read_settings_xml(pugi::xml_node root)
   if (check_for_node(root, "cutoff")) {
     xml_node node_cutoff = root.child("cutoff");
     if (check_for_node(node_cutoff, "weight")) {
-      std::string mcpl_path = find_first_mcpl();
-      vector<SourceSite> site1 = mcpl_source_sites(mcpl_path);
+      vector<SourceSite> site1 = mcpl_source_sites("/surface_source.mcpl");
       weight_cutoff = std::stod(get_node_value(node_cutoff, "weight"));
     }
     if (check_for_node(node_cutoff, "weight_avg")) {
@@ -1001,22 +1000,6 @@ extern "C" int openmc_set_n_batches(
     settings::statepoint_batch.insert(n_batches);
 
   return 0;
-}
-
-extern "C" int openmc_get_n_batches(int* n_batches, bool get_max_batches)
-{
-  *n_batches = get_max_batches ? settings::n_max_batches : settings::n_batches;
-
-  return 0;
-}
-
-string find_first_mcpl() {
-  for (const auto &entry : std::filesystem::directory_iterator(".")) {
-    if (entry.path().extension() == ".mcpl") {
-      return entry.path();
-    }
-  }
-  throw std::runtime_error("No MCPL file found in the current directory.");
 }
 
 } // namespace openmc

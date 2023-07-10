@@ -105,8 +105,8 @@ vector<SourceSite> mcpl_source_sites(std::string path)
   fatal_error(
     "Your build of OpenMC does not support reading MCPL source files.");
 #endif
-  double avgerage_weight = total_weight / n_sites;
-  std::cout<< avgerage_weight<<std::endl;
+  double avg_weight = total_weight / n_sites;
+  std::cout<< avg_weight<<std::endl;
   return sites;
 }
 
