@@ -393,6 +393,7 @@ def test_py_lib_attributes(run_in_tmpdir, pin_model_attributes, mpi_intracomm):
         pytest.approx(0.06891296988603757, abs=1e-13)
     mat_a_dens = np.sum(
         list(test_model.materials[0].get_nuclide_atom_densities().values()))
+    print(mat_a_dens)
     assert mat_a_dens == pytest.approx(0.06891296988603757, abs=1e-8)
     # Change the density
     test_model.update_densities(['UO2'], 2.)
@@ -400,6 +401,7 @@ def test_py_lib_attributes(run_in_tmpdir, pin_model_attributes, mpi_intracomm):
         pytest.approx(2., abs=1e-13)
     mat_a_dens = np.sum(
         list(test_model.materials[0].get_nuclide_atom_densities().values()))
+    print(mat_a_dens)
     assert mat_a_dens == pytest.approx(2., abs=1e-8)
 
     # Now lets do the cell temperature updates.
@@ -454,6 +456,8 @@ def test_deplete(run_in_tmpdir, pin_model_attributes, mpi_intracomm):
     # Get the new Xe136 and U235 atom densities
     after_xe = mats[0].get_nuclide_atom_densities()['Xe136']
     after_u = mats[0].get_nuclide_atom_densities()['U235']
+    print(after_xe)
+    print(after_u)
     assert after_xe + after_u == pytest.approx(initial_u, abs=1e-15)
     assert test_model.is_initialized is False
 
@@ -464,6 +468,7 @@ def test_deplete(run_in_tmpdir, pin_model_attributes, mpi_intracomm):
     for nuc, density in densities.items():
         mats[0].add_nuclide(nuc, density)
         tot_density += density
+    print(tot_density)
     mats[0].set_density('atom/b-cm', tot_density)
 
     # Now we can re-run with the pre-initialized API
