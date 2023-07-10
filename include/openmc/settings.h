@@ -145,8 +145,6 @@ void read_settings_xml(pugi::xml_node root);
 
 void free_memory_settings();
 
-string find_first_mcpl()
-
 } // namespace openmc
 
 #endif // OPENMC_SETTINGS_H
