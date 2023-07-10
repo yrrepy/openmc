@@ -290,7 +290,7 @@ class Material(IDManagerMixin):
                 dists.append(source_per_atom)
                 probs.append(num_atoms)
         return openmc.data.combine_distributions(dists, probs) if dists else None
-
+    
     @classmethod
     def from_hdf5(cls, group: h5py.Group) -> Material:
         """Create material from HDF5 group

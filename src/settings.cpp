@@ -3,6 +3,7 @@
 #include <cmath>  // for ceil, pow
 #include <limits> // for numeric_limits
 #include <string>
+#include <filesystem>
 
 #include <fmt/core.h>
 #ifdef _OPENMP
@@ -508,6 +509,7 @@ void read_settings_xml(pugi::xml_node root)
   if (check_for_node(root, "cutoff")) {
     xml_node node_cutoff = root.child("cutoff");
     if (check_for_node(node_cutoff, "weight")) {
+      vector<SourceSite> site1 = mcpl_source_sites("/surface_source.mcpl");
       weight_cutoff = std::stod(get_node_value(node_cutoff, "weight"));
     }
     if (check_for_node(node_cutoff, "weight_avg")) {
@@ -996,13 +998,6 @@ extern "C" int openmc_set_n_batches(
   if (add_statepoint_batch &&
       !(contains(settings::statepoint_batch, n_batches)))
     settings::statepoint_batch.insert(n_batches);
-
-  return 0;
-}
-
-extern "C" int openmc_get_n_batches(int* n_batches, bool get_max_batches)
-{
-  *n_batches = get_max_batches ? settings::n_max_batches : settings::n_batches;
 
   return 0;
 }

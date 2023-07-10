@@ -8,7 +8,6 @@ namespace openmc {
 //==============================================================================
 // RUSSIAN_ROULETTE
 //==============================================================================
-
 void russian_roulette(Particle& p, double weight_survive)
 {
   if (weight_survive * prn(p.current_seed()) < p.wgt()) {

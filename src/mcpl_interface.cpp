@@ -73,7 +73,7 @@ SourceSite mcpl_particle_to_site(const mcpl_particle_t* particle)
 vector<SourceSite> mcpl_source_sites(std::string path)
 {
   vector<SourceSite> sites;
-
+  double total_weight = 0.0;
 #ifdef OPENMC_MCPL
   // Open MCPL file and determine number of particles
   auto mcpl_file = mcpl_open_file(path.c_str());
@@ -91,6 +91,7 @@ vector<SourceSite> mcpl_source_sites(std::string path)
 
     // Convert to source site and add to vector
     sites.push_back(mcpl_particle_to_site(particle));
+    total_weight += sites.back().wgt;
   }
 
   // Check that some sites were read
@@ -104,7 +105,8 @@ vector<SourceSite> mcpl_source_sites(std::string path)
   fatal_error(
     "Your build of OpenMC does not support reading MCPL source files.");
 #endif
-
+  double avg_weight = total_weight / n_sites;
+  std::cout<< avg_weight<<std::endl;
   return sites;
 }
 
@@ -136,6 +138,8 @@ void write_mcpl_source_bank(mcpl_outfile_t file_id,
           mpi::intracomm, MPI_STATUS_IGNORE);
 #endif
       // now write the source_bank data again.
+      int count1 = 0;
+      double summation = 0;
       for (const auto& site : source_bank) {
         // particle is now at the iterator
         // write it to the mcpl-file
@@ -171,7 +175,11 @@ void write_mcpl_source_bank(mcpl_outfile_t file_id,
         }
 
         mcpl_add_particle(file_id, &p);
+        count1 +=1;
+        summation += (double) site.wgt;
       }
+      double weight_average = summation/(double)count1;
+      std::cout<<weight_average<<std::endl;
     }
 #ifdef OPENMC_MPI
     // Restore state of source bank
