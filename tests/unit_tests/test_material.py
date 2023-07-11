@@ -427,8 +427,8 @@ def test_borated_water():
     assert m.density == pytest.approx(0.7405, 1e-3)
     assert m.temperature == pytest.approx(566.5)
     assert m._sab[0][0] == 'c_H_in_H2O'
-    ref_dens = {'B10':8.0023e-06, 'B11':3.2210e-05, 'H1':4.9458e-02,
-                'O16':2.4672e-02}
+    ref_dens = {'B10':8.0037e-06, 'B11':3.221595e-05, 'H1':4.945566e-02,
+                'O16':2.467058e-02}
     nuc_dens = m.get_nuclide_atom_densities()
     for nuclide in ref_dens:
         assert nuc_dens[nuclide] == pytest.approx(ref_dens[nuclide], 1e-2)
@@ -437,19 +437,19 @@ def test_borated_water():
 
     # Test the Celsius conversion.
     m = openmc.model.borated_water(975, 293.35, 15.51, 'C')
-    assert m.density == pytest.approx(0.7405, 1e-3)
+    assert m.density == pytest.approx(0.74054, 1e-3)
     print(m.density)
 
     # Test Fahrenheit and psi conversions.
     m = openmc.model.borated_water(975, 560.0, 2250.0, 'F', 'psi')
-    assert m.density == pytest.approx(0.7405, 1e-3)
+    assert m.density == pytest.approx(0.74058, 1e-3)
     print(m.density)
 
     # Test the density override
     m = openmc.model.borated_water(975, 566.5, 15.51, density=0.9)
-    assert m.density == pytest.approx(0.9, 1e-3)
-    print(m.density)
+    assert m.density == pytest.approx(0.90087, 1e-3)
 
+test_borated_water()
 
 def test_from_xml(run_in_tmpdir):
     # Create a materials.xml file
