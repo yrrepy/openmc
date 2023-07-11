@@ -449,8 +449,6 @@ def test_borated_water():
     m = openmc.model.borated_water(975, 566.5, 15.51, density=0.9)
     assert m.density == pytest.approx(0.90087, 1e-3)
 
-test_borated_water()
-
 def test_from_xml(run_in_tmpdir):
     # Create a materials.xml file
     m1 = openmc.Material(1, 'water')
