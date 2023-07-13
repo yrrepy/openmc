@@ -423,7 +423,6 @@ def test_materials(run_in_tmpdir):
 def test_borated_water():
     # Test against reference values from the BEAVRS benchmark.
     m = openmc.model.borated_water(975, 566.5, 15.51, material_id=50)
-    print(m.density)
     assert m.density == pytest.approx(0.7405, 1e-3)
     assert m.temperature == pytest.approx(566.5)
     assert m._sab[0][0] == 'c_H_in_H2O'
@@ -432,18 +431,15 @@ def test_borated_water():
     nuc_dens = m.get_nuclide_atom_densities()
     for nuclide in ref_dens:
         assert nuc_dens[nuclide] == pytest.approx(ref_dens[nuclide], 1e-2)
-        print(nuc_dens[nuclide])
     assert m.id == 50
 
     # Test the Celsius conversion.
     m = openmc.model.borated_water(975, 293.35, 15.51, 'C')
     assert m.density == pytest.approx(0.74054, 1e-3)
-    print(m.density)
 
     # Test Fahrenheit and psi conversions.
     m = openmc.model.borated_water(975, 560.0, 2250.0, 'F', 'psi')
     assert m.density == pytest.approx(0.74058, 1e-3)
-    print(m.density)
 
     # Test the density override
     m = openmc.model.borated_water(975, 566.5, 15.51, density=0.9)

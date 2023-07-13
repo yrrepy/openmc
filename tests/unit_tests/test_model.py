@@ -393,7 +393,6 @@ def test_py_lib_attributes(run_in_tmpdir, pin_model_attributes, mpi_intracomm):
         pytest.approx(0.06891296988603757, abs=1e-13)
     mat_a_dens = np.sum(
         list(test_model.materials[0].get_nuclide_atom_densities().values()))
-    print(mat_a_dens)
     assert mat_a_dens == pytest.approx(0.06891296988603757, abs=1e-8)
     # Change the density
     test_model.update_densities(['UO2'], 2.)
@@ -401,7 +400,6 @@ def test_py_lib_attributes(run_in_tmpdir, pin_model_attributes, mpi_intracomm):
         pytest.approx(2., abs=1e-13)
     mat_a_dens = np.sum(
         list(test_model.materials[0].get_nuclide_atom_densities().values()))
-    print(mat_a_dens)
     assert mat_a_dens == pytest.approx(2., abs=1e-8)
 
     # Now lets do the cell temperature updates.
