@@ -126,7 +126,7 @@ int trigger_batch_interval {1};
 int verbosity {7};
 double weight_cutoff {0.25};
 double weight_survive {1.0};
-double sites_avg_weight;
+
 
 } // namespace settings
 
@@ -521,7 +521,11 @@ void read_settings_xml(pugi::xml_node root)
      survival_toggle = get_node_value_bool(node_cutoff, "survival_toggle");
      if (survival_toggle) {
         //If toggle outmultiply
-        vector<SourceSite> site1 = mcpl_source_sites("/surface_source.mcpl",sites_avg_weight);
+        double total_weight = 0.0;
+        for(auto& site : model::external_sources){
+          total_weight += site.wgt;
+        }
+        double sites_avg_weight = total_weight / model::external_sources.size();
         weight_cutoff  *= sites_avg_weight; 
         weight_survive *= sites_avg_weight;
         cout<<"debug weight cutoff: " << weight_cutoff <<endl;
