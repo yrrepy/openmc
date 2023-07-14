@@ -69,6 +69,7 @@ SourceSite mcpl_particle_to_site(const mcpl_particle_t* particle)
 #endif
 
 //==============================================================================
+vector<SourceSite> mcpl_source_sites(std::string path, double& avg_weight)
 
 vector<SourceSite> mcpl_source_sites(std::string path)
 {
@@ -105,8 +106,8 @@ vector<SourceSite> mcpl_source_sites(std::string path)
   fatal_error(
     "Your build of OpenMC does not support reading MCPL source files.");
 #endif
-  double avg_weight = total_weight / n_sites;
-  std::cout<< avg_weight<<std::endl;
+  avg_weight = total_weight / n_sites;
+  std::cout<< "Debug Avg Weight: " + avg_weight<<std::endl; //Debug
   return sites;
 }
 

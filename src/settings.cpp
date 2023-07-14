@@ -77,6 +77,8 @@ bool weight_windows_on {false};
 bool write_all_tracks {false};
 bool write_initial_source {false};
 
+bool survival_toggle {false};  // debug, new function
+
 std::string path_cross_sections;
 std::string path_input;
 std::string path_output;
@@ -124,6 +126,7 @@ int trigger_batch_interval {1};
 int verbosity {7};
 double weight_cutoff {0.25};
 double weight_survive {1.0};
+double sites_avg_weight;
 
 } // namespace settings
 
@@ -509,12 +512,25 @@ void read_settings_xml(pugi::xml_node root)
   if (check_for_node(root, "cutoff")) {
     xml_node node_cutoff = root.child("cutoff");
     if (check_for_node(node_cutoff, "weight")) {
-      vector<SourceSite> site1 = mcpl_source_sites("/surface_source.mcpl");
       weight_cutoff = std::stod(get_node_value(node_cutoff, "weight"));
     }
     if (check_for_node(node_cutoff, "weight_avg")) {
       weight_survive = std::stod(get_node_value(node_cutoff, "weight_avg"));
     }
+    if(check_for_node(node_cutoff, "survival_toggle")){ //Need to create survival toggle xml entry
+     survival_toggle = get_node_value_bool(node_cutoff, "survival_toggle");
+     if (survival_toggle) {
+        //If toggle outmultiply
+        vector<SourceSite> site1 = mcpl_source_sites("/surface_source.mcpl",sites_avg_weight);
+        weight_cutoff  *= sites_avg_weight; 
+        weight_survive *= sites_avg_weight;
+        cout<<"debug weight cutoff: " << weight_cutoff <<endl;
+        cout<<"debug weight survive: " << weight_survive <<endl;
+        cout<<"debug sites average weight: " << sites_avg_weight <<endl;
+        cout<<"Survival Toggle is on: "<< sites_avg_weight<<endl; 
+      }
+    }
+    
     if (check_for_node(node_cutoff, "energy_neutron")) {
       energy_cutoff[0] =
         std::stod(get_node_value(node_cutoff, "energy_neutron"));
