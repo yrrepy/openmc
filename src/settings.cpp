@@ -523,7 +523,7 @@ void read_settings_xml(pugi::xml_node root)
         //If toggle outmultiply
         double total_weight = 0.0;
         for(auto& site : model::external_sources){
-          total_weight += site.wgt;
+          total_weight += sites_.wgt;
         }
         double sites_avg_weight = total_weight / model::external_sources.size();
         weight_cutoff  *= sites_avg_weight; 
