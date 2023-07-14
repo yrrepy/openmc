@@ -522,7 +522,7 @@ void read_settings_xml(pugi::xml_node root)
      if (survival_toggle) {
         //If toggle outmultiply
         double total_weight = 0.0;
-        for(auto& site : model::external_sources){
+        for(auto& sites_ : model::external_sources){
           total_weight += sites_.wgt;
         }
         double sites_avg_weight = total_weight / model::external_sources.size();
