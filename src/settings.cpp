@@ -528,10 +528,10 @@ void read_settings_xml(pugi::xml_node root)
         double sites_avg_weight = total_weight / model::external_sources.size();
         weight_cutoff  *= sites_avg_weight; 
         weight_survive *= sites_avg_weight;
-        cout<<"debug weight cutoff: " << weight_cutoff <<endl;
-        cout<<"debug weight survive: " << weight_survive <<endl;
-        cout<<"debug sites average weight: " << sites_avg_weight <<endl;
-        cout<<"Survival Toggle is on: "<< sites_avg_weight<<endl; 
+        std::cout<<"debug weight cutoff: " << weight_cutoff <<std::endl;
+        std::cout<<"debug weight survive: " << weight_survive <<std::endl;
+        std::cout<<"debug sites average weight: " << sites_avg_weight <<std::endl;
+        std::cout<<"Survival Toggle is on: "<< survival_toggle <<std::endl; 
       }
     }
     
