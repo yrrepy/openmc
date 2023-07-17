@@ -532,6 +532,7 @@ void read_settings_xml(pugi::xml_node root)
             // Access sites_ through getter
             const auto& sites_ = file_source->get_sites();
             for (const auto& site : sites_) {
+                std::cout << site.wgt << std::endl;
                 total_weight += site.wgt;
             }
             ++file_source_count;
