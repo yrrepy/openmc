@@ -524,7 +524,7 @@ void read_settings_xml(pugi::xml_node root)
         double total_weight = 0.0;
         int file_source_count = 0;
         std::cout<<"Debug Start \n";
-        for(auto& source_ptr : model::external_sources){
+        for(const auto& source_ptr : model::external_sources){
           std::cout << "Type of source_ptr: " << typeid(*source_ptr).name() << std::endl;
           // Try to downcast to FileSource
           FileSource* file_source = dynamic_cast<FileSource*>(source_ptr.get());
@@ -532,8 +532,8 @@ void read_settings_xml(pugi::xml_node root)
             // Access sites_ through getter
             const auto& sites_ = file_source->get_sites();
             for (const auto& site : sites_) {
-                std::cout << site.wgt << std::endl;
-                total_weight += site.wgt;
+               double particle_weight = site.wgt;
+              total_weight += particle_weight;
             }
             ++file_source_count;
             std::cout << "Successfully downcast a Source object to a FileSource object.\n";
