@@ -531,6 +531,7 @@ void read_settings_xml(pugi::xml_node root)
           if (file_source != nullptr) {
             // Access sites_ through getter
             const auto& particles = file_source->get_sites();
+            std::cout << "Number of particles from file source: " << particles.size() << std::endl;
             for (const auto& site : particles) {
               total_weight += site.wgt;
               ++particle_count;
