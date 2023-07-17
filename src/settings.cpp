@@ -523,6 +523,7 @@ void read_settings_xml(pugi::xml_node root)
         //If toggle outmultiply
         double total_weight = 0.0;
         int file_source_count = 0;
+        std::cout<<"Debug Start \n";
         for(auto& source_ptr : model::external_sources){
           std::cout << "Type of source_ptr: " << typeid(*source_ptr).name() << std::endl;
           // Try to downcast to FileSource
