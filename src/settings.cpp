@@ -518,13 +518,13 @@ void read_settings_xml(pugi::xml_node root)
       weight_survive = std::stod(get_node_value(node_cutoff, "weight_avg"));
     }
     if(check_for_node(node_cutoff, "survival_toggle")){ //Need to create survival toggle xml entry
-     survival_toggle = get_node_value_bool(node_cutoff, "survival_toggle");
-     if (survival_toggle) {
-        //If toggle outmultiply
+      survival_toggle = get_node_value_bool(node_cutoff, "survival_toggle");
+      if (survival_toggle) {
+        // If toggle outmultiply
         double total_weight = 0.0;
-        int file_source_count = 0;
-        std::cout<<"Debug Start \n";
-        for(const auto& source_ptr : model::external_sources){
+        int particle_count = 0;
+        std::cout << "Debug Start \n";
+        for(const auto& source_ptr : model::external_sources) {
           std::cout << "Type of source_ptr: " << typeid(*source_ptr).name() << std::endl;
           // Try to downcast to FileSource
           FileSource* file_source = dynamic_cast<FileSource*>(source_ptr.get());
@@ -532,24 +532,23 @@ void read_settings_xml(pugi::xml_node root)
             // Access sites_ through getter
             const auto& sites_ = file_source->get_sites();
             for (const auto& site : sites_) {
-               double particle_weight = site.wgt;
-              total_weight += particle_weight;
+              total_weight += site.wgt;
+              ++particle_count;
             }
-            ++file_source_count;
             std::cout << "Successfully downcast a Source object to a FileSource object.\n";
           } else {
             std::cout << "Failed to downcast a Source object to a FileSource object.\n";
           }
-          std::cout <<"debug file_source_count: "<< file_source_count<<std::endl;
+          std::cout <<"debug particle_count: " << particle_count << std::endl;
         }
 
-        double sites_avg_weight = total_weight / file_source_count;
-        weight_cutoff  *= sites_avg_weight; 
-        weight_survive *= sites_avg_weight;
-        std::cout<<"debug weight cutoff: " << weight_cutoff <<std::endl;
-        std::cout<<"debug weight survive: " << weight_survive <<std::endl;
-        std::cout<<"debug sites average weight: " << sites_avg_weight <<std::endl;
-        std::cout<<"Survival Toggle is on: "<< survival_toggle <<std::endl; 
+        double avg_particle_weight = total_weight / particle_count;
+        weight_cutoff  *= avg_particle_weight; 
+        weight_survive *= avg_particle_weight;
+        std::cout << "debug weight cutoff: " << weight_cutoff << std::endl;
+        std::cout << "debug weight survive: " << weight_survive << std::endl;
+        std::cout << "debug average particle weight: " << avg_particle_weight << std::endl;
+        std::cout << "Survival Toggle is on: " << survival_toggle << std::endl; 
       }
     }
     
