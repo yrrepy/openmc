@@ -524,6 +524,7 @@ void read_settings_xml(pugi::xml_node root)
         double total_weight = 0.0;
         int file_source_count = 0;
         for(auto& source_ptr : model::external_sources){
+          std::cout << "Type of source_ptr: " << typeid(*source_ptr).name() << std::endl;
           // Try to downcast to FileSource
           FileSource* file_source = dynamic_cast<FileSource*>(source_ptr.get());
           if (file_source != nullptr) {
@@ -533,7 +534,11 @@ void read_settings_xml(pugi::xml_node root)
                 total_weight += site.wgt;
             }
             ++file_source_count;
+            std::cout << "Successfully downcast a Source object to a FileSource object.\n";
+          } else {
+            std::cout << "Failed to downcast a Source object to a FileSource object.\n";
           }
+          std::cout <<"debug file_source_count: "<< file_source_count<<std::endl;
         }
 
         double sites_avg_weight = total_weight / file_source_count;
