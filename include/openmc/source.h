@@ -107,6 +107,9 @@ public:
   // Methods
   SourceSite sample(uint64_t* seed) const override;
 
+  // Getter function for sites_
+  const vector<SourceSite>& get_sites() const { return sites_; }
+
 private:
   vector<SourceSite> sites_; //!< Source sites from a file
 };
