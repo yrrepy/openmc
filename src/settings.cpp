@@ -522,6 +522,7 @@ void read_settings_xml(pugi::xml_node root)
      if (survival_toggle) {
         //If toggle outmultiply
         double total_weight = 0.0;
+        int file_source_count = 0;
         for(auto& source_ptr : model::external_sources){
           // Try to downcast to FileSource
           FileSource* file_source = dynamic_cast<FileSource*>(source_ptr.get());
@@ -531,10 +532,11 @@ void read_settings_xml(pugi::xml_node root)
             for (const auto& site : sites_) {
                 total_weight += site.wgt;
             }
+            ++file_source_count;
           }
         }
 
-        double sites_avg_weight = total_weight / model::external_sources.size();
+        double sites_avg_weight = total_weight / file_source_count;
         weight_cutoff  *= sites_avg_weight; 
         weight_survive *= sites_avg_weight;
         std::cout<<"debug weight cutoff: " << weight_cutoff <<std::endl;
