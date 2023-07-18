@@ -50,6 +50,8 @@ public:
 
   // Methods that can be overridden
   virtual double strength() const { return 1.0; }
+  
+  virtual std::vector<SourceSite> get_sites() const { return {}; }
 };
 
 //==============================================================================
@@ -107,8 +109,7 @@ public:
   // Methods
   SourceSite sample(uint64_t* seed) const override;
 
-  // Getter function for sites_
-  const vector<SourceSite>& get_sites() const { return sites_; }
+  std::vector<SourceSite> get_sites() const override { return sites_; }
 
 private:
   vector<SourceSite> sites_; //!< Source sites from a file
