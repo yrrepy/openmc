@@ -93,7 +93,6 @@ vector<SourceSite> mcpl_source_sites(std::string path)
     // Convert to source site and add to vector
     sites.push_back(mcpl_particle_to_site(particle));
     std::cout << "Size of sites: " << sites.size() << std::endl;
-    std::cout << "After Weight of particle: " << sites[i].wgt << std::endl;
   }
 
   // Check that some sites were read
