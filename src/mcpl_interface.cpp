@@ -87,14 +87,14 @@ vector<SourceSite> mcpl_source_sites(std::string path)
     while (pdg != 2112 && pdg != 22 && pdg != 11 && pdg != -11) {
       particle = mcpl_read(mcpl_file);
       pdg = particle->pdgcode;
-      std::cout << "During Weight of particle: " << sites.weight << std::endl;
+      std::cout << "During Weight of particle: " << sites.wgt << std::endl;
     }
 
 
     // Convert to source site and add to vector
     sites.push_back(mcpl_particle_to_site(particle));
     std::cout << "Size of sites: " << sites.size() << std::endl;
-    std::cout << "After Weight of particle: " << sites.weight << std::endl;
+    std::cout << "After Weight of particle: " << sites.wgt << std::endl;
   }
 
   // Check that some sites were read
