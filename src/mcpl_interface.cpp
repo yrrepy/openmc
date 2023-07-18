@@ -78,7 +78,7 @@ vector<SourceSite> mcpl_source_sites(std::string path)
   // Open MCPL file and determine number of particles
   auto mcpl_file = mcpl_open_file(path.c_str());
   size_t n_sites = mcpl_hdr_nparticles(mcpl_file);
-
+  std:cout<< "Size of MCPL File: "<< n_sites << endl;
   for (int i = 0; i < n_sites; i++) {
     // Extract particle from mcpl-file, checking if it is a neutron, photon,
     // electron, or positron. Otherwise skip.
