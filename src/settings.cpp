@@ -540,7 +540,7 @@ void read_settings_xml(pugi::xml_node root)
           FileSource* file_source = dynamic_cast<FileSource*>(source_ptr.get());
           if (file_source != nullptr) {
             // Access sites_ through getter
-            auto& particles = source_ptr->get_sites();
+            const auto& particles = source_ptr->get_sites();
             std::cout << "Number of particles from file source: " << particles.size() << std::endl;
             for (auto& site : particles) {
               total_weight += site.wgt;
