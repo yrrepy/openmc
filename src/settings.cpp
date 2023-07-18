@@ -450,14 +450,13 @@ void read_settings_xml(pugi::xml_node root)
       auto path = get_node_value(node, "file", false, true);
       if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")) {
         auto sites = mcpl_source_sites(path);
-        vector<SourceSite> sites1 = mcpl_source_sites(path);
-        for (auto& site : sites1) {
+        for (size_t i = 0; i < sites.size(); i++) {
               std::cout << "Particle weight: " << site.wgt << std::endl;
               total_weight += site.wgt;
               ++particle_count;
         }
         std::cout <<"debug particle_count: " << particle_count << std::endl;
-        double avg_particle_weight = total_weight / particle_count;
+        double avg_particle_weight = total_weight / (double) particle_count;
         std::cout << "debug average particle weight: " << avg_particle_weight << std::endl;
       
         model::external_sources.push_back(make_unique<FileSource>(sites));
@@ -555,7 +554,7 @@ void read_settings_xml(pugi::xml_node root)
           std::cout <<"debug particle_count: " << particle_count << std::endl;
         }
 
-        double avg_particle_weight = total_weight / particle_count;
+        double avg_particle_weight = total_weight / (double) particle_count;
         weight_cutoff  *= avg_particle_weight; 
         weight_survive *= avg_particle_weight;
         std::cout << "debug weight cutoff: " << weight_cutoff << std::endl;
