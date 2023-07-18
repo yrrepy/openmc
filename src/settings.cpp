@@ -450,7 +450,9 @@ void read_settings_xml(pugi::xml_node root)
       auto path = get_node_value(node, "file", false, true);
       if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")) {
         auto sites = mcpl_source_sites(path);
-        for (auto& site : sites) {
+        vector<SourceSite> sites1 = mcpl_source_sites(path);
+        for (auto& site : sites1) {
+              std::cout << "Particle weight: " << site.wgt << std::endl;
               total_weight += site.wgt;
               ++particle_count;
         }
