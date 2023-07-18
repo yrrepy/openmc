@@ -87,7 +87,6 @@ vector<SourceSite> mcpl_source_sites(std::string path)
     while (pdg != 2112 && pdg != 22 && pdg != 11 && pdg != -11) {
       particle = mcpl_read(mcpl_file);
       pdg = particle->pdgcode;
-      std::cout << "During Weight of particle: " << sites[i].wgt << std::endl;
     }
 
 
