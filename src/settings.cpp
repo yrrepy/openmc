@@ -529,8 +529,8 @@ void read_settings_xml(pugi::xml_node root)
           for (auto& site : particles) {
             total_weight += site.wgt;
             ++particle_count;
+          }
         }
-
         double avg_particle_weight = total_weight / (double) particle_count;
         weight_cutoff  *= avg_particle_weight; 
         weight_survive *= avg_particle_weight;
