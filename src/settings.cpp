@@ -520,7 +520,6 @@ void read_settings_xml(pugi::xml_node root)
     if(check_for_node(node_cutoff, "survival_toggle")){ 
       survival_toggle = get_node_value_bool(node_cutoff, "survival_toggle");
       if (survival_toggle) {
-        // If toggle outmultiply
         double total_weight = 0.0;
         int particle_count = 0;
         for(auto& source_ptr : model::external_sources) {
@@ -539,12 +538,16 @@ void read_settings_xml(pugi::xml_node root)
             ++particle_count;
           }
         }
-        double avg_particle_weight = total_weight / (double) particle_count;
-        weight_cutoff  *= avg_particle_weight; 
-        weight_survive *= avg_particle_weight;
-        std::cout << "New weight cutoff: " << weight_cutoff << std::endl;
-        std::cout << "New weight survive: " << weight_survive << std::endl;
-        std::cout << "Average particle weight: " << avg_particle_weight << std::endl; 
+        if(particle_count != 0){
+          double avg_particle_weight = total_weight / (double) particle_count;
+          weight_cutoff  *= avg_particle_weight; 
+          weight_survive *= avg_particle_weight;
+          std::cout << "New weight cutoff: " << weight_cutoff << std::endl;
+          std::cout << "New weight survive: " << weight_survive << std::endl;
+          std::cout << "Average particle weight: " << avg_particle_weight << std::endl; 
+        }else{
+          std::cerr << "Error: Division by zero attempted" << std::endl;
+        }
       }
     }
     
