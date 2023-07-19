@@ -524,14 +524,11 @@ void read_settings_xml(pugi::xml_node root)
         double total_weight = 0.0;
         int particle_count = 0;
         for(auto& source_ptr : model::external_sources) {
-          // Try to downcast to FileSource
-          if (file_source != nullptr) {
-            // Access sites_ through getter
-            const auto& particles = source_ptr->get_sites();
-            for (auto& site : particles) {
-              total_weight += site.wgt;
-              ++particle_count;
-            }
+          // Access sites_ through getter
+          const auto& particles = source_ptr->get_sites();
+          for (auto& site : particles) {
+            total_weight += site.wgt;
+            ++particle_count;
         }
 
         double avg_particle_weight = total_weight / (double) particle_count;
