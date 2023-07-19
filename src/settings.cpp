@@ -517,15 +517,23 @@ void read_settings_xml(pugi::xml_node root)
     if (check_for_node(node_cutoff, "weight_avg")) {
       weight_survive = std::stod(get_node_value(node_cutoff, "weight_avg"));
     }
-    if(check_for_node(node_cutoff, "survival_toggle")){ //Need to create survival toggle xml entry
+    if(check_for_node(node_cutoff, "survival_toggle")){ 
       survival_toggle = get_node_value_bool(node_cutoff, "survival_toggle");
       if (survival_toggle) {
         // If toggle outmultiply
         double total_weight = 0.0;
         int particle_count = 0;
         for(auto& source_ptr : model::external_sources) {
+          if (source_ptr == nullptr) {
+            std::cerr << "Error: Null pointer encountered in model::external_sources" << std::endl;
+            return; 
+          }
           // Access sites_ through getter
           const auto& particles = source_ptr->get_sites();
+          if (particles.empty()) {
+            std::cerr << "Error: No particles in this source" << std::endl;
+            return; 
+          }
           for (auto& site : particles) {
             total_weight += site.wgt;
             ++particle_count;
@@ -534,10 +542,9 @@ void read_settings_xml(pugi::xml_node root)
         double avg_particle_weight = total_weight / (double) particle_count;
         weight_cutoff  *= avg_particle_weight; 
         weight_survive *= avg_particle_weight;
-        std::cout << "debug weight cutoff: " << weight_cutoff << std::endl;
-        std::cout << "debug weight survive: " << weight_survive << std::endl;
-        std::cout << "debug average particle weight: " << avg_particle_weight << std::endl;
-        std::cout << "Survival Toggle is on: " << survival_toggle << std::endl; 
+        std::cout << "New weight cutoff: " << weight_cutoff << std::endl;
+        std::cout << "New weight survive: " << weight_survive << std::endl;
+        std::cout << "Average particle weight: " << avg_particle_weight << std::endl; 
       }
     }
     
