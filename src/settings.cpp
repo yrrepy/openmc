@@ -445,19 +445,9 @@ void read_settings_xml(pugi::xml_node root)
   // Get point to list of <source> elements and make sure there is at least one
   for (pugi::xml_node node : root.children("source")) {
     if (check_for_node(node, "file")) {
-      double total_weight = 0.0;
-      int particle_count = 0;
       auto path = get_node_value(node, "file", false, true);
       if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")) {
         auto sites = mcpl_source_sites(path);
-        for (size_t i = 0; i < sites.size(); i++) {
-              total_weight += sites[i].wgt;
-              ++particle_count;
-        }
-        std::cout <<"debug particle_count: " << particle_count << std::endl;
-        double avg_particle_weight = total_weight / (double) particle_count;
-        std::cout << "debug average particle weight: " << avg_particle_weight << std::endl;
-      
         model::external_sources.push_back(make_unique<FileSource>(sites));
       } else {
         model::external_sources.push_back(make_unique<FileSource>(path));
@@ -533,24 +523,15 @@ void read_settings_xml(pugi::xml_node root)
         // If toggle outmultiply
         double total_weight = 0.0;
         int particle_count = 0;
-        std::cout << "Debug Start \n";
         for(auto& source_ptr : model::external_sources) {
-          std::cout << "Type of source_ptr: " << typeid(*source_ptr).name() << std::endl;
           // Try to downcast to FileSource
-          FileSource* file_source = dynamic_cast<FileSource*>(source_ptr.get());
           if (file_source != nullptr) {
             // Access sites_ through getter
             const auto& particles = source_ptr->get_sites();
-            std::cout << "Number of particles from file source: " << particles.size() << std::endl;
             for (auto& site : particles) {
               total_weight += site.wgt;
               ++particle_count;
             }
-            std::cout << "Successfully downcast a Source object to a FileSource object.\n";
-          } else {
-            std::cout << "Failed to downcast a Source object to a FileSource object.\n";
-          }
-          std::cout <<"debug particle_count: " << particle_count << std::endl;
         }
 
         double avg_particle_weight = total_weight / (double) particle_count;

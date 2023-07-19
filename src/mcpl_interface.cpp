@@ -88,10 +88,8 @@ vector<SourceSite> mcpl_source_sites(std::string path)
       pdg = particle->pdgcode;
     }
 
-
     // Convert to source site and add to vector
     sites.push_back(mcpl_particle_to_site(particle));
-    std::cout << "Size of sites: " << sites.size() << std::endl;
   }
 
   // Check that some sites were read
