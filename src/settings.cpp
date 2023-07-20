@@ -476,15 +476,15 @@ void read_settings_xml(pugi::xml_node root)
 
     std::string path = "surface_source.h5";
     // Check if the user has specified different file for surface source reading
-      if (check_for_node(node_ssr, "path")) {
-        path = get_node_value(node_ssr, "path", false, true);
-      }
-      if (ends_with(path, ".h5") || ends_with(path, ".h5.gz")) {
-        auto sites = mcpl_source_sites(path);
-        model::external_sources.push_back(make_unique<FileSource>(sites));
-      }else{
-        model::external_sources.push_back(make_unique<FileSource>(path));
-      }
+    if (check_for_node(node_ssr, "path")) {
+      path = get_node_value(node_ssr, "path", false, true);
+    }
+    if (ends_with(path, ".h5") || ends_with(path, ".h5.gz")) {
+      auto sites = mcpl_source_sites(path);
+      model::external_sources.push_back(make_unique<FileSource>(sites));
+    }else{
+      model::external_sources.push_back(make_unique<FileSource>(path));
+    }
   }
 
   // If no source specified, default to isotropic point source at origin with
