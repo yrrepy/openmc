@@ -728,13 +728,35 @@ bool using_mpio_device(hid_t obj_id)
   return driver == H5FD_MPIO;
 }
 
-SourceSite hdf5_particle_to_site(hid_t dataset)
+SourceSite hdf5_particle_to_site(hid_t group)
 {
     SourceSite site;
-    
-    // Assuming a dataset named 'pdgcode' containing the type of the particle
+
+    // Open the datasets
+    hid_t pdgcode_dataset = H5Dopen(group, "pdgcode", H5P_DEFAULT);
+    hid_t position_dataset = H5Dopen(group, "position", H5P_DEFAULT);
+    hid_t direction_dataset = H5Dopen(group, "direction", H5P_DEFAULT);
+    hid_t ekin_dataset = H5Dopen(group, "ekin", H5P_DEFAULT);
+    hid_t time_dataset = H5Dopen(group, "time", H5P_DEFAULT);
+    hid_t weight_dataset = H5Dopen(group, "weight", H5P_DEFAULT);
+
+    // Check that all datasets were opened successfully
+    if (pdgcode_dataset < 0 || position_dataset < 0 || direction_dataset < 0 || 
+        ekin_dataset < 0 || time_dataset < 0 || weight_dataset < 0) {
+        fatal_error("Failed to open a dataset.");
+    }
+
+    // Read from the datasets
     int pdgcode;
-    H5Dread(dataset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &pdgcode);
+    H5Dread(pdgcode_dataset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &pdgcode);
+    double position[3];
+    double direction[3];
+    double ekin, time, weight;
+    H5Dread(position_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, position);
+    H5Dread(direction_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, direction);
+    H5Dread(ekin_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &ekin);
+    H5Dread(time_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &time);
+    H5Dread(weight_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &weight);
 
     switch (pdgcode) {
         case 2112:
@@ -751,12 +773,6 @@ SourceSite hdf5_particle_to_site(hid_t dataset)
             break;
     }
 
-    // Assume we have 'position' and 'direction' datasets in the HDF5 file
-    double position[3];
-    double direction[3];
-    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, position);
-    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, direction);
-
     // Copy position and direction
     site.r.x = position[0];
     site.r.y = position[1];
@@ -765,16 +781,18 @@ SourceSite hdf5_particle_to_site(hid_t dataset)
     site.u.y = direction[1];
     site.u.z = direction[2];
 
-    // Assume we have 'ekin', 'time', and 'weight' datasets in the HDF5 file
-    double ekin, time, weight;
-    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &ekin);
-    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &time);
-    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &weight);
-
     // HDF5 stores kinetic energy in [MeV], time in [ms]
     site.E = ekin * 1e6;
     site.time = time * 1e-3;
     site.wgt = weight;
+
+    // Close the datasets
+    H5Dclose(pdgcode_dataset);
+    H5Dclose(position_dataset);
+    H5Dclose(direction_dataset);
+    H5Dclose(ekin_dataset);
+    H5Dclose(time_dataset);
+    H5Dclose(weight_dataset);
 
     return site;
 }
@@ -792,7 +810,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     // Assume we have a group named 'particles'
     hid_t group = H5Gopen(file, "source_bank", H5P_DEFAULT);
     if (group < 0) {
-        fatal_error("Failed to open 'particles' group.");
+        fatal_error("Failed to open 'source_bank' group.");
     }
 
     // Get the number of particles (datasets in the group)
@@ -801,14 +819,14 @@ vector<SourceSite> hdf5_source_sites(std::string path)
 
     // Loop through each dataset (particle)
     for (hsize_t i = 0; i < n_particles; i++) {
-        hid_t dataset = H5Dopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
+        hid_t dataset = H5Gopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
         if (dataset < 0) {
-            fatal_error("Failed to open dataset for particle " + std::to_string(i));
+            fatal_error("Failed to open group for particle " + std::to_string(i));
         }
 
         sites.push_back(hdf5_particle_to_site(dataset));
 
-        H5Dclose(dataset);
+        H5Gclose(dataset);
     }
 
     if (sites.empty()) {
