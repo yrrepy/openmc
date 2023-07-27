@@ -726,6 +726,100 @@ bool using_mpio_device(hid_t obj_id)
   return driver == H5FD_MPIO;
 }
 
+SourceSite hdf5_particle_to_site(hid_t dataset)
+{
+    SourceSite site;
+    
+    // Assuming a dataset named 'pdgcode' containing the type of the particle
+    int pdgcode;
+    H5Dread(dataset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &pdgcode);
+
+    switch (pdgcode) {
+        case 2112:
+            site.particle = ParticleType::neutron;
+            break;
+        case 22:
+            site.particle = ParticleType::photon;
+            break;
+        case 11:
+            site.particle = ParticleType::electron;
+            break;
+        case -11:
+            site.particle = ParticleType::positron;
+            break;
+    }
+
+    // Assume we have 'position' and 'direction' datasets in the HDF5 file
+    double position[3];
+    double direction[3];
+    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, position);
+    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, direction);
+
+    // Copy position and direction
+    site.r.x = position[0];
+    site.r.y = position[1];
+    site.r.z = position[2];
+    site.u.x = direction[0];
+    site.u.y = direction[1];
+    site.u.z = direction[2];
+
+    // Assume we have 'ekin', 'time', and 'weight' datasets in the HDF5 file
+    double ekin, time, weight;
+    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &ekin);
+    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &time);
+    H5Dread(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &weight);
+
+    // HDF5 stores kinetic energy in [MeV], time in [ms]
+    site.E = ekin * 1e6;
+    site.time = time * 1e-3;
+    site.wgt = weight;
+
+    return site;
+}
+
+vector<SourceSite> hdf5_source_sites(std::string path)
+{
+    vector<SourceSite> sites;
+
+    // Open the HDF5 file
+    hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file < 0) {
+        fatal_error("Failed to open HDF5 file.");
+    }
+
+    // Assume we have a group named 'particles'
+    hid_t group = H5Gopen(file, "particles", H5P_DEFAULT);
+    if (group < 0) {
+        fatal_error("Failed to open 'particles' group.");
+    }
+
+    // Get the number of particles (datasets in the group)
+    hsize_t n_particles;
+    H5Gget_num_objs(group, &n_particles);
+
+    // Loop through each dataset (particle)
+    for (hsize_t i = 0; i < n_particles; i++) {
+        hid_t dataset = H5Dopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
+        if (dataset < 0) {
+            fatal_error("Failed to open dataset for particle " + std::to_string(i));
+        }
+
+        sites.push_back(hdf5_particle_to_site(dataset));
+
+        H5Dclose(dataset);
+    }
+
+    if (sites.empty()) {
+        fatal_error("HDF5 file contained no neutron, photon, electron, or positron "
+                    "source particles.");
+    }
+
+    H5Gclose(group);
+    H5Fclose(file);
+
+    return sites;
+}
+
 // Specializations of the H5TypeMap template struct
 template<>
 const hid_t H5TypeMap<bool>::type_id = H5T_NATIVE_INT8;
