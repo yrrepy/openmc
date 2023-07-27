@@ -790,7 +790,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     }
 
     // Assume we have a group named 'particles'
-    hid_t group = H5Gopen(file, "particles", H5P_DEFAULT);
+    hid_t group = H5Gopen(file, "source_bank", H5P_DEFAULT);
     if (group < 0) {
         fatal_error("Failed to open 'particles' group.");
     }
