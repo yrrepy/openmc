@@ -449,11 +449,10 @@ void read_settings_xml(pugi::xml_node root)
       if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")) {
         auto sites = mcpl_source_sites(path);
         model::external_sources.push_back(make_unique<FileSource>(sites));
-      else if(ends_with(path,".h5")||ends_with(path,".h5.gz")){
+      }else if(ends_with(path,".h5")||ends_with(path,".h5.gz")){
         auto sites = hdf5_source_sites(path);
         model::external_sources.push_back(make_unique<FileSource>(sites));
-      }
-      } else {
+      }else {
         model::external_sources.push_back(make_unique<FileSource>(path));
       }
     } else if (check_for_node(node, "library")) {
