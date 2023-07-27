@@ -31,7 +31,7 @@
 #include "openmc/volume_calc.h"
 #include "openmc/weight_windows.h"
 #include "openmc/xml_interface.h"
-#include "hdf5_interface.h"
+#include "openmc/hdf5_interface.h"
 
 namespace openmc {
 
