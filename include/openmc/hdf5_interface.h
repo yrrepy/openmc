@@ -518,6 +518,6 @@ inline void write_dataset(hid_t obj_id, const char* name, std::string buffer)
 {
   write_string(obj_id, name, buffer.c_str(), false);
 }
-
+vector<SourceSite> hdf5_source_sites(std::string path);
 } // namespace openmc
 #endif // OPENMC_HDF5_INTERFACE_H
