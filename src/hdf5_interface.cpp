@@ -3,6 +3,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include "openmc/bank.h"
+#include "openmc/state_point.h"
 
 #include "xtensor/xarray.hpp"
 #include "xtensor/xtensor.hpp"
