@@ -733,7 +733,7 @@ SourceSite hdf5_particle_to_site(hid_t group)
     SourceSite site;
 
     // Open the datasets
-    hid_t pdgcode_dataset = H5Dopen(group, "pdgcode", H5P_DEFAULT);
+    hid_t pdgcode_dataset = H5Dopen(group, "particle", H5P_DEFAULT);
     hid_t position_dataset = H5Dopen(group, "position", H5P_DEFAULT);
     hid_t direction_dataset = H5Dopen(group, "direction", H5P_DEFAULT);
     hid_t ekin_dataset = H5Dopen(group, "ekin", H5P_DEFAULT);
@@ -759,7 +759,7 @@ SourceSite hdf5_particle_to_site(hid_t group)
     H5Dread(weight_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &weight);
 
     switch (pdgcode) {
-        case 2112:
+        case 0:
             site.particle = ParticleType::neutron;
             break;
         case 22:
