@@ -13,11 +13,13 @@
 #include "hdf5_hl.h"
 #include "xtensor/xadapt.hpp"
 #include "xtensor/xarray.hpp"
+#include <gsl/gsl-lite.hpp>
 
 #include "openmc/array.h"
 #include "openmc/error.h"
 #include "openmc/position.h"
 #include "openmc/vector.h"
+#include "openmc/particle_data.h"
 
 namespace openmc {
 
