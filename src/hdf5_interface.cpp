@@ -803,37 +803,34 @@ vector<SourceSite> hdf5_source_sites(std::string path)
 
     // Open the HDF5 file
     hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    std::cout<<path.c_str()<<std::endl;
-    std::cout<<H5F_ACC_RDONLY<<std::endl;
-    std::cout<<H5P_DEFAULT<<std::endl;
     if (file < 0) {
         fatal_error("Failed to open HDF5 file.");
     }
 
-    // Assume we have a group named 'particles'
-    hid_t group = H5Dopen(file, "source_bank", H5P_DEFAULT);
-    std::cout<<file<<std::endl;
-    std::cout<<H5P_DEFAULT<<std::endl;
-    std::cout<<group<<std::endl;
-    if (group < 0) {
-        fatal_error("Failed to open 'source_bank' group.");
+    // Open the 'source_bank' dataset
+    hid_t dataset = H5Dopen(file, "source_bank", H5P_DEFAULT);
+    if (dataset < 0) {
+        fatal_error("Failed to open 'source_bank' dataset.");
     }
 
-    // Get the number of particles (datasets in the group)
-    hsize_t n_particles;
-    H5Dget_num_objs(group, &n_particles);
-    std::cout<<n_particles<<std::endl;
+    // Get dataspace of the dataset and its dimensions
+    hid_t dataspace = H5Dget_space(dataset);
+    int ndims = H5Sget_simple_extent_ndims(dataspace);
+    hsize_t dims[ndims];
+    H5Sget_simple_extent_dims(dataspace, dims, NULL);
 
-    // Loop through each dataset (particle)
+    // Assuming that the first dimension represents the number of particles
+    hsize_t n_particles = dims[0];
+
+    // You'll need to design the reading part of the code according to the shape and
+    // structure of your dataset. You may loop through the dataset and read individual
+    // entries, or read the entire dataset into a suitable data structure and process
+    // it from there.
+
+    // Here's a placeholder loop that assumes hdf5_particle_to_site can take an index
+    // and dataset to read each source site from the 'source_bank' dataset:
     for (hsize_t i = 0; i < n_particles; i++) {
-        hid_t dataset = H5Dopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
-        if (dataset < 0) {
-            fatal_error("Failed to open group for particle " + std::to_string(i));
-        }
-
-        sites.push_back(hdf5_particle_to_site(dataset));
-
-        H5Dclose(dataset);
+        sites.push_back(hdf5_particle_to_site(dataset, i)); // Modify as needed
     }
 
     if (sites.empty()) {
@@ -841,7 +838,9 @@ vector<SourceSite> hdf5_source_sites(std::string path)
                     "source particles.");
     }
 
-    H5Dclose(group);
+    // Close resources
+    H5Sclose(dataspace);
+    H5Dclose(dataset);
     H5Fclose(file);
 
     return sites;
