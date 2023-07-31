@@ -811,8 +811,8 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     }
 
     // Assume we have a group named 'particles'
-    hid_t group = H5Gopen(file, "source_bank", H5P_DEFAULT);
-    std::cout<<file<<std::endl;
+    hid_t group = H5Dopen(file, "source_bank", H5P_DEFAULT);
+    std::cout<<*file<<std::endl;
     std::cout<<H5P_DEFAULT<<std::endl;
     std::cout<<group<<std::endl;
     if (group < 0) {
