@@ -822,7 +822,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     // Get the number of particles (datasets in the group)
     hsize_t n_particles;
     H5Dget_num_objs(group, &n_particles);
-    std::cout<<nparticles<<std::endl;
+    std::cout<<n_particles<<std::endl;
 
     // Loop through each dataset (particle)
     for (hsize_t i = 0; i < n_particles; i++) {
