@@ -821,18 +821,19 @@ vector<SourceSite> hdf5_source_sites(std::string path)
 
     // Get the number of particles (datasets in the group)
     hsize_t n_particles;
-    H5Gget_num_objs(group, &n_particles);
+    H5Dget_num_objs(group, &n_particles);
+    std::cout<<nparticles<<std::endl;
 
     // Loop through each dataset (particle)
     for (hsize_t i = 0; i < n_particles; i++) {
-        hid_t dataset = H5Aopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
+        hid_t dataset = H5Dopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
         if (dataset < 0) {
             fatal_error("Failed to open group for particle " + std::to_string(i));
         }
 
         sites.push_back(hdf5_particle_to_site(dataset));
 
-        H5Gclose(dataset);
+        H5Dclose(dataset);
     }
 
     if (sites.empty()) {
@@ -840,7 +841,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
                     "source particles.");
     }
 
-    H5Gclose(group);
+    H5Dclose(group);
     H5Fclose(file);
 
     return sites;
