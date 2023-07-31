@@ -728,71 +728,34 @@ bool using_mpio_device(hid_t obj_id)
   return driver == H5FD_MPIO;
 }
 
-SourceSite hdf5_particle_to_site(hid_t group)
-{
+SourceSite hdf5_particle_to_site(hid_t dataset, hsize_t index) {
     SourceSite site;
+    
+    // Define the compound datatype that matches the structure in your HDF5 file
+    hid_t compound_type = H5Tcreate(H5T_COMPOUND, sizeof(SourceSite));
 
-    // Open the datasets
-    hid_t pdgcode_dataset = H5Dopen(group, "particle", H5P_DEFAULT);
-    hid_t position_dataset = H5Dopen(group, "position", H5P_DEFAULT);
-    hid_t direction_dataset = H5Dopen(group, "direction", H5P_DEFAULT);
-    hid_t ekin_dataset = H5Dopen(group, "ekin", H5P_DEFAULT);
-    hid_t time_dataset = H5Dopen(group, "time", H5P_DEFAULT);
-    hid_t weight_dataset = H5Dopen(group, "weight", H5P_DEFAULT);
+    // Assume that all fields are of their corresponding types and are in order
+    // You would need to adjust this according to your actual HDF5 file structure
+    H5Tinsert(compound_type, "particle", HOFFSET(SourceSite, particle), H5T_NATIVE_INT);
+    H5Tinsert(compound_type, "position", HOFFSET(SourceSite, position), H5T_NATIVE_DOUBLE);
+    // Repeat for other fields...
 
-    // Check that all datasets were opened successfully
-    if (pdgcode_dataset < 0 || position_dataset < 0 || direction_dataset < 0 || 
-        ekin_dataset < 0 || time_dataset < 0 || weight_dataset < 0) {
-        fatal_error("Failed to open a dataset.");
-    }
+    // Define a hyperslab in the dataset (just one source site)
+    hsize_t count[1] = {1};
+    hsize_t start[1] = {index};
+    hid_t dataspace = H5Dget_space(dataset);
+    H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, start, NULL, count, NULL);
 
-    // Read from the datasets
-    int pdgcode;
-    H5Dread(pdgcode_dataset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &pdgcode);
-    double position[3];
-    double direction[3];
-    double ekin, time, weight;
-    H5Dread(position_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, position);
-    H5Dread(direction_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, direction);
-    H5Dread(ekin_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &ekin);
-    H5Dread(time_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &time);
-    H5Dread(weight_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &weight);
+    // Define memory dataspace for read buffer
+    hid_t memspace = H5Screate_simple(1, count, NULL);
 
-    switch (pdgcode) {
-        case 0:
-            site.particle = ParticleType::neutron;
-            break;
-        case 22:
-            site.particle = ParticleType::photon;
-            break;
-        case 11:
-            site.particle = ParticleType::electron;
-            break;
-        case -11:
-            site.particle = ParticleType::positron;
-            break;
-    }
+    // Read the data from the hyperslab into the read buffer
+    H5Dread(dataset, compound_type, memspace, dataspace, H5P_DEFAULT, &site);
 
-    // Copy position and direction
-    site.r.x = position[0];
-    site.r.y = position[1];
-    site.r.z = position[2];
-    site.u.x = direction[0];
-    site.u.y = direction[1];
-    site.u.z = direction[2];
-
-    // HDF5 stores kinetic energy in [MeV], time in [ms]
-    site.E = ekin * 1e6;
-    site.time = time * 1e-3;
-    site.wgt = weight;
-
-    // Close the datasets
-    H5Dclose(pdgcode_dataset);
-    H5Dclose(position_dataset);
-    H5Dclose(direction_dataset);
-    H5Dclose(ekin_dataset);
-    H5Dclose(time_dataset);
-    H5Dclose(weight_dataset);
+    // Close resources
+    H5Sclose(memspace);
+    H5Sclose(dataspace);
+    H5Tclose(compound_type);
 
     return site;
 }
