@@ -825,7 +825,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
 
     // Loop through each dataset (particle)
     for (hsize_t i = 0; i < n_particles; i++) {
-        hid_t dataset = H5Gopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
+        hid_t dataset = H5Dopen(group, std::to_string(i).c_str(), H5P_DEFAULT);
         if (dataset < 0) {
             fatal_error("Failed to open group for particle " + std::to_string(i));
         }
