@@ -803,12 +803,18 @@ vector<SourceSite> hdf5_source_sites(std::string path)
 
     // Open the HDF5 file
     hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    std::cout<<path.c_str()<<std::endl;
+    std::cout<<H5F_ACC_RDONLY<<std::endl;
+    std::cout<<H5P_DEFAULT<<std::endl;
     if (file < 0) {
         fatal_error("Failed to open HDF5 file.");
     }
 
     // Assume we have a group named 'particles'
     hid_t group = H5Gopen(file, "source_bank", H5P_DEFAULT);
+    std::cout<<file<<std::endl;
+    std::cout<<H5P_DEFAULT<<std::endl;
+    std::cout<<group<<std::endl;
     if (group < 0) {
         fatal_error("Failed to open 'source_bank' group.");
     }
