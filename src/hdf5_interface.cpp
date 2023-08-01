@@ -855,10 +855,27 @@ void explore_group(hid_t group_id, const char *group_name) {
             H5Gclose(subgroup_id);
         }
         else if (obj_type == H5G_DATASET) {
-            printf("  Found dataset: %s\n", name);
-            hid_t dataset_id = H5Dopen(group_id, name, H5P_DEFAULT);
-            // You can do further analysis of the dataset here
-            H5Dclose(dataset_id);
+          printf("  Found dataset: %s\n", name);
+          hid_t dataset_id = H5Dopen(group_id, name, H5P_DEFAULT);
+
+          // Get the datatype of the dataset
+          hid_t datatype_id = H5Dget_type(dataset_id);
+
+          // Check if the datatype is compound
+          if (H5Tget_class(datatype_id) == H5T_COMPOUND) {
+              int nfields = H5Tget_nmembers(datatype_id);
+              printf("  Dataset has %d fields:\n", nfields);
+              for (int field_idx = 0; field_idx < nfields; field_idx++) {
+                  char* field_name = H5Tget_member_name(datatype_id, field_idx);
+                  printf("    Field %d: %s\n", field_idx, field_name);
+                  free(field_name); // Make sure to free the name when done
+              }
+          } else {
+              printf("  Dataset is not a compound datatype\n");
+          }
+          // Close the resources
+          H5Tclose(datatype_id);
+          H5Dclose(dataset_id);
         }
         else if (obj_type == H5G_TYPE) {
             printf("  Found datatype: %s\n", name);
