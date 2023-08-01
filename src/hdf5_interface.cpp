@@ -830,7 +830,8 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     // Here's a placeholder loop that assumes hdf5_particle_to_site can take an index
     // and dataset to read each source site from the 'source_bank' dataset:
     for (hsize_t i = 0; i < n_particles; i++) {
-        sites.push_back(hdf5_particle_to_site(dataset)); // Modify as needed
+      std::cout<<dataset<<std::endl;
+      sites.push_back(hdf5_particle_to_site(dataset)); // Modify as needed
     }
 
     if (sites.empty()) {
