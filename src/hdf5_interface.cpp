@@ -728,37 +728,33 @@ bool using_mpio_device(hid_t obj_id)
   return driver == H5FD_MPIO;
 }
 
-SourceSite hdf5_particle_to_site(hid_t group)
+SourceSite hdf5_particle_to_site(hid_t dataset)
 {
     SourceSite site;
 
-    // Open the datasets
-    hid_t pdgcode_dataset = H5Dopen(group, "particle", H5P_DEFAULT);
-    hid_t position_dataset = H5Dopen(group, "r{0}", H5P_DEFAULT);
-    hid_t direction_dataset = H5Dopen(group, "u{0}", H5P_DEFAULT);
-    hid_t ekin_dataset = H5Dopen(group, "E", H5P_DEFAULT);
-    hid_t time_dataset = H5Dopen(group, "time", H5P_DEFAULT);
-    hid_t weight_dataset = H5Dopen(group, "wgt", H5P_DEFAULT);
+    // Get the datatype
+    hid_t datatype = H5Dget_type(dataset);
 
-    // Check that all datasets were opened successfully
-    if (pdgcode_dataset < 0 || position_dataset < 0 || direction_dataset < 0 || 
-        ekin_dataset < 0 || time_dataset < 0 || weight_dataset < 0) {
-        fatal_error("Failed to open a dataset.");
+    // Check it's a compound datatype
+    if (H5Tget_class(datatype) != H5T_COMPOUND) {
+        fatal_error("Dataset is not a compound datatype.");
     }
 
-    // Read from the datasets
-    int pdgcode;
-    H5Dread(pdgcode_dataset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &pdgcode);
-    double position[3];
-    double direction[3];
-    double ekin, time, weight;
-    H5Dread(position_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, position);
-    H5Dread(direction_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, direction);
-    H5Dread(ekin_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &ekin);
-    H5Dread(time_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &time);
-    H5Dread(weight_dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &weight);
+    // Define a struct to hold a record
+    struct {
+        int pdgcode;
+        double position[3];
+        double direction[3];
+        double ekin;
+        double time;
+        double weight;
+    } record;
 
-    switch (pdgcode) {
+    // Read the record
+    H5Dread(dataset, datatype, H5S_ALL, H5S_ALL, H5P_DEFAULT, &record);
+
+    // Process the record
+    switch (record.pdgcode) {
         case 0:
             site.particle = ParticleType::neutron;
             break;
@@ -773,26 +769,18 @@ SourceSite hdf5_particle_to_site(hid_t group)
             break;
     }
 
-    // Copy position and direction
-    site.r.x = position[0];
-    site.r.y = position[1];
-    site.r.z = position[2];
-    site.u.x = direction[0];
-    site.u.y = direction[1];
-    site.u.z = direction[2];
+    site.r.x = record.position[0];
+    site.r.y = record.position[1];
+    site.r.z = record.position[2];
+    site.u.x = record.direction[0];
+    site.u.y = record.direction[1];
+    site.u.z = record.direction[2];
+    site.E = record.ekin * 1e6;  // Convert from MeV to eV
+    site.time = record.time * 1e-3;  // Convert from ms to s
+    site.wgt = record.weight;
 
-    // HDF5 stores kinetic energy in [MeV], time in [ms]
-    site.E = ekin * 1e6;
-    site.time = time * 1e-3;
-    site.wgt = weight;
-
-    // Close the datasets
-    H5Dclose(pdgcode_dataset);
-    H5Dclose(position_dataset);
-    H5Dclose(direction_dataset);
-    H5Dclose(ekin_dataset);
-    H5Dclose(time_dataset);
-    H5Dclose(weight_dataset);
+    // Clean up
+    H5Tclose(datatype);
 
     return site;
 }
@@ -829,10 +817,9 @@ vector<SourceSite> hdf5_source_sites(std::string path)
 
     // Here's a placeholder loop that assumes hdf5_particle_to_site can take an index
     // and dataset to read each source site from the 'source_bank' dataset:
-    for (hsize_t i = 0; i < n_particles; i++) {
-      std::cout<<dataspace<<std::endl;
-      sites.push_back(hdf5_particle_to_site(dataspace)); // Modify as needed
-    }
+
+    sites.push_back(hdf5_particle_to_site(dataset)); // Modify as needed
+
 
     if (sites.empty()) {
         fatal_error("HDF5 file contained no neutron, photon, electron, or positron "
