@@ -806,7 +806,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     if (file < 0) {
         fatal_error("Failed to open HDF5 file.");
     }
-
+    explore_group(file);
     // Open the 'source_bank' dataset
     hid_t dataset = H5Dopen(file, "source_bank", H5P_DEFAULT);
     if (dataset < 0) {
@@ -844,6 +844,46 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     H5Fclose(file);
 
     return sites;
+}
+
+void explore_group(hid_t group_id) {
+    // Get the number of objects in the group
+    hsize_t num_objects;
+    H5Gget_num_objs(group_id, &num_objects);
+
+    printf("Group has %llu objects\n", (unsigned long long)num_objects);
+
+    // Iterate through the objects in the group
+    for (hsize_t i = 0; i < num_objects; i++) {
+        char name[256];
+        H5Gget_objname_by_idx(group_id, i, name, sizeof(name));
+
+        int obj_type = H5Gget_objtype_by_idx(group_id, (size_t)i);
+
+        if (obj_type == H5G_GROUP) {
+            printf("  Found subgroup: %s\n", name);
+            hid_t subgroup_id = H5Gopen(group_id, name, H5P_DEFAULT);
+            explore_group(subgroup_id, name); // Recursive call to explore subgroup
+            H5Gclose(subgroup_id);
+        }
+        else if (obj_type == H5G_DATASET) {
+            printf("  Found dataset: %s\n", name);
+            hid_t dataset_id = H5Dopen(group_id, name, H5P_DEFAULT);
+            // You can do further analysis of the dataset here
+            H5Dclose(dataset_id);
+        }
+        else if (obj_type == H5G_TYPE) {
+            printf("  Found datatype: %s\n", name);
+            // Handle datatypes if necessary
+        }
+        else if (obj_type == H5G_LINK) {
+            printf("  Found link: %s\n", name);
+            // Handle links if necessary
+        }
+        else {
+            printf("  Unknown object type: %s\n", name);
+        }
+    }
 }
 
 // Specializations of the H5TypeMap template struct
