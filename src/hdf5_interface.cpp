@@ -734,12 +734,12 @@ SourceSite hdf5_particle_to_site(hid_t dataset)
 
     // Get the datatype
     hid_t datatype = H5Dget_type(dataset);
-
+    std::cout<<"troubleshoot1"<<std::endl;
     // Check it's a compound datatype
     if (H5Tget_class(datatype) != H5T_COMPOUND) {
         fatal_error("Dataset is not a compound datatype.");
     }
-
+    std::cout<<"troubleshoot2"<<std::endl;
     // Define a struct to hold a record
     struct {
         int pdgcode;
@@ -749,10 +749,10 @@ SourceSite hdf5_particle_to_site(hid_t dataset)
         double time;
         double weight;
     } record;
-
+    std::cout<<"troubleshoot3"<<std::endl;
     // Read the record
     H5Dread(dataset, datatype, H5S_ALL, H5S_ALL, H5P_DEFAULT, &record);
-
+    std::cout<<"troubleshoot4"<<std::endl;
     // Process the record
     switch (record.pdgcode) {
         case 0:
@@ -768,7 +768,7 @@ SourceSite hdf5_particle_to_site(hid_t dataset)
             site.particle = ParticleType::positron;
             break;
     }
-
+    std::cout<<"troubleshoot5"<<std::endl;
     site.r.x = record.position[0];
     site.r.y = record.position[1];
     site.r.z = record.position[2];
@@ -778,7 +778,7 @@ SourceSite hdf5_particle_to_site(hid_t dataset)
     site.E = record.ekin * 1e6;  // Convert from MeV to eV
     site.time = record.time * 1e-3;  // Convert from ms to s
     site.wgt = record.weight;
-
+    std::cout<<"troubleshoot6"<<std::endl;
     // Clean up
     H5Tclose(datatype);
 
