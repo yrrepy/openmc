@@ -734,11 +734,11 @@ SourceSite hdf5_particle_to_site(hid_t group)
 
     // Open the datasets
     hid_t pdgcode_dataset = H5Dopen(group, "particle", H5P_DEFAULT);
-    hid_t position_dataset = H5Dopen(group, "position", H5P_DEFAULT);
-    hid_t direction_dataset = H5Dopen(group, "direction", H5P_DEFAULT);
-    hid_t ekin_dataset = H5Dopen(group, "ekin", H5P_DEFAULT);
+    hid_t position_dataset = H5Dopen(group, "r{0}", H5P_DEFAULT);
+    hid_t direction_dataset = H5Dopen(group, "u{0}", H5P_DEFAULT);
+    hid_t ekin_dataset = H5Dopen(group, "E", H5P_DEFAULT);
     hid_t time_dataset = H5Dopen(group, "time", H5P_DEFAULT);
-    hid_t weight_dataset = H5Dopen(group, "weight", H5P_DEFAULT);
+    hid_t weight_dataset = H5Dopen(group, "wgt", H5P_DEFAULT);
 
     // Check that all datasets were opened successfully
     if (pdgcode_dataset < 0 || position_dataset < 0 || direction_dataset < 0 || 
