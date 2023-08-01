@@ -806,7 +806,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     if (file < 0) {
         fatal_error("Failed to open HDF5 file.");
     }
-    explore_group(file);
+    explore_group(file,"/");
     // Open the 'source_bank' dataset
     hid_t dataset = H5Dopen(file, "source_bank", H5P_DEFAULT);
     if (dataset < 0) {
@@ -846,7 +846,7 @@ vector<SourceSite> hdf5_source_sites(std::string path)
     return sites;
 }
 
-void explore_group(hid_t group_id) {
+void explore_group(hid_t group_id, const char *group_name) {
     // Get the number of objects in the group
     hsize_t num_objects;
     H5Gget_num_objs(group_id, &num_objects);
