@@ -129,6 +129,9 @@ int verbosity {7};
 double weight_cutoff {0.25};
 double weight_survive {1.0};
 
+double weight_cutoff_fixed;
+double weight_survive_fixed;
+
 
 } // namespace settings
 
@@ -523,6 +526,8 @@ void read_settings_xml(pugi::xml_node root)
     }
     if(check_for_node(node_cutoff, "survive_toggle")){ 
       survival_toggle = get_node_value_bool(node_cutoff, "survive_toggle");
+      weight_cutoff_fixed = weight_cutoff;
+      weight_survive_fixed = weight_survive;
     }
     
     if (check_for_node(node_cutoff, "energy_neutron")) {
