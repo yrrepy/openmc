@@ -580,7 +580,7 @@ void initialize_history(Particle& p, int64_t index_source)
 
 //Toggle to adjust weight cutoff and weight survive by multiplying the current weight
   if(settings::source_file){
-    if(settings::survival_toggle){
+    if(settings::survival_normalization){
       settings::weight_cutoff = settings::weight_cutoff_fixed * p.wgt();
       settings::weight_survive = settings::weight_survive_fixed * p.wgt();
     }

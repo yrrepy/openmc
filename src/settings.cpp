@@ -78,7 +78,7 @@ bool weight_windows_on {false};
 bool write_all_tracks {false};
 bool write_initial_source {false};
 
-bool survival_toggle {true};  // debug, new function
+bool survival_normalization {true};  // debug, new function
 bool source_file {false};
 
 std::string path_cross_sections;
@@ -527,7 +527,7 @@ void read_settings_xml(pugi::xml_node root)
       weight_survive_fixed = weight_survive;
     }
     if(check_for_node(node_cutoff, "survive_normalization")){ 
-      survival_toggle = get_node_value_bool(node_cutoff, "survive_normalization");
+      survival_normalization = get_node_value_bool(node_cutoff, "survive_normalization");
     }
     
     if (check_for_node(node_cutoff, "energy_neutron")) {
