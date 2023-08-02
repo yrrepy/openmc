@@ -62,6 +62,9 @@ extern "C" bool weight_windows_on; //!< are weight windows are enabled?
 extern bool write_all_tracks;      //!< write track files for every particle?
 extern bool write_initial_source;  //!< write out initial source file?
 
+extern bool survival_toggle {false};  // debug, new function
+extern bool source_file {false};
+
 // Paths to various files
 extern std::string path_cross_sections; //!< path to cross_sections.xml
 extern std::string path_input;  //!< directory where main .xml files resides
