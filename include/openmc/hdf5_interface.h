@@ -13,13 +13,11 @@
 #include "hdf5_hl.h"
 #include "xtensor/xadapt.hpp"
 #include "xtensor/xarray.hpp"
-#include <gsl/gsl-lite.hpp>
 
 #include "openmc/array.h"
 #include "openmc/error.h"
 #include "openmc/position.h"
 #include "openmc/vector.h"
-#include "openmc/particle_data.h"
 
 namespace openmc {
 
@@ -520,7 +518,6 @@ inline void write_dataset(hid_t obj_id, const char* name, std::string buffer)
 {
   write_string(obj_id, name, buffer.c_str(), false);
 }
-vector<SourceSite> hdf5_source_sites(std::string path);
-void explore_group(hid_t group_id, const char *group_name);
+
 } // namespace openmc
 #endif // OPENMC_HDF5_INTERFACE_H

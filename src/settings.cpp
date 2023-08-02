@@ -79,6 +79,7 @@ bool write_all_tracks {false};
 bool write_initial_source {false};
 
 bool survival_toggle {false};  // debug, new function
+bool source_file {false};
 
 std::string path_cross_sections;
 std::string path_input;
@@ -450,9 +451,8 @@ void read_settings_xml(pugi::xml_node root)
       if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")) {
         auto sites = mcpl_source_sites(path);
         model::external_sources.push_back(make_unique<FileSource>(sites));
-      }else if(ends_with(path,".h5")||ends_with(path,".h5.gz")){
-        auto sites = hdf5_source_sites(path);
-        model::external_sources.push_back(make_unique<FileSource>(sites));
+      }else if (ends_with(path, ".mcpl") || ends_with(path, ".mcpl.gz")||ends_with(path, ".h5") || ends_with(path, ".h5.gz")){
+        source_file = true;
       }else {
         model::external_sources.push_back(make_unique<FileSource>(path));
       }
@@ -521,38 +521,8 @@ void read_settings_xml(pugi::xml_node root)
     if (check_for_node(node_cutoff, "weight_avg")) {
       weight_survive = std::stod(get_node_value(node_cutoff, "weight_avg"));
     }
-    if(check_for_node(node_cutoff, "weight_cutoffs_norm")){ 
-      survival_toggle = get_node_value_bool(node_cutoff, "weight_cutoffs_norm");
-      if (survival_toggle) {
-        double total_weight = 0.0;
-        int particle_count = 0;
-        for(auto& source_ptr : model::external_sources) {
-          if (source_ptr == nullptr) {
-            std::cerr << "Error: Null pointer encountered in model::external_sources" << std::endl;
-            return; 
-          }
-          // Access sites_ through getter
-          const auto& particles = source_ptr->get_sites();
-          if (particles.empty()) {
-            std::cerr << "Error: No particles in this source" << std::endl;
-            return; 
-          }
-          for (auto& site : particles) {
-            total_weight += site.wgt;
-            ++particle_count;
-          }
-        }
-        if(particle_count != 0){
-          double avg_particle_weight = total_weight / (double) particle_count;
-          weight_cutoff  *= avg_particle_weight; 
-          weight_survive *= avg_particle_weight;
-          std::cout << "New weight cutoff: " << weight_cutoff << std::endl;
-          std::cout << "New weight survive: " << weight_survive << std::endl;
-          std::cout << "Average particle weight: " << avg_particle_weight << std::endl; 
-        }else{
-          std::cerr << "Error: Division by zero attempted" << std::endl;
-        }
-      }
+    if(check_for_node(node_cutoff, "survive_toggle")){ 
+      survival_toggle = get_node_value_bool(node_cutoff, "survive_toggle");
     }
     
     if (check_for_node(node_cutoff, "energy_neutron")) {
