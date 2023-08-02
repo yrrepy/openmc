@@ -574,14 +574,16 @@ void initialize_history(Particle& p, int64_t index_source)
     write_message("Simulating Particle {}", p.id());
   }
 
-// Add paricle's starting weight to count for normalizing tallies later
+// Add particle's starting weight to count for normalizing tallies later
 #pragma omp atomic
   simulation::total_weight += p.wgt();
 
-//Toggle to adjust weight cutoff and weight survive by multiplying the current weight
-  if(settings::source_file){
+// Normalize weight cutoff and weight survive by multiplying them by the intial weight of the current surface-source history particle
+// Applicable only to MCPL and H5 phase-space files.
+// Future: coding to multiply general sources' weight parameters by source minimum weight (applicable to biased general sources (OpenMC, Library).
+  if(settings::source_file  ||  settings::surf_source_read){                      // first condition needs to be correctly implemented
     if(settings::survival_normalization){
-      settings::weight_cutoff = settings::weight_cutoff_fixed * p.wgt();
+      settings::weight_cutoff  = settings::weight_cutoff_fixed  * p.wgt();
       settings::weight_survive = settings::weight_survive_fixed * p.wgt();
     }
   }
