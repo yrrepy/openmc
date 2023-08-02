@@ -526,8 +526,8 @@ void read_settings_xml(pugi::xml_node root)
       weight_survive = std::stod(get_node_value(node_cutoff, "weight_avg"));
       weight_survive_fixed = weight_survive;
     }
-    if(check_for_node(node_cutoff, "survive_normalization")){ 
-      survival_normalization = get_node_value_bool(node_cutoff, "survive_normalization");
+    if(check_for_node(node_cutoff, "survival_normalization")){ 
+      survival_normalization = get_node_value_bool(node_cutoff, "survival_normalization");
     }
     
     if (check_for_node(node_cutoff, "energy_neutron")) {
