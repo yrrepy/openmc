@@ -579,13 +579,13 @@ void initialize_history(Particle& p, int64_t index_source)
   simulation::total_weight += p.wgt();
 
 //Toggle to adjust weight cutoff and weight survive by multiplying the current weight
-  if(source_file){
-    if(survival_toggle){
-      weight_cutoff *= p.wgt();
-      weight_survive *= p.wgt();
+  if(settings::source_file){
+    if(settings::survival_toggle){
+      settings::weight_cutoff *= p.wgt();
+      settings::weight_survive *= p.wgt();
     }
   }
-  
+
   // Force calculation of cross-sections by setting last energy to zero
   if (settings::run_CE) {
     p.invalidate_neutron_xs();
