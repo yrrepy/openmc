@@ -1678,6 +1678,23 @@ default, the cutoff weight in OpenMC is :math:`w_c = 0.25` and the survival
 weight is :math:`w_s = 1.0`. These parameters vary from one Monte Carlo code to
 another.
 
+.. _survival_normalization:
+
+Survival Normalization
+----------------
+
+This parameter can be used to make the adjustable parameters of survival biasing,
+:math:`w_c` and :math:`w_s`, relative to the starting weight of a source particle.
+
+It is currently only implemented for phase-space sources (MCPL file sources
+and HDF5 surface sources). For these, the normalization of the parameters
+is done per source particle. That is for each history the parameters,
+:math:`w_c` and :math:`w_s`, are multiplied by the start weight of the current
+history.
+
+For most problems this normalization is found to improve Figure of Merits and is 
+recommended.
+
 Weight Windows
 --------------
 

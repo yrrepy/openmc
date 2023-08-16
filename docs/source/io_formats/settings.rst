@@ -79,6 +79,12 @@ you care. This element has the following attributes/sub-elements:
 
     *Default*: 1.0
 
+  :survival_normalization:
+    If this element is set to "true", this will enable the use of survival normalization, whereby the weight parameters, weight and weight_avg, are multiplied per 
+    history by the start weight of said history. Currently only implemented for phase-space sources.
+
+    *Default*: true
+
   :energy_neutron:
     The energy under which neutrons will be killed.
 
