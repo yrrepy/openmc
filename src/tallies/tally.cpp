@@ -556,11 +556,6 @@ void Tally::set_scores(const vector<std::string>& scores)
       }
       break;
 
-    case HEATING:
-      if (settings::photon_transport)
-        estimator_ = TallyEstimator::COLLISION;
-      break;
-
     case SCORE_PULSE_HEIGHT:
       if (non_cell_energy_present) {
         fatal_error("Pulse-height tallies are not compatible with filters "
@@ -588,6 +583,7 @@ void Tally::set_scores(const vector<std::string>& scores)
     }
 
     scores_.push_back(score);
+
   }
 
   // Make sure that no duplicate scores exist.
