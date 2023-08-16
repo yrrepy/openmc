@@ -75,18 +75,18 @@ public:
 
   // Methods
 
+  //! Update a position to the local coordinates of the mesh
+  virtual void local_coords(Position& r) const {};
+
+  //! Return a position in the local coordinates of the mesh
+  virtual Position local_coords(const Position& r) const { return r; };
+
   //! Sample a mesh volume using a certain seed
   //
   //! \param[in] seed Seed to use for random sampling
   //! \param[in] bin Bin value of the tet sampled
   //! \return sampled position within tet
   virtual Position sample(uint64_t* seed, int32_t bin) const = 0;
-
-  //! Get the volume of a mesh bin
-  //
-  //! \param[in] bin Bin to return the volume for
-  //! \return Volume of the bin
-  virtual double volume(int bin) const = 0;
 
   //! Determine which bins were crossed by a particle
   //
@@ -119,6 +119,8 @@ public:
   //! Get the number of mesh cell surfaces.
   virtual int n_surface_bins() const = 0;
 
+  int32_t id() const { return id_; }
+
   //! Set the mesh ID
   void set_id(int32_t id = -1);
 
@@ -143,7 +145,15 @@ public:
   //! \param[in] bin Mesh bin to generate a label for
   virtual std::string bin_label(int bin) const = 0;
 
-  //! Return the mesh type
+  //! Get the volume of a mesh bin
+  //
+  //! \param[in] bin Bin to return the volume for
+  //! \return Volume of the bin
+  virtual double volume(int bin) const = 0;
+
+  //! Volumes of all elements in the mesh in bin ordering
+  vector<double> volumes() const;
+
   virtual std::string get_mesh_type() const = 0;
 
   // Data members
@@ -174,8 +184,6 @@ public:
   };
 
   Position sample(uint64_t* seed, int32_t bin) const override;
-
-  double volume(int bin) const override;
 
   int get_bin(Position r) const override;
 
@@ -254,12 +262,39 @@ public:
   //! Get shape as xt::xtensor
   xt::xtensor<int, 1> get_x_shape() const;
 
+  double volume(int bin) const override
+  {
+    return this->volume(get_indices_from_bin(bin));
+  }
+
+  //! Get the volume of a specified element
+  //! \param[in] ijk Mesh index to return the volume for
+  //! \return Volume of the bin
+  virtual double volume(const MeshIndex& ijk) const = 0;
+
   // Data members
   xt::xtensor<double, 1> lower_left_;  //!< Lower-left coordinates of mesh
   xt::xtensor<double, 1> upper_right_; //!< Upper-right coordinates of mesh
   std::array<int, 3> shape_; //!< Number of mesh elements in each dimension
 
 protected:
+};
+
+class PeriodicStructuredMesh : public StructuredMesh {
+
+public:
+  PeriodicStructuredMesh() = default;
+  PeriodicStructuredMesh(pugi::xml_node node) : StructuredMesh {node} {};
+
+  void local_coords(Position& r) const override { r -= origin_; };
+
+  Position local_coords(const Position& r) const override
+  {
+    return r - origin_;
+  };
+
+  // Data members
+  Position origin_ {0.0, 0.0, 0.0}; //!< Origin of the mesh
 };
 
 //==============================================================================
@@ -308,8 +343,12 @@ public:
   xt::xtensor<double, 1> count_sites(
     const SourceSite* bank, int64_t length, bool* outside) const;
 
+  //! Return the volume for a given mesh index
+  double volume(const MeshIndex& ijk) const override;
+
   // Data members
   double volume_frac_;           //!< Volume fraction of each mesh element
+  double element_volume_;        //!< Volume of each mesh element
   xt::xtensor<double, 1> width_; //!< Width of each mesh element
 };
 
@@ -347,12 +386,16 @@ public:
   //! \param[in] i Direction index
   double negative_grid_boundary(const MeshIndex& ijk, int i) const;
 
-  array<vector<double>, 3> grid_;
+  //! Return the volume for a given mesh index
+  double volume(const MeshIndex& ijk) const override;
 
   int set_grid();
+
+  // Data members
+  array<vector<double>, 3> grid_;
 };
 
-class CylindricalMesh : public StructuredMesh {
+class CylindricalMesh : public PeriodicStructuredMesh {
 public:
   // Constructors
   CylindricalMesh() = default;
@@ -375,6 +418,8 @@ public:
 
   void to_hdf5(hid_t group) const override;
 
+  double volume(const MeshIndex& ijk) const override;
+
   array<vector<double>, 3> grid_;
 
   int set_grid();
@@ -389,7 +434,7 @@ private:
 
   bool full_phi_ {false};
 
-  constexpr inline int sanitize_angular_index(int idx, bool full, int N) const
+  inline int sanitize_angular_index(int idx, bool full, int N) const
   {
     if ((idx > 0) and (idx <= N)) {
       return idx;
@@ -406,7 +451,7 @@ private:
   }
 };
 
-class SphericalMesh : public StructuredMesh {
+class SphericalMesh : public PeriodicStructuredMesh {
 public:
   // Constructors
   SphericalMesh() = default;
@@ -444,7 +489,7 @@ private:
   bool full_theta_ {false};
   bool full_phi_ {false};
 
-  constexpr inline int sanitize_angular_index(int idx, bool full, int N) const
+  inline int sanitize_angular_index(int idx, bool full, int N) const
   {
     if ((idx > 0) and (idx <= N)) {
       return idx;
@@ -454,6 +499,8 @@ private:
       return 0;
     }
   }
+
+  double volume(const MeshIndex& ijk) const override;
 
   inline int sanitize_theta(int idx) const
   {
@@ -611,6 +658,10 @@ public:
 
   std::vector<int> connectivity(int id) const override;
 
+  //! Get the volume of a mesh bin
+  //
+  //! \param[in] bin Bin to return the volume for
+  //! \return Volume of the bin
   double volume(int bin) const override;
 
 private:
@@ -768,6 +819,10 @@ public:
 
   std::vector<int> connectivity(int id) const override;
 
+  //! Get the volume of a mesh bin
+  //
+  //! \param[in] bin Bin to return the volume for
+  //! \return Volume of the bin
   double volume(int bin) const override;
 
   libMesh::MeshBase* mesh_ptr() const { return m_; };

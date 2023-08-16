@@ -1,4 +1,4 @@
-import xml.etree.ElementTree as ET
+import lxml.etree as ET
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +20,7 @@ def test_volume(run_in_tmpdir, uo2):
     model.settings.particles = 100
     model.settings.batches = 10
     model.settings.run_mode = 'fixed source'
-    model.settings.source = openmc.Source(space=openmc.stats.Point())
+    model.settings.source = openmc.IndependentSource(space=openmc.stats.Point())
 
     ll, ur = model.geometry.bounding_box
     assert ll == pytest.approx((-outer.r, -outer.r, -outer.r))
@@ -362,8 +362,13 @@ def test_remove_redundant_surfaces():
     clad = get_cyl_cell(r1, r2, z1, z2, m2)
     water = get_cyl_cell(r2, r3, z1, z2, m3)
     root = openmc.Universe(cells=[fuel, clad, water])
-    geom = openmc.Geometry(root)
-    geom.merge_surfaces=True
+    geom = openmc.Geometry(root=root, merge_surfaces=True, surface_precision=11)
+    assert geom.merge_surfaces is True
+    geom.merge_surfaces = False
+    assert geom.merge_surfaces is False
+    assert geom.surface_precision == 11
+    geom.surface_precision = 10
+    assert geom.surface_precision == 10
     model = openmc.model.Model(geometry=geom,
                                materials=openmc.Materials([m1, m2, m3]))
 

@@ -228,6 +228,18 @@ class DecayMode(EqualityMixin):
     def branching_ratio(self):
         return self._branching_ratio
 
+    @branching_ratio.setter
+    def branching_ratio(self, branching_ratio):
+        cv.check_type('branching ratio', branching_ratio, UFloat)
+        cv.check_greater_than('branching ratio',
+                              branching_ratio.nominal_value, 0.0, True)
+        if branching_ratio.nominal_value == 0.0:
+            warn('Decay mode {} of parent {} has a zero branching ratio.'
+                 .format(self.modes, self.parent))
+        cv.check_greater_than('branching ratio uncertainty',
+                              branching_ratio.std_dev, 0.0, True)
+        self._branching_ratio = branching_ratio
+
     @property
     def daughter(self):
         # Determine atomic number and mass number of parent
@@ -250,28 +262,17 @@ class DecayMode(EqualityMixin):
             return '{}{}'.format(ATOMIC_SYMBOL[Z], A)
 
     @property
-    def energy(self):
-        return self._energy
-
-    @property
-    def modes(self):
-        return self._modes
-
-    @property
     def parent(self):
         return self._parent
 
-    @branching_ratio.setter
-    def branching_ratio(self, branching_ratio):
-        cv.check_type('branching ratio', branching_ratio, UFloat)
-        cv.check_greater_than('branching ratio',
-                              branching_ratio.nominal_value, 0.0, True)
-        if branching_ratio.nominal_value == 0.0:
-            warn('Decay mode {} of parent {} has a zero branching ratio.'
-                 .format(self.modes, self.parent))
-        cv.check_greater_than('branching ratio uncertainty',
-                              branching_ratio.std_dev, 0.0, True)
-        self._branching_ratio = branching_ratio
+    @parent.setter
+    def parent(self, parent):
+        cv.check_type('parent nuclide', parent, str)
+        self._parent = parent
+
+    @property
+    def energy(self):
+        return self._energy
 
     @energy.setter
     def energy(self, energy):
@@ -281,15 +282,14 @@ class DecayMode(EqualityMixin):
                               energy.std_dev, 0.0, True)
         self._energy = energy
 
+    @property
+    def modes(self):
+        return self._modes
+
     @modes.setter
     def modes(self, modes):
         cv.check_type('decay modes', modes, Iterable, str)
         self._modes = modes
-
-    @parent.setter
-    def parent(self, parent):
-        cv.check_type('parent nuclide', parent, str)
-        self._parent = parent
 
 
 class Decay(EqualityMixin):
@@ -558,9 +558,9 @@ class Decay(EqualityMixin):
                     raise NotImplementedError("Multiple interpolation regions: {name}, {particle}")
                 interpolation = INTERPOLATION_SCHEME[f.interpolation[0]]
                 if interpolation not in ('histogram', 'linear-linear'):
-                    raise NotImplementedError(
+                    warn(
                         f"Continuous spectra with {interpolation} interpolation "
-                        f"({name}, {particle}) not supported")
+                        f"({name}, {particle}) encountered.")
 
                 intensity = spectra['continuous_normalization'].n
                 rates = decay_constant * intensity * f.y

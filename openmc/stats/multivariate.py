@@ -1,15 +1,17 @@
+from __future__ import annotations
+import typing
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from math import pi, cos
+from math import cos, pi
 from numbers import Real
-from xml.etree import ElementTree as ET
 
+import lxml.etree as ET
 import numpy as np
 
 import openmc.checkvalue as cv
 from .._xml import get_text
-from .univariate import Univariate, Uniform, PowerLaw
 from ..mesh import MeshBase
+from .univariate import PowerLaw, Uniform, Univariate
 
 
 class UnitSphere(ABC):
@@ -102,14 +104,14 @@ class PolarAzimuthal(UnitSphere):
     def mu(self):
         return self._mu
 
-    @property
-    def phi(self):
-        return self._phi
-
     @mu.setter
     def mu(self, mu):
         cv.check_type('cosine of polar angle', mu, Univariate)
         self._mu = mu
+
+    @property
+    def phi(self):
+        return self._phi
 
     @phi.setter
     def phi(self, phi):
@@ -121,7 +123,7 @@ class PolarAzimuthal(UnitSphere):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing angular distribution data
 
         """
@@ -139,7 +141,7 @@ class PolarAzimuthal(UnitSphere):
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -168,7 +170,7 @@ class Isotropic(UnitSphere):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing isotropic distribution data
 
         """
@@ -177,12 +179,12 @@ class Isotropic(UnitSphere):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate isotropic distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -209,7 +211,7 @@ class Monodirectional(UnitSphere):
 
     """
 
-    def __init__(self, reference_uvw=[1., 0., 0.]):
+    def __init__(self, reference_uvw: typing.Sequence[float] = [1., 0., 0.]):
         super().__init__(reference_uvw)
 
     def to_xml_element(self):
@@ -217,7 +219,7 @@ class Monodirectional(UnitSphere):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing monodirectional distribution data
 
         """
@@ -228,12 +230,12 @@ class Monodirectional(UnitSphere):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate monodirectional distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -304,7 +306,12 @@ class CartesianIndependent(Spatial):
 
     """
 
-    def __init__(self, x, y, z):
+    def __init__(
+        self,
+        x: openmc.stats.Univariate,
+        y: openmc.stats.Univariate,
+        z: openmc.stats.Univariate
+    ):
         self.x = x
         self.y = y
         self.z = z
@@ -313,23 +320,23 @@ class CartesianIndependent(Spatial):
     def x(self):
         return self._x
 
-    @property
-    def y(self):
-        return self._y
-
-    @property
-    def z(self):
-        return self._z
-
     @x.setter
     def x(self, x):
         cv.check_type('x coordinate', x, Univariate)
         self._x = x
 
+    @property
+    def y(self):
+        return self._y
+
     @y.setter
     def y(self, y):
         cv.check_type('y coordinate', y, Univariate)
         self._y = y
+
+    @property
+    def z(self):
+        return self._z
 
     @z.setter
     def z(self, z):
@@ -341,7 +348,7 @@ class CartesianIndependent(Spatial):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing spatial distribution data
 
         """
@@ -353,12 +360,12 @@ class CartesianIndependent(Spatial):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate spatial distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -426,32 +433,32 @@ class SphericalIndependent(Spatial):
     def r(self):
         return self._r
 
-    @property
-    def cos_theta(self):
-        return self._cos_theta
-
-    @property
-    def phi(self):
-        return self._phi
-
-    @property
-    def origin(self):
-        return self._origin
-
     @r.setter
     def r(self, r):
         cv.check_type('r coordinate', r, Univariate)
         self._r = r
+
+    @property
+    def cos_theta(self):
+        return self._cos_theta
 
     @cos_theta.setter
     def cos_theta(self, cos_theta):
         cv.check_type('cos_theta coordinate', cos_theta, Univariate)
         self._cos_theta = cos_theta
 
+    @property
+    def phi(self):
+        return self._phi
+
     @phi.setter
     def phi(self, phi):
         cv.check_type('phi coordinate', phi, Univariate)
         self._phi = phi
+
+    @property
+    def origin(self):
+        return self._origin
 
     @origin.setter
     def origin(self, origin):
@@ -464,7 +471,7 @@ class SphericalIndependent(Spatial):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing spatial distribution data
 
         """
@@ -477,12 +484,12 @@ class SphericalIndependent(Spatial):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate spatial distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -548,32 +555,32 @@ class CylindricalIndependent(Spatial):
     def r(self):
         return self._r
 
-    @property
-    def phi(self):
-        return self._phi
-
-    @property
-    def z(self):
-        return self._z
-
-    @property
-    def origin(self):
-        return self._origin
-
     @r.setter
     def r(self, r):
         cv.check_type('r coordinate', r, Univariate)
         self._r = r
+
+    @property
+    def phi(self):
+        return self._phi
 
     @phi.setter
     def phi(self, phi):
         cv.check_type('phi coordinate', phi, Univariate)
         self._phi = phi
 
+    @property
+    def z(self):
+        return self._z
+
     @z.setter
     def z(self, z):
         cv.check_type('z coordinate', z, Univariate)
         self._z = z
+
+    @property
+    def origin(self):
+        return self._origin
 
     @origin.setter
     def origin(self, origin):
@@ -586,7 +593,7 @@ class CylindricalIndependent(Spatial):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing spatial distribution data
 
         """
@@ -599,12 +606,12 @@ class CylindricalIndependent(Spatial):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate spatial distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -698,7 +705,7 @@ class MeshSpatial(Spatial):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing spatial distribution data
 
         """
@@ -719,7 +726,7 @@ class MeshSpatial(Spatial):
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
         meshes : dict
             A dictionary with mesh IDs as keys and openmc.MeshBase instances as
@@ -772,7 +779,12 @@ class Box(Spatial):
 
     """
 
-    def __init__(self, lower_left, upper_right, only_fissionable=False):
+    def __init__(
+        self,
+        lower_left: typing.Sequence[float],
+        upper_right: typing.Sequence[float],
+        only_fissionable: bool = False
+    ):
         self.lower_left = lower_left
         self.upper_right = upper_right
         self.only_fissionable = only_fissionable
@@ -781,25 +793,25 @@ class Box(Spatial):
     def lower_left(self):
         return self._lower_left
 
-    @property
-    def upper_right(self):
-        return self._upper_right
-
-    @property
-    def only_fissionable(self):
-        return self._only_fissionable
-
     @lower_left.setter
     def lower_left(self, lower_left):
         cv.check_type('lower left coordinate', lower_left, Iterable, Real)
         cv.check_length('lower left coordinate', lower_left, 3)
         self._lower_left = lower_left
 
+    @property
+    def upper_right(self):
+        return self._upper_right
+
     @upper_right.setter
     def upper_right(self, upper_right):
         cv.check_type('upper right coordinate', upper_right, Iterable, Real)
         cv.check_length('upper right coordinate', upper_right, 3)
         self._upper_right = upper_right
+
+    @property
+    def only_fissionable(self):
+        return self._only_fissionable
 
     @only_fissionable.setter
     def only_fissionable(self, only_fissionable):
@@ -811,7 +823,7 @@ class Box(Spatial):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing box distribution data
 
         """
@@ -826,12 +838,12 @@ class Box(Spatial):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate box distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -865,7 +877,7 @@ class Point(Spatial):
 
     """
 
-    def __init__(self, xyz=(0., 0., 0.)):
+    def __init__(self, xyz: typing.Sequence[float] = (0., 0., 0.)):
         self.xyz = xyz
 
     @property
@@ -883,7 +895,7 @@ class Point(Spatial):
 
         Returns
         -------
-        element : xml.etree.ElementTree.Element
+        element : lxml.etree._Element
             XML element containing point distribution location
 
         """
@@ -894,12 +906,12 @@ class Point(Spatial):
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem: ET.Element):
         """Generate point distribution from an XML element
 
         Parameters
         ----------
-        elem : xml.etree.ElementTree.Element
+        elem : lxml.etree._Element
             XML element
 
         Returns
@@ -912,8 +924,13 @@ class Point(Spatial):
         return cls(xyz)
 
 
-def spherical_uniform(r_outer, r_inner=0.0, thetas=(0., pi), phis=(0., 2*pi),
-                      origin=(0., 0., 0.)):
+def spherical_uniform(
+        r_outer: float,
+        r_inner: float = 0.0,
+        thetas: typing.Sequence[float] = (0., pi),
+        phis: typing.Sequence[float] = (0., 2*pi),
+        origin: typing.Sequence[float] = (0., 0., 0.)
+    ):
     """Return a uniform spatial distribution over a spherical shell.
 
     This function provides a uniform spatial distribution over a spherical
@@ -926,15 +943,15 @@ def spherical_uniform(r_outer, r_inner=0.0, thetas=(0., pi), phis=(0., 2*pi),
     ----------
     r_outer : float
         Outer radius of the spherical shell in [cm]
-    r_inner : float, optional
+    r_inner : float
         Inner radius of the spherical shell in [cm]
-    thetas : iterable of float, optional
+    thetas : iterable of float
         Starting and ending theta coordinates (angle relative to
         the z-axis) in radius in a reference frame centered at `origin`
-    phis : iterable of float, optional
+    phis : iterable of float
         Starting and ending phi coordinates (azimuthal angle) in
         radians in a reference frame centered at `origin`
-    origin: iterable of float, optional
+    origin: iterable of float
         Coordinates (x0, y0, z0) of the center of the spherical
         reference frame for the distribution.
 

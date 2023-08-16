@@ -170,18 +170,6 @@ class AtomicRelaxation(EqualityMixin):
     def binding_energy(self):
         return self._binding_energy
 
-    @property
-    def num_electrons(self):
-        return self._num_electrons
-
-    @property
-    def subshells(self):
-        return list(sorted(self.binding_energy.keys()))
-
-    @property
-    def transitions(self):
-        return self._transitions
-
     @binding_energy.setter
     def binding_energy(self, binding_energy):
         cv.check_type('binding energies', binding_energy, Mapping)
@@ -191,6 +179,10 @@ class AtomicRelaxation(EqualityMixin):
             cv.check_greater_than('binding energy', energy, 0.0, True)
         self._binding_energy = binding_energy
 
+    @property
+    def num_electrons(self):
+        return self._num_electrons
+
     @num_electrons.setter
     def num_electrons(self, num_electrons):
         cv.check_type('number of electrons', num_electrons, Mapping)
@@ -199,6 +191,14 @@ class AtomicRelaxation(EqualityMixin):
             cv.check_type('number of electrons', num, Real)
             cv.check_greater_than('number of electrons', num, 0.0, True)
         self._num_electrons = num_electrons
+
+    @property
+    def subshells(self):
+        return list(sorted(self.binding_energy.keys()))
+
+    @property
+    def transitions(self):
+        return self._transitions
 
     @transitions.setter
     def transitions(self, transitions):
@@ -506,25 +506,25 @@ class IncidentPhoton(EqualityMixin):
     def atomic_number(self):
         return self._atomic_number
 
-    @property
-    def atomic_relaxation(self):
-        return self._atomic_relaxation
-
-    @property
-    def name(self):
-        return ATOMIC_SYMBOL[self.atomic_number]
-
     @atomic_number.setter
     def atomic_number(self, atomic_number):
         cv.check_type('atomic number', atomic_number, Integral)
         cv.check_greater_than('atomic number', atomic_number, 0, True)
         self._atomic_number = atomic_number
 
+    @property
+    def atomic_relaxation(self):
+        return self._atomic_relaxation
+
     @atomic_relaxation.setter
     def atomic_relaxation(self, atomic_relaxation):
         cv.check_type('atomic relaxation data', atomic_relaxation,
                       AtomicRelaxation)
         self._atomic_relaxation = atomic_relaxation
+
+    @property
+    def name(self):
+        return ATOMIC_SYMBOL[self.atomic_number]
 
     @classmethod
     def from_ace(cls, ace_or_filename):
@@ -556,7 +556,7 @@ class IncidentPhoton(EqualityMixin):
 
         # Read each reaction
         data = cls(Z)
-        for mt in (502, 504, 515, 522, 525):
+        for mt in (502, 504, 517, 522, 525):
             data.reactions[mt] = PhotonReaction.from_ace(ace, mt)
 
         # Total Photon Interaction cross section
@@ -571,7 +571,7 @@ class IncidentPhoton(EqualityMixin):
         # Get heating cross sections [eV-barn] from factors [eV per collision]
         # by multiplying with total xs
         data.reactions[525].xs.y *= sum([data.reactions[mt].xs.y for mt in
-                                         (502, 504, 515, 522)])
+                                         (502, 504, 517, 522)])
 
 
         # Compton profiles
@@ -1060,23 +1060,15 @@ class PhotonReaction(EqualityMixin):
     def anomalous_real(self):
         return self._anomalous_real
 
-    @property
-    def anomalous_imag(self):
-        return self._anomalous_imag
-
-    @property
-    def scattering_factor(self):
-        return self._scattering_factor
-
-    @property
-    def xs(self):
-        return self._xs
-
     @anomalous_real.setter
     def anomalous_real(self, anomalous_real):
         cv.check_type('real part of anomalous scattering factor',
                       anomalous_real, Callable)
         self._anomalous_real = anomalous_real
+
+    @property
+    def anomalous_imag(self):
+        return self._anomalous_imag
 
     @anomalous_imag.setter
     def anomalous_imag(self, anomalous_imag):
@@ -1084,10 +1076,18 @@ class PhotonReaction(EqualityMixin):
                       anomalous_imag, Callable)
         self._anomalous_imag = anomalous_imag
 
+    @property
+    def scattering_factor(self):
+        return self._scattering_factor
+
     @scattering_factor.setter
     def scattering_factor(self, scattering_factor):
         cv.check_type('scattering factor', scattering_factor, Callable)
         self._scattering_factor = scattering_factor
+
+    @property
+    def xs(self):
+        return self._xs
 
     @xs.setter
     def xs(self, xs):
@@ -1126,7 +1126,7 @@ class PhotonReaction(EqualityMixin):
         elif mt == 504:
             # Incoherent scattering
             idx = ace.jxs[1] + n
-        elif mt == 515:
+        elif mt == 517:
             # Pair production
             idx = ace.jxs[1] + 4*n
         elif mt == 522:
@@ -1147,6 +1147,9 @@ class PhotonReaction(EqualityMixin):
         else:
             nonzero = (xs != 0.0)
             xs[nonzero] = np.exp(xs[nonzero])
+
+            # Replace zero elements to small non-zero to enable log-log
+            xs[~nonzero] = np.exp(-500.0)
         rx.xs = Tabulated1D(energy, xs, [n], [5])
 
         # Get form factors for incoherent/coherent scattering

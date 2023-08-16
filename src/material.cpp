@@ -353,6 +353,35 @@ Material::~Material()
   model::material_map.erase(id_);
 }
 
+Material& Material::clone()
+{
+  std::unique_ptr<Material> mat = std::make_unique<Material>();
+
+  // set all other parameters to whatever the calling Material has
+  mat->name_ = name_;
+  mat->nuclide_ = nuclide_;
+  mat->element_ = element_;
+  mat->ncrystal_mat_ = ncrystal_mat_;
+  mat->atom_density_ = atom_density_;
+  mat->density_ = density_;
+  mat->density_gpcc_ = density_gpcc_;
+  mat->volume_ = volume_;
+  mat->fissionable_ = fissionable_;
+  mat->depletable_ = depletable_;
+  mat->p0_ = p0_;
+  mat->mat_nuclide_index_ = mat_nuclide_index_;
+  mat->thermal_tables_ = thermal_tables_;
+  mat->temperature_ = temperature_;
+
+  if (ttb_)
+    mat->ttb_ = std::make_unique<Bremsstrahlung>(*ttb_);
+
+  mat->index_ = model::materials.size();
+  mat->set_id(C_NONE);
+  model::materials.push_back(std::move(mat));
+  return *model::materials.back();
+}
+
 void Material::finalize()
 {
   // Set fissionable if any nuclide is fissionable
@@ -839,21 +868,12 @@ void Material::calculate_neutron_xs(Particle& p) const
     // ======================================================================
     // CALCULATE MICROSCOPIC CROSS SECTION
 
-    // Determine microscopic cross sections for this nuclide
+    // Get nuclide index
     int i_nuclide = nuclide_[i];
 
-    // Calculate microscopic cross section for this nuclide
-    auto& micro {p.neutron_xs(i_nuclide)};
-    if (p.E() != micro.last_E || p.sqrtkT() != micro.last_sqrtkT ||
-        i_sab != micro.index_sab || sab_frac != micro.sab_frac) {
-      data::nuclides[i_nuclide]->calculate_xs(i_sab, i_grid, sab_frac, p);
-
-      // If NCrystal is being used, update micro cross section cache
-      if (ncrystal_xs >= 0.0) {
-        data::nuclides[i_nuclide]->calculate_elastic_xs(p);
-        ncrystal_update_micro(ncrystal_xs, micro);
-      }
-    }
+    // Update microscopic cross section for this nuclide
+    p.update_neutron_xs(i_nuclide, i_grid, i_sab, sab_frac, ncrystal_xs);
+    auto& micro = p.neutron_xs(i_nuclide);
 
     // ======================================================================
     // ADD TO MACROSCOPIC CROSS SECTION

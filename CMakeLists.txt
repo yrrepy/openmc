@@ -4,7 +4,7 @@ project(openmc C CXX)
 # Set version numbers
 set(OPENMC_VERSION_MAJOR 0)
 set(OPENMC_VERSION_MINOR 13)
-set(OPENMC_VERSION_RELEASE 3)
+set(OPENMC_VERSION_RELEASE 4)
 set(OPENMC_VERSION ${OPENMC_VERSION_MAJOR}.${OPENMC_VERSION_MINOR}.${OPENMC_VERSION_RELEASE})
 configure_file(include/openmc/version.h.in "${CMAKE_BINARY_DIR}/include/openmc/version.h" @ONLY)
 
@@ -156,9 +156,9 @@ endif()
 find_package(HDF5 REQUIRED COMPONENTS C HL)
 if(HDF5_IS_PARALLEL)
   if(NOT OPENMC_USE_MPI)
-    message(FATAL_ERROR "Parallel HDF5 was detected, but the detected compiler,\
-     ${CMAKE_CXX_COMPILER}, does not support MPI. An MPI-capable compiler must \
-     be used with parallel HDF5.")
+    message(FATAL_ERROR "Parallel HDF5 was detected, but MPI was not enabled.\
+      To use parallel HDF5, OpenMC needs to be built with MPI support by passing\
+      -DOPENMC_USE_MPI=ON when calling cmake.")
   endif()
   message(STATUS "Using parallel HDF5")
 endif()
@@ -292,7 +292,7 @@ endif()
 
 if(OPENMC_BUILD_TESTS)
   find_package_write_status(Catch2)
-  if (NOT Catch2)
+  if (NOT Catch2_FOUND)
     add_subdirectory(vendor/Catch2)
   endif()
 endif()
@@ -334,10 +334,10 @@ list(APPEND libopenmc_SOURCES
   src/bank.cpp
   src/boundary_condition.cpp
   src/bremsstrahlung.cpp
-  src/dagmc.cpp
   src/cell.cpp
   src/cmfd_solver.cpp
   src/cross_sections.cpp
+  src/dagmc.cpp
   src/distribution.cpp
   src/distribution_angle.cpp
   src/distribution_energy.cpp
@@ -347,11 +347,12 @@ list(APPEND libopenmc_SOURCES
   src/endf.cpp
   src/error.cpp
   src/event.cpp
-  src/initialize.cpp
+  src/file_utils.cpp
   src/finalize.cpp
   src/geometry.cpp
   src/geometry_aux.cpp
   src/hdf5_interface.cpp
+  src/initialize.cpp
   src/lattice.cpp
   src/material.cpp
   src/math_functions.cpp
@@ -393,15 +394,15 @@ list(APPEND libopenmc_SOURCES
   src/tallies/derivative.cpp
   src/tallies/filter.cpp
   src/tallies/filter_azimuthal.cpp
-  src/tallies/filter_cellborn.cpp
-  src/tallies/filter_cellfrom.cpp
   src/tallies/filter_cell.cpp
   src/tallies/filter_cell_instance.cpp
+  src/tallies/filter_cellborn.cpp
+  src/tallies/filter_cellfrom.cpp
+  src/tallies/filter_collision.cpp
   src/tallies/filter_delayedgroup.cpp
   src/tallies/filter_distribcell.cpp
-  src/tallies/filter_energyfunc.cpp
   src/tallies/filter_energy.cpp
-  src/tallies/filter_collision.cpp
+  src/tallies/filter_energyfunc.cpp
   src/tallies/filter_legendre.cpp
   src/tallies/filter_material.cpp
   src/tallies/filter_mesh.cpp
@@ -418,8 +419,8 @@ list(APPEND libopenmc_SOURCES
   src/tallies/tally.cpp
   src/tallies/tally_scoring.cpp
   src/tallies/trigger.cpp
-  src/timer.cpp
   src/thermal.cpp
+  src/timer.cpp
   src/track_output.cpp
   src/universe.cpp
   src/urr.cpp

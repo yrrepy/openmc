@@ -17,6 +17,7 @@
 #include "openmc/message_passing.h"
 #include "openmc/mgxs_interface.h"
 #include "openmc/nuclide.h"
+#include "openmc/particle_data.h"
 #include "openmc/photon.h"
 #include "openmc/physics.h"
 #include "openmc/physics_mg.h"
@@ -35,6 +36,10 @@
 #endif
 
 namespace openmc {
+
+//==============================================================================
+// Particle implementation
+//==============================================================================
 
 double Particle::speed() const
 {
@@ -286,6 +291,11 @@ void Particle::event_collide()
     }
   }
 
+  if (!model::active_pulse_height_tallies.empty() &&
+      type() == ParticleType::photon) {
+    pht_collision_energy();
+  }
+
   // Reset banked weight during collision
   n_bank() = 0;
   n_bank_second() = 0;
@@ -350,6 +360,25 @@ void Particle::event_revive_from_secondary()
     secondary_bank().pop_back();
     n_event() = 0;
 
+    // Subtract secondary particle energy from interim pulse-height results
+    if (!model::active_pulse_height_tallies.empty() &&
+        this->type() == ParticleType::photon) {
+      // Since the birth cell of the particle has not been set we
+      // have to determine it before the energy of the secondary particle can be
+      // removed from the pulse-height of this cell.
+      if (coord(n_coord() - 1).cell == C_NONE) {
+        if (!exhaustive_find_cell(*this)) {
+          mark_as_lost("Could not find the cell containing particle " +
+                       std::to_string(id()));
+          return;
+        }
+        // Set birth cell attribute
+        if (cell_born() == C_NONE)
+          cell_born() = coord(n_coord() - 1).cell;
+      }
+      pht_secondary_particles();
+    }
+
     // Enter new particle in particle track file
     if (write_track())
       add_particle_track(*this);
@@ -383,11 +412,50 @@ void Particle::event_death()
   keff_tally_tracklength() = 0.0;
   keff_tally_leakage() = 0.0;
 
+  if (!model::active_pulse_height_tallies.empty()) {
+    score_pulse_height_tally(*this, model::active_pulse_height_tallies);
+  }
+
   // Record the number of progeny created by this particle.
   // This data will be used to efficiently sort the fission bank.
   if (settings::run_mode == RunMode::EIGENVALUE) {
     int64_t offset = id() - 1 - simulation::work_index[mpi::rank];
     simulation::progeny_per_particle[offset] = n_progeny();
+  }
+}
+
+void Particle::pht_collision_energy()
+{
+  // Adds the energy particles lose in a collision to the pulse-height
+
+  // determine index of cell in pulse_height_cells
+  auto it = std::find(model::pulse_height_cells.begin(),
+    model::pulse_height_cells.end(), coord(n_coord() - 1).cell);
+
+  if (it != model::pulse_height_cells.end()) {
+    int index = std::distance(model::pulse_height_cells.begin(), it);
+    pht_storage()[index] += E_last() - E();
+
+    // If the energy of the particle is below the cutoff, it will not be sampled
+    // so its energy is added to the pulse-height in the cell
+    int photon = static_cast<int>(ParticleType::photon);
+    if (E() < settings::energy_cutoff[photon]) {
+      pht_storage()[index] += E();
+    }
+  }
+}
+
+void Particle::pht_secondary_particles()
+{
+  // Removes the energy of secondary produced particles from the pulse-height
+
+  // determine index of cell in pulse_height_cells
+  auto it = std::find(model::pulse_height_cells.begin(),
+    model::pulse_height_cells.end(), cell_born());
+
+  if (it != model::pulse_height_cells.end()) {
+    int index = std::distance(model::pulse_height_cells.begin(), it);
+    pht_storage()[index] -= E();
   }
 }
 
@@ -400,7 +468,8 @@ void Particle::cross_surface()
     write_message(1, "    Crossing surface {}", surf->id_);
   }
 
-  if (surf->surf_source_ && simulation::current_batch == settings::n_batches) {
+  if (surf->surf_source_ && simulation::current_batch > settings::n_inactive &&
+      !simulation::surf_source_bank.full()) {
     SourceSite site;
     site.r = r();
     site.u = u();
@@ -433,13 +502,9 @@ void Particle::cross_surface()
 #ifdef DAGMC
   // in DAGMC, we know what the next cell should be
   if (surf->geom_type_ == GeometryType::DAG) {
-    auto surfp = dynamic_cast<DAGSurface*>(surf);
-    auto cellp =
-      dynamic_cast<DAGCell*>(model::cells[cell_last(n_coord() - 1)].get());
-    auto univp = static_cast<DAGUniverse*>(
-      model::universes[coord(n_coord() - 1).universe].get());
-    // determine the next cell for this crossing
-    int32_t i_cell = next_cell(univp, cellp, surfp) - 1;
+    int32_t i_cell =
+      next_cell(i_surface, cell_last(n_coord() - 1), lowest_coord().universe) -
+      1;
     // save material and temp
     material_last() = material();
     sqrtkT_last() = sqrtkT();
@@ -708,6 +773,29 @@ void Particle::write_restart() const
     file_close(file_id);
   } // #pragma omp critical
 }
+
+void Particle::update_neutron_xs(
+  int i_nuclide, int i_grid, int i_sab, double sab_frac, double ncrystal_xs)
+{
+  // Get microscopic cross section cache
+  auto& micro = this->neutron_xs(i_nuclide);
+
+  // If the cache doesn't match, recalculate micro xs
+  if (this->E() != micro.last_E || this->sqrtkT() != micro.last_sqrtkT ||
+      i_sab != micro.index_sab || sab_frac != micro.sab_frac) {
+    data::nuclides[i_nuclide]->calculate_xs(i_sab, i_grid, sab_frac, *this);
+
+    // If NCrystal is being used, update micro cross section cache
+    if (ncrystal_xs >= 0.0) {
+      data::nuclides[i_nuclide]->calculate_elastic_xs(*this);
+      ncrystal_update_micro(ncrystal_xs, micro);
+    }
+  }
+}
+
+//==============================================================================
+// Non-method functions
+//==============================================================================
 
 std::string particle_type_to_str(ParticleType type)
 {
