@@ -84,7 +84,7 @@ _REACTION_NAME = {
     569: ('P11 (6h11/2) subshell photoelectric', 'P11'),
     570: ('Q1 (7s1/2) subshell photoelectric', 'Q1'),
     571: ('Q2 (7p1/2) subshell photoelectric', 'Q2'),
-    572: ('Q3 (7p3/2) subshell photoelectric', 'Q3')
+    572: ('Q3 (7p3/2) subshell photoelectric', 'Q3'),
     301: ('Average Photon Heating Number', 'photon_heating_number')             # This should be removed from any official release, mt301 is sometimes eV.Barn, sometimes eV/coll. Here it is eV/coll (525 is eV.barn)
 }
 
