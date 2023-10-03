@@ -556,10 +556,6 @@ void Tally::set_scores(const vector<std::string>& scores)
       }
       break;
 
-    case HEATING:
-      if (settings::photon_transport)
-        estimator_ = TallyEstimator::COLLISION;
-      break;
 
     case SCORE_PULSE_HEIGHT:
       if (non_cell_energy_present) {
