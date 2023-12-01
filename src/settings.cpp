@@ -115,6 +115,7 @@ RunMode run_mode {RunMode::UNSET};
 std::unordered_set<int> sourcepoint_batch;
 std::unordered_set<int> statepoint_batch;
 std::unordered_set<int> source_write_surf_id;
+std::unordered_set<int> source_write_cell_id;
 int64_t max_surface_particles;
 TemperatureMethod temperature_method {TemperatureMethod::NEAREST};
 double temperature_tolerance {10.0};
@@ -725,6 +726,14 @@ void read_settings_xml(pugi::xml_node root)
       }
     }
 
+    // Determine cell ids at which particles crossing above surface ids into said cell are to be banked
+    if (check_for_node(node_ssw, "cell_ids")) {
+      auto temp = get_node_array<int>(node_ssw, "cell_ids");
+      for (const auto& b : temp) {
+        source_write_cell_id.insert(b);
+      }
+    }
+
     // Get maximum number of particles to be banked per surface
     if (check_for_node(node_ssw, "max_particles")) {
       max_surface_particles =
@@ -996,6 +1005,7 @@ void free_memory_settings()
   settings::statepoint_batch.clear();
   settings::sourcepoint_batch.clear();
   settings::source_write_surf_id.clear();
+  settings::source_write_cell_id.clear();
   settings::res_scat_nuclides.clear();
 }
 
