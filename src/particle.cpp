@@ -498,22 +498,6 @@ void Particle::cross_surface()
     write_message(1, "    Crossing surface {}", surf->id_);
   }
 
-  if (surf->surf_source_ && simulation::current_batch > settings::n_inactive &&
-      !simulation::surf_source_bank.full()) {
-    SourceSite site;
-    site.r = r();
-    site.u = u();
-    site.E = E();
-    site.time = time();
-    site.wgt = wgt();
-    site.delayed_group = delayed_group();
-    site.surf_id = surf->id_;
-    site.particle = type();
-    site.parent_id = id();
-    site.progeny_id = n_progeny();
-    int64_t idx = simulation::surf_source_bank.thread_safe_append(site);
-  }
-
 // if we're crossing a CSG surface, make sure the DAG history is reset
 #ifdef DAGMC
   if (surf->geom_type_ == GeometryType::CSG)
@@ -575,6 +559,25 @@ void Particle::cross_surface()
                    " crossed surface " + std::to_string(surf->id_) +
                    " it could not be located in any cell and it did not leak.");
       return;
+    }
+  }
+
+// first test of cell-to constrained SSW
+  if (surf->surf_source_ && simulation::current_batch > settings::n_inactive &&
+      !simulation::surf_source_bank.full()) {
+    if (lowest_coord().cell= settings::source_write_surf_id) {
+      SourceSite site;
+      site.r = r();
+      site.u = u();
+      site.E = E();
+      site.time = time();
+      site.wgt = wgt();
+      site.delayed_group = delayed_group();
+      site.surf_id = surf->id_;
+      site.particle = type();
+      site.parent_id = id();
+      site.progeny_id = n_progeny();
+      int64_t idx = simulation::surf_source_bank.thread_safe_append(site);
     }
   }
 }
