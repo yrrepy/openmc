@@ -1002,7 +1002,6 @@ void free_memory_settings()
   settings::statepoint_batch.clear();
   settings::sourcepoint_batch.clear();
   settings::source_write_surf_id.clear();
-  settings::source_write_cell_id.clear();
   settings::res_scat_nuclides.clear();
 }
 
