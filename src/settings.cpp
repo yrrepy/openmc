@@ -115,7 +115,7 @@ RunMode run_mode {RunMode::UNSET};
 std::unordered_set<int> sourcepoint_batch;
 std::unordered_set<int> statepoint_batch;
 std::unordered_set<int> source_write_surf_id;
-std::unordered_set<int> source_write_cell_id;
+int source_write_cell_id;
 int64_t max_surface_particles;
 TemperatureMethod temperature_method {TemperatureMethod::NEAREST};
 double temperature_tolerance {10.0};
