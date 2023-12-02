@@ -120,7 +120,7 @@ extern std::unordered_set<int>
   statepoint_batch; //!< Batches when state should be written
 extern std::unordered_set<int>
   source_write_surf_id; //!< Surface ids where sources will be written
-extern std::unordered_set<int>
+extern  int
   source_write_cell_id; //!< Cells ids where sources will be written, if the particle crosses one of the surface ids above and enters any of the listed cell ids
 extern int max_splits; //!< maximum number of particle splits for weight windows
 extern int64_t max_surface_particles; //!< maximum number of particles to be
