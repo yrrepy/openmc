@@ -565,7 +565,7 @@ void Particle::cross_surface()
 // first test of cell-to constrained SSW
   if (surf->surf_source_ && simulation::current_batch > settings::n_inactive &&
       !simulation::surf_source_bank.full()) {
-    if (lowest_coord().cell= settings::source_write_surf_id) {
+    if (lowest_coord().cell->id_= settings::source_write_cell_id) {
       SourceSite site;
       site.r = r();
       site.u = u();
