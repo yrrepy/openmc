@@ -531,8 +531,25 @@ void Particle::cross_surface()
   }
 #endif
 
-  if (neighbor_list_find_cell(*this))
+  if (neighbor_list_find_cell(*this)){
+//  first test of cell-to constrained SSW
+//  fmt::print("Crossing-surface: {:>9} | last-cell: {:>9} | new-cell: {:>9}  | constraint-cell: {:>9} | NewBooleanCondition {:>9} \n",surf->id_, model::cells[cell_last(n_coord_last() - 1)]->id_,model::cells[this->lowest_coord().cell]->id_,settings::source_write_cell_id,model::cells[this->lowest_coord().cell]->id_ == settings::source_write_cell_id);
+    if (surf->surf_source_ && simulation::current_batch > settings::n_inactive && !simulation::surf_source_bank.full() && model::cells[this->lowest_coord().cell]->id_ == settings::source_write_cell_id && model::cells[cell_last(n_coord_last() - 1)]->id_ != settings::source_write_cell_id){ // 
+        SourceSite site;
+        site.r = r();
+        site.u = u();
+        site.E = E();
+        site.time = time();
+        site.wgt = wgt();
+        site.delayed_group = delayed_group();
+        site.surf_id = surf->id_;
+        site.particle = type();
+        site.parent_id = id();
+        site.progeny_id = n_progeny();
+        int64_t idx = simulation::surf_source_bank.thread_safe_append(site);
+    }
     return;
+   }
 
   // ==========================================================================
   // COULDN'T FIND PARTICLE IN NEIGHBORING CELLS, SEARCH ALL CELLS
@@ -559,25 +576,6 @@ void Particle::cross_surface()
                    " crossed surface " + std::to_string(surf->id_) +
                    " it could not be located in any cell and it did not leak.");
       return;
-    }
-  }
-
-// first test of cell-to constrained SSW
-  if (surf->surf_source_ && simulation::current_batch > settings::n_inactive &&
-      !simulation::surf_source_bank.full()) {
-    if (lowest_coord().cell == settings::source_write_cell_id) {
-      SourceSite site;
-      site.r = r();
-      site.u = u();
-      site.E = E();
-      site.time = time();
-      site.wgt = wgt();
-      site.delayed_group = delayed_group();
-      site.surf_id = surf->id_;
-      site.particle = type();
-      site.parent_id = id();
-      site.progeny_id = n_progeny();
-      int64_t idx = simulation::surf_source_bank.thread_safe_append(site);
     }
   }
 }
