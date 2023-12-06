@@ -728,7 +728,7 @@ void read_settings_xml(pugi::xml_node root)
 
     // Determine cell ids at which particles crossing above surface ids into said cell are to be banked
     if (check_for_node(node_ssw, "cell_ids")) {
-      source_write_cell_id = std::stoll(get_node_value(root, "cell_ids"));
+      source_write_cell_id = std::stoll(get_node_value(node_ssw, "cell_ids"));
     }
 
     // Get maximum number of particles to be banked per surface
