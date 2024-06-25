@@ -142,6 +142,7 @@ class OpenMCOperator(TransportOperator):
 
         if diff_burnable_mats:
             self._differentiate_burnable_mats()
+            self.materials = self.model.materials
 
         # Determine which nuclides have cross section data
         # This nuclides variables contains every nuclides
@@ -213,7 +214,7 @@ class OpenMCOperator(TransportOperator):
                     msg = (f"Nuclilde {nuclide} in material {mat.id} is not "
                            "present in the depletion chain and has no cross "
                            "section data.")
-                    raise warn(msg)
+                    warn(msg)
             if mat.depletable:
                 burnable_mats.add(str(mat.id))
                 if mat.volume is None:
