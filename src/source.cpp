@@ -319,9 +319,24 @@ FileSource::FileSource(std::string path)
   file_close(file_id);
 }
 
+
+  // Perry-pocalypse
+static  UPtrAngle sIsoAngle = nullptr;
+
+
 SourceSite FileSource::sample(uint64_t* seed) const
 {
   size_t i_site = sites_.size() * prn(seed);
+
+  // isotropic u,v,w override
+  if (!sIsoAngle)
+  {
+  	sIsoAngle = UPtrAngle {new Isotropic()};
+  }
+  
+  Direction* d = const_cast<Direction*>(&(sites_[i_site].u));
+	*d = sIsoAngle->sample(seed);
+
   return sites_[i_site];
 }
 
