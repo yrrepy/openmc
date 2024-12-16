@@ -1,0 +1,149 @@
+# modifications into RandomStream.h
+
+#include "~/Codes/MCNP_Utils/mcpl-1.6.1/include/mcpl.h"
+
+####################
+
+# modifications into local.inc
+
+
+#
+# Compilers
+#
+
+CC		= /usr/bin/gcc
+CXX		= /usr/bin/g++
+MPI_CXX	= /opt/ohpc/pub/mpi/mpich-ofi-gnu9-ohpc/3.3.2/bin/mpic++
+FC      = /opt/ohpc/pub/mpi/mpich-ofi-gnu9-ohpc/3.3.2/bin/mpif90
+
+#
+# Flags
+#
+
+CPPFLAGS	=
+CFLAGS		= -O2
+CXXFLAGS	= -O2
+LDFLAGS		=
+
+#
+# Libraries
+#
+
+ARGTABLE_INC	= ~/Codes/advantg/lib
+ARGTABLE_LIB	= ~/Codes/advantg/lib
+ARGTABLE_LIBS	= -largtable2
+
+HDF5_INC	= ~/Codes/advantg/lib
+HDF5_LIB	= ~/Codes/advantg/lib
+HDF5_LIBS	= -lhdf5 -lhdf5_hl
+
+LAPACK_LIB	= ~/Codes/advantg/lib
+LAPACK_LIBS	= -llapack -lblas
+
+LAVA_INC	= ~/Codes/advantg/src/lava-1.4.0/bin/include
+LAVA_LIB	= ~/Codes/advantg/src/lava-1.4.0/bin/lib
+LAVA_LIBS	= -llava
+
+LIBCONFIG_INC	= ~/Codes/advantg/lib
+LIBCONFIG_LIB	= ~/Codes/advantg/lib
+LIBCONFIG_LIBS	= -lconfig
+
+PYTHON_CONFIG	= ~/Codes/advantg/packages/python/bin/python2.7-config
+PYTHON_LIB	    = ~/Codes/advantg/packages/python/lib
+
+QT4_INC		= ~/Codes/advantg/lib
+QT4_LIB		= ~/Codes/advantg/lib
+
+SCALE_INC	= /software/user_tools/current/cades-nsed-scale/release/6.2.3/linux/INSTALL/include
+SCALE_LIB	= /software/user_tools/current/cades-nsed-scale/release/6.2.3/linux/INSTALL/lib
+
+SILO_INC	= ~/Codes/advantg/lib
+SILO_LIB	= ~/Codes/advantg/lib
+
+
+
+############################
+
+# modifications to Makefile before OBJS
+
+INC_DIR  = /theory/pyoung/Codes/MCNP_Utils/mcpl-1.6.1/include/
+CXXFLAGS += -fopenmp
+CXXFLAGS += -O2
+
+CPPFLAGS += -I.
+CPPFLAGS += -I$(LAVA_INC)
+CPPFLAGS += -I$(INC_DIR)
+
+
+LDFLAGS += -fopenmp
+LDFLAGS += -Wl,-rpath,$(LAVA_LIB) -L$(LAVA_LIB) $(LAVA_LIBS)  -L/theory/pyoung/Codes/MCNP_Utils/mcpl-1.6.1/lib64
+# LDFLAGS += -lm
+LDFLAGS += -lmcpl
+
+
+###########################################
+
+# modifications into RandomStream.cpp
+
+#include "RandomStream.h"
+#include "/theory/pyoung/Codes/MCNP_Utils/mcpl-1.6.1/include/mcpl.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <memory.h>
+#include <cmath>
+#include <random>
+
+
+
+
+const double PI = 3.14159265358979323846;
+
+// Function to generate a random direction vector (isotropic)
+void generateIsotropicDirection(double& u, double& v, double& w) {
+    // Generate random angles
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+    double phi = 2.0 * PI * dist(gen);
+    double cosTheta = 2.0 * dist(gen) - 1.0;
+    double sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    // Calculate direction vector components
+    u = sinTheta * cos(phi);
+    v = sinTheta * sin(phi);
+    w = cosTheta;
+}
+
+
+# add in void RandomStream after variables
+
+
+    string temps = to_string(stream_num);
+    string temp_name = "nagss." + temps;
+
+    mcpl_outfile_t f = mcpl_create_outfile(temp_name.c_str());
+    mcpl_particle_t * p = mcpl_get_empty_particle(f);
+
+
+
+
+            p->pdgcode = 22;                                                // photons
+            p->position[0]  = particle_stream[0];                           // x
+            p->position[1]  = particle_stream[1];                           // y
+            p->position[2]  = particle_stream[2];                           // z
+            double u, v, w;
+            generateIsotropicDirection(u, v, w);
+            p->direction[0] = u;                                            // u
+            p->direction[1] = v;                                            // v
+            p->direction[2] = w;                                            // w
+            p->ekin         = particle_stream[3];                           // kinetic energy in MeV:
+            p->time         = 0;
+            p->weight       = particle_stream[4];                           // weight
+            mcpl_add_particle(f,p);
+
+
+# add in void RandomStream after //        cout << "particle strea
+
+# add in void RandomStream before end of void
+    mcpl_close_outfile(f);
