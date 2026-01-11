@@ -365,6 +365,7 @@ void initialize_maps()
   REACTION_TYPE_MAP["H3-production"] = N_XT;
   REACTION_TYPE_MAP["He3-production"] = N_X3HE;
   REACTION_TYPE_MAP["He4-production"] = N_XA;
+  REACTION_TYPE_MAP["(n,n')"] = N_LEVEL;  // Total inelastic scattering    
 }
 
 std::string reaction_name(int mt)

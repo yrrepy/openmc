@@ -139,6 +139,7 @@ DADZ = {
     '(n,3np)': (-3, -1),
     '(n,n2p)': (-2, -2),
     '(n,npa)': (-5, -3),
+    "(n,n')": (0, 0),  # Inelastic scattering - same nucleus, possibly excited
     '(n,gamma)': (1, 0),
     '(n,p)': (0, -1),
     '(n,d)': (-1, -1),

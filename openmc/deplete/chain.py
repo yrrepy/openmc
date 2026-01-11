@@ -9,7 +9,6 @@ from itertools import chain
 import math
 import numpy as np
 import re
-import numpy as np
 from collections import defaultdict, namedtuple
 from collections.abc import Mapping, Iterable
 from numbers import Real, Integral
@@ -25,7 +24,6 @@ from openmc.data import gnds_name, zam
 from openmc.exceptions import DataError
 from .nuclide import FissionYieldDistribution, Nuclide
 from .._xml import get_text
-from .._sparse_compat import csc_array, dok_array
 import openmc.data
 
 
