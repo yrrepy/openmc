@@ -52,6 +52,15 @@ class OpenMCOperator(TransportOperator):
     reduce_chain_level : int, optional
         Depth of the search when reducing the depletion chain. The default
         value of ``None`` implies no limit on the depth.
+    keep_isomeric_siblings : bool, optional
+        Whether to keep all isomeric state siblings together during chain
+        reduction:
+
+        - True (default): Always keep all isomeric siblings (ground +
+          metastables) when any state is reachable. Required for correct
+          isomeric branching calculations. May increase chain size by 10-30%.
+        - False: Original behavior. Isomeric states treated independently.
+          May cause isomeric branching failures with partial exclusions.
 
     diff_volume_method : str
         Specifies how the volumes of the new materials should be found. Default
@@ -103,7 +112,8 @@ class OpenMCOperator(TransportOperator):
             diff_volume_method='divide equally',
             fission_q=None,
             helper_kwargs=None,
-            reduce_chain_level=None):
+            reduce_chain_level=None,
+            keep_isomeric_siblings=True):
 
         # If chain file was not specified, try to get it from global config
         if chain_file is None:
@@ -135,7 +145,8 @@ class OpenMCOperator(TransportOperator):
                 for name, _dens_percent, _dens_type in material.nuclides:
                     init_nuclides.add(name)
 
-            self.chain = self.chain.reduce(init_nuclides, reduce_chain_level)
+            self.chain = self.chain.reduce(init_nuclides, reduce_chain_level,
+                                          keep_isomeric_siblings=keep_isomeric_siblings)
 
         if diff_burnable_mats:
             self._differentiate_burnable_mats()
@@ -230,7 +241,13 @@ class OpenMCOperator(TransportOperator):
 
         # Sort the sets
         burnable_mats = sorted(burnable_mats, key=int)
-        model_nuclides = sorted(model_nuclides)
+        # CRITICAL: Sort by chain index, not alphabetically!
+        # Chain order is based on atomic number (H1, H2, H3, ..., He3, He4, ...)
+        # which matches how CRAM solver returns concentrations
+        chain_nuclides = list(self.chain.nuclide_dict.keys())
+        model_nuclides = sorted(model_nuclides,
+                               key=lambda x: chain_nuclides.index(x)
+                               if x in chain_nuclides else float('inf'))
 
         # Construct a global nuclide dictionary, burned first
         nuclides = list(self.chain.nuclide_dict)

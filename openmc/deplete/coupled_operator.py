@@ -24,10 +24,11 @@ from .abc import OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
 from .results import Results
+from openmc.mgxs import GROUP_STRUCTURES
 from .helpers import (
-    DirectReactionRateHelper, ChainFissionHelper, ConstantFissionYieldHelper,
-    FissionYieldCutoffHelper, AveragedFissionYieldHelper, EnergyScoreHelper,
-    SourceRateHelper, FluxCollapseHelper)
+    DirectReactionRateHelper, DirectWithFluxHelper, ChainFissionHelper,
+    ConstantFissionYieldHelper, FissionYieldCutoffHelper, AveragedFissionYieldHelper,
+    EnergyScoreHelper, SourceRateHelper, FluxCollapseHelper, IsomericBranchingHelper)
 
 
 __all__ = ["CoupledOperator", "Operator", "OperatorResult"]
@@ -138,14 +139,20 @@ class CoupledOperator(OpenMCOperator):
         ``fission_yield_mode``. Will be passed directly on to the
         helper. Passing a value of None will use the defaults for
         the associated helper.
-    reaction_rate_mode : {"direct", "flux"}, optional
+    reaction_rate_mode : {"direct", "direct_with_flux", "flux"}, optional
         Indicate how one-group reaction rates should be calculated. The "direct"
         method tallies transmutation reaction rates directly. The "flux" method
         tallies a multigroup flux spectrum and then collapses one-group reaction
         rates after a transport solve (with an option to tally some reaction
-        rates directly).
+        rates directly). The "direct_with_flux" method combines direct reaction
+        rate tallies with a flux spectrum tally for automatic isomeric branching
+        support; the energy structure is auto-detected from chain isomeric
+        branching data (CCFE-709 or UKAEA-1102).
 
         .. versionadded:: 0.12.1
+
+        .. versionchanged:: 0.15.4
+            Added "direct_with_flux" mode for isomeric branching support.
     reaction_rate_opts : dict, optional
         Keyword arguments that are passed to the reaction rate helper class.
         When ``reaction_rate_mode`` is set to "flux", energy group boundaries
@@ -159,6 +166,16 @@ class CoupledOperator(OpenMCOperator):
         value of ``None`` implies no limit on the depth.
 
         .. versionadded:: 0.12
+    keep_isomeric_siblings : bool, optional
+        Whether to keep all isomeric state siblings together during chain
+        reduction:
+
+        - True (default): Always keep all isomeric siblings (ground +
+          metastables) when any state is reachable. Required for correct
+          isomeric branching calculations. May increase chain size by 10-30%.
+        - False: Original behavior. Isomeric states treated independently.
+          May cause isomeric branching failures with partial exclusions.
+
     diff_volume_method : str
         Specifies how the volumes of the new materials should be found. Default
         is to 'divide equally' which divides the original material volume
@@ -166,7 +183,18 @@ class CoupledOperator(OpenMCOperator):
         material to volume of the cell they fill.
 
         .. versionadded:: 0.14.0
+    gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
+        GENDF library for on-the-fly multigroup cross-section lookup. When
+        provided with ``reaction_rate_mode='direct_with_flux'``, enables
+        automatic isomeric branching calculations using σ×φ weighting.
+        The GENDF library provides multigroup cross-sections, and the
+        ``DirectWithFluxHelper`` provides the tallied flux spectrum.
+        Default is None.
 
+        .. versionadded:: 0.15.4
+        .. versionchanged:: 0.15.4
+            Now fully functional with ``direct_with_flux`` mode for isomeric
+            branching (previously placeholder only).
     Attributes
     ----------
     model : openmc.model.Model
@@ -208,7 +236,9 @@ class CoupledOperator(OpenMCOperator):
                  normalization_mode="fission-q", fission_q=None,
                  fission_yield_mode="constant", fission_yield_opts=None,
                  reaction_rate_mode="direct", reaction_rate_opts=None,
-                 reduce_chain_level=None):
+                 reduce_chain_level=None,
+                 keep_isomeric_siblings=True,
+                 gendf_library=None):
 
         # check for old call to constructor
         if isinstance(model, openmc.Geometry):
@@ -226,6 +256,8 @@ class CoupledOperator(OpenMCOperator):
                     self._fission_helpers.keys())
         check_value('normalization mode', normalization_mode,
                     ('energy-deposition', 'fission-q', 'source-rate'))
+        check_value('reaction rate mode', reaction_rate_mode,
+                    ('direct', 'direct_with_flux', 'flux'))
         if normalization_mode != "fission-q":
             if fission_q is not None:
                 warn("Fission Q dictionary will not be used")
@@ -255,6 +287,14 @@ class CoupledOperator(OpenMCOperator):
         # Records how many times the operator has been called
         self._n_calls = 0
 
+        # Store GENDF library for isomeric branching support
+        # Used with direct_with_flux mode to enable σ×φ-weighted branching
+        self._gendf_library = gendf_library
+
+        # Placeholder for isomeric branching data - set up after super().__init__()
+        self._isomeric_branching = None
+        self._isomeric_helper = None
+
         super().__init__(
             materials=model.materials,
             cross_sections=cross_sections,
@@ -264,7 +304,137 @@ class CoupledOperator(OpenMCOperator):
             diff_volume_method=diff_volume_method,
             fission_q=fission_q,
             helper_kwargs=helper_kwargs,
-            reduce_chain_level=reduce_chain_level)
+            reduce_chain_level=reduce_chain_level,
+            keep_isomeric_siblings=keep_isomeric_siblings)
+
+        # Set up isomeric branching if data exists and mode supports it
+        # Note: _isomeric_helper is initialized to None in _setup_isomeric_branching
+        self._setup_isomeric_branching()
+
+    def _detect_energy_structure_from_chain(self):
+        """Detect energy structure from chain's isomeric branching data.
+
+        Examines the isomeric branching data stored in the chain to determine
+        whether CCFE-709 or UKAEA-1102 energy group structure is being used.
+
+        Returns
+        -------
+        str or None
+            'CCFE-709', 'UKAEA-1102', or None if no isomeric data exists
+            or energy structure cannot be determined
+        """
+        if not hasattr(self.chain, 'isomeric_branching'):
+            return None
+        if self.chain.isomeric_branching is None:
+            return None
+        if len(self.chain.isomeric_branching) == 0:
+            return None
+
+        # Sample first reaction to determine energy structure
+        for nuc_name, reactions in self.chain.isomeric_branching.items():
+            for rx_type, iso_data in reactions.items():
+                if 'energies' in iso_data and len(iso_data['energies']) > 0:
+                    n_energies = len(iso_data['energies'])
+                    # CCFE-709: up to 710 energy boundaries (709 groups)
+                    # UKAEA-1102: up to 1103 energy boundaries (1102 groups)
+                    if n_energies <= 710:
+                        return 'CCFE-709'
+                    elif n_energies <= 1103:
+                        return 'UKAEA-1102'
+                    else:
+                        warn(f"Unknown energy structure with {n_energies} boundaries. "
+                             f"Isomeric branching will be disabled.")
+                        return None
+
+        return None
+
+    def _setup_isomeric_branching(self):
+        """Set up isomeric branching for CoupledOperator.
+
+        Isomeric branching is enabled when:
+        1. A GENDF library is provided (for multigroup cross-sections)
+        2. The ``direct_with_flux`` reaction rate mode is used (for flux tallying)
+        3. Isomeric branching data exists in the chain
+
+        When enabled, uses the GENDF library for on-the-fly cross-section
+        lookup combined with the tallied flux spectrum to compute σ×φ-weighted
+        isomeric branching ratios after each transport solve.
+
+        When not enabled (missing GENDF or not using direct_with_flux mode),
+        isomeric branching is disabled and default chain branching ratios
+        are used.
+        """
+        # Check if we can enable isomeric branching
+        if self._gendf_library is None:
+            # No GENDF library - disable isomeric branching
+            self._isomeric_helper = None
+            self._isomeric_branching = None
+            return
+
+        if not isinstance(self._rate_helper, DirectWithFluxHelper):
+            # Not using flux tallying - disable isomeric branching
+            if hasattr(self, '_isomeric_energy_structure') and self._isomeric_energy_structure:
+                warn(
+                    "GENDF library provided but reaction_rate_mode is not 'direct_with_flux'. "
+                    "Isomeric branching requires 'direct_with_flux' mode to tally flux spectrum. "
+                    "Isomeric branching will be disabled."
+                )
+            self._isomeric_helper = None
+            self._isomeric_branching = None
+            return
+
+        # Check if energy structure was detected
+        energy_structure = getattr(self, '_isomeric_energy_structure', None)
+        if energy_structure is None:
+            # Could not determine energy structure from chain
+            self._isomeric_helper = None
+            self._isomeric_branching = None
+            return
+
+        # All conditions met - create the isomeric branching helper
+        self._isomeric_helper = IsomericBranchingHelper(
+            self.chain,
+            energy_structure=energy_structure,
+            gendf_library=self._gendf_library
+        )
+
+    def _calculate_isomeric_branching(self):
+        """Calculate σ×φ-weighted isomeric branching ratios.
+
+        Uses the flux spectrum tallied by ``DirectWithFluxHelper`` and
+        cross-sections from the GENDF library to compute weighted branching
+        ratios for each burnable material.
+
+        Returns
+        -------
+        list of dict or None
+            List of weighted branching dictionaries, one per burnable material.
+            Each dict has structure: {nuclide: {reaction: {target: ratio}}}.
+            Returns None if isomeric branching is disabled.
+        """
+        if self._isomeric_helper is None:
+            return None
+
+        if not isinstance(self._rate_helper, DirectWithFluxHelper):
+            return None
+
+        isomeric_branching = []
+
+        # Get energy boundaries from the rate helper
+        energy_bins = self._rate_helper.energies
+
+        # Calculate weighted branching for each burnable material
+        for i, mat_id in enumerate(self.local_mats):
+            # Get the flux spectrum for this material from the tally
+            flux_spectrum = self._rate_helper.get_flux_spectrum(i)
+
+            # Calculate σ×φ-weighted branching (micro_xs=None uses GENDF directly)
+            weighted = self._isomeric_helper.weighted_branching_ratios(
+                flux_spectrum, energy_bins, micro_xs=None
+            )
+            isomeric_branching.append(weighted)
+
+        return isomeric_branching
 
     def _differentiate_burnable_mats(self):
         """Assign distribmats for each burnable material"""
@@ -321,10 +491,38 @@ class CoupledOperator(OpenMCOperator):
         reaction_rate_opts = helper_kwargs['reaction_rate_opts']
         fission_yield_opts = helper_kwargs['fission_yield_opts']
 
+        # Initialize isomeric energy structure tracking
+        self._isomeric_energy_structure = None
+
         # Get classes to assist working with tallies
         if reaction_rate_mode == "direct":
             self._rate_helper = DirectReactionRateHelper(
                 self.reaction_rates.n_nuc, self.reaction_rates.n_react)
+            # Warn if isomeric data exists but can't be used
+            if self._detect_energy_structure_from_chain() is not None:
+                warn(
+                    "Isomeric branching data exists in chain but CoupledOperator is using "
+                    "reaction_rate_mode='direct'. Use 'direct_with_flux' for automatic isomeric "
+                    "branching support, or 'flux' with explicit energy structure. "
+                    "Isomeric branching will be disabled.",
+                    UserWarning
+                )
+
+        elif reaction_rate_mode == "direct_with_flux":
+            energy_structure = self._detect_energy_structure_from_chain()
+            if energy_structure is None:
+                # No isomeric data, fall back to pure direct mode
+                self._rate_helper = DirectReactionRateHelper(
+                    self.reaction_rates.n_nuc, self.reaction_rates.n_react)
+            else:
+                energies = GROUP_STRUCTURES[energy_structure]
+                self._rate_helper = DirectWithFluxHelper(
+                    self.reaction_rates.n_nuc,
+                    self.reaction_rates.n_react,
+                    energies
+                )
+                self._isomeric_energy_structure = energy_structure
+
         elif reaction_rate_mode == "flux":
             # Ensure energy group boundaries were specified
             if 'energies' not in reaction_rate_opts:
@@ -353,6 +551,31 @@ class CoupledOperator(OpenMCOperator):
         fission_helper = self._fission_helpers[fission_yield_mode]
         self._yield_helper = fission_helper.from_operator(
             self, **fission_yield_opts)
+
+    def _calculate_reaction_rates(self, source_rate):
+        """Calculate reaction rates and update isomeric branching.
+
+        This method extends the parent implementation to update flux-weighted
+        isomeric branching ratios after each transport solve.
+
+        Parameters
+        ----------
+        source_rate : float
+            Power in [W] or source rate in [neutron/sec]
+
+        Returns
+        -------
+        rates : openmc.deplete.ReactionRates
+            Reaction rates for nuclides
+        """
+        # Call parent implementation
+        rates = super()._calculate_reaction_rates(source_rate)
+
+        # Update isomeric branching with current step's flux
+        if self._isomeric_helper is not None:
+            self._isomeric_branching = self._calculate_isomeric_branching()
+
+        return rates
 
     def initial_condition(self):
         """Performs final setup and returns initial condition.
