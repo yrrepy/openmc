@@ -300,3 +300,135 @@ class EnergyGroups:
         # Assign merged edges to merged groups
         merged_groups.group_edges = list(merged_edges)
         return merged_groups
+
+
+def convert_flux_groups(flux, source_groups, target_groups):
+    """Convert flux spectrum between energy group structures.
+
+    Uses flux-per-unit-lethargy conservation, which assumes constant flux per
+    unit lethargy within each source group and distributes flux to target
+    groups proportionally to their lethargy width. [1]_ [2]_
+
+    References
+    ----------
+    .. [1] J. J. Duderstadt and L. J. Hamilton, "Nuclear Reactor Analysis,"
+       John Wiley & Sons, 1976.
+    .. [2] M. Fleming and J.-Ch. Sublet, "FISPACT-II User Manual,"
+       UKAEA-R(18)001, UK Atomic Energy Authority, 2018. See GRPCONVERT keyword.
+
+    .. versionadded:: 0.15.4
+
+    Parameters
+    ----------
+    flux : Iterable of float
+        Flux values for source groups. Length must equal
+        source_groups.num_groups.
+    source_groups : EnergyGroups or str
+        Energy group structure of the input flux with boundaries in [eV].
+        Can be an EnergyGroups instance or the name of a group structure
+        (e.g., 'CCFE-709').
+    target_groups : EnergyGroups or str
+        Target energy group structure with boundaries in [eV]. Can be an
+        EnergyGroups instance or the name of a group structure
+        (e.g., 'UKAEA-1102').
+
+    Returns
+    -------
+    numpy.ndarray
+        Flux values for target groups. Total flux is conserved for
+        overlapping energy regions.
+
+    Raises
+    ------
+    TypeError
+        If source_groups or target_groups is not EnergyGroups or str
+    ValueError
+        If flux length doesn't match source_groups, or flux contains
+        negative, NaN, or infinite values
+
+    Notes
+    -----
+    The assumption of constant flux per unit lethargy within each source
+    group is physically reasonable for most reactor spectra but is not
+    exact. For best accuracy, use source spectra with sufficiently fine
+    energy resolution.
+
+    Examples
+    --------
+    Convert FNS 709-group flux to UKAEA-1102 structure:
+
+    >>> import numpy as np
+    >>> flux_709 = np.load('tests/fns_flux_709.npy')
+    >>> flux_1102 = openmc.mgxs.convert_flux_groups(flux_709, 'CCFE-709', 'UKAEA-1102')
+
+    Convert using EnergyGroups instances:
+
+    >>> source = openmc.mgxs.EnergyGroups([1.0, 10.0, 100.0])
+    >>> target = openmc.mgxs.EnergyGroups([1.0, 5.0, 10.0, 50.0, 100.0])
+    >>> flux_target = openmc.mgxs.convert_flux_groups([1e8, 2e8], source, target)
+
+    """
+    # Handle string group structure names
+    if isinstance(source_groups, str):
+        source_groups = EnergyGroups(source_groups)
+    if isinstance(target_groups, str):
+        target_groups = EnergyGroups(target_groups)
+
+    # Type validation
+    cv.check_type('source_groups', source_groups, EnergyGroups)
+    cv.check_type('target_groups', target_groups, EnergyGroups)
+
+    # Convert flux to numpy array
+    flux = np.asarray(flux, dtype=np.float64)
+    if flux.ndim != 1:
+        raise ValueError(f'flux must be 1-dimensional, got shape {flux.shape}')
+
+    # Validate flux length matches source groups
+    if len(flux) != source_groups.num_groups:
+        raise ValueError(
+            f'Length of flux ({len(flux)}) must equal number of source '
+            f'groups ({source_groups.num_groups})'
+        )
+
+    # Check for invalid flux values
+    if np.any(np.isnan(flux)):
+        raise ValueError('flux contains NaN values')
+    if np.any(np.isinf(flux)):
+        raise ValueError('flux contains infinite values')
+    if np.any(flux < 0):
+        raise ValueError('flux values must be non-negative')
+
+    # Get energy edges
+    source_edges = source_groups.group_edges
+    target_edges = target_groups.group_edges
+    n_target = target_groups.num_groups
+
+    # Initialize output array
+    flux_target = np.zeros(n_target)
+
+    # Main conversion loop: distribute flux using lethargy weighting
+    for i_s, flux_s in enumerate(flux):
+        if flux_s == 0:
+            continue
+
+        E_lo_s = source_edges[i_s]
+        E_hi_s = source_edges[i_s + 1]
+        du_source = np.log(E_hi_s / E_lo_s)
+
+        for i_t in range(n_target):
+            E_lo_t = target_edges[i_t]
+            E_hi_t = target_edges[i_t + 1]
+
+            # Skip non-overlapping groups
+            if E_hi_t <= E_lo_s or E_lo_t >= E_hi_s:
+                continue
+
+            # Calculate overlap region
+            E_overlap_lo = max(E_lo_s, E_lo_t)
+            E_overlap_hi = min(E_hi_s, E_hi_t)
+            du_overlap = np.log(E_overlap_hi / E_overlap_lo)
+
+            # Distribute flux proportionally to lethargy fraction
+            flux_target[i_t] += flux_s * (du_overlap / du_source)
+
+    return flux_target
