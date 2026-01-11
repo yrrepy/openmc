@@ -1,0 +1,476 @@
+//! \file gendf_parser.cpp
+//! \brief GENDF file parser for MF=3 cross-sections
+
+#include "openmc/gendf.h"
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+
+#include "openmc/error.h"
+#include "openmc/file_utils.h"
+
+namespace openmc {
+
+//==============================================================================
+// Helper functions for ENDF-6 format parsing
+//==============================================================================
+
+//! Trim whitespace from both ends of string
+//! \param[in] str String to trim
+//! \return Trimmed string
+std::string trim(const std::string& str) {
+  auto start = str.begin();
+  while (start != str.end() && std::isspace(*start)) {
+    ++start;
+  }
+
+  auto end = str.end();
+  do {
+    --end;
+  } while (std::distance(start, end) > 0 && std::isspace(*end));
+
+  return std::string(start, end + 1);
+}
+
+//==============================================================================
+// ZA validation (G9 fix)
+//==============================================================================
+// H2 fix: Removed unsafe extract_int() and extract_double() functions that
+// returned 0 on parse errors without any indication of failure. All parsing
+// now uses extract_int_safe() and extract_double_safe() in the anonymous
+// namespace below, which track success/failure explicitly.
+
+bool validate_za(int za, std::string& error) {
+  if (za <= 0) {
+    error = "ZA value is zero or negative: " + std::to_string(za);
+    return false;
+  }
+
+  int Z = za / 1000;
+  int A = za % 1000;
+
+  if (Z < 1 || Z > 118) {
+    error = "Invalid atomic number Z=" + std::to_string(Z) +
+            " (must be 1-118)";
+    return false;
+  }
+
+  if (A < Z) {
+    error = "Invalid mass number A=" + std::to_string(A) +
+            " < Z=" + std::to_string(Z);
+    return false;
+  }
+
+  // Rough upper bound for stable/metastable nuclei
+  if (A > 3 * Z + 10) {
+    error = "Suspicious mass number A=" + std::to_string(A) +
+            " for Z=" + std::to_string(Z) + " (expected A <= 3*Z+10)";
+    return false;
+  }
+
+  return true;
+}
+
+//==============================================================================
+// Safe extraction functions with error tracking (G9 fix)
+//==============================================================================
+
+namespace {
+
+//! Result from extraction with success/error tracking
+template<typename T>
+struct ExtractResult {
+  T value;
+  bool success;
+  std::string error;
+};
+
+//! Extract integer with error tracking
+ExtractResult<int> extract_int_safe(
+    const std::string& line, size_t start, size_t length) {
+  ExtractResult<int> result{0, false, ""};
+
+  if (line.length() <= start) {
+    result.error = "Line too short for column " + std::to_string(start);
+    return result;
+  }
+
+  size_t end = std::min(start + length, line.length());
+  std::string substr = trim(line.substr(start, end - start));
+
+  if (substr.empty()) {
+    result.value = 0;
+    result.success = true;  // Empty field is valid (means 0)
+    return result;
+  }
+
+  try {
+    result.value = std::stoi(substr);
+    result.success = true;
+  } catch (const std::exception& e) {
+    result.error = "Cannot parse integer from '" + substr + "': " + e.what();
+  }
+
+  return result;
+}
+
+//! Extract double with error tracking
+ExtractResult<double> extract_double_safe(
+    const std::string& line, size_t start, size_t length) {
+  ExtractResult<double> result{0.0, false, ""};
+
+  if (line.length() <= start) {
+    result.error = "Line too short for column " + std::to_string(start);
+    return result;
+  }
+
+  size_t end = std::min(start + length, line.length());
+  std::string substr = trim(line.substr(start, end - start));
+
+  if (substr.empty()) {
+    result.value = 0.0;
+    result.success = true;
+    return result;
+  }
+
+  // Replace ENDF format (e.g., "1.23+4" -> "1.23e+4")
+  size_t plus_pos = substr.find_last_of("+-");
+  if (plus_pos != std::string::npos && plus_pos > 0 &&
+      (substr[plus_pos - 1] != 'e' && substr[plus_pos - 1] != 'E')) {
+    substr.insert(plus_pos, "e");
+  }
+
+  try {
+    result.value = std::stod(substr);
+    result.success = true;
+  } catch (const std::exception& e) {
+    result.error = "Cannot parse double from '" + substr + "': " + e.what();
+  }
+
+  return result;
+}
+
+} // anonymous namespace
+
+//==============================================================================
+// Validated GENDF parser (G9 fix)
+//==============================================================================
+
+GENDFParseResult parse_gendf_validated(
+  const std::string& filename,
+  const GENDFParserOptions& options)
+{
+  GENDFParseResult result;
+
+  // Check file exists
+  if (!file_exists(filename)) {
+    result.error_message = "GENDF file not found: " + filename;
+    return result;
+  }
+
+  std::ifstream infile(filename);
+  if (!infile.is_open()) {
+    result.error_message = "Failed to open GENDF file: " + filename;
+    return result;
+  }
+
+  std::string line;
+  int line_number = 0;
+  int current_mf = 0;
+  int current_mt = 0;
+  vector<double> current_xs;
+  vector<double> current_energies;  // Energy boundaries for threshold alignment
+  int n_groups = 0;
+  bool in_data_section = false;
+  int nr_lines_to_skip = 0;
+  bool found_mf1_header = false;
+  int max_short_line_warnings = 5;
+
+  // Extract basename from filename for cleaner warnings
+  std::string basename = filename;
+  size_t pos = filename.find_last_of("/\\");
+  if (pos != std::string::npos) {
+    basename = filename.substr(pos + 1);
+  }
+
+  while (std::getline(infile, line)) {
+    ++line_number;
+    ++result.lines_read;
+
+    // Track short lines
+    if (line.length() < 70) {
+      ++result.lines_skipped;
+      if (options.warn_short_lines && result.lines_skipped <= max_short_line_warnings) {
+        result.warnings.push_back(
+          "Short line in " + basename + " at line " +
+          std::to_string(line_number) + " (" +
+          std::to_string(line.length()) + " chars), skipped");
+      }
+      continue;
+    }
+
+    // Extract MF/MT with safe parsing
+    auto mf_result = extract_int_safe(line, 70, 2);
+    auto mt_result = extract_int_safe(line, 72, 3);
+
+    if (!mf_result.success || !mt_result.success) {
+      result.warnings.push_back(
+        "Line " + std::to_string(line_number) +
+        ": Could not parse MF/MT fields");
+      continue;
+    }
+
+    int mf = mf_result.value;
+    int mt = mt_result.value;
+
+    // Filter to MF=1 and MF=3 only
+    if (mf != 1 && mf != 3) {
+      continue;
+    }
+
+    // Track section changes
+    if (mf != 0 && mt != 0) {
+      if (mf != current_mf || mt != current_mt) {
+        // Save previous MF=3 section
+        if (current_mf == 3 && !current_xs.empty()) {
+          // H3 fix: Validate energy-XS count consistency
+          if (current_energies.size() != current_xs.size()) {
+            result.warnings.push_back(
+              "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
+              std::to_string(current_mt) + "): " +
+              std::to_string(current_energies.size()) + " energies vs " +
+              std::to_string(current_xs.size()) + " XS values");
+            // Truncate to smaller size to maintain consistency
+            size_t min_size = std::min(current_energies.size(), current_xs.size());
+            current_energies.resize(min_size);
+            current_xs.resize(min_size);
+          }
+          result.xs_data[current_mt] = std::move(current_xs);
+          result.energy_data[current_mt] = std::move(current_energies);
+          current_xs.clear();
+          current_energies.clear();
+        }
+        current_mf = mf;
+        current_mt = mt;
+        in_data_section = false;
+        nr_lines_to_skip = 0;
+      }
+    }
+
+    // Parse MF=1, MT=451 header (only first record is HEAD, rest are TEXT)
+    // Per ENDF-6 format: only the first record contains actual ZA data,
+    // subsequent records are documentation where columns 1-66 are free-form text
+    if (mf == 1 && mt == 451 && !found_mf1_header) {
+      found_mf1_header = true;
+
+      auto za_result = extract_int_safe(line, 0, 11);
+      if (za_result.success && za_result.value > 0) {
+        result.za = za_result.value;
+
+        // Validate ZA (only on HEAD record, not TEXT records)
+        if (options.validate_za) {
+          std::string za_error;
+          if (!validate_za(result.za, za_error)) {
+            result.warnings.push_back(
+              "ZA validation in " + basename + " (MF=1, MT=451): " + za_error);
+          }
+        }
+
+        if (result.zam == 0) {
+          result.zam = result.za;
+        }
+      }
+    }
+
+    // Parse MF=3 cross-section data
+    if (mf == 3) {
+      if (!in_data_section && line.length() >= 55) {
+        auto nr_result = extract_int_safe(line, 44, 11);
+        auto np_result = extract_int_safe(line, 55, 11);
+
+        if (np_result.success && np_result.value > 0) {
+          n_groups = np_result.value;
+          in_data_section = true;
+          nr_lines_to_skip = nr_result.success ? nr_result.value : 0;
+          current_xs.clear();
+          current_xs.reserve(n_groups);
+          current_energies.clear();
+          current_energies.reserve(n_groups + 1);  // n_groups + 1 energy boundaries
+          continue;
+        }
+      }
+
+      if (in_data_section && nr_lines_to_skip > 0) {
+        --nr_lines_to_skip;
+        continue;
+      }
+
+      // Extract energy and XS values with validation
+      // ENDF TAB1 format: alternating Energy, XS pairs
+      // Even indices (0, 2, 4) = energy values
+      // Odd indices (1, 3, 5) = cross-section values
+      if (in_data_section && nr_lines_to_skip == 0 && line.length() >= 66) {
+        for (int i = 0; i < 6 && current_xs.size() < static_cast<size_t>(n_groups); ++i) {
+          int col_start = i * 11;
+          if (col_start + 11 <= 66) {
+            auto val_result = extract_double_safe(line, col_start, 11);
+
+            if (i % 2 == 0) {  // Energy values at even indices
+              if (val_result.success) {
+                current_energies.push_back(val_result.value);
+              } else {
+                // Could not parse energy - use 0 but track
+                current_energies.push_back(0.0);
+                result.warnings.push_back(
+                  "Parse error (energy) in " + basename + " (MF=3, MT=" +
+                  std::to_string(current_mt) + ") at line " +
+                  std::to_string(line_number) + ": " + val_result.error);
+              }
+            } else {  // XS values at odd indices
+              if (val_result.success) {
+                double xs_val = val_result.value;
+
+                // Validate non-negative
+                if (options.validate_xs_positive && xs_val < 0) {
+                  ++result.negative_xs_count;
+                  if (result.negative_xs_count <= 3) {
+                    // Use scientific notation to show actual value
+                    std::ostringstream oss;
+                    oss << std::scientific << xs_val;
+                    result.warnings.push_back(
+                      "Negative XS in " + basename + " (MF=3, MT=" +
+                      std::to_string(current_mt) + "): value=" +
+                      oss.str() + " at line " + std::to_string(line_number));
+                  }
+                  xs_val = 0.0;  // Clamp to zero
+                }
+
+                current_xs.push_back(xs_val);
+              } else {
+                // Could not parse - use 0 but track
+                current_xs.push_back(0.0);
+                result.warnings.push_back(
+                  "Parse error in " + basename + " (MF=3, MT=" +
+                  std::to_string(current_mt) + ") at line " +
+                  std::to_string(line_number) + ": " + val_result.error);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Save last section
+  if (current_mf == 3 && !current_xs.empty()) {
+    // H3 fix: Validate energy-XS count consistency
+    if (current_energies.size() != current_xs.size()) {
+      result.warnings.push_back(
+        "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
+        std::to_string(current_mt) + "): " +
+        std::to_string(current_energies.size()) + " energies vs " +
+        std::to_string(current_xs.size()) + " XS values");
+      // Truncate to smaller size to maintain consistency
+      size_t min_size = std::min(current_energies.size(), current_xs.size());
+      current_energies.resize(min_size);
+      current_xs.resize(min_size);
+    }
+    result.xs_data[current_mt] = std::move(current_xs);
+    result.energy_data[current_mt] = std::move(current_energies);
+  }
+
+  infile.close();
+
+  // Final validation
+  if (result.lines_read < options.min_file_lines) {
+    result.error_message = "File too small: only " +
+      std::to_string(result.lines_read) + " lines (minimum: " +
+      std::to_string(options.min_file_lines) + ")";
+    return result;
+  }
+
+  if (options.require_mf1_header && !found_mf1_header) {
+    result.error_message = "No MF=1, MT=451 header found in file";
+    return result;
+  }
+
+  if (result.xs_data.empty()) {
+    result.error_message = "No MF=3 cross-section data found";
+    return result;
+  }
+
+  if (result.lines_skipped > result.lines_read / 2) {
+    result.warnings.push_back(
+      "More than 50% of lines were skipped (" +
+      std::to_string(result.lines_skipped) + "/" +
+      std::to_string(result.lines_read) + ")");
+  }
+
+  if (result.negative_xs_count > 3) {
+    result.warnings.push_back(
+      "Total " + std::to_string(result.negative_xs_count) +
+      " negative XS values clamped to zero");
+  }
+
+  result.success = true;
+  return result;
+}
+
+//==============================================================================
+// MF=3-only GENDF parser (uses validated parser with optimized options)
+//==============================================================================
+
+void parse_gendf_mf3_only(
+  const std::string& filename,
+  std::unordered_map<int, vector<double>>& xs_data,
+  std::unordered_map<int, vector<double>>& energy_data,
+  int& za,
+  int& zam)
+{
+  // Use validated parser with minimal warnings for performance
+  // This ensures consistent behavior and validation across both entry points
+  GENDFParserOptions options;
+  options.warn_short_lines = false;  // Don't accumulate short line warnings
+  options.validate_za = true;        // Keep ZA validation (cheap)
+  options.validate_xs_positive = true; // Keep XS validation (cheap)
+  options.require_mf1_header = true;
+  options.min_file_lines = 10;
+
+  GENDFParseResult result = parse_gendf_validated(filename, options);
+
+  if (!result.success) {
+    throw std::runtime_error(result.error_message);
+  }
+
+  // Log warnings if any (but not short line warnings since we disabled those)
+  for (const auto& warn : result.warnings) {
+    warning(warn);
+  }
+
+  // Move results to output parameters
+  xs_data = std::move(result.xs_data);
+  energy_data = std::move(result.energy_data);
+  za = result.za;
+  zam = result.zam;
+}
+
+//==============================================================================
+// Full GENDF parser (for validation/debugging)
+//==============================================================================
+
+void parse_gendf_full(
+  const std::string& filename,
+  std::unordered_map<int, vector<double>>& xs_data,
+  std::unordered_map<int, vector<double>>& energy_data,
+  int& za,
+  int& zam)
+{
+  // For now, full parser just calls MF=3-only parser
+  // In the future, this could parse covariances and other data
+  parse_gendf_mf3_only(filename, xs_data, energy_data, za, zam);
+}
+
+} // namespace openmc
