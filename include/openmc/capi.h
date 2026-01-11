@@ -275,6 +275,79 @@ int openmc_properties_export(const char* filename);
 // \return Error code
 int openmc_properties_import(const char* filename);
 
+//==============================================================================
+// GENDF Library Functions
+//==============================================================================
+
+//! Create GENDF library instance
+//! \param[in] library_path Path to GENDF library directory
+//! \param[in] n_energy_bounds Number of energy boundaries
+//! \param[in] energy_bounds Energy group boundaries in eV
+//! \param[in] energy_structure_name Energy structure name (e.g., "CCFE-709")
+//! \param[out] lib_id Library instance ID
+//! \return Error code
+int openmc_gendf_library_create(const char* library_path, int n_energy_bounds,
+  const double* energy_bounds, const char* energy_structure_name,
+  int32_t* lib_id);
+
+//! Free GENDF library instance
+//! \param[in] lib_id Library ID
+//! \return Error code
+int openmc_gendf_library_free(int32_t lib_id);
+
+//! Get number of energy groups in GENDF library
+//! \param[in] lib_id Library ID
+//! \param[out] n_groups Number of groups
+//! \return Error code
+int openmc_gendf_library_get_n_groups(int32_t lib_id, int* n_groups);
+
+//! Get energy group boundaries from GENDF library
+//! \param[in] lib_id Library ID
+//! \param[out] bounds Pointer to energy bounds array
+//! \param[out] n Number of boundaries
+//! \return Error code
+int openmc_gendf_library_get_energy_bounds(
+  int32_t lib_id, const double** bounds, int* n);
+
+//! Check if nuclide is available in GENDF library
+//! \param[in] lib_id Library ID
+//! \param[in] nuclide Nuclide name
+//! \param[out] has Whether nuclide is available
+//! \return Error code
+int openmc_gendf_library_has_nuclide(
+  int32_t lib_id, const char* nuclide, bool* has);
+
+//! Get list of available nuclides in GENDF library
+//! \param[in] lib_id Library ID
+//! \param[out] nuclides Array of nuclide name strings (caller must free)
+//! \param[out] n Number of nuclides
+//! \return Error code
+int openmc_gendf_library_available_nuclides(
+  int32_t lib_id, char*** nuclides, int* n);
+
+//! Get cross-section data for nuclide and reaction
+//! \param[in] lib_id Library ID
+//! \param[in] nuclide Nuclide name
+//! \param[in] mt ENDF MT reaction number
+//! \param[in] n_energy_bounds Number of energy boundaries
+//! \param[in] energy_bounds Energy boundaries for validation
+//! \param[out] xs_data Cross-section array (caller must free with
+//! openmc_gendf_free_xs) \param[out] n_groups Number of groups returned
+//! \return Error code
+int openmc_gendf_get_xs(int32_t lib_id, const char* nuclide, int32_t mt,
+  int n_energy_bounds, const double* energy_bounds, double** xs_data,
+  int* n_groups);
+
+//! Free cross-section array allocated by openmc_gendf_get_xs
+//! \param[in] xs_data Array to free
+void openmc_gendf_free_xs(double* xs_data);
+
+//! Free nuclide array allocated by openmc_gendf_library_available_nuclides
+//! \param[in] nuclides Array of nuclide names to free (may be NULL)
+//! \param[in] n Number of nuclides in array
+//! \note Safe to call with NULL pointer or n=0
+void openmc_gendf_free_nuclides(char** nuclides, int n);
+
 // Error codes
 extern int OPENMC_E_UNASSIGNED;
 extern int OPENMC_E_ALLOCATE;
