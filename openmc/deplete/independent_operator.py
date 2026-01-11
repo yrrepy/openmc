@@ -8,6 +8,7 @@ transport solver by using user-provided multigroup fluxes and cross sections.
 from __future__ import annotations
 from collections.abc import Iterable
 import copy
+import warnings
 
 import numpy as np
 from uncertainties import ufloat
@@ -20,7 +21,9 @@ from .openmc_operator import OpenMCOperator
 from .pool import _distribute
 from .microxs import MicroXS
 from .results import Results
-from .helpers import ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper
+from .helpers import (ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper,
+                      IsomericBranchingHelper)
+from . import get_energy_structure_name
 
 
 class IndependentOperator(OpenMCOperator):
@@ -69,11 +72,28 @@ class IndependentOperator(OpenMCOperator):
     reduce_chain_level : int, optional
         Depth of the search when reducing the depletion chain. The default
         value of ``None`` implies no limit on the depth.
+    keep_isomeric_siblings : bool, optional
+        Whether to keep all isomeric state siblings together during chain
+        reduction:
+
+        - True (default): Always keep all isomeric siblings (ground +
+          metastables) when any state is reachable. Required for correct
+          isomeric branching calculations. May increase chain size by 10-30%.
+        - False: Original behavior. Isomeric states treated independently.
+          May cause isomeric branching failures with partial exclusions.
+
     fission_yield_opts : dict of str to option, optional
         Optional arguments to pass to the
         :class:`openmc.deplete.helpers.FissionYieldHelper` object. Will be
         passed directly on to the helper. Passing a value of None will use the
         defaults for the associated helper.
+    gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
+        GENDF library for on-the-fly multigroup cross-section lookup when
+        MicroXS contains only single-group (collapsed) data. When provided,
+        enables correct isomeric branching for workflows that use collapsed
+        cross-sections (e.g., activator scripts). Default is None.
+
+        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -116,7 +136,10 @@ class IndependentOperator(OpenMCOperator):
                  fission_q=None,
                  prev_results=None,
                  reduce_chain_level=None,
-                 fission_yield_opts=None):
+                 keep_isomeric_siblings=True,
+                 fission_yield_opts=None,
+                 require_isomeric_branching=True,
+                 gendf_library=None):
         # Validate micro-xs parameters
         check_type('materials', materials, Iterable, openmc.Material)
         check_type('micros', micros, Iterable, MicroXS)
@@ -144,6 +167,21 @@ class IndependentOperator(OpenMCOperator):
         fluxes = [fluxes[i] for i in index_sort]
         micros = [micros[i] for i in index_sort]
 
+        # Store energy bins if present in flux tuples
+        self._energy_bins = None
+        self._flux_with_energy = []
+        
+        # Check if fluxes contain energy information
+        for i, flux_item in enumerate(fluxes):
+            if isinstance(flux_item, tuple) and len(flux_item) == 2:
+                self._flux_with_energy.append(flux_item)
+                if self._energy_bins is None:
+                    self._energy_bins = flux_item[1]
+                fluxes[i] = flux_item[0]  # Extract just the flux
+            else:
+                self._flux_with_energy.append((flux_item, None))
+
+
         self.fluxes = fluxes
         super().__init__(
             materials=materials,
@@ -152,7 +190,16 @@ class IndependentOperator(OpenMCOperator):
             prev_results=prev_results,
             fission_q=fission_q,
             helper_kwargs=helper_kwargs,
-            reduce_chain_level=reduce_chain_level)
+            reduce_chain_level=reduce_chain_level,
+            keep_isomeric_siblings=keep_isomeric_siblings)
+
+        # Store parameters for isomeric branching setup
+        self._require_isomeric_branching = require_isomeric_branching
+        self._gendf_library = gendf_library
+
+        # Setup isomeric branching after initialization
+        self._setup_isomeric_branching()
+
 
     @classmethod
     def from_nuclides(cls, volume, nuclides,
@@ -165,7 +212,10 @@ class IndependentOperator(OpenMCOperator):
                       fission_q=None,
                       prev_results=None,
                       reduce_chain_level=None,
-                      fission_yield_opts=None):
+                      keep_isomeric_siblings=True,
+                      fission_yield_opts=None,
+                      require_isomeric_branching=True,
+                      gendf_library=None):
         """
         Alternate constructor from a dictionary of nuclide concentrations
 
@@ -202,11 +252,29 @@ class IndependentOperator(OpenMCOperator):
         reduce_chain_level : int, optional
             Depth of the search when reducing the depletion chain. The default
             value of ``None`` implies no limit on the depth.
+        keep_isomeric_siblings : bool, optional
+            Whether to keep all isomeric state siblings together during chain
+            reduction:
+
+            - True (default): Always keep all isomeric siblings (ground +
+              metastables) when any state is reachable. Required for correct
+              isomeric branching calculations. May increase chain size by 10-30%.
+            - False: Original behavior. Isomeric states treated independently.
+              May cause isomeric branching failures with partial exclusions.
+
         fission_yield_opts : dict of str to option, optional
             Optional arguments to pass to the
             :class:`openmc.deplete.helpers.FissionYieldHelper` class. Will be
             passed directly on to the helper. Passing a value of None will use
             the defaults for the associated helper.
+        require_isomeric_branching : bool, optional
+            If True (default), raises RuntimeError when isomeric branching data
+            exists in the chain but cannot be used (missing flux spectra or
+            unsupported energy structure). If False, issues a warning and
+            proceeds without isomeric branching.
+        gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
+            GENDF library for on-the-fly multigroup cross-section lookup.
+            Default is None.
 
         """
         check_type('nuclides', nuclides, dict, str)
@@ -222,7 +290,10 @@ class IndependentOperator(OpenMCOperator):
                    fission_q=fission_q,
                    prev_results=prev_results,
                    reduce_chain_level=reduce_chain_level,
-                   fission_yield_opts=fission_yield_opts)
+                   keep_isomeric_siblings=keep_isomeric_siblings,
+                   fission_yield_opts=fission_yield_opts,
+                   require_isomeric_branching=require_isomeric_branching,
+                   gendf_library=gendf_library)
 
     @staticmethod
     def _consolidate_nuclides_to_material(nuclides, nuc_units, volume):
@@ -261,6 +332,109 @@ class IndependentOperator(OpenMCOperator):
             for res_obj in prev_results:
                 new_res = res_obj.distribute(self.local_mats, mat_indexes)
                 self.prev_res.append(new_res)
+
+    def _setup_isomeric_branching(self):
+        """Set up isomeric branching helper if data exists.
+
+        Raises
+        ------
+        RuntimeError
+            If isomeric branching data exists but flux spectra or energy bins
+            are missing, or if energy structure cannot be determined, and
+            ``require_isomeric_branching=True`` (default).
+
+        Notes
+        -----
+        If ``require_isomeric_branching=False`` was passed to ``__init__``,
+        warnings are issued instead of errors, and isomeric branching is
+        disabled for this operator.
+        """
+        self._isomeric_branching = None
+
+        # Check if chain has isomeric branching data
+        if not hasattr(self.chain, 'isomeric_branching'):
+            return
+
+        if self.chain.isomeric_branching is None:
+            return
+
+        # Helper for handling errors/warnings based on require_isomeric_branching
+        def _handle_issue(message):
+            if self._require_isomeric_branching:
+                raise RuntimeError(message)
+            else:
+                warnings.warn(
+                    f"{message} Isomeric branching will be disabled.",
+                    UserWarning
+                )
+                return True  # Signal to return early
+
+        # Check flux spectra and energy bins
+        if len(self.fluxes) == 0 or self._energy_bins is None or len(self._energy_bins) == 0:
+            if _handle_issue(
+                "Isomeric branching data is present in chain but flux spectra "
+                "or energy bins are missing. Energy-dependent isomeric branching "
+                "requires flux spectra with energy information."
+            ):
+                return
+
+        # Detect energy structure from first material with flux data
+        energy_structure = None
+        for flux_spectrum, energy in self._flux_with_energy:
+            if energy is not None and isinstance(flux_spectrum, np.ndarray):
+                n_groups = len(flux_spectrum)
+                energy_structure = get_energy_structure_name(n_groups)
+                if energy_structure is not None:
+                    break
+
+        if energy_structure is None:
+            if _handle_issue(
+                "Could not determine energy structure from flux spectra. "
+                "Isomeric branching requires CCFE-709 (709 groups) or "
+                "UKAEA-1102 (1102 groups) energy structure."
+            ):
+                return
+
+        helper = IsomericBranchingHelper(
+            self.chain,
+            energy_structure=energy_structure,
+            gendf_library=self._gendf_library
+        )
+        self._isomeric_branching = []
+
+        # Calculate σ×φ-weighted branching for each material
+        for i, (flux_spectrum, energy) in enumerate(self._flux_with_energy):
+            # STRICT: All materials must have energy information
+            if energy is None or not isinstance(flux_spectrum, np.ndarray):
+                raise RuntimeError(
+                    f"Material {i} is missing flux spectrum or energy information. "
+                    f"All materials must have flux spectra with {energy_structure} "
+                    f"energy structure when using energy-dependent isomeric branching."
+                )
+
+            # Get MicroXS for this material (required for σ×φ weighting)
+            micro_xs = self.cross_sections[i]
+
+            # Calculate σ×φ-weighted branching
+            # The helper will perform strict validation and raise errors if mismatched
+            weighted = helper.weighted_branching_ratios(flux_spectrum, energy, micro_xs)
+
+            self._isomeric_branching.append(weighted)
+
+        # Validate that branching was actually calculated
+        has_branching = any(bool(d) for d in self._isomeric_branching)
+        if not has_branching:
+            warnings.warn(
+                "Isomeric branching data exists in chain but σ×φ-weighted ratios "
+                "could not be calculated. This occurs when MicroXS is single-group "
+                "(collapsed) and no GENDF library was provided.\n"
+                "To enable isomeric branching:\n"
+                "  1. Provide gendf_library parameter with GENDF files, OR\n"
+                "  2. Use multigroup MicroXS matching flux energy structure\n"
+                "Proceeding without isomeric branching.",
+                UserWarning
+            )
+            self._isomeric_branching = None
 
     def _get_nuclides_with_data(self, cross_sections: list[MicroXS]) -> set[str]:
         """Finds nuclides with cross section data
@@ -342,9 +516,12 @@ class IndependentOperator(OpenMCOperator):
                 for i_rx in react_index:
                     rx = self.rx_ind_map[i_rx]
 
+                    # Get cross section data
+                    xs_data = xs[nuc, rx]
+
                     # Determine reaction rate by multiplying xs in [b] by flux
                     # in [n-cm/src] to give [(reactions/src)*b-cm/atom]
-                    self._results_cache[i_nuc, i_rx] = (xs[nuc, rx] * flux).sum()
+                    self._results_cache[i_nuc, i_rx] = (xs_data * flux).sum()
 
             return self._results_cache
 
