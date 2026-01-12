@@ -113,9 +113,7 @@ class AtomNumber:
 
     @property
     def nuclides(self):
-        # Return nuclides sorted by their index to preserve chain order
-        return [nuc for nuc, _ in sorted(self.index_nuc.items(),
-                                        key=lambda x: x[1])]
+        return self.index_nuc.keys()
 
     @property
     def n_nuc(self):
@@ -123,9 +121,7 @@ class AtomNumber:
 
     @property
     def burnable_nuclides(self):
-        # Sort by index to preserve chain order, not alphabetical!
-        return [nuc for nuc, ind in sorted(self.index_nuc.items(),
-                                          key=lambda x: x[1])
+        return [nuc for nuc, ind in self.index_nuc.items()
                 if ind < self.n_nuc_burn]
 
     def get_mat_volume(self, mat):

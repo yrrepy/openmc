@@ -415,10 +415,6 @@ class FissionYieldHelper(ABC):
     def __init__(self, chain_nuclides):
         self._chain_nuclides = {}
         self._constant_yields = defaultdict(dict)
-        # Store original chain order for sorting - CRITICAL for index mapping
-        # The chain order is based on atomic number (H1, H2, H3, ..., He3, He4, ...)
-        # which matches how CRAM solver returns concentrations
-        self._chain_nuclide_order = [nuc.name for nuc in chain_nuclides]
 
         # Get all nuclides with fission yield data
         for nuc in chain_nuclides:
@@ -499,15 +495,10 @@ class FissionYieldHelper(ABC):
             Union of nuclides that the
             :class:`openmc.deplete.abc.TransportOperator` says have non-zero
             densities at this stage and those that have yield data. Sorted by
-            chain index to preserve correct nuclide-to-value mapping.
+            nuclide name
 
         """
-        # Get intersection of nuclides with yield data and non-zero densities
-        overlap = self._chain_set & set(nuclides)
-        # CRITICAL: Sort by chain index, not alphabetically!
-        # Chain order matches how CRAM returns concentrations (by atomic number)
-        return sorted(overlap, key=lambda x: self._chain_nuclide_order.index(x)
-                      if x in self._chain_nuclide_order else float('inf'))
+        return sorted(self._chain_set & set(nuclides))
 
     @classmethod
     def from_operator(cls, operator, **kwargs):

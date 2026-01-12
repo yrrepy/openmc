@@ -1,8 +1,9 @@
 """ELIS-based isomeric state mapping for decay data.
 
-This module provides functions to parse decay libraries and perform
-excitation energy (ELIS) based mapping of isomeric states for use
-with GENDF cross-section data in depletion calculations.
+This module provides functions to parse decay libraries for mapping 
+GENDF LFS (Level Final State) to decay LISO (Isomeric state number)
+physical isomeric states using GENDF-ELFS to DK-ELIS
+excitation energy of state matching.
 
 The key function is :func:`parse_decay_isomeric_levels` which builds a
 lookup table from decay library data. This table is then used by
@@ -49,7 +50,7 @@ class DecayState:
     """Represents a nuclear state from decay library data.
 
     This class stores information extracted from ENDF decay files (MF=1, MT=451)
-    needed to identify isomeric states based on excitation energy (ELIS).
+    needed to identify isomeric states based on excitation energy of state (ELIS).
 
     Attributes
     ----------
@@ -66,7 +67,7 @@ class DecayState:
 
     Notes
     -----
-    The ELIS (Excitation Energy of LISo state) value is the key identifier
+    The ELIS (Excitation Energy of State) value is the key identifier
     for matching GENDF MF=10 product levels to the correct OpenMC `_m{n}` naming.
 
     In ENDF decay files:
@@ -74,7 +75,7 @@ class DecayState:
     - LISO directly gives the isomeric state number (0, 1, 2, ...)
 
     In GENDF MF=10:
-    - ELIS is calculated as QM - QI (Q-value difference)
+    - ELFS is calculated as QM - QI (Q-value difference)
     - LFS is an internal level flag that may not correspond to LISO
 
     Examples
@@ -98,21 +99,21 @@ class DecayState:
 # ============================================================================
 
 def elis_match(
-    gendf_elis: float,
+    gendf_elfs: float,
     dk_elis: float,
     rtol: float = ELIS_RTOL,
     atol: float = ELIS_ATOL
 ) -> bool:
-    """Check if GENDF-derived ELIS matches decay library ELIS within tolerance.
+    """Check if GENDF-derived ELFS matches decay library ELIS within tolerance.
 
     Uses decay library ELIS as the reference (ground truth), consistent with
     NumPy's ``np.isclose()`` semantics where the second argument is the reference:
-    ``abs(gendf_elis - dk_elis) <= atol + rtol * abs(dk_elis)``
+    ``abs(gendf_elfs - dk_elis) <= atol + rtol * abs(dk_elis)``
 
     This approach treats the decay library as the authoritative source for
     excitation energies, since:
     1. Decay library ELIS values are directly measured/evaluated
-    2. GENDF ELIS is derived (QM - QI) and may have evaluation differences
+    2. GENDF ELFS is derived (QM - QI) and may have evaluation differences
     3. Consistent with NumPy convention for tolerance comparisons
 
     The default 50% relative tolerance handles typical evaluation differences
@@ -120,7 +121,7 @@ def elis_match(
 
     Parameters
     ----------
-    gendf_elis : float
+    gendf_elfs : float
         Excitation energy from GENDF (QM - QI) in eV
     dk_elis : float
         Excitation energy from decay library (reference) in eV
@@ -132,16 +133,16 @@ def elis_match(
     Returns
     -------
     bool
-        True if GENDF ELIS is within tolerance of decay library ELIS
+        True if GENDF ELFS is within tolerance of decay library ELIS
 
     Notes
     -----
     The tolerance formula ``rtol * abs(dk_elis)`` means:
     - Large dk_elis values allow larger absolute differences
-    - Question asked: "Is GENDF ELIS within X% of the known isomeric state?"
+    - Question asked: "Is GENDF ELFS within X% of the known isomeric state?"
 
     This differs from the symmetric ``max()``-based formula which could
-    inflate tolerance when GENDF ELIS is larger than decay library ELIS.
+    inflate tolerance when GENDF ELFS is larger than decay library ELIS.
 
     Examples
     --------
@@ -157,7 +158,7 @@ def elis_match(
     >>> elis_match(140000.0, 81200.0)  # diff=58800, tol=40600 -> FAIL
     False
     """
-    return abs(gendf_elis - dk_elis) <= atol + rtol * abs(dk_elis)
+    return abs(gendf_elfs - dk_elis) <= atol + rtol * abs(dk_elis)
 
 
 def lookup_liso(

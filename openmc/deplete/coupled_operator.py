@@ -168,14 +168,14 @@ class CoupledOperator(OpenMCOperator):
         .. versionadded:: 0.12
     keep_isomeric_siblings : bool, optional
         Whether to keep all isomeric state siblings together during chain
-        reduction:
-
+        reduction, as isomers can be at different depths in the chain:
         - True (default): Always keep all isomeric siblings (ground +
           metastables) when any state is reachable. Required for correct
           isomeric branching calculations. May increase chain size by 10-30%.
         - False: Original behavior. Isomeric states treated independently.
           May cause isomeric branching failures with partial exclusions.
 
+        .. versionadded:: 0.15.4
     diff_volume_method : str
         Specifies how the volumes of the new materials should be found. Default
         is to 'divide equally' which divides the original material volume
@@ -192,9 +192,7 @@ class CoupledOperator(OpenMCOperator):
         Default is None.
 
         .. versionadded:: 0.15.4
-        .. versionchanged:: 0.15.4
-            Now fully functional with ``direct_with_flux`` mode for isomeric
-            branching (previously placeholder only).
+
     Attributes
     ----------
     model : openmc.model.Model
@@ -557,6 +555,9 @@ class CoupledOperator(OpenMCOperator):
 
         This method extends the parent implementation to update flux-weighted
         isomeric branching ratios after each transport solve.
+
+        Updates branching ratios after each transport solve, likely should be refactored as name
+        is misleading. Refactor into OpenMCOperator, hook method in parent
 
         Parameters
         ----------

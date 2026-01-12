@@ -505,12 +505,9 @@ class StepResult:
             results.volume[mat] = vol
             results.index_mat[mat] = ind
 
-        # Build a temporary dict to sort nuclides by their stored index
-        # This ensures we preserve the chain order, not alphabetical
-        temp_nuc_dict = {}
         for nuc, nuc_handle in handle["/nuclides"].items():
             ind_atom = nuc_handle.attrs["atom number index"]
-            temp_nuc_dict[nuc] = ind_atom
+            results.index_nuc[nuc] = ind_atom
 
             if "reaction rate index" in nuc_handle.attrs:
                 rxn_nuc_to_ind[nuc] = nuc_handle.attrs["reaction rate index"]

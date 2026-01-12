@@ -58,8 +58,4 @@
       </fission_yields>
     </neutron_fission_yields>
   </nuclide>
-  <nuclide name="O16" decay_modes="0" reactions="0" />
-  <nuclide name="O17" decay_modes="0" reactions="0" />
-  <nuclide name="O18" decay_modes="0" reactions="0" />
-  <nuclide name="U236" decay_modes="0" reactions="0" />
 </depletion_chain>

@@ -66,7 +66,7 @@ REACTION_NAME.update({i: f'(n,2n{i - 875})' for i in range(875, 891)})
 
 REACTION_MT = {name: mt for mt, name in REACTION_NAME.items()}
 REACTION_MT['fission'] = 18
-REACTION_MT["(n,n')"] = 4  # Alias for (n,level) - total inelastic scattering
+REACTION_MT["(n,n')"] = 4
 
 FISSION_MTS = (18, 19, 20, 21, 38)
 

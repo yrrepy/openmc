@@ -51,7 +51,8 @@ class Element(str):
         If a gendf_library is provided, its nuclide list is used instead of the
         HDF5 cross_sections.xml. This is important for GENDF-based activation
         workflows where the GENDF library may have different nuclide coverage
-        than the HDF5 library (e.g., Ta180_m1 in GENDF but not in HDF5).
+        than the HDF5 library (e.g. Ir192_m1(Ir192mg), Ir192_m2(Ir192ng) available
+        in GENDF TENDL2017 but not in HDF5 TENDL2017).
 
         Parameters
         ----------
@@ -80,6 +81,7 @@ class Element(str):
             GENDF library to use for nuclide availability check. If provided,
             takes priority over cross_sections. Default is None.
 
+            .. versionadded:: 0.15.4
         Returns
         -------
         isotopes : list

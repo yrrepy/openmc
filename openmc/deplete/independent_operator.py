@@ -74,33 +74,37 @@ class IndependentOperator(OpenMCOperator):
         value of ``None`` implies no limit on the depth.
     keep_isomeric_siblings : bool, optional
         Whether to keep all isomeric state siblings together during chain
-        reduction:
-
-        - True (default): Always keep all isomeric siblings (ground +
+        reduction, as isomers can be at different depths in the chain:
+        - True (default): Always keep all isomeric siblings (ground + 
           metastables) when any state is reachable. Required for correct
           isomeric branching calculations. May increase chain size by 10-30%.
         - False: Original behavior. Isomeric states treated independently.
           May cause isomeric branching failures with partial exclusions.
 
+        .. versionadded:: 0.15.4
     fission_yield_opts : dict of str to option, optional
         Optional arguments to pass to the
         :class:`openmc.deplete.helpers.FissionYieldHelper` object. Will be
         passed directly on to the helper. Passing a value of None will use the
         defaults for the associated helper.
     gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
-        GENDF library for on-the-fly multigroup cross-section lookup when
-        MicroXS contains only single-group (collapsed) data. When provided,
-        enables correct isomeric branching for workflows that use collapsed
-        cross-sections (e.g., activator scripts). Default is None.
+        GENDF library for σ×φ-weighted isomeric branching ratio calculation.
+        -MicroXS has the flux-collapsed one-group cross-sections.
+        -The chain has the multigroup-binned branching ratios (pre-processed from GENDF) per nuclide-reaction.
+        -To combine the two;
+        The contribution of each branching ratio bin to the collapsed one-group reaction rate must be determined by σ×φ weighting
+        e.g.: the branching ratio itself must have a weighted collapse, this is done by accessing the GENDF XS of the nuclide-reaction
 
-        .. versionadded:: 0.15.4
+        Required for isomeric branching support. Default is None.
+
+      .. versionadded:: 0.15.4
 
     Attributes
     ----------
     materials : openmc.Materials
         All materials present in the model
     cross_sections : list of MicroXS
-        Object containing multigroup cross-sections in [b] for each material.
+        Object containing multigroup cross-sections in [b] for each material.        # *** wrong? I think this is multigroup XS collapsed with multigroup Flux to one group cross-sections ***
     output_dir : pathlib.Path
         Path to output directory to save results.
     round_number : bool
@@ -194,7 +198,7 @@ class IndependentOperator(OpenMCOperator):
             keep_isomeric_siblings=keep_isomeric_siblings)
 
         # Store parameters for isomeric branching setup
-        self._require_isomeric_branching = require_isomeric_branching
+        self._require_isomeric_branching = require_isomeric_branching # require_isomeric_branching, maybe can be wholly removed
         self._gendf_library = gendf_library
 
         # Setup isomeric branching after initialization
@@ -272,6 +276,7 @@ class IndependentOperator(OpenMCOperator):
             exists in the chain but cannot be used (missing flux spectra or
             unsupported energy structure). If False, issues a warning and
             proceeds without isomeric branching.
+            ** Maybe can be wholly removed **
         gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
             GENDF library for on-the-fly multigroup cross-section lookup.
             Default is None.
@@ -404,7 +409,7 @@ class IndependentOperator(OpenMCOperator):
 
         # Calculate σ×φ-weighted branching for each material
         for i, (flux_spectrum, energy) in enumerate(self._flux_with_energy):
-            # STRICT: All materials must have energy information
+            # All materials must have energy information
             if energy is None or not isinstance(flux_spectrum, np.ndarray):
                 raise RuntimeError(
                     f"Material {i} is missing flux spectrum or energy information. "
@@ -426,11 +431,10 @@ class IndependentOperator(OpenMCOperator):
         if not has_branching:
             warnings.warn(
                 "Isomeric branching data exists in chain but σ×φ-weighted ratios "
-                "could not be calculated. This occurs when MicroXS is single-group "
-                "(collapsed) and no GENDF library was provided.\n"
-                "To enable isomeric branching:\n"
-                "  1. Provide gendf_library parameter with GENDF files, OR\n"
-                "  2. Use multigroup MicroXS matching flux energy structure\n"
+                "could not be calculated. MicroXS stores flux-collapsed single-group "
+                "cross-sections and cannot provide spectral information for weighting.\n"
+                "To enable isomeric branching, provide gendf_library parameter with "
+                "GENDF files containing multigroup cross-sections.\n"
                 "Proceeding without isomeric branching.",
                 UserWarning
             )
@@ -516,12 +520,9 @@ class IndependentOperator(OpenMCOperator):
                 for i_rx in react_index:
                     rx = self.rx_ind_map[i_rx]
 
-                    # Get cross section data
-                    xs_data = xs[nuc, rx]
-
                     # Determine reaction rate by multiplying xs in [b] by flux
                     # in [n-cm/src] to give [(reactions/src)*b-cm/atom]
-                    self._results_cache[i_nuc, i_rx] = (xs_data * flux).sum()
+                    self._results_cache[i_nuc, i_rx] = (xs[nuc, rx] * flux).sum()
 
             return self._results_cache
 

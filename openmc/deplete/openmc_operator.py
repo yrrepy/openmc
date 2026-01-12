@@ -54,14 +54,14 @@ class OpenMCOperator(TransportOperator):
         value of ``None`` implies no limit on the depth.
     keep_isomeric_siblings : bool, optional
         Whether to keep all isomeric state siblings together during chain
-        reduction:
-
+        reduction, as isomers can be at different depths in the chain:
         - True (default): Always keep all isomeric siblings (ground +
           metastables) when any state is reachable. Required for correct
           isomeric branching calculations. May increase chain size by 10-30%.
         - False: Original behavior. Isomeric states treated independently.
           May cause isomeric branching failures with partial exclusions.
 
+        .. versionadded:: 0.15.4
     diff_volume_method : str
         Specifies how the volumes of the new materials should be found. Default
         is to 'divide equally' which divides the original material volume
@@ -241,13 +241,7 @@ class OpenMCOperator(TransportOperator):
 
         # Sort the sets
         burnable_mats = sorted(burnable_mats, key=int)
-        # CRITICAL: Sort by chain index, not alphabetically!
-        # Chain order is based on atomic number (H1, H2, H3, ..., He3, He4, ...)
-        # which matches how CRAM solver returns concentrations
-        chain_nuclides = list(self.chain.nuclide_dict.keys())
-        model_nuclides = sorted(model_nuclides,
-                               key=lambda x: chain_nuclides.index(x)
-                               if x in chain_nuclides else float('inf'))
+        model_nuclides = sorted(model_nuclides)
 
         # Construct a global nuclide dictionary, burned first
         nuclides = list(self.chain.nuclide_dict)

@@ -6,19 +6,12 @@ import inspect
 import warnings
 from itertools import repeat, starmap
 from multiprocessing import Pool
-from typing import Any, Callable, List, Optional, TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import hstack
 
 from openmc.mpi import comm
 from .._sparse_compat import block_array
-
-if TYPE_CHECKING:
-    from .chain import Chain
-    from .abc import TransportOperator
-    from .reaction_rates import ReactionRates
-    from .transfer_rates import TransferRates
 
 # Configurable switch that enables / disables the use of
 # multiprocessing routines during depletion
@@ -28,7 +21,7 @@ USE_MULTIPROCESSING = True
 # calculations
 NUM_PROCESSES = None
 
-def _distribute(items: List) -> List:
+def _distribute(items):
     """Distribute items across MPI communicator
 
     Parameters
@@ -51,19 +44,9 @@ def _distribute(items: List) -> List:
         j += chunk_size
 
 
-def deplete(
-    func: Callable,
-    chain: 'Chain',
-    n: List[np.ndarray],
-    rates: 'ReactionRates',
-    dt: float,
-    current_timestep: Optional[int] = None,
-    matrix_func: Optional[Callable] = None,
-    transfer_rates: Optional['TransferRates'] = None,
-    external_source_rates: Optional[Any] = None,
-    operator: Optional['TransportOperator'] = None,
-    *matrix_args: Any
-) -> List[np.ndarray]:
+def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
+        transfer_rates=None, external_source_rates=None, operator=None,
+        *matrix_args):
     """Deplete materials using given reaction rates for a specified time
 
     Parameters
@@ -98,6 +81,7 @@ def deplete(
     operator : OperatorBase, optional
         Transport operator instance. If provided, isomeric branching data
         will be extracted from operator._isomeric_branching
+        Operator now passed explicitly as parameter (clearer than hasattr detection)
 
         .. versionadded:: 0.15.3
     matrix_args: Any, optional
@@ -110,7 +94,6 @@ def deplete(
         list contains the number of [atom] of each nuclide.
 
     """
-    # Operator now passed explicitly as parameter (clearer than hasattr detection)
 
     fission_yields = chain.fission_yields
     if len(fission_yields) == 1:
@@ -131,7 +114,7 @@ def deplete(
             if len(isomeric_branching) == 1:
                 isomeric_branching = repeat(isomeric_branching[0])
             elif len(isomeric_branching) != len(n):
-                # Size mismatch - disable isomeric branching
+                # Size mismatch - disable isomeric branching. May be redundant and can be refactored (or removed)
                 operator_type = type(operator).__name__
                 chain_size = len(chain) if hasattr(chain, '__len__') else 'unknown'
                 warnings.warn(
@@ -151,14 +134,13 @@ def deplete(
             # Use isomeric branching in matrix formation
             matrices = []
             for rate, fy, iso in zip(rates, fission_yields, isomeric_branching):
-                matrix = chain.form_matrix(rate, fission_yields=fy,
-                                          isomeric_branching=iso)
+                matrix = chain.form_matrix(rate, fy, iso)
                 matrices.append(matrix)
         else:
             # Original behavior - no isomeric branching
             matrices = []
             for rate, fy in zip(rates, fission_yields):
-                matrix = chain.form_matrix(rate, fission_yields=fy)
+                matrix = chain.form_matrix(rate, fy)
                 matrices.append(matrix)
     else:
         # Custom matrix function - need to handle both with and without isomeric branching
@@ -167,11 +149,11 @@ def deplete(
             matrices = []
             for c, r, fy, iso in zip(repeat(chain), rates,
                                     fission_yields, isomeric_branching):
-                # Check if the custom matrix function accepts isomeric_branching
+                # Check if the custom matrix function accepts isomeric_branching. May be redundant and can be refactored (or removed)
                 sig = inspect.signature(matrix_func)
                 params = list(sig.parameters.keys())
                 
-                # If function accepts 4 or more parameters, pass isomeric_branching
+                # If function accepts 4 or more parameters, pass isomeric_branching. May be redundant and can be refactored (or removed)
                 if len(params) >= 4:
                     m = matrix_func(c, r, fy, iso, *matrix_args)
                 else:
