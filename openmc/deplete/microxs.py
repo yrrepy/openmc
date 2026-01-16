@@ -25,7 +25,7 @@ from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
 from ..utility_funcs import h5py_file_or_group
 import openmc.lib
 from openmc.mpi import comm
-from .gendf import GENDFLibrary, _PythonGENDFLibrary, _CppGENDFLibrary
+from .gendf import GENDFLibrary, _PythonGENDFLibrary, _CppGENDFLibrary, detect_energy_structure
 
 # Build tuple of valid GENDF backend types for isinstance checks
 _GENDF_TYPES = (_PythonGENDFLibrary,)
@@ -245,12 +245,8 @@ def get_microxs_and_flux(
     model.tallies = original_tallies
 
     # Package flux with energy information for isomeric branching
-    fluxes_with_energy = []
-    for flux in fluxes:
-        # Create tuple of (flux, energy_bins) for each domain
-        flux_tuple = (flux, energy_filter.values)
-        fluxes_with_energy.append(flux_tuple)
-    
+    fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
+
     return fluxes_with_energy, micros
 
 
@@ -260,20 +256,20 @@ def get_gendf_and_flux(
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
     nuclides: Sequence[str] | None = None,
     reactions: Sequence[str] | None = None,
-    energies: Sequence[float] | str | None = None,
     chain_file: PathLike | Chain | None = None,
     path_statepoint: PathLike | None = None,
+    path_input: PathLike | None = None,
     run_kwargs=None
 ) -> tuple[list[tuple[np.ndarray, Sequence[float]]], list[MicroXS]]:
-    """Generate microscopic cross sections and fluxes using GENDF library.
+    """Generate microscopic cross sections and fluxes for multiple domains using GENDF library.
 
     This function runs a neutron transport solve to obtain the flux in the
-    specified domains and retrieves microscopic cross sections from a FISPACT
-    GENDF library. It is similar to :func:`get_microxs_and_flux` but uses
-    pre-processed group-averaged cross-sections instead of calculating them
-    from continuous-energy data.
+    specified domains and computes collapsed one-group microscopic cross sections
+    from said multi-group flux and a multi-group GENDF cross section library. 
+    It is similar to :func:`get_microxs_and_flux` but uses pre-processed 
+    group-averaged cross-sections instead of calculating them from continuous-energy data.
 
-    .. versionadded:: 0.15.3
+    .. versionadded:: 0.15.4
 
     Parameters
     ----------
@@ -291,10 +287,6 @@ def get_gendf_and_flux(
     reactions : list of str, optional
         Reactions to get cross sections for. If not specified, all neutron
         reactions listed in the depletion chain file are used.
-    energies : iterable of float or str, optional
-        Energy group boundaries in [eV] or the name of the group structure.
-        Must match the GENDF library structure. If left as None, defaults to
-        'UKAEA-1102' to match common FISPACT GENDF libraries.
     chain_file : PathLike or Chain, optional
         Path to the depletion chain XML file or an instance of
         openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
@@ -302,6 +294,10 @@ def get_gendf_and_flux(
         Path to write the statepoint file from the neutron transport solve to.
         By default, the statepoint file is written to a temporary directory and
         is not kept.
+    path_input : path-like, optional
+        Path to write the model XML file from the neutron transport solve to.
+        By default, the model XML file is written to a temporary directory and
+        not kept.
     run_kwargs : dict, optional
         Keyword arguments passed to :meth:`openmc.Model.run`
 
@@ -320,28 +316,18 @@ def get_gendf_and_flux(
     openmc.deplete.IndependentOperator
     openmc.deplete.gendf.GENDFLibrary
 
-    Examples
-    --------
-    >>> from openmc import Model
-    >>> from openmc.deplete import get_gendf_and_flux
-    >>> model = Model(...)  # Your OpenMC model
-    >>> materials = model.materials
-    >>> gendf_path = '/path/to/JEFF40-GENDF/'
-    >>> fluxes_with_energy, microxs = get_gendf_and_flux(
-    ...     model, materials, gendf_path, energies='UKAEA-1102'
-    ... )
     """
     # Handle GENDF library input
     if isinstance(gendf_library, (str, Path)):
-        gendf_library = GENDFLibrary(gendf_library, energy_structure='UKAEA-1102')
+        detected = detect_energy_structure(gendf_library)
+        gendf_library = GENDFLibrary(gendf_library, energy_structure=detected)
     elif not isinstance(gendf_library, _GENDF_TYPES):
         raise TypeError(
             f"gendf_library must be a path or GENDFLibrary instance, "
             f"not {type(gendf_library)}")
 
-    # Default energy structure to match GENDF library
-    if energies is None:
-        energies = gendf_library.energy_structure
+    # Use GENDF library's energy structure
+    energies = gendf_library.energy_bounds
 
     # Save any original tallies on the model
     original_tallies = model.tallies
@@ -352,18 +338,13 @@ def get_gendf_and_flux(
         reactions = chain.reactions
 
     # Get nuclides from chain, filtered to those with GENDF data
-    # This matches the CE workflow where only nuclides with HDF5 data are included
-    # in nuclides_with_data. Products without XS data are tracked via decay.
     if not nuclides:
         available_nuclides = gendf_library.available_nuclides_set()
         nuclides = [nuc.name for nuc in chain.nuclides
                     if nuc.name in available_nuclides]
 
     # Set up the flux tallies
-    if isinstance(energies, str):
-        energy_filter = openmc.EnergyFilter.from_group_structure(energies)
-    else:
-        energy_filter = openmc.EnergyFilter(energies)
+    energy_filter = openmc.EnergyFilter(energies)
 
     if isinstance(domains, openmc.Filter):
         domain_filter = domains
@@ -383,7 +364,6 @@ def get_gendf_and_flux(
     flux_tally.scores = ['flux']
     model.tallies = [flux_tally]
 
-    # Run transport calculation
     if openmc.lib.is_initialized:
         openmc.lib.finalize()
 
@@ -393,14 +373,16 @@ def get_gendf_and_flux(
         # Reinitialize with tallies
         openmc.lib.init(intracomm=comm)
 
-    # Create temporary run
     with TemporaryDirectory() as temp_dir:
-        if run_kwargs is None:
-            run_kwargs = {}
-        else:
-            run_kwargs = dict(run_kwargs)
-        run_kwargs.setdefault('cwd', temp_dir)
+        # Indicate to run in temporary directory unless being executed through
+        # openmc.lib, in which case we don't need to specify the cwd
+        run_kwargs = dict(run_kwargs) if run_kwargs else {}
+        if not openmc.lib.is_initialized:
+            run_kwargs.setdefault('cwd', temp_dir)
+
+        # Run transport simulation and synchronize
         statepoint_path = model.run(**run_kwargs)
+        comm.barrier()
 
         if comm.rank == 0:
             # Move the statepoint file if it is being saved to a specific path
@@ -408,12 +390,19 @@ def get_gendf_and_flux(
                 shutil.move(statepoint_path, path_statepoint)
                 statepoint_path = path_statepoint
 
-            with StatePoint(statepoint_path) as sp:
-                flux_tally = sp.tallies[flux_tally.id]
-                flux_tally._read_results()
+            # Export the model to path_input if provided
+            if path_input is not None:
+                model.export_to_model_xml(path_input)
+
+        # Broadcast updated statepoint path to all ranks
+        statepoint_path = comm.bcast(statepoint_path)
+
+        # Read in tally results (on all ranks)
+        with StatePoint(statepoint_path) as sp:
+            flux_tally = sp.tallies[flux_tally.id]
+            flux_tally._read_results()
 
     # Get flux values and make energy groups last dimension
-    flux_tally = comm.bcast(flux_tally)
     flux = flux_tally.get_reshaped_data()  # (domains, groups, 1, 1)
     flux = np.moveaxis(flux, 1, -1)  # (domains, 1, 1, groups)
 
@@ -422,7 +411,6 @@ def get_gendf_and_flux(
 
     # Generate microscopic cross sections using GENDF library
     micros = [MicroXS.from_multigroup_flux_with_gendf(
-        energies=energies,
         multigroup_flux=flux_i,
         gendf_library=gendf_library,
         chain_file=chain_file,
@@ -434,12 +422,7 @@ def get_gendf_and_flux(
     model.tallies = original_tallies
 
     # Package flux with energy information for isomeric branching
-    fluxes_with_energy = []
-    for flux in fluxes:
-        # Create tuple of (flux, energy_bins) for each domain
-        flux_tuple = (flux, energy_filter.values)
-        fluxes_with_energy.append(flux_tuple)
-    
+    fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
     return fluxes_with_energy, micros
 
 
@@ -566,10 +549,12 @@ class MicroXS:
         # Create 3D array for microscopic cross sections
         microxs_arr = np.zeros((len(nuclides), len(mts), 1))
 
-        # Normalize multigroup flux (return zeros if flux sum is zero)
+        # If flux is zero, safely return zero cross sections
         multigroup_flux = np.array(multigroup_flux)
         if (flux_sum := multigroup_flux.sum()) == 0.0:
             return cls(microxs_arr, nuclides, reactions)
+
+        # Normalize multigroup flux
         multigroup_flux /= flux_sum
 
         # Compute microscopic cross sections within a temporary session
@@ -589,32 +574,28 @@ class MicroXS:
     @classmethod
     def from_multigroup_flux_with_gendf(
         cls,
-        energies: Sequence[float] | str,
         multigroup_flux: Sequence[float],
         gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
         chain_file: PathLike | Chain | None = None,
         nuclides: Sequence[str] | None = None,
         reactions: Sequence[str] | None = None,
     ) -> MicroXS:
-        """Generate microscopic cross sections from multigroup flux using GENDF library.
+        """Generate one group microscopic cross sections by collapsing
+        multigroup flux with multigroup cross-sections from a GENDF library.
 
-        This method uses pre-processed group-averaged cross-sections from FISPACT
-        GENDF files instead of calculating them from continuous-energy data. It
-        bypasses the C++ collapse_rate calculation, directly retrieving cross-sections
-        from the GENDF library.
+        Uses pre-processed group-averaged cross-sections from a GENDF library 
+        instead of calculating them from continuous-energy data, directly 
+        retrieving cross-sections from a GENDF library.
 
-        .. versionadded:: 0.15.3
+        .. versionadded:: 0.15.4
 
         Parameters
         ----------
-        energies : iterable of float or str
-            Energy group boundaries in [eV] or the name of the group structure.
-            Must match the energy structure of the GENDF library ('CCFE-709' or 'UKAEA-1102').
         multigroup_flux : iterable of float
             Energy-dependent multigroup flux values for each energy group
         gendf_library : path-like or GENDFLibrary
             Path to GENDF library directory or GENDFLibrary instance. If a path is
-            provided, a GENDFLibrary object will be created with UKAEA-1102 structure.
+            provided, the energy structure is auto-detected from the GENDF library.
         chain_file : PathLike or Chain, optional
             Path to the depletion chain XML file or an instance of
             openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
@@ -633,69 +614,38 @@ class MicroXS:
 
         Notes
         -----
-        The flux-weighted cross-section for each nuclide and reaction is calculated as:
+        The collapsed one-group cross-section for each nuclide and reaction is calculated as:
 
         .. math::
             \\langle\\sigma\\rangle = \\sum_g \\sigma_g \\phi_g / \\sum_g \\phi_g
 
         where σ_g is the group-averaged cross-section from GENDF and φ_g is the
-        multigroup flux. Since the flux is normalized, this simplifies to:
+        multigroup flux.
 
-        .. math::
-            \\langle\\sigma\\rangle = \\sum_g \\sigma_g \\phi_g
-
-        Examples
-        --------
-        >>> from openmc.deplete import GENDFLibrary
-        >>> gendf_lib = GENDFLibrary('/path/to/JEFF40-GENDF/', 'UKAEA-1102')
-        >>> flux = [...]  # Your multigroup flux from transport calculation
-        >>> microxs = MicroXS.from_multigroup_flux_with_gendf(
-        ...     energies='UKAEA-1102',
-        ...     multigroup_flux=flux,
-        ...     gendf_library=gendf_lib
-        ... )
         """
         # Handle GENDF library input
         if isinstance(gendf_library, (str, Path)):
-            gendf_library = GENDFLibrary(gendf_library, energy_structure='UKAEA-1102')
+            detected = detect_energy_structure(gendf_library)
+            gendf_library = GENDFLibrary(gendf_library, energy_structure=detected)
         elif not isinstance(gendf_library, _GENDF_TYPES):
             raise TypeError(
                 f"gendf_library must be a path or GENDFLibrary instance, "
                 f"not {type(gendf_library)}")
 
-        # Get energy boundaries
-        if isinstance(energies, str):
-            energies = GROUP_STRUCTURES[energies]
-        else:
-            energies = np.asarray(energies)
-            # Check they are ascending
-            if not np.all(np.diff(energies) > 0):
-                raise ValueError('Energy group boundaries must be in ascending order')
-
-        # Validate energy boundaries match GENDF library
-        # Use pure relative tolerance (rtol=1e-6) to align with OpenMC standards
-        # (same as detect_energy_structure() and isomeric branching sum validation)
-        # NOTE: May need to relax to rtol=1e-5 if too strict for some FISPACT GENDF files
-        if not np.allclose(energies, gendf_library.energy_bounds, rtol=1e-6, atol=0.0):
-            raise ValueError(
-                f"Energy boundaries do not match GENDF library energy structure "
-                f"'{gendf_library.energy_structure}'")
+        # Use GENDF library's energy structure
+        energies = gendf_library.energy_bounds
 
         # Check dimension consistency
         if len(multigroup_flux) != len(energies) - 1:
             raise ValueError('Length of flux array should be len(energies)-1')
 
-        # Get chain and available reactions
-        chain = _get_chain(chain_file)
 
-        # Get set of available nuclides for O(1) lookup (cached)
-        # This is done BEFORE nuclide list generation to enable filtering
+        chain = _get_chain(chain_file)
+        # get available GENDF nuclides
         available_nuclides = gendf_library.available_nuclides_set()
 
-        # If no nuclides specified, use only those from chain that have GENDF data
-        # This matches the CE workflow where only nuclides with HDF5 data are included
-        # in nuclides_with_data. Products without XS data (e.g., Al28 from Al27+n)
-        # are still tracked via decay (_decay_nucs), not reaction rates.
+        # If no nuclides were specified, default to all nuclides from the chain
+        # regardless, filter to those with GENDF data
         if not nuclides:
             nuclides = [nuc.name for nuc in chain.nuclides
                         if nuc.name in available_nuclides]
@@ -703,35 +653,31 @@ class MicroXS:
             # Filter user-provided nuclides to those with GENDF data
             nuclides = [nuc for nuc in nuclides if nuc in available_nuclides]
 
+
         # Get reaction MT values
         if reactions is None:
             reactions = chain.reactions
         mts = [REACTION_MT[name] for name in reactions]
 
-        # Normalize multigroup flux (sum to 1)
-        multigroup_flux = np.array(multigroup_flux)
-        multigroup_flux /= multigroup_flux.sum()
-
         # Create 3D array for microscopic cross sections
-        # Shape: (nuclides, reactions, 1)
         microxs_arr = np.zeros((len(nuclides), len(mts), 1))
 
+        # If flux is zero, safely return zero cross sections
+        multigroup_flux = np.array(multigroup_flux)
+        if (flux_sum := multigroup_flux.sum()) == 0.0:
+            return cls(microxs_arr, nuclides, reactions)
+
+        # Normalize multigroup flux
+        multigroup_flux /= flux_sum
+
         # For each nuclide and reaction, get GENDF XS and compute flux-weighted value
-        # All nuclides in list are guaranteed to have GENDF data (filtered above)
         for nuc_index, nuc in enumerate(nuclides):
             for mt_index, mt in enumerate(mts):
                 try:
                     # Get group-averaged cross-section from GENDF
                     xs_group = gendf_library.get_xs(nuc, mt, energies)
 
-                    # Check shape consistency
-                    if len(xs_group) != len(multigroup_flux):
-                        raise ValueError(
-                            f"Shape mismatch for {nuc} MT={mt}: "
-                            f"GENDF has {len(xs_group)} groups, "
-                            f"flux has {len(multigroup_flux)} groups")
-
-                    # Compute flux-weighted cross-section
+                    # Collapse cross-section
                     # Since flux is normalized: <σ> = Σ σ_g * φ_g
                     microxs_arr[nuc_index, mt_index, 0] = np.sum(xs_group * multigroup_flux)
 

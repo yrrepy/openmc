@@ -36,12 +36,8 @@ std::string trim(const std::string& str) {
 }
 
 //==============================================================================
-// ZA validation (G9 fix)
+// ZA validation
 //==============================================================================
-// H2 fix: Removed unsafe extract_int() and extract_double() functions that
-// returned 0 on parse errors without any indication of failure. All parsing
-// now uses extract_int_safe() and extract_double_safe() in the anonymous
-// namespace below, which track success/failure explicitly.
 
 bool validate_za(int za, std::string& error) {
   if (za <= 0) {
@@ -75,7 +71,7 @@ bool validate_za(int za, std::string& error) {
 }
 
 //==============================================================================
-// Safe extraction functions with error tracking (G9 fix)
+// Safe extraction functions with error tracking
 //==============================================================================
 
 namespace {
@@ -156,7 +152,7 @@ ExtractResult<double> extract_double_safe(
 } // anonymous namespace
 
 //==============================================================================
-// Validated GENDF parser (G9 fix)
+// Validated GENDF parser
 //==============================================================================
 
 GENDFParseResult parse_gendf_validated(
@@ -366,7 +362,7 @@ GENDFParseResult parse_gendf_validated(
 
   // Save last section
   if (current_mf == 3 && !current_xs.empty()) {
-    // H3 fix: Validate energy-XS count consistency
+    // Validate energy-XS count consistency
     if (current_energies.size() != current_xs.size()) {
       result.warnings.push_back(
         "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
@@ -434,8 +430,8 @@ void parse_gendf_mf3_only(
   // This ensures consistent behavior and validation across both entry points
   GENDFParserOptions options;
   options.warn_short_lines = false;  // Don't accumulate short line warnings
-  options.validate_za = true;        // Keep ZA validation (cheap)
-  options.validate_xs_positive = true; // Keep XS validation (cheap)
+  options.validate_za = true;        // Keep ZA validation
+  options.validate_xs_positive = true; // Keep XS validation
   options.require_mf1_header = true;
   options.min_file_lines = 10;
 
@@ -445,7 +441,7 @@ void parse_gendf_mf3_only(
     throw std::runtime_error(result.error_message);
   }
 
-  // Log warnings if any (but not short line warnings since we disabled those)
+  // Log warnings if any
   for (const auto& warn : result.warnings) {
     warning(warn);
   }
@@ -455,22 +451,6 @@ void parse_gendf_mf3_only(
   energy_data = std::move(result.energy_data);
   za = result.za;
   zam = result.zam;
-}
-
-//==============================================================================
-// Full GENDF parser (for validation/debugging)
-//==============================================================================
-
-void parse_gendf_full(
-  const std::string& filename,
-  std::unordered_map<int, vector<double>>& xs_data,
-  std::unordered_map<int, vector<double>>& energy_data,
-  int& za,
-  int& zam)
-{
-  // For now, full parser just calls MF=3-only parser
-  // In the future, this could parse covariances and other data
-  parse_gendf_mf3_only(filename, xs_data, energy_data, za, zam);
 }
 
 } // namespace openmc

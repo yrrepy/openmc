@@ -29,7 +29,6 @@ from .abc import (
 
 if TYPE_CHECKING:
     from .chain import Chain
-    from .microxs import MicroXS
 
 __all__ = (
     "DirectReactionRateHelper", "DirectWithFluxHelper", "ChainFissionHelper",
@@ -1159,16 +1158,16 @@ class AveragedFissionYieldHelper(TalliedFissionYieldHelper):
         return cls(operator.chain.nuclides)
 
 class IsomericBranchingHelper:
-    """Helper for automatic flux-weighted isomeric branching calculations.
+    """Helper for automatic reaction-rate weighted isomeric branching calculations.
 
-    Calculates flux-weighted isomeric branching ratios for reactions that
+    Calculates reaction-rate weighted isomeric branching ratios for reactions that
     can produce both ground state and metastable products. The weighting
-    is performed without interpolation to maintain consistency with the
-    flat-in-bin assumption used in group-wise data.
+    is performed with group-wise GENDF ratios placed on the chain and group-wise
+    cross-sections obtained from a user-provided GENDF library.
 
-    **IMPORTANT**: Flux spectrum MUST use the same energy group structure
-    (CCFE-709 or UKAEA-1102) as the isomeric branching data. Mismatches
-    will raise ValueError.
+    Flux spectrum must use the same energy group structure(typically CCFE-709
+    or UKAEA-1102) as the isomeric branching data on the chain files.
+    Mismatches will raise ValueError.
 
     .. versionadded:: 0.15.4
 
@@ -1176,15 +1175,11 @@ class IsomericBranchingHelper:
     ----------
     chain : openmc.deplete.Chain
         Chain containing isomeric branching data
+    gendf_library : GENDFLibrary
+        GENDF library for on-the-fly multigroup cross-section lookup.
+        Required for σ×φ-weighted isomeric branching.
     energy_structure : {'CCFE-709', 'UKAEA-1102'}, optional
         Required energy group structure. Default is 'UKAEA-1102'.
-    gendf_library : GENDFLibrary, optional
-        GENDF library for on-the-fly multigroup cross-section lookup when
-        MicroXS contains only single-group (collapsed) data. When provided,
-        enables correct isomeric branching for workflows that use collapsed
-        cross-sections (e.g., activator scripts with GENDF). Default is None.
-
-        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -1198,15 +1193,15 @@ class IsomericBranchingHelper:
         Expected energy bin boundaries in eV
     n_groups : int
         Number of energy groups
-    gendf_library : GENDFLibrary or None
-        Optional GENDF library for on-the-fly XS lookup
+    gendf_library : GENDFLibrary
+        GENDF library for on-the-fly XS lookup
     """
 
     def __init__(
         self,
         chain: 'Chain',
-        energy_structure: str = 'UKAEA-1102',
-        gendf_library=None
+        gendf_library,
+        energy_structure: str = 'UKAEA-1102'
     ) -> None:
         """Initialize with a depletion chain and energy structure.
 
@@ -1214,11 +1209,10 @@ class IsomericBranchingHelper:
         ----------
         chain : openmc.deplete.Chain
             Chain containing isomeric branching data
-        energy_structure : {'CCFE-709', 'UKAEA-1102'}, optional
-            Required energy group structure. Default is 'UKAEA-1102'.
-        gendf_library : GENDFLibrary, optional
+        gendf_library : GENDFLibrary
             GENDF library for on-the-fly multigroup cross-section lookup.
-            Default is None.
+        energy_structure : {'CCFE-709', 'UKAEA-1102'}, optional
+            Energy group structure. Default is 'UKAEA-1102'.
 
         Raises
         ------
@@ -1227,6 +1221,9 @@ class IsomericBranchingHelper:
         """
         check_value('energy_structure', energy_structure,
                    ['CCFE-709', 'UKAEA-1102'])
+
+        if gendf_library is None:
+            raise ValueError("gendf_library is required for IsomericBranchingHelper")
 
         self.chain: 'Chain' = chain
         self.isomeric_data: Optional[Dict] = chain.isomeric_branching
@@ -1238,41 +1235,23 @@ class IsomericBranchingHelper:
     def weighted_branching_ratios(
         self,
         flux_spectrum: np.ndarray,
-        energy_bins: np.ndarray,
-        micro_xs: 'MicroXS' = None
+        energy_bins: np.ndarray
     ) -> Dict[str, Dict[str, Dict[str, float]]]:
         """Calculate σ×φ-weighted branching ratios with strict validation.
 
-        Computes the effective branching ratios for isomeric states by
+        Computes the effective isomeric branching ratios to metastable states by
         weighting the energy-dependent branching data with the reaction rate
-        spectrum (σ×φ). This ensures correct treatment of threshold reactions
-        where sub-threshold flux should not contribute to the weighted average.
-
-        No interpolation is performed between energy points to maintain
-        consistency with the flat-in-bin assumption.
-
-        **SUBSET HANDLING**: Isomeric branching data may use a subset of the
-        full energy structure (e.g., threshold reactions only have data above
-        threshold). The flux spectrum MUST use the full CCFE-709 or UKAEA-1102
-        structure, and weighting is performed over the energy range where
-        isomeric data exists.
+        spectrum (σ×φ). No interpolation is performed between energy points, 
+        flux flat-in-bin. Consistent with the GENDF group cross-sections.
 
         Parameters
         ----------
         flux_spectrum : numpy.ndarray
             Neutron flux in each energy group [n-cm/src].
-            Must use full CCFE-709 or UKAEA-1102 energy structure.
+            Must use full energy structure (typically CCFE-709 or UKAEA-1102).
         energy_bins : numpy.ndarray
             Energy bin boundaries in [eV]. Must match the full expected
             energy structure exactly.
-        micro_xs : MicroXS, optional
-            Microscopic cross-section data for σ×φ weighting. When provided,
-            cross-sections are looked up from this object. When None and
-            `gendf_library` was provided at initialization, cross-sections
-            are fetched directly from the GENDF library. Default is None.
-
-            .. versionchanged:: 0.15.4
-                Now optional (was required). When None, uses GENDF library.
 
         Returns
         -------
@@ -1280,14 +1259,12 @@ class IsomericBranchingHelper:
             Nested dictionary with structure:
             {nuclide: {reaction: {target: weighted_ratio}}}
             Returns empty dict if no isomeric data available.
-            Reactions not found in micro_xs are skipped (empty dict for that reaction).
+            Reactions not found in GENDF are skipped (empty dict for that reaction).
 
         Raises
         ------
         ValueError
             If flux spectrum dimensions don't match expected energy structure,
-            or if MicroXS has single-group (collapsed) cross-sections,
-            or if MicroXS group structure doesn't match flux groups.
         RuntimeError
             If energy bin boundaries don't match expected structure within
             tolerance (rtol=1e-6)
@@ -1297,53 +1274,34 @@ class IsomericBranchingHelper:
         if self.isomeric_data is None:
             return {}
 
-        # STRICT VALIDATION OF FLUX STRUCTURE - MUST USE FULL CCFE-709 or UKAEA-1102
-        n_expected = self.n_groups
-
-        if len(flux_spectrum) != n_expected:
-            raise ValueError(
-                f"Flux spectrum has {len(flux_spectrum)} groups but "
-                f"isomeric branching requires {n_expected} groups "
-                f"({self.energy_structure} structure). "
-                f"Flux spectrum MUST use {self.energy_structure} energy structure."
-            )
-
-        if len(energy_bins) != len(self.expected_energies):
-            raise ValueError(
-                f"Energy bins has {len(energy_bins)} boundaries but "
-                f"expected {len(self.expected_energies)} "
-                f"({self.energy_structure} structure). "
-                f"Flux spectrum MUST use {self.energy_structure} energy structure."
-            )
-
-        # Verify energy boundaries match (within tolerance)
+        # Verify energy bin boundaries match (within tolerance)
         # Relaxed tolerance to accommodate FISPACT flux files which have slightly
         # different precision than OpenMC's GROUP_STRUCTURES definition.
         # Max observed difference: 48 eV at ~3 MeV (1.6e-5 relative).
         # Using rtol=2e-5 + atol=50 eV to handle both relative and absolute differences.
         if not np.allclose(energy_bins, self.expected_energies, rtol=2e-5, atol=50.0):
-            max_diff = np.max(np.abs(energy_bins - self.expected_energies))
-            raise RuntimeError(
-                f"Energy bin boundaries do not match {self.energy_structure}. "
-                f"Maximum difference: {max_diff:.6e} eV. "
-                f"Flux spectrum MUST use {self.energy_structure} energy structure."
+            raise ValueError(
+                f"Energy bins do not match {self.energy_structure} structure"
+            )
+  
+        if len(flux_spectrum) != len(energy_bins) - 1:
+            raise ValueError(
+                f"Flux has {len(flux_spectrum)} groups, energy bins define {len(energy_bins) - 1}"
             )
 
         # Process each nuclide with isomeric data
-        # NOTE: Individual reactions may have subset energy ranges
         for nuclide, reactions in self.isomeric_data.items():
             for reaction, data in reactions.items():
                 # Calculate σ×φ-weighted ratios for this reaction
-                # Isomeric data may be a subset of the full flux energy range
                 weighted = self._calculate_weighted(
-                    data, flux_spectrum, energy_bins, nuclide, reaction, micro_xs
+                    data, flux_spectrum, energy_bins, nuclide, reaction
                 )
                 if weighted:
                     result[nuclide][reaction] = weighted
 
         return dict(result)
     
-    def _compute_iso_indices(
+    def _compute_isomeric_indices(
         self,
         iso_energies: np.ndarray,
         energy_bins: np.ndarray,
@@ -1356,8 +1314,8 @@ class IsomericBranchingHelper:
         target nuclides, reducing computational cost from O(N_targets * N_groups)
         to O(N_groups).
 
-        Uses the flat-in-bin convention following ENDF/GENDF standard where
-        value at E_i applies to energy interval [E_i, E_{i+1}).
+        Groupwise GENDF, so uses flat-in-bin; value at bin boundary E_i applies
+        to energy interval [E_i, E_{i+1}).
 
         Parameters
         ----------
@@ -1432,10 +1390,10 @@ class IsomericBranchingHelper:
         Notes
         -----
         Out-of-range groups (below threshold or above data range) are set to zero.
-        This is correct because:
         - Below threshold: reaction cannot occur (σ=0)
-        - Above data range: typically data extends to max energy; if not, conservative
-        The σ×φ weighting will naturally zero these out anyway, but explicit zeros
+        - Above data range: typically GENDF branching ratio data stops at 30MeV, 
+        itself already above OpenMC upper energy limit (φ=0)
+        The σ×φ weighting will naturally zero these out,but explicit zeros
         are clearer and avoid numerical issues with extrapolated values.
         """
         # Initialize to zero - out-of-range groups contribute nothing
@@ -1447,56 +1405,6 @@ class IsomericBranchingHelper:
             br_array[in_range] = ratios[iso_indices[in_range]]
 
         return br_array
-
-    def _compute_weighted_sum(
-        self,
-        br_array: np.ndarray,
-        flux_spectrum: np.ndarray,
-        flux_sum: float,
-        target: str,
-        e_min_iso: float,
-        e_max_iso: float
-    ) -> Optional[float]:
-        """Compute the flux-weighted branching ratio for a single target.
-
-        Performs the actual weighted summation using np.dot() for efficiency.
-        Handles the edge case of zero total flux by returning None.
-
-        Parameters
-        ----------
-        br_array : numpy.ndarray
-            Branching ratios aligned with flux energy groups
-        flux_spectrum : numpy.ndarray
-            Neutron flux in each energy group
-        flux_sum : float
-            Pre-computed sum of flux spectrum (for normalization)
-        target : str
-            Target nuclide name (for warning messages)
-        e_min_iso : float
-            Minimum energy of isomeric data range (for warning messages)
-        e_max_iso : float
-            Maximum energy of isomeric data range (for warning messages)
-
-        Returns
-        -------
-        float or None
-            Flux-weighted branching ratio, or None if flux_sum is zero
-        """
-        # Vectorized weighted sum using np.dot()
-        weighted_sum = np.dot(br_array, flux_spectrum)
-
-        # Calculate final weighted ratio
-        if flux_sum > 0:
-            return weighted_sum / flux_sum
-        else:
-            # Zero flux - skip this target
-            warnings.warn(
-                f"Zero total flux in isomeric energy range for {target}. "
-                f"Isomeric data energy range: {e_min_iso:.3e} - {e_max_iso:.3e} eV. "
-                f"Skipping this target for isomeric branching (will use default chain behavior).",
-                UserWarning
-            )
-            return None
 
     def _normalize_ratios(
         self,
@@ -1568,64 +1476,52 @@ class IsomericBranchingHelper:
         flux_spectrum: np.ndarray,
         energy_bins: np.ndarray,
         nuclide: str,
-        reaction: str,
-        micro_xs: 'MicroXS'
+        reaction: str
     ) -> Dict[str, float]:
         """Calculate σ×φ-weighted average branching ratios.
-
-        Uses reaction rate weighting (σ×φ) instead of flux-only weighting to
-        correctly handle threshold reactions where sub-threshold flux should
-        not contribute to the weighted average.
-
+    
+        Uses reaction rate weighting (σ×φ) to compute effective isomeric
+        branching ratios for a given nuclide and reaction. Flux flat-in-bin.
+    
         Handles subset energy structures where isomeric data may only exist
         over a limited energy range (e.g., threshold reactions). Weighting is
         performed only over the energy range where isomeric data exists.
-
-        Uses flat-in-bin assumption following ENDF/GENDF convention where
-        value at E_i applies to interval [E_i, E_{i+1}).
-
-        **OPTIMIZATIONS**:
+        
+        Performance Optimizations:
         - Pre-computes index mapping for all flux groups using a single call
           to np.searchsorted(), then reuses this mapping for all target nuclides.
         - Vectorizes the weighting calculation using NumPy array operations
           and np.dot() for the weighted sum.
-
+    
         Parameters
         ----------
         data : dict
             Isomeric data containing 'energies', 'targets', and
             'branching_ratios' keys. Energies may be a subset of flux_spectrum.
         flux_spectrum : numpy.ndarray
-            Neutron flux in each energy group (full CCFE-709 or UKAEA-1102)
+            Neutron flux in each energy group 
         energy_bins : numpy.ndarray
-            Energy bin boundaries (full structure)
+            Energy bin boundaries (full structure, typically CCFE-709 or UKAEA-1102)
         nuclide : str
             Nuclide name for cross-section lookup
         reaction : str
             Reaction type for cross-section lookup (e.g., "(n,gamma)")
-        micro_xs : MicroXS or None
-            Microscopic cross-section data for σ×φ weighting. When None,
-            cross-sections are fetched directly from the GENDF library
-            (requires gendf_library to have been set at initialization).
-
+    
         Returns
         -------
         dict
             {target: weighted_ratio} for each target nuclide.
-            Returns empty dict if nuclide/reaction not found in micro_xs
-            or GENDF library (reaction won't occur), or if all reaction
-            rate is below threshold.
-
+            Returns empty dict if nuclide/reaction not found in GENDF library
+            (reaction won't occur), or if all reaction rate is below threshold.
+    
         Raises
         ------
         ValueError
-            If MicroXS has single-group (collapsed) cross-sections or if
-            MicroXS group structure doesn't match flux groups, or if
-            micro_xs is None and no gendf_library was provided.
-
+            If GENDF group structure doesn't match flux groups.
+    
         See Also
         --------
-        _compute_iso_indices : Computes energy index mapping
+        _compute_isomeric_indices : Computes energy index mapping
         _build_branching_array : Constructs aligned branching ratio array
         _normalize_ratios : Normalizes ratios to sum to 1.0
         """
@@ -1635,105 +1531,67 @@ class IsomericBranchingHelper:
                 f"Flux spectrum contains negative values. "
                 f"Min value: {flux_spectrum.min():.6e}"
             )
-
+    
         n_flux_groups = len(flux_spectrum)
-
-        # Get cross-section: either from MicroXS or directly from GENDF
-        if micro_xs is None:
-            # No MicroXS provided - use GENDF library directly
-            # This path is used by CoupledOperator where MicroXS is not available
-            if self.gendf_library is None:
-                raise ValueError(
-                    "micro_xs is None but no gendf_library was provided. "
-                    "Either provide micro_xs or initialize with gendf_library."
-                )
-
-            mt = REACTION_TO_MT.get(reaction)
-            if mt is None:
-                return {}
-
-            try:
-                sigma_g = self.gendf_library.get_xs(nuclide, mt, energy_bins)
-            except (KeyError, ValueError):
-                return {}
-        else:
-            # MicroXS provided - get cross-section from it
-            # If nuclide/reaction not in MicroXS, the reaction won't occur → skip
-            try:
-                sigma_g = micro_xs[nuclide, reaction]
-            except (KeyError, IndexError):
-                return {}
-
-            # Flatten and validate multigroup structure
-            sigma_g = sigma_g.flatten()
-
-            # Handle single-group MicroXS by fetching from GENDF library if available
-            if len(sigma_g) == 1:
-                if self.gendf_library is not None:
-                    # Try on-the-fly GENDF lookup for multigroup XS
-                    mt = REACTION_TO_MT.get(reaction)
-                    if mt is not None:
-                        try:
-                            # Don't pass energy_bins - use library's native energy structure
-                            # The flux should already match the GENDF energy structure
-                            sigma_g = self.gendf_library.get_xs(nuclide, mt)
-                        except (KeyError, ValueError, OpenMCError):
-                            return {}
-                    else:
-                        return {}
-                else:
-                    # No GENDF library available - skip this reaction
-                    return {}
-
+    
+        mt = REACTION_TO_MT.get(reaction)
+        if mt is None:
+            return {}
+    
+        try:
+            sigma_g = self.gendf_library.get_xs(nuclide, mt, energy_bins)
+        except (KeyError, ValueError):
+            return {}
+    
         if len(sigma_g) != n_flux_groups:
             raise ValueError(
-                f"MicroXS groups ({len(sigma_g)}) != flux groups ({n_flux_groups}) "
+                f"GENDF groups ({len(sigma_g)}) != flux groups ({n_flux_groups}) "
                 f"for {nuclide} {reaction}. Energy group structure mismatch."
             )
-
+    
         iso_energies = data['energies']
         targets = data['targets']
         branching_ratios = data['branching_ratios']
-
+    
         # Get energy range of isomeric data (subset of full structure)
         e_min_iso = iso_energies[0]
         e_max_iso = iso_energies[-1]
-
+    
         # Step 1: Compute index mapping (vectorized, done once)
-        iso_indices, flux_e_low, flux_e_high = self._compute_iso_indices(
+        iso_indices, flux_e_low, flux_e_high = self._compute_isomeric_indices(
             iso_energies, energy_bins, n_flux_groups
         )
-
+    
         # Step 2: Pre-compute masks for vectorized operations
         below_range = flux_e_high <= e_min_iso  # Groups entirely below isomeric data
         above_range = flux_e_low > e_max_iso    # Groups entirely above isomeric data
         in_range = ~below_range & ~above_range  # Groups within or overlapping isomeric range
-
+    
         # Step 3: Compute σ×φ weight array
         weight = sigma_g * flux_spectrum
         weight[~in_range] = 0.0  # Zero out-of-range (should already be ~0 below threshold)
         weight_sum = np.sum(weight)
-
+    
         if weight_sum == 0:
             return {}
-
+    
         weighted_ratios = {}
-
+    
         # Step 4: Calculate σ×φ-weighted ratio for each target
         for target in targets:
             ratios = branching_ratios[target]
-
+    
             # Build branching ratio array aligned with flux groups
             # (out-of-range groups are zero, not extrapolated)
             br_array = self._build_branching_array(
                 ratios, iso_indices, below_range, above_range, in_range, n_flux_groups
             )
-
+    
             # Compute σ×φ-weighted sum: Σ(BR × σ × φ) / Σ(σ × φ)
             weighted_sum = np.dot(br_array, weight)
             ratio = weighted_sum / weight_sum
-
+    
             weighted_ratios[target] = ratio
-
+    
         # Step 5: Normalize and return
         return self._normalize_ratios(weighted_ratios, nuclide, reaction)

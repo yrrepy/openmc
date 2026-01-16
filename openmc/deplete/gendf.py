@@ -1,18 +1,17 @@
 """GENDF Cross-Section Library Module
 
-This module provides functionality for reading and using FISPACT GENDF
-(Group-averaged ENDF) cross-section libraries for depletion calculations.
-GENDF files contain pre-processed, group-averaged cross-sections optimized
-for activation and burnup calculations.
+This module provides functionality for reading and using GENDF cross-section
+libraries. GENDF files contain pre-processed, group-averaged cross-sections
+optimized for activation calculations.
 
 The module supports:
-- Loading GENDF libraries (ENDF-6 format .asc files)
+- Loading GENDF libraries (ENDF-6 format files)
 - Extracting cross-sections for specific nuclides and reactions
 - Validating energy group structures (CCFE-709, UKAEA-1102)
 - Caching for efficient repeated access
 - Automatic selection of C++ (fast) or Python (fallback) backend
 
-.. versionadded:: 0.15.3
+.. versionadded:: 0.15.4
 """
 
 from __future__ import annotations
@@ -45,7 +44,6 @@ from openmc.deplete.decay_elis import (
 # Supported energy group structures for GENDF libraries
 SUPPORTED_GROUP_STRUCTURES = {'CCFE-709', 'UKAEA-1102'}
 
-# H1 fix: Unified tolerance constants (must match C++ gendf.h)
 # Relative tolerance for energy boundary matching
 GENDF_RTOL_MATCH = 1.0e-6
 # Relative tolerance for energy boundary mismatch warnings
@@ -91,19 +89,12 @@ MT_TO_REACTION = _build_mt_to_reaction()
 # Reverse mapping for convenience (reaction name -> MT)
 REACTION_TO_MT = {v: k for k, v in MT_TO_REACTION.items()}
 
-# Try to import C++ backend (via openmc.lib.gendf)
-# If available, it will be used automatically for better performance
-_CPP_BACKEND_AVAILABLE = False
-_CppGENDFLibrary = None
-
+# If C++ backend available, use it
+# Try C++ backend, fall back to Python
 try:
-    from openmc.lib import gendf as cpp_gendf
-    _CppGENDFLibrary = cpp_gendf.GENDFLibrary
-    _CPP_BACKEND_AVAILABLE = True
+    from openmc.lib.gendf import GENDFLibrary as _CppGENDFLibrary
 except (ImportError, AttributeError):
-    # C++ backend not available - will use Python implementation
-    pass
-
+    _CppGENDFLibrary = None
 
 # ============================================================================
 # Utility Functions for GENDF File Interaction
@@ -125,12 +116,6 @@ def get_target_name(material: endf.Material) -> str:
     str
         Nuclide name in OpenMC format (e.g., 'U235', 'Am242_m1')
 
-    Examples
-    --------
-    >>> mat = endf.Material('U235.asc')
-    >>> get_target_name(mat)
-    'U235'
-    """
     metadata = material.section_data[1, 451]
     Z, A = divmod(metadata['ZA'], 1000)
     symbol = ATOMIC_SYMBOL[Z]
@@ -139,7 +124,7 @@ def get_target_name(material: endf.Material) -> str:
         return f"{symbol}{A}"
     else:
         return f"{symbol}{A}_m{metadata['LISO']}"
-
+    """
 
 def get_product_name(izap: int, lfs: int) -> Optional[str]:
     """Construct product nuclide name from IZAP and LFS.
@@ -152,7 +137,7 @@ def get_product_name(izap: int, lfs: int) -> Optional[str]:
     izap : int
         ENDF IZAP value (Z*1000 + A)
     lfs : int
-        Level number (0=ground state, >0=metastable state)
+        Level number (0=ground state, >0=excited state)
 
     Returns
     -------
@@ -166,14 +151,6 @@ def get_product_name(izap: int, lfs: int) -> Optional[str]:
     in JEFF33). When encountered, this function returns None to allow graceful
     handling rather than crashing.
 
-    Examples
-    --------
-    >>> get_product_name(92235, 0)  # U-235 ground state
-    'U235'
-    >>> get_product_name(95242, 1)  # Am-242 first metastable
-    'Am242_m1'
-    >>> get_product_name(0, 0)      # Invalid IZAP
-    None
     """
     # Handle invalid IZAP values (data quality issue)
     if izap == 0:
@@ -197,10 +174,6 @@ def get_product_name(izap: int, lfs: int) -> Optional[str]:
         return f"{symbol}{A}"
     else:
         return f"{symbol}{A}_m{lfs}"
-
-
-# Note: ELIS-based isomeric state mapping functions (DecayState, elis_match,
-# parse_decay_isomeric_levels, lookup_liso) have been moved to decay_elis.py
 
 
 def detect_energy_structure(library_path: PathLike) -> str:
@@ -233,117 +206,58 @@ def detect_energy_structure(library_path: PathLike) -> str:
     The function tries files in priority order to maximize chances of finding
     a full energy range reaction:
     1. Common actinides (U235, Pu239) - usually have full range
-    2. Hydrogen isotopes - lightest nuclides
-    3. All other files - systematic search
+    2. Hydrogen isotopes              - lightest nuclides
+    3. All other files                - systematic search
 
     This avoids failures when alphabetically-first files contain only
     threshold reactions with partial energy coverage.
 
-    Examples
-    --------
-    >>> structure = detect_energy_structure('/path/to/GENDF/')
-    >>> print(f"Detected: {structure}")
-    Detected: UKAEA-1102
     """
     library_path = Path(library_path)
 
-    # Find all GENDF files
-    all_files = list(library_path.glob('*.asc'))
-    if not all_files:
-        raise FileNotFoundError(f"No .asc files found in {library_path}")
+    # Priority: actinides and H have full energy range (avoid threshold reactions)
+    patterns = ['*U235*.asc', '*Pu239*.asc', '*H1*.asc', '*H2*.asc', '*.asc']
 
-    # Smart prioritization: Try files most likely to have full energy range
-    # Threshold reactions (e.g., n,2n) have partial coverage and cause false negatives
-    priority_patterns = [
-        '*U235*.asc',      # Common actinide, full range
-        '*Pu239*.asc',     # Common actinide, full range
-        '*H1*.asc',        # Lightest nuclide
-        '*H2*.asc',        # Deuterium
-        '*.asc'            # Fallback: all files
-    ]
-
-    # Collect files to try, avoiding duplicates
-    files_to_try = []
     seen = set()
+    files_to_try = []
+    for pattern in patterns:
+        for f in sorted(library_path.glob(pattern))[:5]:
+            if f not in seen:
+                files_to_try.append(f)
+                seen.add(f)
 
-    for pattern in priority_patterns:
-        candidates = sorted(library_path.glob(pattern))
-        for file in candidates[:5]:  # Try up to 5 files per pattern
-            if file not in seen:
-                files_to_try.append(file)
-                seen.add(file)
-
-    # Track failures for better error reporting
-    failures = []
+    if not files_to_try:
+        raise FileNotFoundError(f"No .asc files found in {library_path}")
 
     for sample_file in files_to_try:
         try:
-            # Use endf library to load the file
             material = endf.Material(str(sample_file))
-
-            # Get any MF=3 section to check energy grid
-            mf3_sections = [(mf, mt) for mf, mt in material.section_data.keys() if mf == 3]
-            if not mf3_sections:
-                failures.append((sample_file.name, "No MF=3 data"))
+            mf3 = [(mf, mt) for mf, mt in material.section_data if mf == 3]
+            if not mf3:
                 continue
 
-            # Extract energy grid
-            mf, mt = mf3_sections[0]
-            xs_data = material.section_data[mf, mt]
-
-            if 'sigma' not in xs_data:
-                failures.append((sample_file.name, f"No sigma data in MT={mt}"))
+            # Extract energy grid from sigma data
+            sigma = material.section_data[mf3[0]].get('sigma')
+            if sigma is None or not hasattr(sigma, 'x'):
                 continue
 
-            sigma = xs_data['sigma']
-            if not hasattr(sigma, 'x'):
-                failures.append((sample_file.name, "Cannot extract energy grid"))
-                continue
-
-            file_energies = sigma.x
-            n_groups = len(file_energies)
-
-            # Compare against known structures
-            for structure_name in SUPPORTED_GROUP_STRUCTURES:
-                ref_energies = GROUP_STRUCTURES[structure_name]
-
-                # Check if number of points matches
-                if len(ref_energies) == n_groups:
-                    # Check if energy values match (H1: use unified tolerance)
-                    if np.allclose(file_energies, ref_energies, rtol=GENDF_RTOL_MATCH):
-                        return structure_name
-
-            # No match for this file
-            failures.append((sample_file.name,
-                           f"Has {n_groups} groups, expected {len(GROUP_STRUCTURES['CCFE-709'])} or {len(GROUP_STRUCTURES['UKAEA-1102'])}"))
-
-        except Exception as e:
-            failures.append((sample_file.name, str(e)))
+            n_groups = len(sigma.x)
+            for name in SUPPORTED_GROUP_STRUCTURES:
+                ref = GROUP_STRUCTURES[name]
+                if len(ref) == n_groups and np.allclose(sigma.x, ref, rtol=GENDF_RTOL_MATCH):
+                    return name
+        except Exception:
             continue
 
-    # If we get here, no file matched
-    # Provide detailed error report
-    error_msg = (
-        f"Could not detect energy structure from {len(files_to_try)} files in {library_path}.\n"
-        f"Supported structures: {SUPPORTED_GROUP_STRUCTURES}\n"
-        f"Files tried:\n"
+    raise ValueError(
+        f"Could not detect energy structure from {len(files_to_try)} files in {library_path}. "
+        f"Supported: {SUPPORTED_GROUP_STRUCTURES}"
     )
-    for filename, reason in failures[:10]:  # Show first 10 failures
-        error_msg += f"  - {filename}: {reason}\n"
 
-    if len(failures) > 10:
-        error_msg += f"  ... and {len(failures) - 10} more files\n"
-
-    raise ValueError(error_msg)
-
-
-# ============================================================================
-# IsomericBranching Data Class
-# ============================================================================
 
 @dataclass
 class IsomericBranching:
-    """Container for energy-dependent isomeric branching data.
+    """Class for energy-dependent isomeric branching data.
 
     This class stores branching ratios that vary with incident neutron energy,
     typically extracted from ENDF MF=10 (production cross-sections) data.
@@ -373,24 +287,12 @@ class IsomericBranching:
         - 'method': 'elis' (matched via excitation energy), 'lfs_order' (positional
           mapping based on sorted LFS values), or 'unmatched' (product omitted)
         - 'elis': Excitation energy in eV (from GENDF QM-QI calculation)
-        - 'liso': Isomeric state number (1 for _m1, 2 for _m2, etc.)
+        - 'liso': Isomeric state number (1 for _m1(m), 2 for _m2(n), etc.)
         - For 'lfs_order' mode, additional fields: 'lfs' (original LFS value),
           'position' (sorted position), 'elis_ref_status' ('ok', 'mismatch', or
           'wrong_liso' indicating ELIS check result for reference)
         Example: {'Ir192_m1': {'method': 'elis', 'elis': 56720.0, 'liso': 1}}
 
-    Examples
-    --------
-    >>> branching = IsomericBranching(
-    ...     energies=np.array([1e5, 1e6, 1e7]),
-    ...     products=['Rh104', 'Rh104_m1'],
-    ...     branching_ratios=np.array([[0.7, 0.6, 0.5], [0.3, 0.4, 0.5]]),
-    ...     parent_nuclide='Rh103',
-    ...     reaction='(n,gamma)',
-    ...     mt=102
-    ... )
-    >>> branching.get_branching_at_energy(5e5)
-    {'Rh104': 0.65, 'Rh104_m1': 0.35}
     """
     energies: np.ndarray
     products: List[str]
@@ -401,25 +303,6 @@ class IsomericBranching:
     lfs_mapping: Optional[Dict[str, int]] = None
     elis_mapping: Optional[Dict[str, Dict[str, Any]]] = None
 
-    def get_branching_at_energy(self, energy: float) -> Dict[str, float]:
-        """Get branching ratios at specific energy with linear interpolation.
-
-        Parameters
-        ----------
-        energy : float
-            Energy in eV
-
-        Returns
-        -------
-        dict
-            Dictionary mapping product names to branching fractions
-        """
-        result = {}
-        for i, product in enumerate(self.products):
-            # Linear interpolation
-            ratio = np.interp(energy, self.energies, self.branching_ratios[i, :])
-            result[product] = float(ratio)
-        return result
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization.
@@ -466,9 +349,8 @@ class _PythonGENDFLibrary:
     """Python implementation of GENDF cross-section library.
 
     This class provides access to pre-processed group-averaged cross-sections
-    from FISPACT GENDF libraries. It handles loading ENDF-6 formatted .asc files,
-    caching materials, and extracting cross-section data for specific nuclides
-    and reactions.
+    from GENDF libraries. It handles loading ENDF-6 files, caching materials,
+    and extracting cross-section data for specific nuclides and reactions.
 
     .. note::
         Users should use the :class:`GENDFLibrary` factory function instead of
@@ -485,10 +367,6 @@ class _PythonGENDFLibrary:
     validate_energy_grid : bool, optional
         If True, validate that each GENDF file's energy grid matches the
         specified energy structure. Default is True.
-    use_fast_parser : bool, optional
-        If True, use optimized MF=3-only parser that skips covariance data,
-        providing 3-4x speedup. If False, use full endf.Material parser.
-        Default is True.
     decay_file : path-like, optional
         Path to ENDF decay library for ELIS-based isomeric state mapping.
         Can be a directory of decay files or a single concatenated file.
@@ -523,59 +401,33 @@ class _PythonGENDFLibrary:
         Decay state lookup table if decay_file was provided, None otherwise.
         Maps (Z, A) tuples to lists of :class:`DecayState` objects.
 
-    Examples
-    --------
-    >>> # Basic usage for cross-section retrieval (no decay file needed)
-    >>> gendf_lib = GENDFLibrary('/path/to/JEFF40-GENDF/', 'UKAEA-1102')
-    >>> xs = gendf_lib.get_xs('Ac225', 102, gendf_lib.energy_bounds)
-    >>>
-    >>> # With ELIS-based isomeric mapping (recommended)
-    >>> gendf_lib = GENDFLibrary(
-    ...     '/path/to/JEFF40-GENDF/',
-    ...     decay_file='/path/to/JEFF40-decay/'
-    ... )
-    >>> branching = gendf_lib.get_branching_ratios('Ir191', 102)
-    >>> print(branching.products)  # Correctly mapped: ['Ir192', 'Ir192_m1', 'Ir192_m2']
-    >>>
-    >>> # Cross-library usage with relaxed tolerance
-    >>> gendf_lib = GENDFLibrary(
-    ...     '/path/to/TENDL2017-GENDF/',
-    ...     decay_file='/path/to/UKDD12_decay.dat',
-    ...     elis_rtol=0.10  # Allow 10% tolerance for cross-library mismatches
-    ... )
-
     Notes
     -----
     GENDF files use naming convention with suffixes:
-    - 'g' for ground state (e.g., Ac225g.asc)
-    - 'm' for metastable state (e.g., Ac225mg.asc)
+    - 'g' for ground state (e.g., Ir192g.asc)
+    - 'm' for first metastable state (e.g., Ir192mg.asc)
+    - 'n' for second metastable state (e.g., Ir192ng.asc)
+    - and so on...
 
     The energy grid in GENDF files represents group boundaries. Cross-section
     values are group-averaged (integrated over each group).
 
-    **ELIS-Based Mapping** (when decay_file is provided):
-
-    Instead of assuming LFS order equals LISO order, the library uses excitation
-    energy (ELIS) matching:
+    ELIS-Based Mapping:
+    Decay_file library is provided.
+    Use excitation energy (GENDF-ELIF to DK-ELIS) matching.
+    (FISPACT assumes LFS order equals LISO order.)
 
     1. For each GENDF MF=10 metastable product, calculate ELIS = QM - QI
     2. Look up matching metastable state in decay library by ELIS
     3. Use decay library's LISO value for ``_m{n}`` naming
 
     This handles cases like Ir191(n,gamma)->Ir192 where GENDF uses LFS=3,15
-    but decay library correctly identifies these as LISO=1,2 (m1, m2).
+    but decay library identifies these as LISO=1,2 (m1, m2).
 
     .. warning::
-        **Thread Safety (H5 fix)**: This Python backend is NOT thread-safe.
-        The internal caches (`_material_cache`, `_file_index`, `_pending_metastable`)
-        are modified without synchronization. For thread-safe access, either:
-
-        1. Use the C++ backend (GENDFLibrary with backend='cpp'), which uses
-           proper `std::shared_mutex` read/write locking
-        2. Create separate library instances per thread
-        3. Externally synchronize access (e.g., using `threading.Lock`)
-
-        The C++ backend is recommended for multi-threaded applications.
+        Python backend is NOT thread-safe, is used for build isomeric chains.
+        The C++ backend is recommended for multi-threaded applications and
+        on-the-fly cross-section retrieval during activation.
 
     See Also
     --------
@@ -589,7 +441,6 @@ class _PythonGENDFLibrary:
         library_path: PathLike,
         energy_structure: str = 'UKAEA-1102',
         validate_energy_grid: bool = True,
-        use_fast_parser: bool = True,
         decay_file: Optional[PathLike] = None,
         elis_rtol: float = ELIS_RTOL,
         elis_atol: float = ELIS_ATOL,
@@ -600,7 +451,6 @@ class _PythonGENDFLibrary:
         check_type('library_path', library_path, (str, Path))
         check_value('energy_structure', energy_structure, SUPPORTED_GROUP_STRUCTURES)
         check_type('validate_energy_grid', validate_energy_grid, bool)
-        check_type('use_fast_parser', use_fast_parser, bool)
         check_type('elis_rtol', elis_rtol, float)
         check_type('elis_atol', elis_atol, float)
         check_type('skip_zero_elis_metastables', skip_zero_elis_metastables, bool)
@@ -618,7 +468,6 @@ class _PythonGENDFLibrary:
         self.energy_bounds = GROUP_STRUCTURES[energy_structure].copy()
         self.n_groups = len(self.energy_bounds) - 1
         self._validate_energy_grid = validate_energy_grid
-        self._use_fast_parser = use_fast_parser
 
         # Isomeric state mapping parameters
         self._mapping_mode = mapping_mode
@@ -675,7 +524,7 @@ class _PythonGENDFLibrary:
         Creates mapping from OpenMC nuclide names to GENDF filenames.
         Handles naming conventions like 'Al027g.asc' → 'Al27', 'Ac225g.asc' → 'Ac225'
 
-        FISPACT metastable naming convention:
+        GENDF metastable naming convention:
         - 'g'  = ground state → Element{A}
         - 'mg' = m1 (1st metastable) → Element{A}_m1
         - 'ng' = m2 (2nd metastable) → Element{A}_m2
@@ -693,8 +542,7 @@ class _PythonGENDFLibrary:
         # Maps preliminary name -> (filepath, needs_validation)
         self._pending_metastable = {}
 
-        # FISPACT suffix to OpenMC metastable level mapping
-        # Order matters: check longer suffixes first
+        # GENDF suffix to OpenMC metastable level mapping
         METASTABLE_SUFFIXES = {
             'mg': '_m1',  # 1st metastable
             'ng': '_m2',  # 2nd metastable
@@ -947,9 +795,6 @@ class _PythonGENDFLibrary:
         str
             Correct nuclide name based on LISO value (e.g., 'Co62_m1' or 'Co62_m2')
         """
-        # H5 note: This method modifies _file_index, _material_cache, and
-        # _pending_metastable without synchronization. See class docstring
-        # for thread-safety warnings.
         if preliminary_name not in self._pending_metastable:
             # Not a pending metastable or already validated
             return preliminary_name
@@ -1000,9 +845,9 @@ class _PythonGENDFLibrary:
         nuclide_name : str
             Nuclide name in OpenMC format (e.g., 'Ac225', 'Ag110m')
         require_full_parser : bool, optional
-            If True, forces use of the full endf.Material parser even when
-            fast parser is enabled. Required for accessing MF=10 data
-            (isomeric branching). Default is False.
+            If True, forces use of the full endf.Material parser.
+            Required for accessing MF=10 data (isomeric branching).
+            Default is False.
 
         Returns
         -------
@@ -1067,10 +912,15 @@ class _PythonGENDFLibrary:
 
         # Load material from file
         try:
-            # Use full parser if requested OR if fast parser is disabled
-            use_full = require_full_parser or not self._use_fast_parser
+            if require_full_parser:
+                # Use full endf.Material parser (slower but complete)
+                # Required for MF=10 (isomeric branching) data
+                material = endf.Material(str(filepath))
 
-            if not use_full:
+                # Validate energy grid if requested
+                if self._validate_energy_grid:
+                    self._validate_material_energy_grid(material, nuclide_name)
+            else:
                 # Use optimized MF=3-only parser (3-4x faster)
                 section_data = self._parse_gendf_mf3_only(filepath)
 
@@ -1082,20 +932,11 @@ class _PythonGENDFLibrary:
 
                 material = _FastMaterial(section_data)
 
-                # Fast parser doesn't need energy validation (already filtered)
-            else:
-                # Use full endf.Material parser (slower but complete)
-                # Required for MF=10 (isomeric branching) data
-                material = endf.Material(str(filepath))
-
-                # Validate energy grid if requested
-                if self._validate_energy_grid:
-                    self._validate_material_energy_grid(material, nuclide_name)
-
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load GENDF file for {nuclide_name}: {filepath}\n"
                 f"Error: {e}")
+
 
         # Cache and return
         self._material_cache[nuclide_name] = material
@@ -1196,13 +1037,6 @@ class _PythonGENDFLibrary:
             If energy bounds don't match library structure, or if strict_alignment
             is True and threshold reaction energies cannot be exactly aligned.
 
-        Examples
-        --------
-        >>> lib = GENDFLibrary('/path/to/gendf/')
-        >>> energy = lib.energy_bounds
-        >>> xs_ngamma = lib.get_xs('Ac225', 102, energy)  # (n,gamma)
-        >>> xs_n2n = lib.get_xs('Ac225', 16, energy)      # (n,2n)
-
         Notes
         -----
         For threshold reactions like (n,2n) with threshold ~6 MeV, GENDF files
@@ -1210,8 +1044,7 @@ class _PythonGENDFLibrary:
         align exactly with library group boundaries for accurate placement.
         """
         # Validate energy bounds
-        # H1: Use unified tolerance constants (same as C++ backend)
-        # NOTE: May need to relax GENDF_RTOL_MATCH if too strict for some FISPACT GENDF files
+        # May need to relax GENDF_RTOL_MATCH if too strict for some GENDF files
         if not np.allclose(energy_bounds, self.energy_bounds,
                           rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL):
             raise ValueError(
@@ -1237,8 +1070,6 @@ class _PythonGENDFLibrary:
         sigma = xs_data['sigma']
 
         # Handle threshold reactions that may have partial energy coverage
-        # GENDF files for threshold reactions (like n,2n) may only contain data
-        # for energies above the threshold, resulting in fewer groups than the full structure
         gendf_energies = sigma.x
         gendf_xs = sigma.y
 
@@ -1255,7 +1086,7 @@ class _PythonGENDFLibrary:
             start_energy = gendf_energies[0]
             end_energy = gendf_energies[-1]
 
-            # Try exact match for start boundary (H1: use unified tolerance)
+            # Try exact match for start boundary
             start_matches = np.where(np.isclose(
                 self.energy_bounds, start_energy,
                 rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL))[0]
@@ -1294,13 +1125,10 @@ class _PythonGENDFLibrary:
                     start_idx = nearest_idx
 
             # Calculate number of GENDF groups and end index
-            # GENDF energies are boundaries, so n_groups = len(energies) - 1
             n_gendf_groups = len(gendf_energies) - 1
             end_idx = min(start_idx + n_gendf_groups, self.n_groups)
 
             # Validate end boundary also matches (sanity check for contiguous data)
-            # H1: Use slightly looser tolerance (10x) for end boundary due to
-            # potential accumulated numerical error across many energy groups
             if end_idx < self.n_groups:
                 expected_end = self.energy_bounds[end_idx]
                 end_rtol = GENDF_RTOL_MATCH * 10  # 1e-5 for end boundary sanity check
@@ -1385,12 +1213,6 @@ class _PythonGENDFLibrary:
         frozenset of str
             Immutable set of nuclide names
 
-        Examples
-        --------
-        >>> lib = GENDFLibrary('/path/to/GENDF/', 'UKAEA-1102')
-        >>> available = lib.available_nuclides_set()
-        >>> if 'U235' in available:  # O(1) lookup
-        ...     xs = lib.get_xs('U235', 102)
         """
         if not hasattr(self, '_nuclides_set_cache') or self._nuclides_set_cache is None:
             self._nuclides_set_cache = frozenset(self._file_index.keys())
@@ -1426,7 +1248,7 @@ class _PythonGENDFLibrary:
         """Extract energy-dependent isomeric branching ratios from MF=10.
 
         Reads ENDF MF=10 (production cross-sections) data to determine
-        how products are distributed among ground and metastable states
+        how products are distributed among ground and excited states
         as a function of incident neutron energy.
 
         Parameters
@@ -1457,31 +1279,22 @@ class _PythonGENDFLibrary:
         The mapping of GENDF MF=10 metastable products to OpenMC ``_m{n}`` naming
         depends on whether a decay file was provided:
 
-        **With decay_file (ELIS-based mapping, recommended)**:
+        With decay_file (ELIS-based mapping, recommended):
 
-        - Calculate excitation energy (ELIS) from GENDF: ``ELIS = QM - QI``
-        - Look up LISO in decay library by matching ELIS within tolerance
+        - Calculate excitation energy (ELIF) from GENDF: ``ELIF = QM - QI``
+        - Look up LISO in decay library by matching GENDF-ELIF with DK-ELIS,
+          within tolerance
         - Use decay library's LISO for naming (e.g., LISO=1 -> ``_m1``)
         - If no match within rtol/atol: skip product, warn, renormalize remaining
         - If no metastable states in decay library: skip product, warn, renormalize
 
-        **Note**: decay_file is required for isomeric branching. Without it,
+        Decay_file is required for isomeric branching. Without it,
         get_branching_ratios() will raise ValueError.
 
         Example with ELIS mapping (Ir191(n,gamma) -> Ir192):
-        - GENDF: LFS=3, QM-QI=56720 eV; LFS=15, QM-QI=168140 eV
+        - GENDF: LFS=3, ELFS=QM-QI=56720 eV; LFS=15, ELFS=QM-QI=168140 eV
         - Decay: Ir192m (LISO=1, ELIS=56720); Ir192n (LISO=2, ELIS=168140)
-        - Result: LFS=3 -> Ir192_m1, LFS=15 -> Ir192_m2 (correctly matched by ELIS)
-
-        Examples
-        --------
-        >>> # ELIS-based mapping (decay_file required)
-        >>> lib = GENDFLibrary(
-        ...     '/path/to/JEFF40-GENDF/',
-        ...     decay_file='/path/to/JEFF40-decay/'
-        ... )
-        >>> branching = lib.get_branching_ratios('Ir191', 102)
-        >>> print(branching.products)  # ['Ir192', 'Ir192_m1', 'Ir192_m2']
+        - Result: LFS=3 -> Ir192_m1, LFS=15 -> Ir192_m2 (mapped by ELIS)
 
         See Also
         --------
@@ -1513,7 +1326,6 @@ class _PythonGENDFLibrary:
             sigma = level['sigma']
 
             # Get product name (without metastable mapping - just base name)
-            # We'll handle metastable naming separately
             if izap == 0:
                 warnings.warn(
                     f"Skipping MF=10 level in {nuclide_name} MT={mt}: "
@@ -2373,7 +2185,6 @@ def GENDFLibrary(
     library_path: PathLike,
     energy_structure: str = 'UKAEA-1102',
     validate_energy_grid: bool = True,
-    use_fast_parser: bool = True,
     backend: str = 'auto',
     decay_file: Optional[PathLike] = None,
     elis_rtol: float = ELIS_RTOL,
@@ -2400,9 +2211,6 @@ def GENDFLibrary(
         If True, validate that each GENDF file's energy grid matches the
         specified energy structure. Default is True. Only used with Python
         backend.
-    use_fast_parser : bool, optional
-        If True, use optimized MF=3-only parser that skips covariance data.
-        Default is True. Only used with Python backend.
     backend : {'auto', 'cpp', 'python'}, optional
         Backend selection:
         - 'auto': Automatically use C++ if available, otherwise Python (default)
@@ -2526,7 +2334,7 @@ def GENDFLibrary(
     # Determine which backend to use
     use_cpp = False
     if backend == 'cpp':
-        if not _CPP_BACKEND_AVAILABLE:
+        if _CppGENDFLibrary is None:
             raise ValueError(
                 "C++ backend requested but not available. "
                 "Ensure OpenMC was built with C++ GENDF support.")
@@ -2537,7 +2345,7 @@ def GENDFLibrary(
         if decay_file is not None:
             use_cpp = False
         else:
-            use_cpp = _CPP_BACKEND_AVAILABLE
+            use_cpp = _CppGENDFLibrary is not None
     # else backend == 'python', use_cpp remains False
 
     # Warn if C++ backend requested but isomeric mapping parameters provided
@@ -2564,7 +2372,6 @@ def GENDFLibrary(
             library_path,
             energy_structure,
             validate_energy_grid,
-            use_fast_parser,
             decay_file,
             elis_rtol,
             elis_atol,

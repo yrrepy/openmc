@@ -56,7 +56,6 @@ def _create_microxs_with_mocks(chain_nuclides, gendf_nuclides, user_nuclides=Non
     mock_chain = MockChain(chain_nuclides)
 
     flux = np.ones(709)  # CCFE-709
-    energies = mock_gendf.energy_bounds
 
     # Patch chain loading and add MockGENDFLibrary to valid GENDF types
     with patch('openmc.deplete.microxs._get_chain', return_value=mock_chain):
@@ -65,7 +64,6 @@ def _create_microxs_with_mocks(chain_nuclides, gendf_nuclides, user_nuclides=Non
         try:
             microxs_mod._GENDF_TYPES = (MockGENDFLibrary,) + original_types
             micro_xs = MicroXS.from_multigroup_flux_with_gendf(
-                energies=energies,
                 multigroup_flux=flux,
                 gendf_library=mock_gendf,
                 chain_file='dummy_chain.xml',
