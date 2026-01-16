@@ -1,5 +1,12 @@
 //! \file gendf_parser.cpp
 //! \brief GENDF file parser for MF=3 cross-sections
+//!
+//! ENDF-6 Format Reference (ENDF-102):
+//! - Columns 1-66: Data fields (six 11-character fields)
+//! - Columns 67-70: MAT (material number)
+//! - Columns 71-72: MF (file number)
+//! - Columns 73-75: MT (section number)
+//! - Each data field is 11 characters wide
 
 #include "openmc/gendf.h"
 
@@ -149,6 +156,37 @@ ExtractResult<double> extract_double_safe(
   return result;
 }
 
+//! Store validated section data into result
+//! \param[in] basename Filename for warning messages
+//! \param[in] mt Current MT number
+//! \param[in,out] xs Cross-section data (moved out)
+//! \param[in,out] energies Energy boundary data (moved out)
+//! \param[out] result Parse result to store into
+void store_section_data(
+  const std::string& basename,
+  int mt,
+  vector<double>& xs,
+  vector<double>& energies,
+  GENDFParseResult& result)
+{
+  if (xs.empty()) return;
+
+  // Validate energy-XS count consistency (H3 fix)
+  if (energies.size() != xs.size()) {
+    result.warnings.push_back(
+      "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
+      std::to_string(mt) + "): " +
+      std::to_string(energies.size()) + " energies vs " +
+      std::to_string(xs.size()) + " XS values");
+    size_t min_size = std::min(energies.size(), xs.size());
+    energies.resize(min_size);
+    xs.resize(min_size);
+  }
+
+  result.xs_data[mt] = std::move(xs);
+  result.energy_data[mt] = std::move(energies);
+}
+
 } // anonymous namespace
 
 //==============================================================================
@@ -231,21 +269,8 @@ GENDFParseResult parse_gendf_validated(
     if (mf != 0 && mt != 0) {
       if (mf != current_mf || mt != current_mt) {
         // Save previous MF=3 section
-        if (current_mf == 3 && !current_xs.empty()) {
-          // H3 fix: Validate energy-XS count consistency
-          if (current_energies.size() != current_xs.size()) {
-            result.warnings.push_back(
-              "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
-              std::to_string(current_mt) + "): " +
-              std::to_string(current_energies.size()) + " energies vs " +
-              std::to_string(current_xs.size()) + " XS values");
-            // Truncate to smaller size to maintain consistency
-            size_t min_size = std::min(current_energies.size(), current_xs.size());
-            current_energies.resize(min_size);
-            current_xs.resize(min_size);
-          }
-          result.xs_data[current_mt] = std::move(current_xs);
-          result.energy_data[current_mt] = std::move(current_energies);
+        if (current_mf == 3) {
+          store_section_data(basename, current_mt, current_xs, current_energies, result);
           current_xs.clear();
           current_energies.clear();
         }
@@ -361,21 +386,8 @@ GENDFParseResult parse_gendf_validated(
   }
 
   // Save last section
-  if (current_mf == 3 && !current_xs.empty()) {
-    // Validate energy-XS count consistency
-    if (current_energies.size() != current_xs.size()) {
-      result.warnings.push_back(
-        "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
-        std::to_string(current_mt) + "): " +
-        std::to_string(current_energies.size()) + " energies vs " +
-        std::to_string(current_xs.size()) + " XS values");
-      // Truncate to smaller size to maintain consistency
-      size_t min_size = std::min(current_energies.size(), current_xs.size());
-      current_energies.resize(min_size);
-      current_xs.resize(min_size);
-    }
-    result.xs_data[current_mt] = std::move(current_xs);
-    result.energy_data[current_mt] = std::move(current_energies);
+  if (current_mf == 3) {
+    store_section_data(basename, current_mt, current_xs, current_energies, result);
   }
 
   infile.close();

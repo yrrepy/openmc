@@ -569,9 +569,9 @@ class _PythonGENDFLibrary:
             # Check for metastable suffixes (must check before single 'g')
             metastable_suffix = None
             openmc_suffix = None
-            for fispact_suffix, omc_suffix in METASTABLE_SUFFIXES.items():
-                if filename.endswith(fispact_suffix):
-                    metastable_suffix = fispact_suffix
+            for gendf_suffix, omc_suffix in METASTABLE_SUFFIXES.items():
+                if filename.endswith(gendf_suffix):
+                    metastable_suffix = gendf_suffix
                     openmc_suffix = omc_suffix
                     break
 
@@ -629,25 +629,7 @@ class _PythonGENDFLibrary:
             Values: dict with 'sigma' key containing Tabulated1D object
         """
         from openmc.data.function import Tabulated1D
-        try:
-            from endf.records import float_endf, int_endf
-        except ImportError:
-            # Fallback if endf C extensions not available
-            def float_endf(s):
-                s = s.strip()
-                if not s:
-                    return 0.0
-                # Simple ENDF float parser (handles +/- exponent format)
-                import re
-                s = re.sub(r'([+-])(\s*\d)', r'\1\2', s)
-                s = s.replace('+', 'e+').replace('-', 'e-')
-                if s.startswith('e'):
-                    s = '1' + s
-                return float(s)
-
-            def int_endf(s):
-                s = s.strip()
-                return 0 if not s or s.isspace() else int(s)
+        from endf.records import float_endf, int_endf
 
         section_data = {}
 
