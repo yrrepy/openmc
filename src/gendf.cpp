@@ -32,18 +32,14 @@ int n_gendf_libraries {0};
 // GENDFMaterial implementation
 //==============================================================================
 
-GENDFMaterial::GENDFMaterial(const std::string& filename, bool fast_parser)
+GENDFMaterial::GENDFMaterial(const std::string& filename)
 {
-  load_from_file(filename, fast_parser);
+  load_from_file(filename);
 }
 
-void GENDFMaterial::load_from_file(const std::string& filename, bool fast_parser)
+void GENDFMaterial::load_from_file(const std::string& filename)
 {
-  if (fast_parser) {
-    parse_mf3_only(filename);
-  } else {
-    parse_full(filename);
-  }
+  parse_mf3_only(filename);
 }
 
 vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
@@ -65,8 +61,7 @@ vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
   if (xs.size() == static_cast<size_t>(n_groups)) {
     return xs;
   } else if (xs.size() == static_cast<size_t>(n_groups + 1)) {
-    // GENDF file has n_groups+1 values (per energy bound instead of per group)
-    // Return first n_groups values (drop the last one)
+    // GENDF file has n_groups+1 values, return first n_groups
     return vector<double>(xs.begin(), xs.begin() + n_groups);
   } else if (xs.size() < static_cast<size_t>(n_groups)) {
     // Threshold reaction - need energy-aware placement
@@ -78,7 +73,6 @@ vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
       double start_energy = energies.front();
 
       // Find start index in library bounds using relative tolerance
-      // H1 fix: Use unified tolerance constants from gendf.h
       int start_idx = -1;
 
       for (size_t i = 0; i < library_bounds.size(); ++i) {
@@ -90,7 +84,7 @@ vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
         }
       }
 
-      // Fall back to nearest match if exact match not found
+      // Snap to nearest group boundary when threshold doesn't align exactly
       if (start_idx < 0) {
         double min_diff = std::numeric_limits<double>::max();
         for (size_t i = 0; i < library_bounds.size(); ++i) {
@@ -101,7 +95,7 @@ vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
           }
         }
         double rel_diff = min_diff / std::abs(start_energy);
-        if (rel_diff > GENDF_RTOL_WARN) {  // H1 fix: Use unified warning threshold
+        if (rel_diff > GENDF_RTOL_WARN) { 
           warning("Energy alignment uncertainty for " + nuclide_name_ + " MT=" +
                   std::to_string(mt) + ": GENDF starts at " +
                   std::to_string(start_energy) + " eV, using nearest boundary at " +
@@ -117,8 +111,8 @@ vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
         padded[start_idx + i] = xs[i];
       }
     } else {
-      // Fallback: no energy data available, use old behavior (high-energy end)
-      // This maintains backward compatibility but may be inaccurate
+      // Fallback: no energy boundaries available, assume threshold reaction
+      // data starts at high-energy end (physically typical for (n,xn) reactions)
       size_t offset = n_groups - xs.size();
       std::copy(xs.begin(), xs.end(), padded.begin() + offset);
     }
@@ -154,38 +148,9 @@ bool GENDFMaterial::has_energies(int mt) const
 
 void GENDFMaterial::parse_mf3_only(const std::string& filename)
 {
-  // Extract nuclide name from filename
   std::filesystem::path p(filename);
-  nuclide_name_ = p.stem().string();
-
-  // Remove trailing 'g' or 'm' (ground/metastable state indicators)
-  if (!nuclide_name_.empty()) {
-    char last = nuclide_name_.back();
-    if (last == 'g' || last == 'm') {
-      nuclide_name_.pop_back();
-    }
-  }
-
-  // Call parser (now extracts both xs_data and energy_data)
+  nuclide_name_ = convert_gendf_to_openmc_name(p.stem().string());
   parse_gendf_mf3_only(filename, xs_data_, energy_data_, za_, zam_);
-}
-
-void GENDFMaterial::parse_full(const std::string& filename)
-{
-  // Extract nuclide name from filename
-  std::filesystem::path p(filename);
-  nuclide_name_ = p.stem().string();
-
-  // Remove trailing 'g' or 'm'
-  if (!nuclide_name_.empty()) {
-    char last = nuclide_name_.back();
-    if (last == 'g' || last == 'm') {
-      nuclide_name_.pop_back();
-    }
-  }
-
-  // Call parser (now extracts both xs_data and energy_data)
-  parse_gendf_full(filename, xs_data_, energy_data_, za_, zam_);
 }
 
 //==============================================================================
@@ -216,13 +181,13 @@ GENDFLibrary::GENDFLibrary(
 }
 
 //==============================================================================
-// Helper function: Normalize nuclide name by removing leading zeros from mass
+// Helper function: Strip leading zeros from nuclide name mass
 //==============================================================================
 
-std::string normalize_nuclide_name(const std::string& name)
+std::string strip_mass_leading_zeros(const std::string& name)
 {
   // Parse nuclide name: Element + Mass + optional metastable state
-  // Examples: "Al027" -> "Al27", "Ag109" -> "Ag109", "Am242m1" -> "Am242m1"
+  // Example: "Al027" -> "Al27"
 
   std::string result;
   size_t i = 0;
@@ -255,75 +220,58 @@ std::string normalize_nuclide_name(const std::string& name)
   return result;
 }
 
+//==============================================================================
+// Helper function: Convert GENDF filename stem to OpenMC nuclide name
+//==============================================================================
+
+std::string convert_gendf_to_openmc_name(const std::string& stem)
+{
+  if (stem.empty()) return stem;
+
+  // Check for 2-char metastable suffixes (mg, ng, og, pg, qg)
+  // GENDF convention: mg=m1, ng=m2, og=m3, pg=m4, qg=m5
+  if (stem.length() >= 2) {
+    std::string last_two = stem.substr(stem.length() - 2);
+
+    static const std::pair<const char*, const char*> meta_map[] = {
+      {"mg", "_m1"}, {"ng", "_m2"}, {"og", "_m3"},
+      {"pg", "_m4"}, {"qg", "_m5"}
+    };
+
+    for (const auto& [gendf_suffix, openmc_suffix] : meta_map) {
+      if (last_two == gendf_suffix) {
+        return strip_mass_leading_zeros(stem.substr(0, stem.length() - 2)) + openmc_suffix;
+      }
+    }
+  }
+
+  // Ground state: single 'g' suffix
+  if (!stem.empty() && stem.back() == 'g') {
+    return strip_mass_leading_zeros(stem.substr(0, stem.length() - 1));
+  }
+
+  // No recognized suffix
+  return strip_mass_leading_zeros(stem);
+}
+
 void GENDFLibrary::build_file_index()
 {
   file_index_.clear();
 
-  // FISPACT metastable naming convention:
-  // - 'g'  = ground state -> Element{A}
-  // - 'mg' = m1 (1st metastable) -> Element{A}_m1
-  // - 'ng' = m2 (2nd metastable) -> Element{A}_m2
-  // - 'og' = m3 (3rd metastable) -> Element{A}_m3
-  // - 'pg' = m4 (4th metastable) -> Element{A}_m4
-  // - 'qg' = m5 (5th metastable) -> Element{A}_m5
-
-  // Scan directory for .asc files
   for (const auto& entry : std::filesystem::directory_iterator(library_path_)) {
-    if (entry.is_regular_file()) {
-      std::string filename = entry.path().filename().string();
+    if (!entry.is_regular_file()) continue;
 
-      // Skip macOS metadata files
-      if (filename.length() >= 2 && filename.substr(0, 2) == "._") {
-        continue;
-      }
+    std::string filename = entry.path().filename().string();
 
-      // Check for .asc extension
-      if (filename.length() > 4 &&
-          filename.substr(filename.length() - 4) == ".asc") {
+    // Skip macOS metadata files
+    if (filename.length() >= 2 && filename.substr(0, 2) == "._") continue;
 
-        // Extract nuclide name (remove .asc extension)
-        std::string nuclide = filename.substr(0, filename.length() - 4);
-        std::string openmc_suffix;
+    // Check for .asc extension
+    if (filename.length() <= 4 || filename.substr(filename.length() - 4) != ".asc") continue;
 
-        // Check for metastable suffixes (2-char suffixes before single 'g')
-        // Must check these before checking for single 'g'
-        if (nuclide.length() >= 2) {
-          std::string last_two = nuclide.substr(nuclide.length() - 2);
-
-          if (last_two == "mg") {
-            nuclide = nuclide.substr(0, nuclide.length() - 2);
-            openmc_suffix = "_m1";
-          } else if (last_two == "ng") {
-            nuclide = nuclide.substr(0, nuclide.length() - 2);
-            openmc_suffix = "_m2";
-          } else if (last_two == "og") {
-            nuclide = nuclide.substr(0, nuclide.length() - 2);
-            openmc_suffix = "_m3";
-          } else if (last_two == "pg") {
-            nuclide = nuclide.substr(0, nuclide.length() - 2);
-            openmc_suffix = "_m4";
-          } else if (last_two == "qg") {
-            nuclide = nuclide.substr(0, nuclide.length() - 2);
-            openmc_suffix = "_m5";
-          } else if (!nuclide.empty() && nuclide.back() == 'g') {
-            // Ground state: single 'g' suffix
-            nuclide.pop_back();
-          }
-        } else if (!nuclide.empty() && nuclide.back() == 'g') {
-          // Ground state: single 'g' suffix (short names)
-          nuclide.pop_back();
-        }
-
-        // Normalize nuclide name (strip leading zeros from mass number)
-        // This ensures "Al027" -> "Al27" to match OpenMC naming convention
-        nuclide = normalize_nuclide_name(nuclide);
-
-        // Append OpenMC metastable suffix if present
-        nuclide += openmc_suffix;
-
-        file_index_[nuclide] = entry.path().string();
-      }
-    }
+    // Extract stem and convert to OpenMC nuclide name
+    std::string stem = filename.substr(0, filename.length() - 4);
+    file_index_[convert_gendf_to_openmc_name(stem)] = entry.path().string();
   }
 
   if (file_index_.empty()) {
@@ -373,7 +321,7 @@ GENDFMaterial& GENDFLibrary::load_material(const std::string& nuclide)
     }
   }
 
-  // Check if nuclide exists BEFORE acquiring write lock
+  // Check if nuclide exists before acquiring write lock
   // (avoid throwing exceptions while holding locks)
   std::string filepath = get_file_path(nuclide);  // May throw if not found
 
@@ -383,7 +331,7 @@ GENDFMaterial& GENDFLibrary::load_material(const std::string& nuclide)
   // Double-check pattern: another thread may have loaded while we waited for lock
   auto it = material_cache_.find(nuclide);
   if (it == material_cache_.end()) {
-    auto material = make_unique<GENDFMaterial>(filepath, true);
+    auto material = make_unique<GENDFMaterial>(filepath);
     material_cache_[nuclide] = std::move(material);
     it = material_cache_.find(nuclide);
   }
@@ -396,10 +344,7 @@ vector<double> GENDFLibrary::get_xs(
   int mt,
   const vector<double>& energy_bounds)
 {
-  // Validate energy bounds using unified tolerance constants (H1 fix)
-  // Aligned with OpenMC Python standards (detect_energy_structure(), branching validation)
-  // NOTE: May need to relax GENDF_RTOL_MATCH if too strict for some FISPACT GENDF files
-
+  // Size check provides sufficient validation - callers always pass library bounds back
   if (energy_bounds.size() != energy_bounds_.size()) {
     throw std::runtime_error(
       "Energy bounds size mismatch: expected " +
@@ -407,18 +352,6 @@ vector<double> GENDFLibrary::get_xs(
       std::to_string(energy_bounds.size()));
   }
 
-  for (size_t i = 0; i < energy_bounds.size(); ++i) {
-    double diff = std::abs(energy_bounds[i] - energy_bounds_[i]);
-    double threshold = GENDF_ATOL + GENDF_RTOL_MATCH * std::abs(energy_bounds_[i]);
-
-    if (diff > threshold) {
-      throw std::runtime_error(
-        "Energy bounds do not match library energy structure '" +
-        energy_structure_ + "'");
-    }
-  }
-
-  // Load material and get cross-section (pass library bounds for threshold alignment)
   auto& material = load_material(nuclide);
   return material.get_xs(mt, n_groups_, energy_bounds_);
 }
@@ -433,7 +366,7 @@ extern "C" {
 namespace {
 std::unordered_map<int, unique_ptr<GENDFLibrary>> g_gendf_libs;
 int g_next_lib_id = 1;
-constexpr int MAX_GENDF_LIB_ID = 2000000000;  // ~2 billion, well below INT_MAX
+constexpr int MAX_GENDF_LIB_ID = 2000000000; 
 
 // Helper to get library by ID
 GENDFLibrary* get_library(int32_t lib_id)

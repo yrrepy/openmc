@@ -372,10 +372,8 @@ class GENDFLibrary:
             pointer(n_groups)
         )
 
-        # Copy data to numpy array
-        xs_array = np.zeros(n_groups.value, dtype=np.float64)
-        for i in range(n_groups.value):
-            xs_array[i] = xs_ptr[i]
+        # Copy data to numpy array (must copy before freeing C memory)
+        xs_array = np.ctypeslib.as_array(xs_ptr, shape=(n_groups.value,)).copy()
 
         # Free C-allocated memory
         _dll.openmc_gendf_free_xs(xs_ptr)

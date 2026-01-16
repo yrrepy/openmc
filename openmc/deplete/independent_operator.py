@@ -397,8 +397,8 @@ class IndependentOperator(OpenMCOperator):
 
         helper = IsomericBranchingHelper(
             self.chain,
-            energy_structure=energy_structure,
-            gendf_library=self._gendf_library
+            self._gendf_library,
+            energy_structure=energy_structure,            
         )
         self._isomeric_branching = []
 
@@ -412,12 +412,9 @@ class IndependentOperator(OpenMCOperator):
                     f"energy structure when using energy-dependent isomeric branching."
                 )
 
-            # Get MicroXS for this material (required for σ×φ weighting)
-            micro_xs = self.cross_sections[i]
-
             # Calculate σ×φ-weighted branching
             # The helper will perform strict validation and raise errors if mismatched
-            weighted = helper.weighted_branching_ratios(flux_spectrum, energy, micro_xs)
+            weighted = helper.weighted_branching_ratios(flux_spectrum, energy)
 
             self._isomeric_branching.append(weighted)
 

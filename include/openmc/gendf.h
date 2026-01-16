@@ -64,15 +64,13 @@ public:
 
   //! Construct material from GENDF file
   //! \param[in] filename Path to GENDF .asc file
-  //! \param[in] fast_parser If true, use MF=3-only parser (7.6x faster)
-  explicit GENDFMaterial(const std::string& filename, bool fast_parser = true);
+  explicit GENDFMaterial(const std::string& filename);
 
   // Methods
 
   //! Load material data from GENDF file
   //! \param[in] filename Path to GENDF .asc file
-  //! \param[in] fast_parser If true, use MF=3-only parser (7.6x faster)
-  void load_from_file(const std::string& filename, bool fast_parser = true);
+  void load_from_file(const std::string& filename);
 
   //! Get cross-section data for specific MT number with energy-aware alignment
   //! \param[in] mt ENDF MT reaction number
@@ -118,10 +116,6 @@ private:
   //! Parse GENDF file (MF=3 only for speed)
   //! \param[in] filename Path to GENDF .asc file
   void parse_mf3_only(const std::string& filename);
-
-  //! Parse full GENDF file (for debugging/validation)
-  //! \param[in] filename Path to GENDF .asc file
-  void parse_full(const std::string& filename);
 };
 
 //==============================================================================
@@ -199,9 +193,6 @@ private:
   //! \param[in] nuclide Nuclide name
   //! \return Full path to GENDF file
   std::string get_file_path(const std::string& nuclide) const;
-
-  //! Initialize energy group structure
-  void init_energy_structure();
 };
 
 //==============================================================================
@@ -222,6 +213,17 @@ extern int n_gendf_libraries;
 // Non-member functions
 //==============================================================================
 
+//! Strip leading zeros from mass number in nuclide name
+//! \param[in] name Nuclide name with possible leading zeros (e.g., "Al027")
+//! \return Name with leading zeros stripped (e.g., "Al27")
+std::string strip_mass_leading_zeros(const std::string& name);
+
+//! Convert GENDF filename stem to OpenMC nuclide name
+//! Handles metastable suffixes: mg->_m1, ng->_m2, og->_m3, pg->_m4, qg->_m5, g->ground
+//! \param[in] stem GENDF filename stem (e.g., "U235g", "Am242mg")
+//! \return OpenMC nuclide name (e.g., "U235", "Am242_m1")
+std::string convert_gendf_to_openmc_name(const std::string& stem);
+
 //! Parse GENDF file using MF=3-only parser (7.6x faster)
 //! \param[in] filename Path to GENDF .asc file
 //! \param[out] xs_data Map of MT -> vector<double> (cross-sections)
@@ -229,19 +231,6 @@ extern int n_gendf_libraries;
 //! \param[out] za Z*1000 + A
 //! \param[out] zam Z*1000 + A + isomeric state
 void parse_gendf_mf3_only(
-  const std::string& filename,
-  std::unordered_map<int, vector<double>>& xs_data,
-  std::unordered_map<int, vector<double>>& energy_data,
-  int& za,
-  int& zam);
-
-//! Parse full GENDF file (for validation)
-//! \param[in] filename Path to GENDF .asc file
-//! \param[out] xs_data Map of MT -> vector<double> (cross-sections)
-//! \param[out] energy_data Map of MT -> vector<double> (energy boundaries)
-//! \param[out] za Z*1000 + A
-//! \param[out] zam Z*1000 + A + isomeric state
-void parse_gendf_full(
   const std::string& filename,
   std::unordered_map<int, vector<double>>& xs_data,
   std::unordered_map<int, vector<double>>& energy_data,

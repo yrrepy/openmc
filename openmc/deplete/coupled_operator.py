@@ -394,8 +394,8 @@ class CoupledOperator(OpenMCOperator):
         # All conditions met - create the isomeric branching helper
         self._isomeric_helper = IsomericBranchingHelper(
             self.chain,
-            energy_structure=energy_structure,
-            gendf_library=self._gendf_library
+            self._gendf_library,
+            energy_structure=energy_structure
         )
 
     def _calculate_isomeric_branching(self):
@@ -428,9 +428,9 @@ class CoupledOperator(OpenMCOperator):
             # Get the flux spectrum for this material from the tally
             flux_spectrum = self._rate_helper.get_flux_spectrum(i)
 
-            # Calculate σ×φ-weighted branching (micro_xs=None uses GENDF directly)
+            # Calculate σ×φ-weighted branching
             weighted = self._isomeric_helper.weighted_branching_ratios(
-                flux_spectrum, energy_bins, micro_xs=None
+                flux_spectrum, energy_bins
             )
             isomeric_branching.append(weighted)
 
