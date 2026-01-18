@@ -307,14 +307,7 @@ def convert_flux_groups(flux, source_groups, target_groups):
 
     Uses flux-per-unit-lethargy conservation, which assumes constant flux per
     unit lethargy within each source group and distributes flux to target
-    groups proportionally to their lethargy width. [1]_ [2]_
-
-    References
-    ----------
-    .. [1] J. J. Duderstadt and L. J. Hamilton, "Nuclear Reactor Analysis,"
-       John Wiley & Sons, 1976.
-    .. [2] M. Fleming and J.-Ch. Sublet, "FISPACT-II User Manual,"
-       UKAEA-R(18)001, UK Atomic Energy Authority, 2018. See GRPCONVERT keyword.
+    groups proportionally to their lethargy width.
 
     .. versionadded:: 0.15.4
 
@@ -346,6 +339,10 @@ def convert_flux_groups(flux, source_groups, target_groups):
         If flux length doesn't match source_groups, or flux contains
         negative, NaN, or infinite values
 
+    See Also
+    --------
+    EnergyGroups : Energy group structure class
+
     Notes
     -----
     The assumption of constant flux per unit lethargy within each source
@@ -366,6 +363,13 @@ def convert_flux_groups(flux, source_groups, target_groups):
     >>> source = openmc.mgxs.EnergyGroups([1.0, 10.0, 100.0])
     >>> target = openmc.mgxs.EnergyGroups([1.0, 5.0, 10.0, 50.0, 100.0])
     >>> flux_target = openmc.mgxs.convert_flux_groups([1e8, 2e8], source, target)
+
+    References
+    ----------
+    .. [1] J. J. Duderstadt and L. J. Hamilton, "Nuclear Reactor Analysis,"
+       John Wiley & Sons, 1976.
+    .. [2] M. Fleming and J.-Ch. Sublet, "FISPACT-II User Manual,"
+       UKAEA-R(18)001, UK Atomic Energy Authority, 2018. See GRPCONVERT keyword.
 
     """
     # Handle string group structure names
@@ -401,34 +405,34 @@ def convert_flux_groups(flux, source_groups, target_groups):
     # Get energy edges
     source_edges = source_groups.group_edges
     target_edges = target_groups.group_edges
-    n_target = target_groups.num_groups
+    num_target = target_groups.num_groups
 
     # Initialize output array
-    flux_target = np.zeros(n_target)
+    flux_target = np.zeros(num_target)
 
     # Main conversion loop: distribute flux using lethargy weighting
-    for i_s, flux_s in enumerate(flux):
-        if flux_s == 0:
+    for idx_src, flux_src in enumerate(flux):
+        if flux_src == 0:
             continue
 
-        E_lo_s = source_edges[i_s]
-        E_hi_s = source_edges[i_s + 1]
-        du_source = np.log(E_hi_s / E_lo_s)
+        e_low_src = source_edges[idx_src]
+        e_high_src = source_edges[idx_src + 1]
+        lethargy_src = np.log(e_high_src / e_low_src)
 
-        for i_t in range(n_target):
-            E_lo_t = target_edges[i_t]
-            E_hi_t = target_edges[i_t + 1]
+        for idx_tgt in range(num_target):
+            e_low_tgt = target_edges[idx_tgt]
+            e_high_tgt = target_edges[idx_tgt + 1]
 
             # Skip non-overlapping groups
-            if E_hi_t <= E_lo_s or E_lo_t >= E_hi_s:
+            if e_high_tgt <= e_low_src or e_low_tgt >= e_high_src:
                 continue
 
             # Calculate overlap region
-            E_overlap_lo = max(E_lo_s, E_lo_t)
-            E_overlap_hi = min(E_hi_s, E_hi_t)
-            du_overlap = np.log(E_overlap_hi / E_overlap_lo)
+            e_low_overlap = max(e_low_src, e_low_tgt)
+            e_high_overlap = min(e_high_src, e_high_tgt)
+            lethargy_overlap = np.log(e_high_overlap / e_low_overlap)
 
             # Distribute flux proportionally to lethargy fraction
-            flux_target[i_t] += flux_s * (du_overlap / du_source)
+            flux_target[idx_tgt] += flux_src * (lethargy_overlap / lethargy_src)
 
     return flux_target
