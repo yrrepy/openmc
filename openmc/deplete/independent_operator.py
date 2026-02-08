@@ -184,7 +184,6 @@ class IndependentOperator(OpenMCOperator):
             else:
                 self._flux_with_energy.append((flux_item, None))
 
-
         self.fluxes = fluxes
         super().__init__(
             materials=materials,
@@ -195,6 +194,11 @@ class IndependentOperator(OpenMCOperator):
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level,
             keep_isomeric_siblings=keep_isomeric_siblings)
+
+        # Filter _flux_with_energy to local materials for MPI
+        if len(self._flux_with_energy) != len(self.local_mats):
+            local_indices = [self._mat_index_map[m] for m in self.local_mats]
+            self._flux_with_energy = [self._flux_with_energy[i] for i in local_indices]
 
         # Store parameters for isomeric branching setup
         self._require_isomeric_branching = require_isomeric_branching # require_isomeric_branching, maybe can be wholly removed
