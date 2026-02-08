@@ -23,7 +23,6 @@ from .microxs import MicroXS
 from .results import Results
 from .helpers import (ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper,
                       IsomericBranchingHelper)
-from . import get_energy_structure_name
 
 
 class IndependentOperator(OpenMCOperator):
@@ -378,6 +377,13 @@ class IndependentOperator(OpenMCOperator):
                 )
                 return True  # Signal to return early
 
+        if self._gendf_library is None:
+            if _handle_issue(
+                "Isomeric branching data is present in chain but no GENDF "
+                "library was provided."
+            ):
+                return
+
         # Check flux spectra and energy bins
         if len(self.fluxes) == 0 or self._energy_bins is None or len(self._energy_bins) == 0:
             if _handle_issue(
@@ -387,27 +393,9 @@ class IndependentOperator(OpenMCOperator):
             ):
                 return
 
-        # Detect energy structure from first material with flux data
-        energy_structure = None
-        for flux_spectrum, energy in self._flux_with_energy:
-            if energy is not None and isinstance(flux_spectrum, np.ndarray):
-                n_groups = len(flux_spectrum)
-                energy_structure = get_energy_structure_name(n_groups)
-                if energy_structure is not None:
-                    break
-
-        if energy_structure is None:
-            if _handle_issue(
-                "Could not determine energy structure from flux spectra. "
-                "Isomeric branching requires CCFE-709 (709 groups) or "
-                "UKAEA-1102 (1102 groups) energy structure."
-            ):
-                return
-
         helper = IsomericBranchingHelper(
             self.chain,
             self._gendf_library,
-            energy_structure=energy_structure,            
         )
         self._isomeric_branching = []
 
@@ -417,8 +405,9 @@ class IndependentOperator(OpenMCOperator):
             if energy is None or not isinstance(flux_spectrum, np.ndarray):
                 raise RuntimeError(
                     f"Material {i} is missing flux spectrum or energy information. "
-                    f"All materials must have flux spectra with {energy_structure} "
-                    f"energy structure when using energy-dependent isomeric branching."
+                    f"All materials must have flux spectra with "
+                    f"{helper.energy_structure} energy structure when using "
+                    f"energy-dependent isomeric branching."
                 )
 
             # Calculate σ×φ-weighted branching
