@@ -154,6 +154,7 @@ class GENDFLibrary:
         """
         # Convert inputs
         self._energy_bounds = np.asarray(energy_bounds, dtype=np.float64)
+        self._energy_structure = energy_structure_name
         n_bounds = len(self._energy_bounds)
 
         # Prepare C arrays
@@ -226,6 +227,16 @@ class GENDFLibrary:
             Energy boundaries array (length n_groups + 1)
         """
         return self.energy_bounds
+
+    @property
+    def energy_structure(self) -> Optional[str]:
+        """Name of the energy group structure (e.g., 'CCFE-709', 'UKAEA-1102')."""
+        return self._energy_structure
+
+    @property
+    def decay_lookup(self):
+        """C++ backend does not support decay file lookup."""
+        return None
 
     def has_nuclide(self, nuclide: str) -> bool:
         """

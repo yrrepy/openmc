@@ -383,19 +383,9 @@ class CoupledOperator(OpenMCOperator):
             self._isomeric_branching = None
             return
 
-        # Check if energy structure was detected
-        energy_structure = getattr(self, '_isomeric_energy_structure', None)
-        if energy_structure is None:
-            # Could not determine energy structure from chain
-            self._isomeric_helper = None
-            self._isomeric_branching = None
-            return
-
-        # All conditions met - create the isomeric branching helper
         self._isomeric_helper = IsomericBranchingHelper(
             self.chain,
             self._gendf_library,
-            energy_structure=energy_structure
         )
 
     def _calculate_isomeric_branching(self):

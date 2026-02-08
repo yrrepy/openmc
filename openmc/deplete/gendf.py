@@ -360,12 +360,9 @@ class _PythonGENDFLibrary:
     ----------
     library_path : path-like
         Path to directory containing GENDF .asc files
-    energy_structure : str, optional
-        Name of the energy group structure. Must be one of 'CCFE-709' or
-        'UKAEA-1102'. Default is 'UKAEA-1102'.
     validate_energy_grid : bool, optional
         If True, validate that each GENDF file's energy grid matches the
-        specified energy structure. Default is True.
+        auto-detected energy structure. Default is True.
     decay_file : path-like, optional
         Path to ENDF decay library for ELIS-based isomeric state mapping.
         Can be a directory of decay files or a single concatenated file.
@@ -438,17 +435,15 @@ class _PythonGENDFLibrary:
     def __init__(
         self,
         library_path: PathLike,
-        energy_structure: str = 'UKAEA-1102',
         validate_energy_grid: bool = True,
         decay_file: Optional[PathLike] = None,
         elis_rtol: float = ELIS_RTOL,
         elis_atol: float = ELIS_ATOL,
         skip_zero_elis_metastables: bool = True,
-        mapping_mode: str = 'elis'
+        mapping_mode: str = 'elis',
+        _energy_structure: Optional[str] = None
     ):
-        # Validate inputs
         check_type('library_path', library_path, (str, Path))
-        check_value('energy_structure', energy_structure, SUPPORTED_GROUP_STRUCTURES)
         check_type('validate_energy_grid', validate_energy_grid, bool)
         check_type('elis_rtol', elis_rtol, float)
         check_type('elis_atol', elis_atol, float)
@@ -462,6 +457,11 @@ class _PythonGENDFLibrary:
         if not self.library_path.is_dir():
             raise ValueError(
                 f"GENDF library path must be a directory: {self.library_path}")
+
+        if _energy_structure is not None:
+            energy_structure = _energy_structure
+        else:
+            energy_structure = detect_energy_structure(self.library_path)
 
         self.energy_structure = energy_structure
         self.energy_bounds = GROUP_STRUCTURES[energy_structure].copy()
@@ -2320,9 +2320,7 @@ class _PythonGENDFLibrary:
 
 def GENDFLibrary(
     library_path: PathLike,
-    energy_structure: str = 'UKAEA-1102',
     validate_energy_grid: bool = True,
-    backend: str = 'auto',
     decay_file: Optional[PathLike] = None,
     elis_rtol: float = ELIS_RTOL,
     elis_atol: float = ELIS_ATOL,
@@ -2331,54 +2329,38 @@ def GENDFLibrary(
 ):
     """Create a GENDF cross-section library with automatic backend selection.
 
-    This factory function automatically selects the best available backend
-    for GENDF cross-section loading:
-    - **C++ backend**: Fast implementation (2-5x speedup) if OpenMC was built
-      with C++ GENDF support
-    - **Python backend**: Pure Python fallback implementation
+    Energy structure is auto-detected from the GENDF files. The backend
+    (C++ or Python) is selected automatically: C++ if available and no
+    decay_file is provided, otherwise Python.
 
     Parameters
     ----------
     library_path : path-like
         Path to directory containing GENDF .asc files
-    energy_structure : str, optional
-        Name of the energy group structure. Must be one of 'CCFE-709' or
-        'UKAEA-1102'. Default is 'UKAEA-1102'.
     validate_energy_grid : bool, optional
         If True, validate that each GENDF file's energy grid matches the
-        specified energy structure. Default is True. Only used with Python
+        detected energy structure. Default is True. Only used with Python
         backend.
-    backend : {'auto', 'cpp', 'python'}, optional
-        Backend selection:
-        - 'auto': Automatically use C++ if available, otherwise Python (default)
-        - 'cpp': Force C++ backend (raises error if not available)
-        - 'python': Force Python backend
     decay_file : path-like, optional
         Path to ENDF decay library for ELIS-based isomeric state mapping.
         Can be a directory of decay files or a single concatenated file.
         When provided, enables accurate mapping of GENDF MF=10 metastable
         products to OpenMC ``_m{n}`` naming based on excitation energy
         matching. **Highly recommended** for isomeric branching workflows.
-        Only used with Python backend.
     elis_rtol : float, optional
         Relative tolerance for ELIS matching (default: 0.01 = 1%).
-        Only used with Python backend when decay_file is provided.
     elis_atol : float, optional
         Absolute tolerance in eV for ELIS matching (default: 100.0 eV).
-        Only used with Python backend when decay_file is provided.
     skip_zero_elis_metastables : bool, optional
         If True, skip metastable states with ELIS=0 in decay library (likely
-        data errors). Default is True. Only used with Python backend when
-        decay_file is provided.
+        data errors). Default is True.
     mapping_mode : {'elis', 'lfs_order'}, optional
         Isomeric state mapping mode:
         - 'elis' (default): Use excitation energy (ELIS) matching between
           GENDF MF=10 products and decay library. Most accurate method.
         - 'lfs_order': Use FISPACT-like positional mapping where the 1st
           metastable LFS maps to _m1, 2nd to _m2, etc. Useful for validation
-          testing against FISPACT-II. **Warning**: LFS order may not match
-          LISO order for some nuclides (e.g., Ag116).
-        Only used with Python backend.
+          testing against FISPACT-II.
 
     Returns
     -------
@@ -2387,17 +2369,14 @@ def GENDFLibrary(
 
     Raises
     ------
-    ValueError
-        If requested backend is not available
     FileNotFoundError
         If library_path does not exist
     ValueError
-        If energy_structure is not supported
+        If energy structure cannot be detected from GENDF files
 
     Examples
     --------
-    >>> # Auto-select fastest backend (without ELIS mapping)
-    >>> lib = GENDFLibrary('/path/to/JEFF40-GENDF/', 'UKAEA-1102')
+    >>> lib = GENDFLibrary('/path/to/JEFF40-GENDF/')
     >>> xs = lib.get_xs('U235', 102, lib.energy_bounds)
     >>>
     >>> # With ELIS-based isomeric mapping (recommended for branching)
@@ -2405,49 +2384,6 @@ def GENDFLibrary(
     ...     '/path/to/JEFF40-GENDF/',
     ...     decay_file='/path/to/JEFF40-decay/'
     ... )
-    >>> branching = lib.get_branching_ratios('Ir191', 102)
-    >>> print(branching.products)  # ['Ir192', 'Ir192_m1', 'Ir192_m2']
-    >>>
-    >>> # Cross-library usage with relaxed tolerance
-    >>> lib = GENDFLibrary(
-    ...     '/path/to/TENDL2017-GENDF/',
-    ...     decay_file='/path/to/UKDD12_decay.dat',
-    ...     elis_rtol=0.10  # Allow 10% tolerance for cross-library mismatches
-    ... )
-    >>>
-    >>> # Force Python backend
-    >>> lib_py = GENDFLibrary('/path/to/JEFF40-GENDF/', backend='python')
-    >>>
-    >>> # Force C++ backend (error if not available)
-    >>> lib_cpp = GENDFLibrary('/path/to/JEFF40-GENDF/', backend='cpp')
-
-    Notes
-    -----
-    The C++ backend provides significant performance improvements:
-    - 2-5x faster GENDF file parsing
-    - Lower memory overhead
-    - Better caching performance
-
-    Both backends provide identical interfaces and results, so code using
-    GENDFLibrary does not need to change when switching backends.
-
-    **ELIS-Based Mapping** (Python backend only, when decay_file is provided):
-
-    Instead of assuming LFS order equals LISO order, the library uses excitation
-    energy (ELIS) matching:
-
-    1. For each GENDF MF=10 metastable product, calculate ELIS = QM - QI
-    2. Look up matching metastable state in decay library by ELIS
-    3. Use decay library's LISO value for ``_m{n}`` naming
-
-    This handles cases like Ir191(n,gamma)->Ir192 where GENDF uses LFS=3,15
-    but decay library correctly identifies these as LISO=1,2 (m1, m2).
-
-    .. versionadded:: 0.15.3
-        C++ backend and automatic selection
-
-    .. versionadded:: 0.15.3
-        ELIS-based isomeric state mapping (decay_file, elis_rtol, elis_atol)
 
     See Also
     --------
@@ -2455,48 +2391,19 @@ def GENDFLibrary(
     lookup_liso : Find LISO for given excitation energy
     DecayState : Data class for nuclear state information
     """
-    # Validate backend choice
-    if backend not in ('auto', 'cpp', 'python'):
+    library_path = Path(library_path)
+    if not library_path.exists():
+        raise FileNotFoundError(
+            f"GENDF library path does not exist: {library_path}")
+    if not library_path.is_dir():
         raise ValueError(
-            f"Invalid backend '{backend}'. Must be 'auto', 'cpp', or 'python'")
+            f"GENDF library path must be a directory: {library_path}")
 
-    # Validate mapping_mode
-    if mapping_mode not in ('elis', 'lfs_order'):
-        raise ValueError(
-            f"Invalid mapping_mode '{mapping_mode}'. Must be 'elis' or 'lfs_order'")
+    energy_structure = detect_energy_structure(library_path)
 
-    # decay_file is optional - only needed for isomeric branching (MF=10)
-    # Library can still be used for available_nuclides() and XS retrieval without it
+    use_cpp = _CppGENDFLibrary is not None and decay_file is None
 
-    # Determine which backend to use
-    use_cpp = False
-    if backend == 'cpp':
-        if _CppGENDFLibrary is None:
-            raise ValueError(
-                "C++ backend requested but not available. "
-                "Ensure OpenMC was built with C++ GENDF support.")
-        use_cpp = True
-    elif backend == 'auto':
-        # If decay_file is provided, force Python backend for ELIS mapping
-        # C++ backend doesn't support ELIS mapping yet
-        if decay_file is not None:
-            use_cpp = False
-        else:
-            use_cpp = _CppGENDFLibrary is not None
-    # else backend == 'python', use_cpp remains False
-
-    # Warn if C++ backend requested but isomeric mapping parameters provided
-    if use_cpp and decay_file is not None:
-        warnings.warn(
-            "C++ backend does not support isomeric state mapping (neither 'elis' "
-            "nor 'lfs_order' mode). decay_file and mapping_mode parameters will "
-            "be ignored. Use backend='python' to enable isomeric state mapping.",
-            UserWarning
-        )
-
-    # Create appropriate backend
     if use_cpp:
-        # Use C++ backend
         energy_bounds = GROUP_STRUCTURES[energy_structure]
         return _CppGENDFLibrary(
             str(library_path),
@@ -2504,16 +2411,15 @@ def GENDFLibrary(
             energy_structure
         )
     else:
-        # Use Python backend
         return _PythonGENDFLibrary(
             library_path,
-            energy_structure,
             validate_energy_grid,
             decay_file,
             elis_rtol,
             elis_atol,
             skip_zero_elis_metastables,
-            mapping_mode
+            mapping_mode,
+            _energy_structure=energy_structure
         )
 
 

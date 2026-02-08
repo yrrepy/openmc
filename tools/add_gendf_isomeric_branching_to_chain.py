@@ -31,7 +31,7 @@ from xml.dom import minidom
 
 from openmc.deplete import Chain
 from openmc.deplete.gendf import (
-    GENDFLibrary, detect_energy_structure, REACTION_TO_MT
+    GENDFLibrary, REACTION_TO_MT
 )
 
 
@@ -1561,7 +1561,6 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
          mt_list=None, verbose=True,
          isomer_mapping_log_file=None,
          renormalization_log_file=None,
-         energy_structure='auto',
          prune_nn_prime_self_loops=False,
          suppress_single_target_yields=False):
     """
@@ -1615,15 +1614,9 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     print(f"  Loaded {len(chain.nuclides)} nuclides")
 
     # Step 2: Detect energy structure
-    print("\nStep 2: Detecting energy structure...")
-    if energy_structure == 'auto':
-        energy_structure = detect_energy_structure(endf_gxs_dir)
-    print(f"  Energy structure: {energy_structure}")
-
-    # Step 3: Load GENDF library and extract branching
-    print("\nStep 3: Loading GENDF library...")
+    # Step 2-3: Load GENDF library (energy structure auto-detected)
+    print("\nStep 2: Loading GENDF library...")
     lib_kwargs = {
-        'energy_structure': energy_structure,
         'validate_energy_grid': False,
         'skip_zero_elis_metastables': skip_zero_elis_metastables,
         'decay_file': decay_file,
@@ -1635,6 +1628,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     print(f"  ELIS tolerance: rtol={elis_rtol} ({elis_rtol*100:.0f}%), atol={elis_atol} eV")
 
     lib = GENDFLibrary(endf_gxs_dir, **lib_kwargs)
+    print(f"  Energy structure: {lib.energy_structure}")
     print(f"  Available nuclides: {len(lib.available_nuclides())}")
 
     print("\nStep 4: Extracting MF=10 branching data...")
@@ -1807,7 +1801,6 @@ if __name__ == '__main__':
         elis_atol=args.atol,
         verbose=verbose,
         isomer_mapping_log_file=log_file,
-        energy_structure='auto',
         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
         suppress_single_target_yields=args.suppress_single_target_yields
     )
