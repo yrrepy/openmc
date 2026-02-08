@@ -154,6 +154,14 @@ class IndependentOperator(OpenMCOperator):
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level)
 
+        # Filter fluxes and cross sections to local materials only
+        if comm.size > 1:
+            local_indices = [self._mat_index_map[m] for m in self.local_mats]
+            self.fluxes = [self.fluxes[i] for i in local_indices]
+            self.cross_sections = [self.cross_sections[i] for i in local_indices]
+            self._mat_index_map = {
+                lm: i for i, lm in enumerate(self.local_mats)}
+
     @classmethod
     def from_nuclides(cls, volume, nuclides,
                       flux,
@@ -416,36 +424,14 @@ class IndependentOperator(OpenMCOperator):
         return copy.deepcopy(op_result)
 
     def _update_materials(self):
-        """Updates material compositions in OpenMC on all processes."""
-
-        for rank in range(comm.size):
-            number_i = comm.bcast(self.number, root=rank)
-
-            for mat in number_i.materials:
-                nuclides = []
-                densities = []
-                for nuc in number_i.nuclides:
-                    if nuc in self.nuclides_with_data:
-                        val = 1.0e-24 * number_i.get_atom_density(mat, nuc)
-
-                        # If nuclide is zero, do not add to the problem.
-                        if val > 0.0:
-                            if self.round_number:
-                                val_magnitude = np.floor(np.log10(val))
-                                val_scaled = val / 10**val_magnitude
-                                val_round = round(val_scaled, 8)
-
-                                val = val_round * 10**val_magnitude
-
-                            nuclides.append(nuc)
-                            densities.append(val)
-                        else:
-                            # Only output warnings if values are significantly
-                            # negative. CRAM does not guarantee positive
-                            # values.
-                            if val < -1.0e-21:
-                                print(f'WARNING: nuclide {nuc} in material'
-                                      f'{mat} is negative (density = {val}'
-
-                                      ' atom/b-cm)')
-                            number_i[mat, nuc] = 0.0
+        """Zero out negative nuclide densities on local materials."""
+        for mat in self.number.materials:
+            for nuc in self.number.nuclides:
+                if nuc in self.nuclides_with_data:
+                    val = 1.0e-24 * self.number.get_atom_density(mat, nuc)
+                    if val < 0.0:
+                        if val < -1.0e-21:
+                            print(f'WARNING: nuclide {nuc} in material '
+                                  f'{mat} is negative (density = {val}'
+                                  ' atom/b-cm)')
+                        self.number[mat, nuc] = 0.0
