@@ -250,7 +250,7 @@ def get_microxs_and_flux(
     return fluxes_with_energy, micros
 
 
-def get_gendf_and_flux(
+def get_gendfxs_and_flux(
     model: openmc.Model,
     domains: DomainTypes,
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
