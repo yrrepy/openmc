@@ -14,10 +14,9 @@ import warnings
 from numpy import dot, zeros, newaxis, asarray
 import numpy as np
 
-from openmc.mgxs import GROUP_STRUCTURES
 
 from openmc.mpi import comm
-from openmc.checkvalue import check_type, check_greater_than, check_value
+from openmc.checkvalue import check_type, check_greater_than
 from openmc.data import JOULE_PER_EV, REACTION_MT
 from openmc.exceptions import OpenMCError
 from openmc.deplete.gendf import REACTION_TO_MT
@@ -1177,9 +1176,7 @@ class IsomericBranchingHelper:
         Chain containing isomeric branching data
     gendf_library : GENDFLibrary
         GENDF library for on-the-fly multigroup cross-section lookup.
-        Required for σ×φ-weighted isomeric branching.
-    energy_structure : {'CCFE-709', 'UKAEA-1102'}, optional
-        Required energy group structure. Default is 'UKAEA-1102'.
+        Energy structure is derived from the library.
 
     Attributes
     ----------
@@ -1188,7 +1185,7 @@ class IsomericBranchingHelper:
     isomeric_data : dict or None
         Isomeric branching data from the chain
     energy_structure : str
-        Name of the required energy group structure
+        Name of the energy group structure (from gendf_library)
     expected_energies : numpy.ndarray
         Expected energy bin boundaries in eV
     n_groups : int
@@ -1201,9 +1198,8 @@ class IsomericBranchingHelper:
         self,
         chain: 'Chain',
         gendf_library,
-        energy_structure: str = 'UKAEA-1102'
     ) -> None:
-        """Initialize with a depletion chain and energy structure.
+        """Initialize with a depletion chain and GENDF library.
 
         Parameters
         ----------
@@ -1211,26 +1207,22 @@ class IsomericBranchingHelper:
             Chain containing isomeric branching data
         gendf_library : GENDFLibrary
             GENDF library for on-the-fly multigroup cross-section lookup.
-        energy_structure : {'CCFE-709', 'UKAEA-1102'}, optional
-            Energy group structure. Default is 'UKAEA-1102'.
+            Energy structure is read from the library.
 
         Raises
         ------
         ValueError
-            If energy_structure is not supported
+            If gendf_library is None
         """
-        check_value('energy_structure', energy_structure,
-                   ['CCFE-709', 'UKAEA-1102'])
-
         if gendf_library is None:
             raise ValueError("gendf_library is required for IsomericBranchingHelper")
 
         self.chain: 'Chain' = chain
         self.isomeric_data: Optional[Dict] = chain.isomeric_branching
-        self.energy_structure: str = energy_structure
-        self.expected_energies: np.ndarray = GROUP_STRUCTURES[energy_structure].copy()
-        self.n_groups: int = len(self.expected_energies) - 1
         self.gendf_library = gendf_library
+        self.energy_structure: str = gendf_library.energy_structure
+        self.expected_energies: np.ndarray = gendf_library.energy_bounds.copy()
+        self.n_groups: int = len(self.expected_energies) - 1
     
     def weighted_branching_ratios(
         self,

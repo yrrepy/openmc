@@ -25,7 +25,7 @@ from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
 from ..utility_funcs import h5py_file_or_group
 import openmc.lib
 from openmc.mpi import comm
-from .gendf import GENDFLibrary, _PythonGENDFLibrary, _CppGENDFLibrary, detect_energy_structure
+from .gendf import GENDFLibrary, _PythonGENDFLibrary, _CppGENDFLibrary
 
 # Build tuple of valid GENDF backend types for isinstance checks
 _GENDF_TYPES = (_PythonGENDFLibrary,)
@@ -319,8 +319,7 @@ def get_gendfxs_and_flux(
     """
     # Handle GENDF library input
     if isinstance(gendf_library, (str, Path)):
-        detected = detect_energy_structure(gendf_library)
-        gendf_library = GENDFLibrary(gendf_library, energy_structure=detected)
+        gendf_library = GENDFLibrary(gendf_library)
     elif not isinstance(gendf_library, _GENDF_TYPES):
         raise TypeError(
             f"gendf_library must be a path or GENDFLibrary instance, "
@@ -625,8 +624,7 @@ class MicroXS:
         """
         # Handle GENDF library input
         if isinstance(gendf_library, (str, Path)):
-            detected = detect_energy_structure(gendf_library)
-            gendf_library = GENDFLibrary(gendf_library, energy_structure=detected)
+            gendf_library = GENDFLibrary(gendf_library)
         elif not isinstance(gendf_library, _GENDF_TYPES):
             raise TypeError(
                 f"gendf_library must be a path or GENDFLibrary instance, "
