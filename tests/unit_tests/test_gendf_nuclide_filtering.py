@@ -28,6 +28,7 @@ class MockGENDFLibrary:
         self.energy_structure = 'CCFE-709'
         # CCFE-709 has 710 energy boundaries (709 groups)
         self.energy_bounds = np.logspace(-5, np.log10(2e7), 710)
+        self.n_groups = 709
 
     def available_nuclides_set(self):
         return self._available
@@ -36,8 +37,14 @@ class MockGENDFLibrary:
         """Return mock cross-section data."""
         if nuclide not in self._available:
             raise KeyError(f"Nuclide {nuclide} not in GENDF library")
-        # Return 709 group values (for CCFE-709)
         return np.ones(709) * 1.0  # 1 barn for all groups
+
+    def get_all_xs(self, nuclide):
+        """Return all reactions for a nuclide."""
+        if nuclide not in self._available:
+            raise KeyError(f"Nuclide {nuclide} not in GENDF library")
+        # MT 102 = (n,gamma), MT 18 = fission
+        return {102: np.ones(709) * 1.0, 18: np.ones(709) * 1.0}
 
 
 class MockChain:

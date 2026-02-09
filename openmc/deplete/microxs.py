@@ -338,10 +338,12 @@ def get_gendfxs_and_flux(
         reactions = chain.reactions
 
     # Get nuclides from chain, filtered to those with GENDF data
+    available_nuclides = gendf_library.available_nuclides_set()
     if not nuclides:
-        available_nuclides = gendf_library.available_nuclides_set()
         nuclides = [nuc.name for nuc in chain.nuclides
                     if nuc.name in available_nuclides]
+    else:
+        nuclides = [nuc for nuc in nuclides if nuc in available_nuclides]
 
     # Set up the flux tallies
     energy_filter = openmc.EnergyFilter(energies)
@@ -409,14 +411,23 @@ def get_gendfxs_and_flux(
     # Create list where each item corresponds to one domain
     fluxes = list(flux.squeeze((1, 2)))
 
-    # Generate microscopic cross sections using GENDF library
-    micros = [MicroXS.from_multigroup_flux_with_gendf(
-        multigroup_flux=flux_i,
-        gendf_library=gendf_library,
-        chain_file=chain_file,
-        nuclides=nuclides,
-        reactions=reactions
-    ) for flux_i in fluxes]
+    # Build sparse XS table once (GENDF XS are domain-independent)
+    mts = [REACTION_MT[name] for name in reactions]
+    table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
+
+    # Collapse per domain
+    micros = []
+    for flux_i in fluxes:
+        flux_arr = np.asarray(flux_i, dtype=float)
+        flux_sum = flux_arr.sum()
+        if flux_sum == 0.0:
+            micros.append(MicroXS(
+                np.zeros((len(nuclides), len(reactions), 1)),
+                nuclides, reactions))
+            continue
+        collapsed = table.collapse(flux_arr / flux_sum)
+        micros.append(MicroXS(collapsed[:, :, np.newaxis],
+                               nuclides, reactions))
 
     # Reset tallies
     model.tallies = original_tallies
@@ -746,34 +757,17 @@ class MicroXS:
             reactions = chain.reactions
         mts = [REACTION_MT[name] for name in reactions]
 
-        # Create 3D array for microscopic cross sections
-        microxs_arr = np.zeros((len(nuclides), len(mts), 1))
-
         # If flux is zero, safely return zero cross sections
-        multigroup_flux = np.array(multigroup_flux)
+        multigroup_flux = np.asarray(multigroup_flux, dtype=float)
         if (flux_sum := multigroup_flux.sum()) == 0.0:
-            return cls(microxs_arr, nuclides, reactions)
+            return cls(np.zeros((len(nuclides), len(mts), 1)),
+                       nuclides, reactions)
 
-        # Normalize multigroup flux
-        multigroup_flux /= flux_sum
+        # Build sparse table and collapse with normalized flux
+        table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
+        collapsed = table.collapse(multigroup_flux / flux_sum)
 
-        # For each nuclide and reaction, get GENDF XS and compute flux-weighted value
-        for nuc_index, nuc in enumerate(nuclides):
-            for mt_index, mt in enumerate(mts):
-                try:
-                    # Get group-averaged cross-section from GENDF
-                    xs_group = gendf_library.get_xs(nuc, mt, energies)
-
-                    # Collapse cross-section
-                    # Since flux is normalized: <σ> = Σ σ_g * φ_g
-                    microxs_arr[nuc_index, mt_index, 0] = np.sum(xs_group * multigroup_flux)
-
-                except (KeyError, openmc.exceptions.OpenMCError):
-                    # Reaction not available in GENDF for this nuclide
-                    # Leave as zero (e.g., H1 doesn't have MT=16 n,2n)
-                    pass
-
-        return cls(microxs_arr, nuclides, reactions)
+        return cls(collapsed[:, :, np.newaxis], nuclides, reactions)
 
     @classmethod
     def from_csv(cls, csv_file, **kwargs):
