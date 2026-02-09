@@ -1047,97 +1047,126 @@ class _PythonGENDFLibrary:
                 f"Reaction MT={mt} not found for {nuclide_name} in GENDF library. "
                 f"Available reactions: {[mt for mf,mt in material.section_data.keys() if mf==3]}")
 
-        # Extract cross-section data
         xs_data = material.section_data[3, mt]
+        return self._extract_xs(xs_data, nuclide_name, mt, strict_alignment)
 
+    def get_all_xs(
+        self,
+        nuclide_name: str,
+        strict_alignment: bool = True
+    ) -> dict[int, np.ndarray]:
+        """Get all available cross-sections for a nuclide.
+
+        Loads the material once and extracts all MF=3 reactions in a single
+        pass. More efficient than calling :meth:`get_xs` per reaction.
+
+        Parameters
+        ----------
+        nuclide_name : str
+            Nuclide name in OpenMC format (e.g., 'U235', 'Ac225')
+        strict_alignment : bool, optional
+            If True (default), raise ValueError for threshold alignment
+            failures. See :meth:`get_xs` for details.
+
+        Returns
+        -------
+        dict of int to numpy.ndarray
+            Mapping of MT number to group-averaged cross-section array.
+            Each array has length n_groups.
+        """
+        material = self._load_material(nuclide_name)
+        result = {}
+        for (mf, mt), xs_data in material.section_data.items():
+            if mf != 3:
+                continue
+            if 'sigma' not in xs_data:
+                continue
+            result[mt] = self._extract_xs(
+                xs_data, nuclide_name, mt, strict_alignment)
+        return result
+
+    def _extract_xs(self, xs_data, nuclide_name, mt, strict_alignment):
+        """Extract and align XS from a single MF=3 section. Returns a copy."""
         if 'sigma' not in xs_data:
             raise ValueError(
                 f"No 'sigma' data in MF=3, MT={mt} for {nuclide_name}")
 
         sigma = xs_data['sigma']
-
-        # Handle threshold reactions that may have partial energy coverage
         gendf_energies = sigma.x
         gendf_xs = sigma.y
 
-        # Check if this is a full or partial energy range
+        # Full energy range
         if len(gendf_energies) == len(self.energy_bounds):
-            # Full energy range - use first n_groups values directly
-            # Return view instead of copy for performance (values are read-only in usage)
-            xs_values = gendf_xs[:self.n_groups]
+            return gendf_xs[:self.n_groups].copy()
+
+        # Partial energy range (threshold reaction)
+        xs_values = np.zeros(self.n_groups)
+
+        start_energy = gendf_energies[0]
+        end_energy = gendf_energies[-1]
+
+        # Try exact match for start boundary
+        start_matches = np.where(np.isclose(
+            self.energy_bounds, start_energy,
+            rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL))[0]
+
+        if len(start_matches) == 1:
+            start_idx = start_matches[0]
+        elif len(start_matches) > 1:
+            warnings.warn(
+                f"Multiple energy boundary matches for {nuclide_name} MT={mt} "
+                f"start energy {start_energy:.6e} eV. Using first match.",
+                UserWarning)
+            start_idx = start_matches[0]
         else:
-            # Partial energy range (threshold reaction)
-            # Find where the GENDF energies fit in the full energy structure
-            xs_values = np.zeros(self.n_groups)
+            # No exact match found
+            nearest_idx = np.argmin(np.abs(self.energy_bounds - start_energy))
+            nearest_energy = self.energy_bounds[nearest_idx]
+            relative_diff = abs(start_energy - nearest_energy) / max(start_energy, 1e-10)
 
-            start_energy = gendf_energies[0]
-            end_energy = gendf_energies[-1]
-
-            # Try exact match for start boundary
-            start_matches = np.where(np.isclose(
-                self.energy_bounds, start_energy,
-                rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL))[0]
-
-            if len(start_matches) == 1:
-                start_idx = start_matches[0]
-            elif len(start_matches) > 1:
-                # Ambiguous match - should not happen with unique energy bounds
-                warnings.warn(
-                    f"Multiple energy boundary matches for {nuclide_name} MT={mt} "
-                    f"start energy {start_energy:.6e} eV. Using first match.",
-                    UserWarning)
-                start_idx = start_matches[0]
+            if strict_alignment:
+                raise ValueError(
+                    f"Cannot align GENDF energy grid for {nuclide_name} MT={mt}. "
+                    f"GENDF starts at {start_energy:.6e} eV, "
+                    f"nearest library boundary is {nearest_energy:.6e} eV "
+                    f"(relative difference: {relative_diff:.2e}). "
+                    f"This may indicate incompatible energy structures. "
+                    f"Set strict_alignment=False to use nearest-group alignment.")
             else:
-                # No exact match found
-                nearest_idx = np.argmin(np.abs(self.energy_bounds - start_energy))
-                nearest_energy = self.energy_bounds[nearest_idx]
-                relative_diff = abs(start_energy - nearest_energy) / max(start_energy, 1e-10)
+                warnings.warn(
+                    f"Energy alignment uncertainty for {nuclide_name} MT={mt}: "
+                    f"GENDF starts at {start_energy:.6e} eV, "
+                    f"using nearest boundary {nearest_energy:.6e} eV "
+                    f"(relative difference: {relative_diff:.2e}). "
+                    f"Cross-section placement may be off by one energy group.",
+                    UserWarning)
+                start_idx = nearest_idx
 
+        # Calculate number of GENDF groups and end index
+        n_gendf_groups = len(gendf_energies) - 1
+        end_idx = min(start_idx + n_gendf_groups, self.n_groups)
+
+        # Validate end boundary (sanity check for contiguous data)
+        if end_idx < self.n_groups:
+            expected_end = self.energy_bounds[end_idx]
+            end_rtol = GENDF_RTOL_MATCH * 10  # 1e-5 for end boundary
+            if not np.isclose(expected_end, end_energy, rtol=end_rtol, atol=GENDF_ATOL):
+                relative_diff_end = abs(end_energy - expected_end) / max(end_energy, 1e-10)
                 if strict_alignment:
                     raise ValueError(
-                        f"Cannot align GENDF energy grid for {nuclide_name} MT={mt}. "
-                        f"GENDF starts at {start_energy:.6e} eV, "
-                        f"nearest library boundary is {nearest_energy:.6e} eV "
-                        f"(relative difference: {relative_diff:.2e}). "
-                        f"This may indicate incompatible energy structures. "
-                        f"Set strict_alignment=False to use nearest-group alignment.")
+                        f"GENDF energy range for {nuclide_name} MT={mt} does not "
+                        f"align with library structure. End energy mismatch: "
+                        f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
+                        f"(relative difference: {relative_diff_end:.2e})")
                 else:
                     warnings.warn(
-                        f"Energy alignment uncertainty for {nuclide_name} MT={mt}: "
-                        f"GENDF starts at {start_energy:.6e} eV, "
-                        f"using nearest boundary {nearest_energy:.6e} eV "
-                        f"(relative difference: {relative_diff:.2e}). "
-                        f"Cross-section placement may be off by one energy group.",
+                        f"End energy mismatch for {nuclide_name} MT={mt}: "
+                        f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
+                        f"(relative difference: {relative_diff_end:.2e})",
                         UserWarning)
-                    start_idx = nearest_idx
 
-            # Calculate number of GENDF groups and end index
-            n_gendf_groups = len(gendf_energies) - 1
-            end_idx = min(start_idx + n_gendf_groups, self.n_groups)
-
-            # Validate end boundary also matches (sanity check for contiguous data)
-            if end_idx < self.n_groups:
-                expected_end = self.energy_bounds[end_idx]
-                end_rtol = GENDF_RTOL_MATCH * 10  # 1e-5 for end boundary sanity check
-                if not np.isclose(expected_end, end_energy, rtol=end_rtol, atol=GENDF_ATOL):
-                    relative_diff_end = abs(end_energy - expected_end) / max(end_energy, 1e-10)
-                    if strict_alignment:
-                        raise ValueError(
-                            f"GENDF energy range for {nuclide_name} MT={mt} does not "
-                            f"align with library structure. End energy mismatch: "
-                            f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
-                            f"(relative difference: {relative_diff_end:.2e})")
-                    else:
-                        warnings.warn(
-                            f"End energy mismatch for {nuclide_name} MT={mt}: "
-                            f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
-                            f"(relative difference: {relative_diff_end:.2e})",
-                            UserWarning)
-
-            # Fill in the cross-section values for the available energy range
-            n_values = min(end_idx - start_idx, len(gendf_xs))
-            xs_values[start_idx:start_idx + n_values] = gendf_xs[:n_values]
-
+        n_values = min(end_idx - start_idx, len(gendf_xs))
+        xs_values[start_idx:start_idx + n_values] = gendf_xs[:n_values]
         return xs_values
 
     def has_nuclide(self, nuclide_name: str) -> bool:
