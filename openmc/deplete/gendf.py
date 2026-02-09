@@ -484,6 +484,9 @@ class _PythonGENDFLibrary:
             n_nuclides = len(self.decay_lookup)
             n_states = sum(len(states) for states in self.decay_lookup.values())
 
+        # Skip redundant energy validation after first successful check
+        self._energy_validated = False
+
         # Cache for loaded ENDF materials
         # Key: nuclide name (OpenMC format), Value: endf.Material object OR dict
         self._material_cache = {}
@@ -984,7 +987,7 @@ class _PythonGENDFLibrary:
         self,
         nuclide_name: str,
         mt: int,
-        energy_bounds: np.ndarray,
+        energy_bounds: Optional[np.ndarray] = None,
         strict_alignment: bool = True
     ) -> np.ndarray:
         """Get group-averaged cross-section for a nuclide and reaction.
@@ -995,8 +998,9 @@ class _PythonGENDFLibrary:
             Nuclide name in OpenMC format (e.g., 'U235', 'Ac225')
         mt : int
             ENDF MT number for the reaction
-        energy_bounds : numpy.ndarray
-            Energy group boundaries in eV. Must match the library's energy structure.
+        energy_bounds : numpy.ndarray, optional
+            Energy group boundaries in eV. If None, uses the library's
+            energy structure. If provided, must match the library's structure.
         strict_alignment : bool, optional
             If True (default), raise ValueError when GENDF energy grid for
             threshold reactions cannot be exactly aligned with library energy
@@ -1024,13 +1028,15 @@ class _PythonGENDFLibrary:
         only contain data above the threshold. The start and end energies must
         align exactly with library group boundaries for accurate placement.
         """
-        # Validate energy bounds
-        # May need to relax GENDF_RTOL_MATCH if too strict for some GENDF files
-        if not np.allclose(energy_bounds, self.energy_bounds,
-                          rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL):
-            raise ValueError(
-                f"Provided energy bounds do not match library energy structure "
-                f"'{self.energy_structure}'")
+        if energy_bounds is None:
+            energy_bounds = self.energy_bounds
+        elif not self._energy_validated:
+            if not np.allclose(energy_bounds, self.energy_bounds,
+                              rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL):
+                raise ValueError(
+                    f"Provided energy bounds do not match library energy "
+                    f"structure '{self.energy_structure}'")
+            self._energy_validated = True
 
         # Load material
         material = self._load_material(nuclide_name)
