@@ -6,6 +6,7 @@ IndependentOperator class for depletion.
 
 from __future__ import annotations
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
@@ -25,7 +26,7 @@ from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
 from ..utility_funcs import h5py_file_or_group
 import openmc.lib
 from openmc.mpi import comm
-from .gendf import GENDFLibrary, _PythonGENDFLibrary, _CppGENDFLibrary, detect_energy_structure
+from .gendf import GENDFLibrary, _PythonGENDFLibrary, _CppGENDFLibrary
 
 # Build tuple of valid GENDF backend types for isinstance checks
 _GENDF_TYPES = (_PythonGENDFLibrary,)
@@ -250,7 +251,7 @@ def get_microxs_and_flux(
     return fluxes_with_energy, micros
 
 
-def get_gendf_and_flux(
+def get_gendfxs_and_flux(
     model: openmc.Model,
     domains: DomainTypes,
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
@@ -319,8 +320,7 @@ def get_gendf_and_flux(
     """
     # Handle GENDF library input
     if isinstance(gendf_library, (str, Path)):
-        detected = detect_energy_structure(gendf_library)
-        gendf_library = GENDFLibrary(gendf_library, energy_structure=detected)
+        gendf_library = GENDFLibrary(gendf_library)
     elif not isinstance(gendf_library, _GENDF_TYPES):
         raise TypeError(
             f"gendf_library must be a path or GENDFLibrary instance, "
@@ -338,10 +338,12 @@ def get_gendf_and_flux(
         reactions = chain.reactions
 
     # Get nuclides from chain, filtered to those with GENDF data
+    available_nuclides = gendf_library.available_nuclides_set()
     if not nuclides:
-        available_nuclides = gendf_library.available_nuclides_set()
         nuclides = [nuc.name for nuc in chain.nuclides
                     if nuc.name in available_nuclides]
+    else:
+        nuclides = [nuc for nuc in nuclides if nuc in available_nuclides]
 
     # Set up the flux tallies
     energy_filter = openmc.EnergyFilter(energies)
@@ -409,14 +411,23 @@ def get_gendf_and_flux(
     # Create list where each item corresponds to one domain
     fluxes = list(flux.squeeze((1, 2)))
 
-    # Generate microscopic cross sections using GENDF library
-    micros = [MicroXS.from_multigroup_flux_with_gendf(
-        multigroup_flux=flux_i,
-        gendf_library=gendf_library,
-        chain_file=chain_file,
-        nuclides=nuclides,
-        reactions=reactions
-    ) for flux_i in fluxes]
+    # Build sparse XS table once (GENDF XS are domain-independent)
+    mts = [REACTION_MT[name] for name in reactions]
+    table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
+
+    # Collapse per domain
+    micros = []
+    for flux_i in fluxes:
+        flux_arr = np.asarray(flux_i, dtype=float)
+        flux_sum = flux_arr.sum()
+        if flux_sum == 0.0:
+            micros.append(MicroXS(
+                np.zeros((len(nuclides), len(reactions), 1)),
+                nuclides, reactions))
+            continue
+        collapsed = table.collapse(flux_arr / flux_sum)
+        micros.append(MicroXS(collapsed[:, :, np.newaxis],
+                               nuclides, reactions))
 
     # Reset tallies
     model.tallies = original_tallies
@@ -424,6 +435,94 @@ def get_gendf_and_flux(
     # Package flux with energy information for isomeric branching
     fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
     return fluxes_with_energy, micros
+
+
+@dataclass
+class _SparseXSTable:
+    """Sparse storage of GENDF cross-sections for vectorized flux collapse.
+
+    Stores only non-zero (nuclide, reaction) pairs. xs_matrix has shape
+    (nnz, n_groups); nuc_indices and rxn_indices map rows to positions
+    in the dense (n_nuclides, n_reactions) result.
+    """
+    nuclides: list[str]
+    reactions: list[str]
+    n_groups: int
+    xs_matrix: np.ndarray
+    nuc_indices: np.ndarray
+    rxn_indices: np.ndarray
+
+    def collapse(self, phi_norm: np.ndarray) -> np.ndarray:
+        """Collapse to one-group XS. phi_norm must sum to 1."""
+        collapsed_sparse = self.xs_matrix @ phi_norm
+        result = np.zeros((len(self.nuclides), len(self.reactions)))
+        result[self.nuc_indices, self.rxn_indices] = collapsed_sparse
+        return result
+
+
+def _build_sparse_xs_table(
+    gendf_library,
+    nuclides: list[str],
+    reactions: list[str],
+    mts: list[int]
+) -> _SparseXSTable:
+    """Build a sparse XS table from a GENDF library.
+
+    Parameters
+    ----------
+    gendf_library : _PythonGENDFLibrary or _CppGENDFLibrary
+        GENDF library instance
+    nuclides : list of str
+        Nuclide names to include
+    reactions : list of str
+        Reaction names (parallel to mts)
+    mts : list of int
+        MT numbers corresponding to reactions
+
+    Returns
+    -------
+    _SparseXSTable
+        Sparse table ready for vectorized collapse
+    """
+    if len(reactions) != len(mts):
+        raise ValueError(
+            f"reactions ({len(reactions)}) and mts ({len(mts)}) "
+            f"must have same length")
+
+    n_groups = gendf_library.n_groups
+    rows = []
+    nuc_idx_list = []
+    rxn_idx_list = []
+
+    mt_to_rxn_idx = {mt: i for i, mt in enumerate(mts)}
+    is_cpp = (_CppGENDFLibrary is not None
+              and isinstance(gendf_library, _CppGENDFLibrary))
+
+    for nuc_idx, nuc in enumerate(nuclides):
+        if is_cpp:
+            all_xs = gendf_library.get_all_xs(nuc, mts=mts)
+        else:
+            all_xs = gendf_library.get_all_xs(nuc)
+        for mt, xs_arr in all_xs.items():
+            if mt not in mt_to_rxn_idx:
+                continue
+            rows.append(xs_arr)
+            nuc_idx_list.append(nuc_idx)
+            rxn_idx_list.append(mt_to_rxn_idx[mt])
+
+    if rows:
+        xs_matrix = np.vstack(rows)
+    else:
+        xs_matrix = np.empty((0, n_groups))
+
+    return _SparseXSTable(
+        nuclides=nuclides,
+        reactions=reactions,
+        n_groups=n_groups,
+        xs_matrix=xs_matrix,
+        nuc_indices=np.array(nuc_idx_list, dtype=np.int32),
+        rxn_indices=np.array(rxn_idx_list, dtype=np.int32),
+    )
 
 
 class MicroXS:
@@ -625,8 +724,7 @@ class MicroXS:
         """
         # Handle GENDF library input
         if isinstance(gendf_library, (str, Path)):
-            detected = detect_energy_structure(gendf_library)
-            gendf_library = GENDFLibrary(gendf_library, energy_structure=detected)
+            gendf_library = GENDFLibrary(gendf_library)
         elif not isinstance(gendf_library, _GENDF_TYPES):
             raise TypeError(
                 f"gendf_library must be a path or GENDFLibrary instance, "
@@ -659,34 +757,17 @@ class MicroXS:
             reactions = chain.reactions
         mts = [REACTION_MT[name] for name in reactions]
 
-        # Create 3D array for microscopic cross sections
-        microxs_arr = np.zeros((len(nuclides), len(mts), 1))
-
         # If flux is zero, safely return zero cross sections
-        multigroup_flux = np.array(multigroup_flux)
+        multigroup_flux = np.asarray(multigroup_flux, dtype=float)
         if (flux_sum := multigroup_flux.sum()) == 0.0:
-            return cls(microxs_arr, nuclides, reactions)
+            return cls(np.zeros((len(nuclides), len(mts), 1)),
+                       nuclides, reactions)
 
-        # Normalize multigroup flux
-        multigroup_flux /= flux_sum
+        # Build sparse table and collapse with normalized flux
+        table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
+        collapsed = table.collapse(multigroup_flux / flux_sum)
 
-        # For each nuclide and reaction, get GENDF XS and compute flux-weighted value
-        for nuc_index, nuc in enumerate(nuclides):
-            for mt_index, mt in enumerate(mts):
-                try:
-                    # Get group-averaged cross-section from GENDF
-                    xs_group = gendf_library.get_xs(nuc, mt, energies)
-
-                    # Collapse cross-section
-                    # Since flux is normalized: <σ> = Σ σ_g * φ_g
-                    microxs_arr[nuc_index, mt_index, 0] = np.sum(xs_group * multigroup_flux)
-
-                except (KeyError, openmc.exceptions.OpenMCError):
-                    # Reaction not available in GENDF for this nuclide
-                    # Leave as zero (e.g., H1 doesn't have MT=16 n,2n)
-                    pass
-
-        return cls(microxs_arr, nuclides, reactions)
+        return cls(collapsed[:, :, np.newaxis], nuclides, reactions)
 
     @classmethod
     def from_csv(cls, csv_file, **kwargs):

@@ -11,6 +11,7 @@ import numpy as np
 
 from . import _dll
 from .error import _error_handler
+from openmc.exceptions import OpenMCError
 
 
 # =============================================================================
@@ -154,6 +155,7 @@ class GENDFLibrary:
         """
         # Convert inputs
         self._energy_bounds = np.asarray(energy_bounds, dtype=np.float64)
+        self._energy_structure = energy_structure_name
         n_bounds = len(self._energy_bounds)
 
         # Prepare C arrays
@@ -226,6 +228,16 @@ class GENDFLibrary:
             Energy boundaries array (length n_groups + 1)
         """
         return self.energy_bounds
+
+    @property
+    def energy_structure(self) -> Optional[str]:
+        """Name of the energy group structure (e.g., 'CCFE-709', 'UKAEA-1102')."""
+        return self._energy_structure
+
+    @property
+    def decay_lookup(self):
+        """C++ backend does not support decay file lookup."""
+        return None
 
     def has_nuclide(self, nuclide: str) -> bool:
         """
@@ -379,6 +391,36 @@ class GENDFLibrary:
         _dll.openmc_gendf_free_xs(xs_ptr)
 
         return xs_array
+
+    def get_all_xs(self, nuclide: str,
+                   mts: Optional[list[int]] = None) -> dict[int, np.ndarray]:
+        """Get cross-sections for all requested reactions for a nuclide.
+
+        Parameters
+        ----------
+        nuclide : str
+            Nuclide name (e.g., 'U235', 'Pu239')
+        mts : list of int, optional
+            MT numbers to retrieve. If None, raises ValueError (C++ backend
+            cannot discover available reactions).
+
+        Returns
+        -------
+        dict of int to numpy.ndarray
+            Mapping of MT number to cross-section array. MTs not found
+            in the library are silently skipped.
+        """
+        if mts is None:
+            raise ValueError(
+                "C++ backend requires explicit mts list; cannot discover "
+                "available reactions. Use Python backend or pass mts.")
+        result = {}
+        for mt in mts:
+            try:
+                result[mt] = self.get_xs(nuclide, mt)
+            except OpenMCError:
+                pass
+        return result
 
     def __repr__(self):
         return (f"GENDFLibrary(lib_id={self._lib_id}, "

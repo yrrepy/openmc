@@ -317,9 +317,7 @@ def test_gendf_library_with_elis_mapping(jeff33_gendf_path, jeff33_decay_path):
     # Create library with ELIS mapping
     lib = GENDFLibrary(
         jeff33_gendf_path,
-        energy_structure='CCFE-709',
         decay_file=jeff33_decay_path,
-        backend='python'
     )
 
     # Verify decay_lookup is populated
@@ -331,13 +329,7 @@ def test_library_without_decay_file(jeff33_gendf_path):
     """Test that GENDFLibrary works without decay_file but has no decay_lookup."""
     from openmc.deplete.gendf import GENDFLibrary
 
-    # decay_file is optional - library works without it but can't do isomeric mapping
-    lib = GENDFLibrary(
-        jeff33_gendf_path,
-        energy_structure='CCFE-709',
-        backend='python'
-        # decay_file not provided -> decay_lookup will be None
-    )
+    lib = GENDFLibrary(jeff33_gendf_path)
 
     # Without decay_file, decay_lookup is None
     assert lib.decay_lookup is None
@@ -347,12 +339,9 @@ def test_library_with_decay_file_works(jeff33_gendf_path, jeff33_decay_path):
     """Test that GENDFLibrary works with decay_file."""
     from openmc.deplete.gendf import GENDFLibrary
 
-    # Create library with decay_file (required)
     lib = GENDFLibrary(
         jeff33_gendf_path,
-        energy_structure='CCFE-709',
         decay_file=jeff33_decay_path,
-        backend='python'
     )
 
     # decay_lookup should be populated

@@ -23,7 +23,6 @@ from .microxs import MicroXS
 from .results import Results
 from .helpers import (ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper,
                       IsomericBranchingHelper)
-from . import get_energy_structure_name
 
 
 class IndependentOperator(OpenMCOperator):
@@ -185,7 +184,6 @@ class IndependentOperator(OpenMCOperator):
             else:
                 self._flux_with_energy.append((flux_item, None))
 
-
         self.fluxes = fluxes
         super().__init__(
             materials=materials,
@@ -197,8 +195,18 @@ class IndependentOperator(OpenMCOperator):
             reduce_chain_level=reduce_chain_level,
             keep_isomeric_siblings=keep_isomeric_siblings)
 
+        # Filter fluxes, cross sections, and flux-with-energy to local
+        # materials only (MPI RAM savings: O(all_mats) -> O(local_mats))
+        if comm.size > 1:
+            local_indices = [self._mat_index_map[m] for m in self.local_mats]
+            self.fluxes = [self.fluxes[i] for i in local_indices]
+            self.cross_sections = [self.cross_sections[i] for i in local_indices]
+            self._flux_with_energy = [self._flux_with_energy[i] for i in local_indices]
+            self._mat_index_map = {
+                lm: i for i, lm in enumerate(self.local_mats)}
+
         # Store parameters for isomeric branching setup
-        self._require_isomeric_branching = require_isomeric_branching # require_isomeric_branching, maybe can be wholly removed
+        self._require_isomeric_branching = require_isomeric_branching
         self._gendf_library = gendf_library
 
         # Setup isomeric branching after initialization
@@ -374,6 +382,13 @@ class IndependentOperator(OpenMCOperator):
                 )
                 return True  # Signal to return early
 
+        if self._gendf_library is None:
+            if _handle_issue(
+                "Isomeric branching data is present in chain but no GENDF "
+                "library was provided."
+            ):
+                return
+
         # Check flux spectra and energy bins
         if len(self.fluxes) == 0 or self._energy_bins is None or len(self._energy_bins) == 0:
             if _handle_issue(
@@ -383,27 +398,9 @@ class IndependentOperator(OpenMCOperator):
             ):
                 return
 
-        # Detect energy structure from first material with flux data
-        energy_structure = None
-        for flux_spectrum, energy in self._flux_with_energy:
-            if energy is not None and isinstance(flux_spectrum, np.ndarray):
-                n_groups = len(flux_spectrum)
-                energy_structure = get_energy_structure_name(n_groups)
-                if energy_structure is not None:
-                    break
-
-        if energy_structure is None:
-            if _handle_issue(
-                "Could not determine energy structure from flux spectra. "
-                "Isomeric branching requires CCFE-709 (709 groups) or "
-                "UKAEA-1102 (1102 groups) energy structure."
-            ):
-                return
-
         helper = IsomericBranchingHelper(
             self.chain,
             self._gendf_library,
-            energy_structure=energy_structure,            
         )
         self._isomeric_branching = []
 
@@ -413,8 +410,9 @@ class IndependentOperator(OpenMCOperator):
             if energy is None or not isinstance(flux_spectrum, np.ndarray):
                 raise RuntimeError(
                     f"Material {i} is missing flux spectrum or energy information. "
-                    f"All materials must have flux spectra with {energy_structure} "
-                    f"energy structure when using energy-dependent isomeric branching."
+                    f"All materials must have flux spectra with "
+                    f"{helper.energy_structure} energy structure when using "
+                    f"energy-dependent isomeric branching."
                 )
 
             # Calculate σ×φ-weighted branching
@@ -591,36 +589,14 @@ class IndependentOperator(OpenMCOperator):
         return copy.deepcopy(op_result)
 
     def _update_materials(self):
-        """Updates material compositions in OpenMC on all processes."""
-
-        for rank in range(comm.size):
-            number_i = comm.bcast(self.number, root=rank)
-
-            for mat in number_i.materials:
-                nuclides = []
-                densities = []
-                for nuc in number_i.nuclides:
-                    if nuc in self.nuclides_with_data:
-                        val = 1.0e-24 * number_i.get_atom_density(mat, nuc)
-
-                        # If nuclide is zero, do not add to the problem.
-                        if val > 0.0:
-                            if self.round_number:
-                                val_magnitude = np.floor(np.log10(val))
-                                val_scaled = val / 10**val_magnitude
-                                val_round = round(val_scaled, 8)
-
-                                val = val_round * 10**val_magnitude
-
-                            nuclides.append(nuc)
-                            densities.append(val)
-                        else:
-                            # Only output warnings if values are significantly
-                            # negative. CRAM does not guarantee positive
-                            # values.
-                            if val < -1.0e-21:
-                                print(f'WARNING: nuclide {nuc} in material'
-                                      f'{mat} is negative (density = {val}'
-
-                                      ' atom/b-cm)')
-                            number_i[mat, nuc] = 0.0
+        """Zero out negative nuclide densities on local materials."""
+        for mat in self.number.materials:
+            for nuc in self.number.nuclides:
+                if nuc in self.nuclides_with_data:
+                    val = 1.0e-24 * self.number.get_atom_density(mat, nuc)
+                    if val < 0.0:
+                        if val < -1.0e-21:
+                            print(f'WARNING: nuclide {nuc} in material '
+                                  f'{mat} is negative (density = {val}'
+                                  ' atom/b-cm)')
+                        self.number[mat, nuc] = 0.0

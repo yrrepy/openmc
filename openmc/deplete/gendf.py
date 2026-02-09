@@ -360,12 +360,9 @@ class _PythonGENDFLibrary:
     ----------
     library_path : path-like
         Path to directory containing GENDF .asc files
-    energy_structure : str, optional
-        Name of the energy group structure. Must be one of 'CCFE-709' or
-        'UKAEA-1102'. Default is 'UKAEA-1102'.
     validate_energy_grid : bool, optional
         If True, validate that each GENDF file's energy grid matches the
-        specified energy structure. Default is True.
+        auto-detected energy structure. Default is True.
     decay_file : path-like, optional
         Path to ENDF decay library for ELIS-based isomeric state mapping.
         Can be a directory of decay files or a single concatenated file.
@@ -438,17 +435,15 @@ class _PythonGENDFLibrary:
     def __init__(
         self,
         library_path: PathLike,
-        energy_structure: str = 'UKAEA-1102',
         validate_energy_grid: bool = True,
         decay_file: Optional[PathLike] = None,
         elis_rtol: float = ELIS_RTOL,
         elis_atol: float = ELIS_ATOL,
         skip_zero_elis_metastables: bool = True,
-        mapping_mode: str = 'elis'
+        mapping_mode: str = 'elis',
+        _energy_structure: Optional[str] = None
     ):
-        # Validate inputs
         check_type('library_path', library_path, (str, Path))
-        check_value('energy_structure', energy_structure, SUPPORTED_GROUP_STRUCTURES)
         check_type('validate_energy_grid', validate_energy_grid, bool)
         check_type('elis_rtol', elis_rtol, float)
         check_type('elis_atol', elis_atol, float)
@@ -462,6 +457,11 @@ class _PythonGENDFLibrary:
         if not self.library_path.is_dir():
             raise ValueError(
                 f"GENDF library path must be a directory: {self.library_path}")
+
+        if _energy_structure is not None:
+            energy_structure = _energy_structure
+        else:
+            energy_structure = detect_energy_structure(self.library_path)
 
         self.energy_structure = energy_structure
         self.energy_bounds = GROUP_STRUCTURES[energy_structure].copy()
@@ -483,6 +483,9 @@ class _PythonGENDFLibrary:
             self.decay_lookup = parse_decay_isomeric_levels(self._decay_file)
             n_nuclides = len(self.decay_lookup)
             n_states = sum(len(states) for states in self.decay_lookup.values())
+
+        # Skip redundant energy validation after first successful check
+        self._energy_validated = False
 
         # Cache for loaded ENDF materials
         # Key: nuclide name (OpenMC format), Value: endf.Material object OR dict
@@ -984,7 +987,7 @@ class _PythonGENDFLibrary:
         self,
         nuclide_name: str,
         mt: int,
-        energy_bounds: np.ndarray,
+        energy_bounds: Optional[np.ndarray] = None,
         strict_alignment: bool = True
     ) -> np.ndarray:
         """Get group-averaged cross-section for a nuclide and reaction.
@@ -995,8 +998,9 @@ class _PythonGENDFLibrary:
             Nuclide name in OpenMC format (e.g., 'U235', 'Ac225')
         mt : int
             ENDF MT number for the reaction
-        energy_bounds : numpy.ndarray
-            Energy group boundaries in eV. Must match the library's energy structure.
+        energy_bounds : numpy.ndarray, optional
+            Energy group boundaries in eV. If None, uses the library's
+            energy structure. If provided, must match the library's structure.
         strict_alignment : bool, optional
             If True (default), raise ValueError when GENDF energy grid for
             threshold reactions cannot be exactly aligned with library energy
@@ -1024,13 +1028,15 @@ class _PythonGENDFLibrary:
         only contain data above the threshold. The start and end energies must
         align exactly with library group boundaries for accurate placement.
         """
-        # Validate energy bounds
-        # May need to relax GENDF_RTOL_MATCH if too strict for some GENDF files
-        if not np.allclose(energy_bounds, self.energy_bounds,
-                          rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL):
-            raise ValueError(
-                f"Provided energy bounds do not match library energy structure "
-                f"'{self.energy_structure}'")
+        if energy_bounds is None:
+            energy_bounds = self.energy_bounds
+        elif not self._energy_validated:
+            if not np.allclose(energy_bounds, self.energy_bounds,
+                              rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL):
+                raise ValueError(
+                    f"Provided energy bounds do not match library energy "
+                    f"structure '{self.energy_structure}'")
+            self._energy_validated = True
 
         # Load material
         material = self._load_material(nuclide_name)
@@ -1041,97 +1047,126 @@ class _PythonGENDFLibrary:
                 f"Reaction MT={mt} not found for {nuclide_name} in GENDF library. "
                 f"Available reactions: {[mt for mf,mt in material.section_data.keys() if mf==3]}")
 
-        # Extract cross-section data
         xs_data = material.section_data[3, mt]
+        return self._extract_xs(xs_data, nuclide_name, mt, strict_alignment)
 
+    def get_all_xs(
+        self,
+        nuclide_name: str,
+        strict_alignment: bool = True
+    ) -> dict[int, np.ndarray]:
+        """Get all available cross-sections for a nuclide.
+
+        Loads the material once and extracts all MF=3 reactions in a single
+        pass. More efficient than calling :meth:`get_xs` per reaction.
+
+        Parameters
+        ----------
+        nuclide_name : str
+            Nuclide name in OpenMC format (e.g., 'U235', 'Ac225')
+        strict_alignment : bool, optional
+            If True (default), raise ValueError for threshold alignment
+            failures. See :meth:`get_xs` for details.
+
+        Returns
+        -------
+        dict of int to numpy.ndarray
+            Mapping of MT number to group-averaged cross-section array.
+            Each array has length n_groups.
+        """
+        material = self._load_material(nuclide_name)
+        result = {}
+        for (mf, mt), xs_data in material.section_data.items():
+            if mf != 3:
+                continue
+            if 'sigma' not in xs_data:
+                continue
+            result[mt] = self._extract_xs(
+                xs_data, nuclide_name, mt, strict_alignment)
+        return result
+
+    def _extract_xs(self, xs_data, nuclide_name, mt, strict_alignment):
+        """Extract and align XS from a single MF=3 section. Returns a copy."""
         if 'sigma' not in xs_data:
             raise ValueError(
                 f"No 'sigma' data in MF=3, MT={mt} for {nuclide_name}")
 
         sigma = xs_data['sigma']
-
-        # Handle threshold reactions that may have partial energy coverage
         gendf_energies = sigma.x
         gendf_xs = sigma.y
 
-        # Check if this is a full or partial energy range
+        # Full energy range
         if len(gendf_energies) == len(self.energy_bounds):
-            # Full energy range - use first n_groups values directly
-            # Return view instead of copy for performance (values are read-only in usage)
-            xs_values = gendf_xs[:self.n_groups]
+            return gendf_xs[:self.n_groups].copy()
+
+        # Partial energy range (threshold reaction)
+        xs_values = np.zeros(self.n_groups)
+
+        start_energy = gendf_energies[0]
+        end_energy = gendf_energies[-1]
+
+        # Try exact match for start boundary
+        start_matches = np.where(np.isclose(
+            self.energy_bounds, start_energy,
+            rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL))[0]
+
+        if len(start_matches) == 1:
+            start_idx = start_matches[0]
+        elif len(start_matches) > 1:
+            warnings.warn(
+                f"Multiple energy boundary matches for {nuclide_name} MT={mt} "
+                f"start energy {start_energy:.6e} eV. Using first match.",
+                UserWarning)
+            start_idx = start_matches[0]
         else:
-            # Partial energy range (threshold reaction)
-            # Find where the GENDF energies fit in the full energy structure
-            xs_values = np.zeros(self.n_groups)
+            # No exact match found
+            nearest_idx = np.argmin(np.abs(self.energy_bounds - start_energy))
+            nearest_energy = self.energy_bounds[nearest_idx]
+            relative_diff = abs(start_energy - nearest_energy) / max(start_energy, 1e-10)
 
-            start_energy = gendf_energies[0]
-            end_energy = gendf_energies[-1]
-
-            # Try exact match for start boundary
-            start_matches = np.where(np.isclose(
-                self.energy_bounds, start_energy,
-                rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL))[0]
-
-            if len(start_matches) == 1:
-                start_idx = start_matches[0]
-            elif len(start_matches) > 1:
-                # Ambiguous match - should not happen with unique energy bounds
-                warnings.warn(
-                    f"Multiple energy boundary matches for {nuclide_name} MT={mt} "
-                    f"start energy {start_energy:.6e} eV. Using first match.",
-                    UserWarning)
-                start_idx = start_matches[0]
+            if strict_alignment:
+                raise ValueError(
+                    f"Cannot align GENDF energy grid for {nuclide_name} MT={mt}. "
+                    f"GENDF starts at {start_energy:.6e} eV, "
+                    f"nearest library boundary is {nearest_energy:.6e} eV "
+                    f"(relative difference: {relative_diff:.2e}). "
+                    f"This may indicate incompatible energy structures. "
+                    f"Set strict_alignment=False to use nearest-group alignment.")
             else:
-                # No exact match found
-                nearest_idx = np.argmin(np.abs(self.energy_bounds - start_energy))
-                nearest_energy = self.energy_bounds[nearest_idx]
-                relative_diff = abs(start_energy - nearest_energy) / max(start_energy, 1e-10)
+                warnings.warn(
+                    f"Energy alignment uncertainty for {nuclide_name} MT={mt}: "
+                    f"GENDF starts at {start_energy:.6e} eV, "
+                    f"using nearest boundary {nearest_energy:.6e} eV "
+                    f"(relative difference: {relative_diff:.2e}). "
+                    f"Cross-section placement may be off by one energy group.",
+                    UserWarning)
+                start_idx = nearest_idx
 
+        # Calculate number of GENDF groups and end index
+        n_gendf_groups = len(gendf_energies) - 1
+        end_idx = min(start_idx + n_gendf_groups, self.n_groups)
+
+        # Validate end boundary (sanity check for contiguous data)
+        if end_idx < self.n_groups:
+            expected_end = self.energy_bounds[end_idx]
+            end_rtol = GENDF_RTOL_MATCH * 10  # 1e-5 for end boundary
+            if not np.isclose(expected_end, end_energy, rtol=end_rtol, atol=GENDF_ATOL):
+                relative_diff_end = abs(end_energy - expected_end) / max(end_energy, 1e-10)
                 if strict_alignment:
                     raise ValueError(
-                        f"Cannot align GENDF energy grid for {nuclide_name} MT={mt}. "
-                        f"GENDF starts at {start_energy:.6e} eV, "
-                        f"nearest library boundary is {nearest_energy:.6e} eV "
-                        f"(relative difference: {relative_diff:.2e}). "
-                        f"This may indicate incompatible energy structures. "
-                        f"Set strict_alignment=False to use nearest-group alignment.")
+                        f"GENDF energy range for {nuclide_name} MT={mt} does not "
+                        f"align with library structure. End energy mismatch: "
+                        f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
+                        f"(relative difference: {relative_diff_end:.2e})")
                 else:
                     warnings.warn(
-                        f"Energy alignment uncertainty for {nuclide_name} MT={mt}: "
-                        f"GENDF starts at {start_energy:.6e} eV, "
-                        f"using nearest boundary {nearest_energy:.6e} eV "
-                        f"(relative difference: {relative_diff:.2e}). "
-                        f"Cross-section placement may be off by one energy group.",
+                        f"End energy mismatch for {nuclide_name} MT={mt}: "
+                        f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
+                        f"(relative difference: {relative_diff_end:.2e})",
                         UserWarning)
-                    start_idx = nearest_idx
 
-            # Calculate number of GENDF groups and end index
-            n_gendf_groups = len(gendf_energies) - 1
-            end_idx = min(start_idx + n_gendf_groups, self.n_groups)
-
-            # Validate end boundary also matches (sanity check for contiguous data)
-            if end_idx < self.n_groups:
-                expected_end = self.energy_bounds[end_idx]
-                end_rtol = GENDF_RTOL_MATCH * 10  # 1e-5 for end boundary sanity check
-                if not np.isclose(expected_end, end_energy, rtol=end_rtol, atol=GENDF_ATOL):
-                    relative_diff_end = abs(end_energy - expected_end) / max(end_energy, 1e-10)
-                    if strict_alignment:
-                        raise ValueError(
-                            f"GENDF energy range for {nuclide_name} MT={mt} does not "
-                            f"align with library structure. End energy mismatch: "
-                            f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
-                            f"(relative difference: {relative_diff_end:.2e})")
-                    else:
-                        warnings.warn(
-                            f"End energy mismatch for {nuclide_name} MT={mt}: "
-                            f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
-                            f"(relative difference: {relative_diff_end:.2e})",
-                            UserWarning)
-
-            # Fill in the cross-section values for the available energy range
-            n_values = min(end_idx - start_idx, len(gendf_xs))
-            xs_values[start_idx:start_idx + n_values] = gendf_xs[:n_values]
-
+        n_values = min(end_idx - start_idx, len(gendf_xs))
+        xs_values[start_idx:start_idx + n_values] = gendf_xs[:n_values]
         return xs_values
 
     def has_nuclide(self, nuclide_name: str) -> bool:
@@ -2320,9 +2355,7 @@ class _PythonGENDFLibrary:
 
 def GENDFLibrary(
     library_path: PathLike,
-    energy_structure: str = 'UKAEA-1102',
     validate_energy_grid: bool = True,
-    backend: str = 'auto',
     decay_file: Optional[PathLike] = None,
     elis_rtol: float = ELIS_RTOL,
     elis_atol: float = ELIS_ATOL,
@@ -2331,54 +2364,38 @@ def GENDFLibrary(
 ):
     """Create a GENDF cross-section library with automatic backend selection.
 
-    This factory function automatically selects the best available backend
-    for GENDF cross-section loading:
-    - **C++ backend**: Fast implementation (2-5x speedup) if OpenMC was built
-      with C++ GENDF support
-    - **Python backend**: Pure Python fallback implementation
+    Energy structure is auto-detected from the GENDF files. The backend
+    (C++ or Python) is selected automatically: C++ if available and no
+    decay_file is provided, otherwise Python.
 
     Parameters
     ----------
     library_path : path-like
         Path to directory containing GENDF .asc files
-    energy_structure : str, optional
-        Name of the energy group structure. Must be one of 'CCFE-709' or
-        'UKAEA-1102'. Default is 'UKAEA-1102'.
     validate_energy_grid : bool, optional
         If True, validate that each GENDF file's energy grid matches the
-        specified energy structure. Default is True. Only used with Python
+        detected energy structure. Default is True. Only used with Python
         backend.
-    backend : {'auto', 'cpp', 'python'}, optional
-        Backend selection:
-        - 'auto': Automatically use C++ if available, otherwise Python (default)
-        - 'cpp': Force C++ backend (raises error if not available)
-        - 'python': Force Python backend
     decay_file : path-like, optional
         Path to ENDF decay library for ELIS-based isomeric state mapping.
         Can be a directory of decay files or a single concatenated file.
         When provided, enables accurate mapping of GENDF MF=10 metastable
         products to OpenMC ``_m{n}`` naming based on excitation energy
         matching. **Highly recommended** for isomeric branching workflows.
-        Only used with Python backend.
     elis_rtol : float, optional
         Relative tolerance for ELIS matching (default: 0.01 = 1%).
-        Only used with Python backend when decay_file is provided.
     elis_atol : float, optional
         Absolute tolerance in eV for ELIS matching (default: 100.0 eV).
-        Only used with Python backend when decay_file is provided.
     skip_zero_elis_metastables : bool, optional
         If True, skip metastable states with ELIS=0 in decay library (likely
-        data errors). Default is True. Only used with Python backend when
-        decay_file is provided.
+        data errors). Default is True.
     mapping_mode : {'elis', 'lfs_order'}, optional
         Isomeric state mapping mode:
         - 'elis' (default): Use excitation energy (ELIS) matching between
           GENDF MF=10 products and decay library. Most accurate method.
         - 'lfs_order': Use FISPACT-like positional mapping where the 1st
           metastable LFS maps to _m1, 2nd to _m2, etc. Useful for validation
-          testing against FISPACT-II. **Warning**: LFS order may not match
-          LISO order for some nuclides (e.g., Ag116).
-        Only used with Python backend.
+          testing against FISPACT-II.
 
     Returns
     -------
@@ -2387,17 +2404,14 @@ def GENDFLibrary(
 
     Raises
     ------
-    ValueError
-        If requested backend is not available
     FileNotFoundError
         If library_path does not exist
     ValueError
-        If energy_structure is not supported
+        If energy structure cannot be detected from GENDF files
 
     Examples
     --------
-    >>> # Auto-select fastest backend (without ELIS mapping)
-    >>> lib = GENDFLibrary('/path/to/JEFF40-GENDF/', 'UKAEA-1102')
+    >>> lib = GENDFLibrary('/path/to/JEFF40-GENDF/')
     >>> xs = lib.get_xs('U235', 102, lib.energy_bounds)
     >>>
     >>> # With ELIS-based isomeric mapping (recommended for branching)
@@ -2405,49 +2419,6 @@ def GENDFLibrary(
     ...     '/path/to/JEFF40-GENDF/',
     ...     decay_file='/path/to/JEFF40-decay/'
     ... )
-    >>> branching = lib.get_branching_ratios('Ir191', 102)
-    >>> print(branching.products)  # ['Ir192', 'Ir192_m1', 'Ir192_m2']
-    >>>
-    >>> # Cross-library usage with relaxed tolerance
-    >>> lib = GENDFLibrary(
-    ...     '/path/to/TENDL2017-GENDF/',
-    ...     decay_file='/path/to/UKDD12_decay.dat',
-    ...     elis_rtol=0.10  # Allow 10% tolerance for cross-library mismatches
-    ... )
-    >>>
-    >>> # Force Python backend
-    >>> lib_py = GENDFLibrary('/path/to/JEFF40-GENDF/', backend='python')
-    >>>
-    >>> # Force C++ backend (error if not available)
-    >>> lib_cpp = GENDFLibrary('/path/to/JEFF40-GENDF/', backend='cpp')
-
-    Notes
-    -----
-    The C++ backend provides significant performance improvements:
-    - 2-5x faster GENDF file parsing
-    - Lower memory overhead
-    - Better caching performance
-
-    Both backends provide identical interfaces and results, so code using
-    GENDFLibrary does not need to change when switching backends.
-
-    **ELIS-Based Mapping** (Python backend only, when decay_file is provided):
-
-    Instead of assuming LFS order equals LISO order, the library uses excitation
-    energy (ELIS) matching:
-
-    1. For each GENDF MF=10 metastable product, calculate ELIS = QM - QI
-    2. Look up matching metastable state in decay library by ELIS
-    3. Use decay library's LISO value for ``_m{n}`` naming
-
-    This handles cases like Ir191(n,gamma)->Ir192 where GENDF uses LFS=3,15
-    but decay library correctly identifies these as LISO=1,2 (m1, m2).
-
-    .. versionadded:: 0.15.3
-        C++ backend and automatic selection
-
-    .. versionadded:: 0.15.3
-        ELIS-based isomeric state mapping (decay_file, elis_rtol, elis_atol)
 
     See Also
     --------
@@ -2455,48 +2426,19 @@ def GENDFLibrary(
     lookup_liso : Find LISO for given excitation energy
     DecayState : Data class for nuclear state information
     """
-    # Validate backend choice
-    if backend not in ('auto', 'cpp', 'python'):
+    library_path = Path(library_path)
+    if not library_path.exists():
+        raise FileNotFoundError(
+            f"GENDF library path does not exist: {library_path}")
+    if not library_path.is_dir():
         raise ValueError(
-            f"Invalid backend '{backend}'. Must be 'auto', 'cpp', or 'python'")
+            f"GENDF library path must be a directory: {library_path}")
 
-    # Validate mapping_mode
-    if mapping_mode not in ('elis', 'lfs_order'):
-        raise ValueError(
-            f"Invalid mapping_mode '{mapping_mode}'. Must be 'elis' or 'lfs_order'")
+    energy_structure = detect_energy_structure(library_path)
 
-    # decay_file is optional - only needed for isomeric branching (MF=10)
-    # Library can still be used for available_nuclides() and XS retrieval without it
+    use_cpp = _CppGENDFLibrary is not None and decay_file is None
 
-    # Determine which backend to use
-    use_cpp = False
-    if backend == 'cpp':
-        if _CppGENDFLibrary is None:
-            raise ValueError(
-                "C++ backend requested but not available. "
-                "Ensure OpenMC was built with C++ GENDF support.")
-        use_cpp = True
-    elif backend == 'auto':
-        # If decay_file is provided, force Python backend for ELIS mapping
-        # C++ backend doesn't support ELIS mapping yet
-        if decay_file is not None:
-            use_cpp = False
-        else:
-            use_cpp = _CppGENDFLibrary is not None
-    # else backend == 'python', use_cpp remains False
-
-    # Warn if C++ backend requested but isomeric mapping parameters provided
-    if use_cpp and decay_file is not None:
-        warnings.warn(
-            "C++ backend does not support isomeric state mapping (neither 'elis' "
-            "nor 'lfs_order' mode). decay_file and mapping_mode parameters will "
-            "be ignored. Use backend='python' to enable isomeric state mapping.",
-            UserWarning
-        )
-
-    # Create appropriate backend
     if use_cpp:
-        # Use C++ backend
         energy_bounds = GROUP_STRUCTURES[energy_structure]
         return _CppGENDFLibrary(
             str(library_path),
@@ -2504,16 +2446,15 @@ def GENDFLibrary(
             energy_structure
         )
     else:
-        # Use Python backend
         return _PythonGENDFLibrary(
             library_path,
-            energy_structure,
             validate_energy_grid,
             decay_file,
             elis_rtol,
             elis_atol,
             skip_zero_elis_metastables,
-            mapping_mode
+            mapping_mode,
+            _energy_structure=energy_structure
         )
 
 

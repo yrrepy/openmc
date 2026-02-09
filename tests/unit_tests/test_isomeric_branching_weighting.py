@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from unittest.mock import Mock, MagicMock
 
+from openmc.mgxs import GROUP_STRUCTURES
 from openmc.deplete.helpers import IsomericBranchingHelper
 from openmc.deplete.chain import Chain
 
@@ -34,7 +35,8 @@ def create_mock_chain_with_isomeric_data():
     return chain
 
 
-def create_mock_gendf_library(n_groups, energy_bins, in_range_mask=None):
+def create_mock_gendf_library(n_groups, energy_bins, in_range_mask=None,
+                              energy_structure='CCFE-709'):
     """Create a mock GENDF library for testing.
 
     Parameters
@@ -46,8 +48,13 @@ def create_mock_gendf_library(n_groups, energy_bins, in_range_mask=None):
     in_range_mask : numpy.ndarray, optional
         Boolean mask for groups with non-zero XS. If None, uses isomeric
         data energy range (1e5 to 1e7 eV).
+    energy_structure : str, optional
+        Energy structure name. Default is 'CCFE-709'.
     """
     mock_gendf = Mock()
+    mock_gendf.energy_structure = energy_structure
+    mock_gendf.energy_bounds = energy_bins.copy()
+    mock_gendf.n_groups = n_groups
 
     if in_range_mask is None:
         # Isomeric data energy range is 1e5 to 1e7 eV
@@ -71,7 +78,9 @@ def test_no_extrapolation_below_threshold():
     """Verify BR array is zero below isomeric data range."""
     chain = create_mock_chain_with_isomeric_data()
     mock_gendf = Mock()
-    helper = IsomericBranchingHelper(chain, mock_gendf, energy_structure='CCFE-709')
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = GROUP_STRUCTURES['CCFE-709'].copy()
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     # Create arrays simulating energy ranges
     n_groups = 10
@@ -95,7 +104,9 @@ def test_no_extrapolation_above_range():
     """Verify BR array is zero above isomeric data range."""
     chain = create_mock_chain_with_isomeric_data()
     mock_gendf = Mock()
-    helper = IsomericBranchingHelper(chain, mock_gendf, energy_structure='CCFE-709')
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = GROUP_STRUCTURES['CCFE-709'].copy()
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     n_groups = 10
     ratios = np.array([0.9, 0.8, 0.7])
@@ -116,7 +127,9 @@ def test_in_range_values_preserved():
     """Verify in-range BR values are correctly mapped."""
     chain = create_mock_chain_with_isomeric_data()
     mock_gendf = Mock()
-    helper = IsomericBranchingHelper(chain, mock_gendf, energy_structure='CCFE-709')
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = GROUP_STRUCTURES['CCFE-709'].copy()
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     n_groups = 5
     ratios = np.array([0.9, 0.8, 0.7])
@@ -143,14 +156,13 @@ def test_sigma_phi_weighting_basic():
     chain = create_mock_chain_with_isomeric_data()
 
     # Use CCFE-709 structure (709 groups)
-    from openmc.mgxs import GROUP_STRUCTURES
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709
 
     # Create mock GENDF library
     mock_gendf = create_mock_gendf_library(n_groups, energy_bins)
 
-    helper = IsomericBranchingHelper(chain, mock_gendf, energy_structure='CCFE-709')
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     # Create flux spectrum - uniform
     flux_spectrum = np.ones(n_groups)
@@ -172,7 +184,6 @@ def test_skip_when_nuclide_not_in_gendf():
     """Verify empty dict returned when nuclide not in GENDF library."""
     chain = create_mock_chain_with_isomeric_data()
 
-    from openmc.mgxs import GROUP_STRUCTURES
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709
 
@@ -180,9 +191,11 @@ def test_skip_when_nuclide_not_in_gendf():
 
     # GENDF library that raises KeyError for Ag109
     mock_gendf = Mock()
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = energy_bins.copy()
     mock_gendf.get_xs = Mock(side_effect=KeyError("Ag109 not found"))
 
-    helper = IsomericBranchingHelper(chain, mock_gendf, energy_structure='CCFE-709')
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     result = helper.weighted_branching_ratios(flux_spectrum, energy_bins)
 
@@ -196,7 +209,7 @@ def test_gendf_library_required():
 
     # gendf_library=None should raise ValueError at construction
     with pytest.raises(ValueError, match="gendf_library is required"):
-        IsomericBranchingHelper(chain, None, energy_structure='CCFE-709')
+        IsomericBranchingHelper(chain, None)
 
 
 def test_with_gendf_succeeds():
@@ -207,14 +220,13 @@ def test_with_gendf_succeeds():
     """
     chain = create_mock_chain_with_isomeric_data()
 
-    from openmc.mgxs import GROUP_STRUCTURES
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709
 
     # Create mock GENDF library
     mock_gendf = create_mock_gendf_library(n_groups, energy_bins)
 
-    helper = IsomericBranchingHelper(chain, mock_gendf, energy_structure='CCFE-709')
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     flux_spectrum = np.ones(n_groups)
 
@@ -241,7 +253,6 @@ def test_error_on_group_mismatch():
     """Verify ValueError raised when GENDF groups don't match flux."""
     chain = create_mock_chain_with_isomeric_data()
 
-    from openmc.mgxs import GROUP_STRUCTURES
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709
 
@@ -249,11 +260,11 @@ def test_error_on_group_mismatch():
 
     # GENDF library that returns wrong number of groups
     mock_gendf = Mock()
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = energy_bins.copy()
     mock_gendf.get_xs = Mock(return_value=np.ones(500))  # Wrong number!
 
-    helper = IsomericBranchingHelper(
-        chain, energy_structure='CCFE-709', gendf_library=mock_gendf
-    )
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     with pytest.raises(ValueError, match="group structure mismatch"):
         helper.weighted_branching_ratios(flux_spectrum, energy_bins)
@@ -263,7 +274,6 @@ def test_zero_weight_sum_returns_empty():
     """Verify empty dict when all reaction rate is below threshold."""
     chain = create_mock_chain_with_isomeric_data()
 
-    from openmc.mgxs import GROUP_STRUCTURES
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709
 
@@ -276,11 +286,11 @@ def test_zero_weight_sum_returns_empty():
     gendf_xs[650:] = 1.0  # Only fast XS
 
     mock_gendf = Mock()
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = energy_bins.copy()
     mock_gendf.get_xs = Mock(return_value=gendf_xs)
 
-    helper = IsomericBranchingHelper(
-        chain, energy_structure='CCFE-709', gendf_library=mock_gendf
-    )
+    helper = IsomericBranchingHelper(chain, mock_gendf)
 
     result = helper.weighted_branching_ratios(flux_spectrum, energy_bins)
 
@@ -338,9 +348,11 @@ def test_coupled_operator_isomeric_enabled_with_gendf():
 
     # Create minimal mock to test the methods
     mock_coupled = Mock(spec=CoupledOperator)
-    mock_coupled._gendf_library = Mock()  # Has GENDF library
+    mock_gendf = Mock()
+    mock_gendf.energy_structure = 'CCFE-709'
+    mock_gendf.energy_bounds = GROUP_STRUCTURES['CCFE-709'].copy()
+    mock_coupled._gendf_library = mock_gendf
     mock_coupled._rate_helper = Mock(spec=DirectWithFluxHelper)  # Correct helper type
-    mock_coupled._isomeric_energy_structure = 'CCFE-709'
     mock_coupled.chain = create_mock_chain_with_isomeric_data()
 
     # Should enable isomeric branching
@@ -369,9 +381,7 @@ def test_coupled_operator_calculate_isomeric_branching():
 
     # Create actual helper (not mock)
     chain = create_mock_chain_with_isomeric_data()
-    mock_coupled._isomeric_helper = IsomericBranchingHelper(
-        chain, energy_structure='CCFE-709', gendf_library=mock_gendf
-    )
+    mock_coupled._isomeric_helper = IsomericBranchingHelper(chain, mock_gendf)
 
     # Mock rate helper with flux spectrum
     mock_rate_helper = Mock(spec=DirectWithFluxHelper)
