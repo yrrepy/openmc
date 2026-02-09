@@ -6,6 +6,7 @@ IndependentOperator class for depletion.
 
 from __future__ import annotations
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
@@ -423,6 +424,94 @@ def get_gendfxs_and_flux(
     # Package flux with energy information for isomeric branching
     fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
     return fluxes_with_energy, micros
+
+
+@dataclass
+class _SparseXSTable:
+    """Sparse storage of GENDF cross-sections for vectorized flux collapse.
+
+    Stores only non-zero (nuclide, reaction) pairs. xs_matrix has shape
+    (nnz, n_groups); nuc_indices and rxn_indices map rows to positions
+    in the dense (n_nuclides, n_reactions) result.
+    """
+    nuclides: list[str]
+    reactions: list[str]
+    n_groups: int
+    xs_matrix: np.ndarray
+    nuc_indices: np.ndarray
+    rxn_indices: np.ndarray
+
+    def collapse(self, phi_norm: np.ndarray) -> np.ndarray:
+        """Collapse to one-group XS. phi_norm must sum to 1."""
+        collapsed_sparse = self.xs_matrix @ phi_norm
+        result = np.zeros((len(self.nuclides), len(self.reactions)))
+        result[self.nuc_indices, self.rxn_indices] = collapsed_sparse
+        return result
+
+
+def _build_sparse_xs_table(
+    gendf_library,
+    nuclides: list[str],
+    reactions: list[str],
+    mts: list[int]
+) -> _SparseXSTable:
+    """Build a sparse XS table from a GENDF library.
+
+    Parameters
+    ----------
+    gendf_library : _PythonGENDFLibrary or _CppGENDFLibrary
+        GENDF library instance
+    nuclides : list of str
+        Nuclide names to include
+    reactions : list of str
+        Reaction names (parallel to mts)
+    mts : list of int
+        MT numbers corresponding to reactions
+
+    Returns
+    -------
+    _SparseXSTable
+        Sparse table ready for vectorized collapse
+    """
+    if len(reactions) != len(mts):
+        raise ValueError(
+            f"reactions ({len(reactions)}) and mts ({len(mts)}) "
+            f"must have same length")
+
+    n_groups = gendf_library.n_groups
+    rows = []
+    nuc_idx_list = []
+    rxn_idx_list = []
+
+    mt_to_rxn_idx = {mt: i for i, mt in enumerate(mts)}
+    is_cpp = (_CppGENDFLibrary is not None
+              and isinstance(gendf_library, _CppGENDFLibrary))
+
+    for nuc_idx, nuc in enumerate(nuclides):
+        if is_cpp:
+            all_xs = gendf_library.get_all_xs(nuc, mts=mts)
+        else:
+            all_xs = gendf_library.get_all_xs(nuc)
+        for mt, xs_arr in all_xs.items():
+            if mt not in mt_to_rxn_idx:
+                continue
+            rows.append(xs_arr)
+            nuc_idx_list.append(nuc_idx)
+            rxn_idx_list.append(mt_to_rxn_idx[mt])
+
+    if rows:
+        xs_matrix = np.vstack(rows)
+    else:
+        xs_matrix = np.empty((0, n_groups))
+
+    return _SparseXSTable(
+        nuclides=nuclides,
+        reactions=reactions,
+        n_groups=n_groups,
+        xs_matrix=xs_matrix,
+        nuc_indices=np.array(nuc_idx_list, dtype=np.int32),
+        rxn_indices=np.array(rxn_idx_list, dtype=np.int32),
+    )
 
 
 class MicroXS:
