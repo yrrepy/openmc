@@ -172,18 +172,13 @@ class IndependentOperator(OpenMCOperator):
         # Store energy bins if present in flux tuples
         self._energy_bins = None
         self._flux_with_energy = []
-        
-        # Check if fluxes contain energy information
-        for i, flux_item in enumerate(fluxes):
+        for flux_item in fluxes:
             if isinstance(flux_item, tuple) and len(flux_item) == 2:
                 self._flux_with_energy.append(flux_item)
                 if self._energy_bins is None:
                     self._energy_bins = flux_item[1]
-                fluxes[i] = flux_item[0]  # Extract just the flux
             else:
                 self._flux_with_energy.append((flux_item, None))
-
-        self.fluxes = fluxes
         super().__init__(
             materials=materials,
             cross_sections=micros,
@@ -198,7 +193,6 @@ class IndependentOperator(OpenMCOperator):
             if not _prefiltered:
                 local_indices = [self._mat_index_map[m]
                                  for m in self.local_mats]
-                self.fluxes = [self.fluxes[i] for i in local_indices]
                 self.cross_sections = [self.cross_sections[i] for i in local_indices]
                 self._flux_with_energy = [self._flux_with_energy[i] for i in local_indices]
 
@@ -216,6 +210,10 @@ class IndependentOperator(OpenMCOperator):
         # Setup isomeric branching after initialization
         self._setup_isomeric_branching()
 
+    @property
+    def fluxes(self):
+        """List of flux arrays, derived from _flux_with_energy."""
+        return [f for f, _ in self._flux_with_energy]
 
     @classmethod
     def from_nuclides(cls, volume, nuclides,
@@ -501,7 +499,7 @@ class IndependentOperator(OpenMCOperator):
                 return
 
         # Check flux spectra and energy bins
-        if len(self.fluxes) == 0 or self._energy_bins is None or len(self._energy_bins) == 0:
+        if len(self._flux_with_energy) == 0 or self._energy_bins is None or len(self._energy_bins) == 0:
             if _handle_issue(
                 "Isomeric branching data is present in chain but flux spectra "
                 "or energy bins are missing. Energy-dependent isomeric branching "
@@ -621,7 +619,7 @@ class IndependentOperator(OpenMCOperator):
             self._results_cache.fill(0.0)
 
             # Get flux and microscopic cross sections from operator
-            flux = self._op.fluxes[mat_index]
+            flux = self._op._flux_with_energy[mat_index][0]
             xs = self._op.cross_sections[mat_index]
 
             for i_nuc in nuc_index:
