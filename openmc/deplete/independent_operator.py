@@ -320,7 +320,10 @@ class IndependentOperator(OpenMCOperator):
         fission_q=None,
         prev_results=None,
         reduce_chain_level=None,
+        keep_isomeric_siblings=True,
         fission_yield_opts=None,
+        require_isomeric_branching=True,
+        gendf_library=None,
     ):
         """Construct operator from a pre-written MicroXS HDF5 file.
 
@@ -350,8 +353,14 @@ class IndependentOperator(OpenMCOperator):
             Results from a previous depletion calculation.
         reduce_chain_level : int, optional
             Depth of the search when reducing the depletion chain.
+        keep_isomeric_siblings : bool, optional
+            Whether to keep isomeric siblings. Defaults to True.
         fission_yield_opts : dict, optional
             Arguments for the FissionYieldHelper.
+        require_isomeric_branching : bool, optional
+            If True, require isomeric branching ratios. Defaults to True.
+        gendf_library : GENDFLibrary, optional
+            GENDF library for isomeric branching ratios.
 
         Returns
         -------
@@ -375,9 +384,11 @@ class IndependentOperator(OpenMCOperator):
         local_micros, local_flux_with_energy = read_local_microxs_hdf5(
             microxs_file, local_mats)
 
-        # Build fluxes list from HDF5 data or default to unit flux
+        # Build fluxes list from HDF5 data or default to unit flux.
+        # Pass full (flux, energy_bounds) tuples so __init__ populates
+        # _flux_with_energy for isomeric branching.
         if local_flux_with_energy is not None:
-            local_fluxes = [item[0] for item in local_flux_with_energy]
+            local_fluxes = list(local_flux_with_energy)
         else:
             n_groups = local_micros[0].data.shape[2] if local_micros else 1
             local_fluxes = [np.ones(n_groups) for _ in local_mats]
@@ -392,7 +403,10 @@ class IndependentOperator(OpenMCOperator):
             fission_q=fission_q,
             prev_results=prev_results,
             reduce_chain_level=reduce_chain_level,
+            keep_isomeric_siblings=keep_isomeric_siblings,
             fission_yield_opts=fission_yield_opts,
+            require_isomeric_branching=require_isomeric_branching,
+            gendf_library=gendf_library,
             _prefiltered=True,
         )
 
