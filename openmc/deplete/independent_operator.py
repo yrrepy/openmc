@@ -157,17 +157,21 @@ class IndependentOperator(OpenMCOperator):
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level)
 
-        # Filter fluxes and cross sections to local materials only
-        if _prefiltered:
-            # Data already local-only; remap to 0-based local indices
+        # Filter to local materials only (MPI distribution)
+        if comm.size > 1:
+            if not _prefiltered:
+                local_indices = [self._mat_index_map[m]
+                                 for m in self.local_mats]
+                self.fluxes = [self.fluxes[i] for i in local_indices]
+                self.cross_sections = [self.cross_sections[i]
+                                       for i in local_indices]
+
+            # Remap to 0-based local indices; drop non-local materials
             self._mat_index_map = {
                 lm: i for i, lm in enumerate(self.local_mats)}
-        elif comm.size > 1:
-            local_indices = [self._mat_index_map[m] for m in self.local_mats]
-            self.fluxes = [self.fluxes[i] for i in local_indices]
-            self.cross_sections = [self.cross_sections[i] for i in local_indices]
-            self._mat_index_map = {
-                lm: i for i, lm in enumerate(self.local_mats)}
+            local_set = set(self.local_mats)
+            self.materials = openmc.Materials(
+                [m for m in self.materials if str(m.id) in local_set])
 
     @classmethod
     def from_nuclides(cls, volume, nuclides,
