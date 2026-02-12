@@ -1144,16 +1144,14 @@ def write_global_microxs_hdf5(
         f.attrs['n_reactions'] = n_rxn
         f.attrs['n_groups'] = n_grp
 
-        ds = f.create_dataset(
+        stacked = np.stack([m.data for m in micros]).astype(dtype)
+        f.create_dataset(
             'xs_data',
-            shape=(n_mats, n_nuc, n_rxn, n_grp),
-            dtype=dtype,
+            data=stacked,
             chunks=(chunk_mats, n_nuc, n_rxn, n_grp),
             compression=comp,
             compression_opts=comp_opts,
         )
-        for i, m in enumerate(micros):
-            ds[i] = m.data
 
         f.create_dataset(
             'nuclides', data=np.array(micros[0].nuclides, dtype='S'))
