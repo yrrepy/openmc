@@ -4,10 +4,12 @@
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from openmc import Material
 from openmc.deplete import IndependentOperator, MicroXS, Chain
+from openmc.deplete.microxs import write_global_microxs_hdf5
 
 CHAIN_PATH = Path(__file__).parents[1] / "chain_simple.xml"
 ONE_GROUP_XS = Path(__file__).parents[1] / "micro_xs_simple.csv"
@@ -53,3 +55,79 @@ def test_error_handling():
     micros = [micro_xs]
     with pytest.raises(ValueError, match=r"The length of fluxes \(2\)"):
         IndependentOperator(materials, fluxes, micros, CHAIN_PATH)
+
+
+# --- Helper for HDF5 integration tests ---
+
+def _make_material(mat_id):
+    """Create a depletable material with only chain nuclides."""
+    mat = Material(material_id=mat_id)
+    mat.add_nuclide('U235', 1e-3)
+    mat.add_nuclide('U238', 1e-2)
+    mat.set_density('sum')
+    mat.depletable = True
+    mat.volume = 1.0
+    return mat
+
+
+# --- from_microxs_file integration tests ---
+
+def test_from_microxs_file(tmp_path):
+    """from_microxs_file produces a working operator."""
+    micro_xs = MicroXS.from_csv(ONE_GROUP_XS)
+    n_mats = 3
+    materials = [_make_material(i + 1) for i in range(n_mats)]
+    mat_ids = sorted([str(m.id) for m in materials], key=int)
+
+    fname = tmp_path / 'microxs.h5'
+    write_global_microxs_hdf5(
+        [micro_xs] * n_mats, fname, mat_ids)
+
+    op = IndependentOperator.from_microxs_file(
+        materials, fname, chain_file=CHAIN_PATH)
+
+    assert len(op.cross_sections) == n_mats
+    assert len(op.fluxes) == n_mats
+    for xs in op.cross_sections:
+        np.testing.assert_array_equal(xs.data, micro_xs.data)
+
+
+def test_from_microxs_file_with_flux(tmp_path):
+    """from_microxs_file correctly extracts flux arrays from tuples."""
+    micro_xs = MicroXS.from_csv(ONE_GROUP_XS)
+    n_mats = 2
+    materials = [_make_material(i + 1) for i in range(n_mats)]
+    mat_ids = sorted([str(m.id) for m in materials], key=int)
+
+    flux = np.array([1.5, 2.5, 3.5])
+    energy_bounds = np.array([0.0, 0.625, 1e6, 2e7])
+    fluxes = [(flux, energy_bounds)] * n_mats
+
+    fname = tmp_path / 'microxs.h5'
+    write_global_microxs_hdf5(
+        [micro_xs] * n_mats, fname, mat_ids, fluxes=fluxes)
+
+    op = IndependentOperator.from_microxs_file(
+        materials, fname, chain_file=CHAIN_PATH)
+
+    # Fluxes should be plain arrays, not tuples
+    for f in op.fluxes:
+        assert isinstance(f, np.ndarray)
+        np.testing.assert_array_equal(f, flux)
+
+
+def test_prefiltered_skips_validation(tmp_path):
+    """_prefiltered=True allows len(micros) < len(materials)."""
+    micro_xs = MicroXS.from_csv(ONE_GROUP_XS)
+    materials = [_make_material(i + 1) for i in range(5)]
+
+    # Pass only 2 micros/fluxes for 5 materials -- would fail without
+    # _prefiltered=True
+    op = IndependentOperator(
+        materials,
+        [np.ones(1), np.ones(1)],
+        [micro_xs, micro_xs],
+        chain_file=CHAIN_PATH,
+        _prefiltered=True,
+    )
+    assert len(op.cross_sections) == 2

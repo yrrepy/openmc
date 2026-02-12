@@ -19,7 +19,7 @@ from openmc.mpi import comm
 from .abc import ReactionRateHelper, OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
-from .microxs import MicroXS
+from .microxs import MicroXS, read_local_microxs_hdf5
 from .results import Results
 from .helpers import (ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper,
                       IsomericBranchingHelper)
@@ -138,17 +138,19 @@ class IndependentOperator(OpenMCOperator):
                  keep_isomeric_siblings=True,
                  fission_yield_opts=None,
                  require_isomeric_branching=True,
-                 gendf_library=None):
+                 gendf_library=None,
+                 _prefiltered=False):
         # Validate micro-xs parameters
         check_type('materials', materials, Iterable, openmc.Material)
         check_type('micros', micros, Iterable, MicroXS)
         materials = openmc.Materials(materials)
 
-        if not (len(fluxes) == len(micros) == len(materials)):
-            msg = (f'The length of fluxes ({len(fluxes)}) should be equal to '
-                   f'the length of micros ({len(micros)}) and the length of '
-                   f'materials ({len(materials)}).')
-            raise ValueError(msg)
+        if not _prefiltered:
+            if not (len(fluxes) == len(micros) == len(materials)):
+                msg = (f'The length of fluxes ({len(fluxes)}) should be equal '
+                       f'to the length of micros ({len(micros)}) and the '
+                       f'length of materials ({len(materials)}).')
+                raise ValueError(msg)
 
         if keff is not None:
             check_type('keff', keff, tuple, float)
@@ -161,10 +163,11 @@ class IndependentOperator(OpenMCOperator):
         helper_kwargs = {'normalization_mode': normalization_mode,
                          'fission_yield_opts': fission_yield_opts}
 
-        # Sort fluxes and micros in same order that materials get sorted
-        index_sort = np.argsort([mat.id for mat in materials])
-        fluxes = [fluxes[i] for i in index_sort]
-        micros = [micros[i] for i in index_sort]
+        if not _prefiltered:
+            # Sort fluxes and micros in same order that materials get sorted
+            index_sort = np.argsort([mat.id for mat in materials])
+            fluxes = [fluxes[i] for i in index_sort]
+            micros = [micros[i] for i in index_sort]
 
         # Store energy bins if present in flux tuples
         self._energy_bins = None
@@ -191,9 +194,12 @@ class IndependentOperator(OpenMCOperator):
             reduce_chain_level=reduce_chain_level,
             keep_isomeric_siblings=keep_isomeric_siblings)
 
-        # Filter fluxes, cross sections, and flux-with-energy to local
-        # materials only (MPI RAM savings: O(all_mats) -> O(local_mats))
-        if comm.size > 1:
+        # Filter fluxes and cross sections to local materials only
+        if _prefiltered:
+            # Data already local-only; remap to 0-based local indices
+            self._mat_index_map = {
+                lm: i for i, lm in enumerate(self.local_mats)}
+        elif comm.size > 1:
             local_indices = [self._mat_index_map[m] for m in self.local_mats]
             self.fluxes = [self.fluxes[i] for i in local_indices]
             self.cross_sections = [self.cross_sections[i] for i in local_indices]
@@ -302,6 +308,100 @@ class IndependentOperator(OpenMCOperator):
                    fission_yield_opts=fission_yield_opts,
                    require_isomeric_branching=require_isomeric_branching,
                    gendf_library=gendf_library)
+
+    @classmethod
+    def from_microxs_file(
+        cls,
+        materials,
+        microxs_file,
+        chain_file=None,
+        keff=None,
+        normalization_mode='fission-q',
+        fission_q=None,
+        prev_results=None,
+        reduce_chain_level=None,
+        fission_yield_opts=None,
+    ):
+        """Construct operator from a pre-written MicroXS HDF5 file.
+
+        Each MPI rank reads only its local material slices from the file,
+        eliminating the memory peak from loading all cross sections at once.
+
+        .. versionadded:: 0.15.4
+
+        Parameters
+        ----------
+        materials : iterable of openmc.Material
+            All materials in the model (not just local). Must include all
+            depletable materials whose IDs appear in the HDF5 file.
+        microxs_file : path-like
+            Path to HDF5 file written by
+            :func:`~openmc.deplete.write_global_microxs_hdf5`.
+        chain_file : PathLike or Chain, optional
+            Path to the depletion chain XML file or instance of
+            openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
+        keff : 2-tuple of float, optional
+            keff eigenvalue and uncertainty from transport calculation.
+        normalization_mode : {"fission-q", "source-rate"}
+            How reaction rates should be calculated.
+        fission_q : dict, optional
+            Dictionary of nuclides and their fission Q values [eV].
+        prev_results : Results, optional
+            Results from a previous depletion calculation.
+        reduce_chain_level : int, optional
+            Depth of the search when reducing the depletion chain.
+        fission_yield_opts : dict, optional
+            Arguments for the FissionYieldHelper.
+
+        Returns
+        -------
+        IndependentOperator
+
+        See Also
+        --------
+        write_global_microxs_hdf5 : Write the HDF5 file consumed here.
+        read_local_microxs_hdf5 : Low-level reader used internally.
+
+        """
+        check_type('materials', materials, Iterable, openmc.Material)
+        materials_obj = openmc.Materials(materials)
+
+        # Determine burnable materials in sorted order (same logic as
+        # OpenMCOperator._get_burnable_mats)
+        burnable_mats = sorted(
+            [str(mat.id) for mat in materials_obj if mat.depletable], key=int)
+        local_mats = _distribute(burnable_mats)
+
+        local_micros, local_flux_with_energy = read_local_microxs_hdf5(
+            microxs_file, local_mats)
+
+        # Build fluxes list from HDF5 data or default to unit flux
+        if local_flux_with_energy is not None:
+            local_fluxes = [item[0] for item in local_flux_with_energy]
+        else:
+            n_groups = local_micros[0].data.shape[2] if local_micros else 1
+            local_fluxes = [np.ones(n_groups) for _ in local_mats]
+
+        op = cls(
+            materials_obj,
+            local_fluxes,
+            local_micros,
+            chain_file=chain_file,
+            keff=keff,
+            normalization_mode=normalization_mode,
+            fission_q=fission_q,
+            prev_results=prev_results,
+            reduce_chain_level=reduce_chain_level,
+            fission_yield_opts=fission_yield_opts,
+            _prefiltered=True,
+        )
+
+        # Verify _distribute agreement between from_microxs_file and __init__
+        assert list(op.local_mats) == list(local_mats), (
+            f"_distribute mismatch: from_microxs_file got {local_mats}, "
+            f"but __init__ computed {op.local_mats}")
+
+        return op
 
     @staticmethod
     def _consolidate_nuclides_to_material(nuclides, nuc_units, volume):
@@ -445,6 +545,8 @@ class IndependentOperator(OpenMCOperator):
             Set of nuclide names that have cross section data
 
         """
+        if not cross_sections:
+            return set()
         return set(cross_sections[0].nuclides)
 
     class _IndependentRateHelper(ReactionRateHelper):
