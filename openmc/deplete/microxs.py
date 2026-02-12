@@ -604,7 +604,7 @@ class MicroXS:
                 f'match dimensions of data array of shape {data.shape}')
         check_iterable_type('nuclides', nuclides, str)
         check_iterable_type('reactions', reactions, str)
-        check_type('data', data, np.ndarray, expected_iter_type=float)
+        check_type('data', data, np.ndarray, expected_iter_type=np.floating)
         for reaction in reactions:
             check_value('reactions', reaction, _valid_rxns)
 
@@ -1033,3 +1033,221 @@ def read_microxs_hdf5(filename: PathLike) -> dict[str, MicroXS]:
     """
     with h5py.File(filename, 'r') as f:
         return {name: MicroXS.from_hdf5(group) for name, group in f.items()}
+
+
+def _write_flux_data(f, fluxes, dtype='float64', compression=None,
+                     compression_opts=None):
+    """Write flux arrays and optional energy bounds to an open HDF5 file."""
+    energy_bounds = None
+    flux_arrays = []
+    for item in fluxes:
+        if isinstance(item, tuple) and len(item) == 2:
+            flux_arrays.append(np.asarray(item[0], dtype=dtype))
+            if energy_bounds is None:
+                energy_bounds = np.asarray(item[1], dtype='float64')
+        else:
+            flux_arrays.append(np.asarray(item, dtype=dtype))
+
+    f.create_dataset('fluxes', data=np.stack(flux_arrays),
+                     compression=compression, compression_opts=compression_opts)
+    if energy_bounds is not None:
+        f.create_dataset('energy_bounds', data=energy_bounds)
+
+
+def write_global_microxs_hdf5(
+    micros: Sequence[MicroXS],
+    filename: PathLike,
+    material_ids: Sequence[str],
+    fluxes: Sequence | None = None,
+    dtype: str = 'float64',
+    compression: bool | tuple = True,
+) -> None:
+    """Write all MicroXS to a single rank-independent HDF5 file.
+
+    Stores cross section data for every burnable material in a stacked 4D
+    dataset that can be efficiently subset-read by individual MPI ranks
+    using :func:`read_local_microxs_hdf5`.
+    This is meant to reduce RAM usage by each individal rank and enable greater MPI scaling.
+    
+    .. versionadded:: 0.15.4
+
+    Parameters
+    ----------
+    micros : list of MicroXS
+        MicroXS objects, one per burnable material, ordered by
+        ``sorted(material_ids, key=int)``.
+    filename : path-like
+        Output HDF5 file path.
+    material_ids : list of str
+        Material ID strings in the same order as ``micros``. Must be sorted
+        by ``int()`` value.
+    fluxes : list, optional
+        Flux data for each material. Each element is either a 1D numpy
+        array or a ``(flux_array, energy_bounds)`` tuple. MG-flux is needed for isomeric branching
+    dtype : str, optional
+        NumPy dtype for cross section and flux data. Default ``'float64'``.
+        Use ``'float32'`` to halve file size and per-rank RAM.
+    compression : bool or tuple, optional
+        HDF5 compression. Default ``True`` uses lzf. ``False`` disables
+        compression. A tuple ``('gzip', level)`` uses gzip.
+
+    See Also
+    --------
+    read_local_microxs_hdf5 : Read local material slices from this file.
+
+    """
+    if len(micros) == 0:
+        raise ValueError("No MicroXS objects to write.")
+    if len(micros) != len(material_ids):
+        raise ValueError(
+            f"Length of micros ({len(micros)}) != length of "
+            f"material_ids ({len(material_ids)})")
+    if fluxes is not None and len(fluxes) != len(micros):
+        raise ValueError(
+            f"Length of fluxes ({len(fluxes)}) != length of "
+            f"micros ({len(micros)})")
+
+    int_ids = [int(mid) for mid in material_ids]
+    if int_ids != sorted(int_ids):
+        raise ValueError("material_ids must be sorted by int() value")
+
+    ref_shape = micros[0].data.shape
+    for i, m in enumerate(micros):
+        if m.data.shape != ref_shape:
+            raise ValueError(
+                f"MicroXS[{i}] shape {m.data.shape} != "
+                f"MicroXS[0] shape {ref_shape}")
+
+    # Resolve compression settings
+    if compression is False:
+        comp, comp_opts = None, None
+    elif compression is True:
+        comp, comp_opts = 'lzf', None
+    elif isinstance(compression, tuple):
+        comp, comp_opts = compression
+    else:
+        raise ValueError(
+            f"compression must be True, False, or a tuple like "
+            f"('gzip', 4), got {compression!r}")
+
+    n_mats = len(micros)
+    n_nuc, n_rxn, n_grp = ref_shape
+    bytes_per_elem = np.dtype(dtype).itemsize
+    target_chunk_bytes = 32 * 1024 * 1024
+    row_bytes = n_nuc * n_rxn * n_grp * bytes_per_elem
+    chunk_mats = max(1, min(n_mats, 256, target_chunk_bytes // row_bytes))
+
+    with h5py.File(filename, 'w') as f:
+        f.attrs['version'] = 1
+        f.attrs['n_materials'] = n_mats
+        f.attrs['n_nuclides'] = n_nuc
+        f.attrs['n_reactions'] = n_rxn
+        f.attrs['n_groups'] = n_grp
+
+        ds = f.create_dataset(
+            'xs_data',
+            shape=(n_mats, n_nuc, n_rxn, n_grp),
+            dtype=dtype,
+            chunks=(chunk_mats, n_nuc, n_rxn, n_grp),
+            compression=comp,
+            compression_opts=comp_opts,
+        )
+        for i, m in enumerate(micros):
+            ds[i] = m.data
+
+        f.create_dataset(
+            'nuclides', data=np.array(micros[0].nuclides, dtype='S'))
+        f.create_dataset(
+            'reactions', data=np.array(micros[0].reactions, dtype='S'))
+        f.create_dataset(
+            'material_ids', data=np.array(material_ids, dtype='S'))
+
+        if fluxes is not None:
+            _write_flux_data(f, fluxes, dtype=dtype,
+                             compression=comp, compression_opts=comp_opts)
+
+
+def read_local_microxs_hdf5(
+    filename: PathLike,
+    local_mat_ids: Sequence[str],
+) -> tuple[list[MicroXS], list[tuple] | None]:
+    """Read local material slices from a global MicroXS HDF5 file.
+
+    Reads only the rows corresponding to ``local_mat_ids`` from the stacked
+    dataset, using h5py fancy indexing for efficient I/O.
+    This is meant to reduce RAM usage by each individal rank and enable greater MPI scaling.
+
+    .. versionadded:: 0.15.4
+
+    Parameters
+    ----------
+    filename : path-like
+        Path to HDF5 file written by :func:`write_global_microxs_hdf5`.
+    local_mat_ids : list of str
+        Material IDs for this MPI rank.
+
+    Returns
+    -------
+    micros : list of MicroXS
+        MicroXS objects in the same order as ``local_mat_ids``.
+    flux_with_energy : list of tuple or None
+        If flux data exists in the file, a list of
+        ``(flux_array, energy_bounds)`` tuples. Returns ``None`` if no
+        flux data in file.
+
+    See Also
+    --------
+    write_global_microxs_hdf5 : Write the global file.
+
+    """
+    if len(local_mat_ids) == 0:
+        return [], None
+
+    with h5py.File(filename, 'r') as f:
+        version = f.attrs.get('version', None)
+        if version != 1:
+            raise ValueError(
+                f"Unsupported MicroXS HDF5 version: {version}. "
+                f"Expected version 1.")
+
+        all_mat_ids = [s.decode() for s in f['material_ids'][:]]
+        nuclides = [s.decode() for s in f['nuclides'][:]]
+        reactions = [s.decode() for s in f['reactions'][:]]
+
+        mat_id_to_row = {mid: i for i, mid in enumerate(all_mat_ids)}
+        local_rows = []
+        for mid in local_mat_ids:
+            if mid not in mat_id_to_row:
+                sample = all_mat_ids[:5]
+                raise ValueError(
+                    f"Material '{mid}' not found in {filename}. "
+                    f"File contains {len(all_mat_ids)} materials: "
+                    f"{sample}{'...' if len(all_mat_ids) > 5 else ''}")
+            local_rows.append(mat_id_to_row[mid])
+
+        # h5py requires fancy indices to be strictly sorted ascending
+        sorted_rows = sorted(local_rows)
+        xs_block = f['xs_data'][sorted_rows]
+
+        # Reorder to match local_mat_ids order
+        sort_map = {row: pos for pos, row in enumerate(sorted_rows)}
+        reorder = [sort_map[r] for r in local_rows]
+        xs_block = xs_block[reorder]
+
+        micros = [MicroXS(xs_block[i], nuclides, reactions)
+                  for i in range(len(local_mat_ids))]
+
+        flux_with_energy = None
+        if 'fluxes' in f:
+            energy_bounds = None
+            if 'energy_bounds' in f:
+                energy_bounds = f['energy_bounds'][:]
+
+            flux_block = f['fluxes'][sorted_rows]
+            flux_block = flux_block[reorder]
+            flux_with_energy = [
+                (flux_block[i], energy_bounds)
+                for i in range(len(local_mat_ids))
+            ]
+
+    return micros, flux_with_energy
