@@ -396,6 +396,8 @@ int reaction_type(std::string name)
     return N_3N;
   } else if (name == "n4n") {
     return N_4N;
+  } else if (name == "(n,n')") {
+    return N_LEVEL;
   } else if (name == "H1-production") {
     return N_XP;
   } else if (name == "H2-production") {

@@ -38,7 +38,7 @@ class Element(str):
 
     def expand(self, percent, percent_type, enrichment=None,
                enrichment_target=None, enrichment_type=None,
-               cross_sections=None):
+               cross_sections=None, gendf_library=None):
         """Expand natural element into its naturally-occurring isotopes.
 
         An optional cross_sections argument or the ``cross_sections``
@@ -47,6 +47,12 @@ class Element(str):
         isotopes/nuclides present in cross_sections.xml. If no
         cross_sections.xml file is found, the element is expanded based on its
         naturally occurring isotopes.
+
+        If a gendf_library is provided, its nuclide list is used instead of the
+        HDF5 cross_sections.xml. This is important for GENDF-based activation
+        workflows where the GENDF library may have different nuclide coverage
+        than the HDF5 library (e.g. Ir192_m1(Ir192mg), Ir192_m2(Ir192ng) available
+        in GENDF TENDL2017 but not in HDF5 TENDL2017).
 
         Parameters
         ----------
@@ -71,7 +77,11 @@ class Element(str):
             .. versionadded:: 0.12
         cross_sections : str, optional
             Location of cross_sections.xml file. Default is None.
+        gendf_library : openmc.deplete.GENDFLibrary, optional
+            GENDF library to use for nuclide availability check. If provided,
+            takes priority over cross_sections. Default is None.
 
+            .. versionadded:: 0.15.4
         Returns
         -------
         isotopes : list
@@ -131,76 +141,109 @@ class Element(str):
         # Create dict to store the expanded nuclides and abundances
         abundances = {}
 
-        # If cross_sections is None, get the cross sections from the global
-        # configuration
-        if cross_sections is None:
-            cross_sections = openmc.config.get('cross_sections')
-
-        # If a cross_sections library is present, check natural nuclides
-        # against the nuclides in the library
-        if cross_sections is not None:
+        # If gendf_library is provided, use its nuclide list (takes priority)
+        if gendf_library is not None:
             library_nuclides = set()
-            tree = ET.parse(cross_sections)
-            root = tree.getroot()
-            for child in root.findall('library'):
-                nuclide = child.attrib['materials']
-                if re.match(r'{}\d+'.format(self), nuclide):
-                    library_nuclides.add(nuclide)
+            for nuc in gendf_library.available_nuclides():
+                if re.match(r'{}\d+'.format(self), nuc):
+                    library_nuclides.add(nuc)
 
-            # Get a set of the mutual and absent nuclides. Convert to lists
-            # and sort to avoid different ordering between Python 2 and 3.
+            # Get mutual and absent nuclides
             mutual_nuclides = natural_nuclides.intersection(library_nuclides)
             absent_nuclides = natural_nuclides.difference(mutual_nuclides)
             mutual_nuclides = sorted(mutual_nuclides, key=zam)
             absent_nuclides = sorted(absent_nuclides, key=zam)
 
-            # If all naturally occurring isotopes are present in the library,
-            # add them based on their abundance
+            # If all naturally occurring isotopes are in GENDF library
             if len(absent_nuclides) == 0:
                 for nuclide in mutual_nuclides:
                     abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
-
-            # If some naturally occurring isotopes are not present in the
-            # library, check if the "natural" nuclide (e.g., C0) is present. If
-            # so, set the abundance to 1 for this nuclide.
-            elif (self + '0') in library_nuclides:
-                abundances[self + '0'] = 1.0
-
             elif len(mutual_nuclides) == 0:
-                msg = (f'Unable to expand element {self} because the cross '
-                       'section library provided does not contain any of '
+                msg = (f'Unable to expand element {self} because the GENDF '
+                       'library provided does not contain any of '
                        'the natural isotopes for that element.')
                 raise ValueError(msg)
-
-            # If some naturally occurring isotopes are in the library, add them.
-            # For the absent nuclides, add them based on our knowledge of the
-            # common cross section libraries (ENDF, JEFF, and JENDL)
             else:
-                # Add the mutual isotopes
+                # Add mutual isotopes, warn about absent ones
                 for nuclide in mutual_nuclides:
                     abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
+                if absent_nuclides:
+                    warnings.warn(
+                        f'GENDF library missing natural isotopes {absent_nuclides} '
+                        f'for element {self}. Their abundance will be ignored.'
+                    )
 
-                # Adjust the abundances for the absent nuclides
-                for nuclide in absent_nuclides:
-                    if nuclide in ['O17', 'O18'] and 'O16' in mutual_nuclides:
-                        abundances['O16'] += NATURAL_ABUNDANCE[nuclide]
-                    elif nuclide == 'Ta180_m1' and 'Ta181' in mutual_nuclides:
-                            abundances['Ta181'] += NATURAL_ABUNDANCE[nuclide]
-                    elif nuclide == 'W180' and 'W182' in mutual_nuclides:
-                        abundances['W182'] += NATURAL_ABUNDANCE[nuclide]
-                    else:
-                        msg = 'Unsure how to partition natural abundance of ' \
-                              'isotope {0} into other natural isotopes of ' \
-                              'this element that are present in the cross ' \
-                              'section library provided. Consider adding ' \
-                              'the isotopes of this element individually.'
-                        raise ValueError(msg)
-
-        # If a cross_section library is not present, expand the element into
-        # its natural nuclides
+        # Otherwise, check HDF5 cross_sections library
         else:
-            for nuclide in sorted(natural_nuclides, key=zam):
-                abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
+            # If cross_sections is None, get from global configuration
+            if cross_sections is None:
+                cross_sections = openmc.config.get('cross_sections')
+
+            # If a cross_sections library is present, check natural nuclides
+            # against the nuclides in the library
+            if cross_sections is not None:
+                library_nuclides = set()
+                tree = ET.parse(cross_sections)
+                root = tree.getroot()
+                for child in root.findall('library'):
+                    nuclide = child.attrib['materials']
+                    if re.match(r'{}\d+'.format(self), nuclide):
+                        library_nuclides.add(nuclide)
+
+                # Get a set of the mutual and absent nuclides. Convert to lists
+                # and sort to avoid different ordering between Python 2 and 3.
+                mutual_nuclides = natural_nuclides.intersection(library_nuclides)
+                absent_nuclides = natural_nuclides.difference(mutual_nuclides)
+                mutual_nuclides = sorted(mutual_nuclides, key=zam)
+                absent_nuclides = sorted(absent_nuclides, key=zam)
+
+                # If all naturally occurring isotopes are present in the library,
+                # add them based on their abundance
+                if len(absent_nuclides) == 0:
+                    for nuclide in mutual_nuclides:
+                        abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
+
+                # If some naturally occurring isotopes are not present in the
+                # library, check if the "natural" nuclide (e.g., C0) is present. If
+                # so, set the abundance to 1 for this nuclide.
+                elif (self + '0') in library_nuclides:
+                    abundances[self + '0'] = 1.0
+
+                elif len(mutual_nuclides) == 0:
+                    msg = (f'Unable to expand element {self} because the cross '
+                           'section library provided does not contain any of '
+                           'the natural isotopes for that element.')
+                    raise ValueError(msg)
+
+                # If some naturally occurring isotopes are in the library, add them.
+                # For the absent nuclides, add them based on our knowledge of the
+                # common cross section libraries (ENDF, JEFF, and JENDL)
+                else:
+                    # Add the mutual isotopes
+                    for nuclide in mutual_nuclides:
+                        abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
+
+                    # Adjust the abundances for the absent nuclides
+                    for nuclide in absent_nuclides:
+                        if nuclide in ['O17', 'O18'] and 'O16' in mutual_nuclides:
+                            abundances['O16'] += NATURAL_ABUNDANCE[nuclide]
+                        elif nuclide == 'Ta180_m1' and 'Ta181' in mutual_nuclides:
+                            abundances['Ta181'] += NATURAL_ABUNDANCE[nuclide]
+                        elif nuclide == 'W180' and 'W182' in mutual_nuclides:
+                            abundances['W182'] += NATURAL_ABUNDANCE[nuclide]
+                        else:
+                            msg = 'Unsure how to partition natural abundance of ' \
+                                  'isotope {0} into other natural isotopes of ' \
+                                  'this element that are present in the cross ' \
+                                  'section library provided. Consider adding ' \
+                                  'the isotopes of this element individually.'
+                            raise ValueError(msg)
+
+            # If a cross_section library is not present, expand the element into
+            # its natural nuclides
+            else:
+                for nuclide in sorted(natural_nuclides, key=zam):
+                    abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
 
         # Modify mole fractions if enrichment provided
         # Old treatment for Uranium

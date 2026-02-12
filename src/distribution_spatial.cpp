@@ -218,7 +218,7 @@ std::pair<Position, double> SphericalIndependent::sample(uint64_t* seed) const
   double x = r * std::sqrt(1 - cos_theta * cos_theta) * cos(phi) + origin_.x;
   double y = r * std::sqrt(1 - cos_theta * cos_theta) * sin(phi) + origin_.y;
   double z = r * cos_theta + origin_.z;
-  Position xi {x, y, z};
+  Position xi {y, x, z};
   return {xi, r_wgt * cos_theta_wgt * phi_wgt};
 }
 

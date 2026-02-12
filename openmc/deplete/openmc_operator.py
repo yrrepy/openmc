@@ -52,7 +52,16 @@ class OpenMCOperator(TransportOperator):
     reduce_chain_level : int, optional
         Depth of the search when reducing the depletion chain. The default
         value of ``None`` implies no limit on the depth.
+    keep_isomeric_siblings : bool, optional
+        Whether to keep all isomeric state siblings together during chain
+        reduction, as isomers can be at different depths in the chain:
+        - True (default): Always keep all isomeric siblings (ground +
+          metastables) when any state is reachable. Required for correct
+          isomeric branching calculations. May increase chain size by 10-30%.
+        - False: Original behavior. Isomeric states treated independently.
+          May cause isomeric branching failures with partial exclusions.
 
+        .. versionadded:: 0.15.4
     diff_volume_method : str
         Specifies how the volumes of the new materials should be found. Default
         is to 'divide equally' which divides the original material volume
@@ -103,7 +112,8 @@ class OpenMCOperator(TransportOperator):
             diff_volume_method='divide equally',
             fission_q=None,
             helper_kwargs=None,
-            reduce_chain_level=None):
+            reduce_chain_level=None,
+            keep_isomeric_siblings=True):
 
         # If chain file was not specified, try to get it from global config
         if chain_file is None:
@@ -135,7 +145,8 @@ class OpenMCOperator(TransportOperator):
                 for name, _dens_percent, _dens_type in material.nuclides:
                     init_nuclides.add(name)
 
-            self.chain = self.chain.reduce(init_nuclides, reduce_chain_level)
+            self.chain = self.chain.reduce(init_nuclides, reduce_chain_level,
+                                          keep_isomeric_siblings=keep_isomeric_siblings)
 
         if diff_burnable_mats:
             self._differentiate_burnable_mats()

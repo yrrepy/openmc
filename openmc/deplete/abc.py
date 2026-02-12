@@ -735,7 +735,7 @@ class Integrator(ABC):
         start = time.time()
         results = deplete(
             self._solver, self.chain, n, rates, dt, i, matrix_func,
-            self.transfer_rates, self.external_source_rates)
+            self.transfer_rates, self.external_source_rates, self.operator)
         # filter-out negative atom densities (non-physical)
         results = [np.maximum(r, 0.0) for r in results]
         return time.time() - start, results
@@ -874,6 +874,13 @@ class Integrator(ABC):
         with change_directory(self.operator.output_dir):
             n = self.operator.initial_condition()
             t, self._i_res = self._get_start_data()
+
+            # Notify user if isomeric branching is enabled
+            if output and comm.rank == 0:
+                if (hasattr(self.operator, '_isomeric_branching') and
+                    self.operator._isomeric_branching and
+                    any(bool(d) for d in self.operator._isomeric_branching)):
+                    print("[openmc.deplete] Depletion is using Isomeric Branching")
 
             for i, (dt, source_rate) in enumerate(self):
                 if output and comm.rank == 0:

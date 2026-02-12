@@ -764,7 +764,8 @@ class Material(IDManagerMixin):
                     enrichment: float | None = None,
                     enrichment_target: str | None = None,
                     enrichment_type: str | None = None,
-                    cross_sections: str | None = None):
+                    cross_sections: str | None = None,
+                    gendf_library=None):
         """Add a natural element to the material
 
         Parameters
@@ -793,6 +794,12 @@ class Material(IDManagerMixin):
             .. versionadded:: 0.12
         cross_sections : str, optional
             Location of cross_sections.xml file.
+        gendf_library : openmc.deplete.GENDFLibrary, optional
+            GENDF library to use for nuclide availability check. If provided,
+            takes priority over cross_sections. This is important for GENDF-based
+            activation workflows where the GENDF library may have different
+            nuclide coverage than the HDF5 library (e.g. Ir192_m1(Ir192mg), 
+            Ir192_m2(Ir192ng) available in GENDF TENDL2017 but not in HDF5 TENDL2017).
 
         Notes
         -----
@@ -871,7 +878,8 @@ class Material(IDManagerMixin):
                                       enrichment,
                                       enrichment_target,
                                       enrichment_type,
-                                      cross_sections):
+                                      cross_sections,
+                                      gendf_library):
             self.add_nuclide(*nuclide)
 
     def add_elements_from_formula(self, formula: str, percent_type: str = 'ao',

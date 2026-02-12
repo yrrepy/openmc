@@ -2,6 +2,8 @@
 
 Provided to avoid some circular imports
 """
+import inspect
+import warnings
 from itertools import repeat, starmap
 from multiprocessing import Pool
 
@@ -41,8 +43,10 @@ def _distribute(items):
             return items[j:j + chunk_size]
         j += chunk_size
 
+
 def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
-            transfer_rates=None, external_source_rates=None, *matrix_args):
+        transfer_rates=None, external_source_rates=None, operator=None,
+        *matrix_args):
     """Deplete materials using given reaction rates for a specified time
 
     Parameters
@@ -61,17 +65,23 @@ def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
         Time in [s] to deplete for
     current_timestep : int
         Current timestep index
-    maxtrix_func : callable, optional
+    matrix_func : callable, optional
         Function to form the depletion matrix after calling ``matrix_func(chain,
-        rates, fission_yields)``, where ``fission_yields = {parent: {product:
-        yield_frac}}`` Expected to return the depletion matrix required by
-        ``func``
+        rates, fission_yields, isomeric_branching)``, where ``fission_yields = {parent: {product:
+        yield_frac}}`` and ``isomeric_branching = {parent: {reaction: {target: ratio}}}``
+        Expected to return the depletion matrix required by ``func``
     transfer_rates : openmc.deplete.TransferRates, Optional
         Transfer rates for continuous removal/feed.
 
         .. versionadded:: 0.14.0
     external_source_rates : openmc.deplete.ExternalSourceRates, Optional
         External source rates for continuous removal/feed.
+
+        .. versionadded:: 0.15.3
+    operator : OperatorBase, optional
+        Transport operator instance. If provided, isomeric branching data
+        will be extracted from operator._isomeric_branching
+        Operator now passed explicitly as parameter (clearer than hasattr detection)
 
         .. versionadded:: 0.15.3
     matrix_args: Any, optional
@@ -94,11 +104,68 @@ def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
             "equal to the number of compositions {}".format(
                 len(fission_yields), len(n)))
 
+    # Get isomeric branching from operator if available
+    isomeric_branching = None
+    if operator is not None:
+        # Extract isomeric branching data from operator
+        isomeric_branching = getattr(operator, '_isomeric_branching', None)
+
+        if isomeric_branching is not None:
+            if len(isomeric_branching) == 1:
+                isomeric_branching = repeat(isomeric_branching[0])
+            elif len(isomeric_branching) != len(n):
+                # Size mismatch - disable isomeric branching. May be redundant and can be refactored (or removed)
+                operator_type = type(operator).__name__
+                chain_size = len(chain) if hasattr(chain, '__len__') else 'unknown'
+                warnings.warn(
+                    f"Isomeric branching list length ({len(isomeric_branching)}) "
+                    f"does not match number of materials ({len(n)}). "
+                    f"Operator: {operator_type}, Chain size: {chain_size} nuclides. "
+                    f"Disabling isomeric branching for safety. This may indicate "
+                    f"an internal error or manual modification of operator state.",
+                    UserWarning
+                )
+                isomeric_branching = None
+
+
+    # Form matrices with isomeric branching if available
     if matrix_func is None:
-        matrices = map(chain.form_matrix, rates, fission_yields)
+        if isomeric_branching is not None:
+            # Use isomeric branching in matrix formation
+            matrices = []
+            for rate, fy, iso in zip(rates, fission_yields, isomeric_branching):
+                matrix = chain.form_matrix(rate, fy, iso)
+                matrices.append(matrix)
+        else:
+            # Original behavior - no isomeric branching
+            matrices = []
+            for rate, fy in zip(rates, fission_yields):
+                matrix = chain.form_matrix(rate, fy)
+                matrices.append(matrix)
     else:
-        matrices = map(matrix_func, repeat(chain), rates, fission_yields,
-                       *matrix_args)
+        # Custom matrix function - need to handle both with and without isomeric branching
+        if isomeric_branching is not None:
+            # Try to pass isomeric branching to custom matrix function
+            matrices = []
+            for c, r, fy, iso in zip(repeat(chain), rates,
+                                    fission_yields, isomeric_branching):
+                # Check if the custom matrix function accepts isomeric_branching. May be redundant and can be refactored (or removed)
+                sig = inspect.signature(matrix_func)
+                params = list(sig.parameters.keys())
+                
+                # If function accepts 4 or more parameters, pass isomeric_branching. May be redundant and can be refactored (or removed)
+                if len(params) >= 4:
+                    m = matrix_func(c, r, fy, iso, *matrix_args)
+                else:
+                    # Function doesn't accept isomeric_branching - use old signature
+                    m = matrix_func(c, r, fy, *matrix_args)
+                matrices.append(m)
+        else:
+            # Original behavior - no isomeric branching
+            matrices = []
+            for c, r, fy in zip(repeat(chain), rates, fission_yields):
+                m = matrix_func(c, r, fy, *matrix_args)
+                matrices.append(m)
 
     if (transfer_rates is not None and
         current_timestep in transfer_rates.external_timesteps):
@@ -172,7 +239,7 @@ def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
             else:
                 n_result = None
 
-            # Braodcast result to other ranks
+            # Broadcast result to other ranks
             n_result = comm.bcast(n_result)
             # Distribute results across MPI
             n_result = _distribute(n_result)

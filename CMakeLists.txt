@@ -352,6 +352,8 @@ list(APPEND libopenmc_SOURCES
   src/event.cpp
   src/file_utils.cpp
   src/finalize.cpp
+  src/gendf.cpp
+  src/gendf_parser.cpp
   src/geometry.cpp
   src/geometry_aux.cpp
   src/hdf5_interface.cpp

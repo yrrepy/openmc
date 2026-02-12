@@ -87,7 +87,7 @@ class TestChain:
     def get_default_fission_yields():
         return None
 
-    def form_matrix(self, rates, _fission_yields=None):
+    def form_matrix(self, rates, _fission_yields=None, _isomeric_branching=None):
         """Forms the f(y) matrix in y' = f(y)y.
 
         Nominally a depletion matrix, this is abstracted on the off chance
@@ -98,6 +98,8 @@ class TestChain:
         rates : numpy.ndarray
             Slice of reaction rates for a single material
         _fission_yields : optional
+            Not used
+        _isomeric_branching : optional
             Not used
 
         Returns
