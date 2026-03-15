@@ -282,10 +282,10 @@ def test_chain_xml_with_nn_prime(tmp_path):
     reaction_types = [r.type for r in in115.reactions]
     assert "(n,n')" in reaction_types
 
-    # Verify isomeric branching is loaded
-    if hasattr(chain, 'isomeric_branching') and chain.isomeric_branching:
-        if 'In115' in chain.isomeric_branching:
-            assert "(n,n')" in chain.isomeric_branching['In115']
+    # Verify isomeric branching targets are loaded
+    if chain.isomeric_branching_targets:
+        if 'In115' in chain.isomeric_branching_targets:
+            assert "(n,n')" in chain.isomeric_branching_targets['In115']
 
 
 def test_form_matrix_with_nn_prime(tmp_path):

@@ -309,43 +309,6 @@ class CoupledOperator(OpenMCOperator):
         # Note: _isomeric_helper is initialized to None in _setup_isomeric_branching
         self._setup_isomeric_branching()
 
-    def _detect_energy_structure_from_chain(self):
-        """Detect energy structure from chain's isomeric branching data.
-
-        Examines the isomeric branching data stored in the chain to determine
-        whether CCFE-709 or UKAEA-1102 energy group structure is being used.
-
-        Returns
-        -------
-        str or None
-            'CCFE-709', 'UKAEA-1102', or None if no isomeric data exists
-            or energy structure cannot be determined
-        """
-        if not hasattr(self.chain, 'isomeric_branching'):
-            return None
-        if self.chain.isomeric_branching is None:
-            return None
-        if len(self.chain.isomeric_branching) == 0:
-            return None
-
-        # Sample first reaction to determine energy structure
-        for nuc_name, reactions in self.chain.isomeric_branching.items():
-            for rx_type, iso_data in reactions.items():
-                if 'energies' in iso_data and len(iso_data['energies']) > 0:
-                    n_energies = len(iso_data['energies'])
-                    # CCFE-709: up to 710 energy boundaries (709 groups)
-                    # UKAEA-1102: up to 1103 energy boundaries (1102 groups)
-                    if n_energies <= 710:
-                        return 'CCFE-709'
-                    elif n_energies <= 1103:
-                        return 'UKAEA-1102'
-                    else:
-                        warn(f"Unknown energy structure with {n_energies} boundaries. "
-                             f"Isomeric branching will be disabled.")
-                        return None
-
-        return None
-
     def _setup_isomeric_branching(self):
         """Set up isomeric branching for CoupledOperator.
 
@@ -371,7 +334,7 @@ class CoupledOperator(OpenMCOperator):
 
         if not isinstance(self._rate_helper, DirectWithFluxHelper):
             # Not using flux tallying - disable isomeric branching
-            if hasattr(self, '_isomeric_energy_structure') and self._isomeric_energy_structure:
+            if self.chain.isomeric_branching_targets:
                 warn(
                     "GENDF library provided but reaction_rate_mode is not 'direct_with_flux'. "
                     "Isomeric branching requires 'direct_with_flux' mode to tally flux spectrum. "
@@ -479,37 +442,33 @@ class CoupledOperator(OpenMCOperator):
         reaction_rate_opts = helper_kwargs['reaction_rate_opts']
         fission_yield_opts = helper_kwargs['fission_yield_opts']
 
-        # Initialize isomeric energy structure tracking
-        self._isomeric_energy_structure = None
-
         # Get classes to assist working with tallies
+        has_isomeric = bool(self.chain.isomeric_branching_targets)
+
         if reaction_rate_mode == "direct":
             self._rate_helper = DirectReactionRateHelper(
                 self.reaction_rates.n_nuc, self.reaction_rates.n_react)
-            # Warn if isomeric data exists but can't be used
-            if self._detect_energy_structure_from_chain() is not None:
+            if has_isomeric:
                 warn(
                     "Isomeric branching data exists in chain but CoupledOperator is using "
                     "reaction_rate_mode='direct'. Use 'direct_with_flux' for automatic isomeric "
-                    "branching support, or 'flux' with explicit energy structure. "
-                    "Isomeric branching will be disabled.",
+                    "branching support. Isomeric branching will be disabled.",
                     UserWarning
                 )
 
         elif reaction_rate_mode == "direct_with_flux":
-            energy_structure = self._detect_energy_structure_from_chain()
-            if energy_structure is None:
-                # No isomeric data, fall back to pure direct mode
-                self._rate_helper = DirectReactionRateHelper(
-                    self.reaction_rates.n_nuc, self.reaction_rates.n_react)
-            else:
+            if has_isomeric and self._gendf_library is not None:
+                energy_structure = self._gendf_library.energy_structure
                 energies = GROUP_STRUCTURES[energy_structure]
                 self._rate_helper = DirectWithFluxHelper(
                     self.reaction_rates.n_nuc,
                     self.reaction_rates.n_react,
                     energies
                 )
-                self._isomeric_energy_structure = energy_structure
+            else:
+                # No isomeric data or no GENDF library — fall back to pure direct mode
+                self._rate_helper = DirectReactionRateHelper(
+                    self.reaction_rates.n_nuc, self.reaction_rates.n_react)
 
         elif reaction_rate_mode == "flux":
             # Ensure energy group boundaries were specified

@@ -1,6 +1,5 @@
 """Unit tests for Chain.reduce() isomeric sibling keeping feature."""
 
-import numpy as np
 import pytest
 import tempfile
 from pathlib import Path
@@ -44,16 +43,9 @@ def create_chain_with_siblings():
     chain.add_nuclide(pd108)
 
     # Add isomeric branching data - Pd108 produces both states
-    chain.isomeric_branching = {
+    chain.isomeric_branching_targets = {
         'Pd108': {
-            '(n,p)': {
-                'energies': np.array([5e6, 10e6, 15e6]),
-                'targets': ['Ag109', 'Ag109_m1'],
-                'branching_ratios': {
-                    'Ag109': np.array([0.70, 0.65, 0.60]),
-                    'Ag109_m1': np.array([0.30, 0.35, 0.40])
-                }
-            }
+            '(n,p)': ['Ag109', 'Ag109_m1']
         }
     }
 
@@ -89,26 +81,12 @@ def create_complex_sibling_chain():
     chain.add_nuclide(ag111_m1)
 
     # Add isomeric branching
-    chain.isomeric_branching = {
+    chain.isomeric_branching_targets = {
         'Ag109': {
-            '(n,gamma)': {
-                'energies': np.array([1e-5, 1e-3]),
-                'targets': ['Ag110', 'Ag110_m1'],
-                'branching_ratios': {
-                    'Ag110': np.array([0.95, 0.93]),
-                    'Ag110_m1': np.array([0.05, 0.07])
-                }
-            }
+            '(n,gamma)': ['Ag110', 'Ag110_m1']
         },
         'Ag110': {
-            '(n,gamma)': {
-                'energies': np.array([1e-5, 1e-3]),
-                'targets': ['Ag111', 'Ag111_m1'],
-                'branching_ratios': {
-                    'Ag111': np.array([0.98, 0.97]),
-                    'Ag111_m1': np.array([0.02, 0.03])
-                }
-            }
+            '(n,gamma)': ['Ag111', 'Ag111_m1']
         }
     }
 
@@ -163,7 +141,7 @@ def test_reduce_siblings_true_no_branching():
     chain.add_nuclide(cd112_m1)
 
     # No isomeric branching data
-    chain.isomeric_branching = None
+    chain.isomeric_branching_targets = None
 
     # Reduce with policy=True
     reduced = chain.reduce(['Cd111'], level=1, keep_isomeric_siblings=True)
@@ -233,14 +211,14 @@ def test_siblings_isomeric_data_preserved():
 
     reduced = chain.reduce(['Ag109'], level=2, keep_isomeric_siblings=True)
 
-    # Check that isomeric branching data is preserved
-    assert reduced.isomeric_branching is not None
-    assert 'Ag109' in reduced.isomeric_branching
-    assert 'Ag110' in reduced.isomeric_branching
+    # Check that isomeric branching targets are preserved
+    assert reduced.isomeric_branching_targets is not None
+    assert 'Ag109' in reduced.isomeric_branching_targets
+    assert 'Ag110' in reduced.isomeric_branching_targets
 
-    # Check Ag110 isomeric data (should be unchanged)
-    iso_data = reduced.isomeric_branching['Ag110']['(n,gamma)']
-    assert set(iso_data['targets']) == {'Ag111', 'Ag111_m1'}
+    # Check Ag110 targets (should be unchanged)
+    targets = reduced.isomeric_branching_targets['Ag110']['(n,gamma)']
+    assert set(targets) == {'Ag111', 'Ag111_m1'}
 
 
 # ==================== Integration Tests ====================
@@ -265,11 +243,11 @@ def test_siblings_export_import_roundtrip():
         reloaded_names = {n.name for n in reloaded.nuclides}
         assert original_names == reloaded_names
 
-        # Verify isomeric data preserved
-        if reduced.isomeric_branching:
-            assert reloaded.isomeric_branching is not None
-            for parent in reduced.isomeric_branching:
-                assert parent in reloaded.isomeric_branching
+        # Verify isomeric targets preserved
+        if reduced.isomeric_branching_targets:
+            assert reloaded.isomeric_branching_targets is not None
+            for parent in reduced.isomeric_branching_targets:
+                assert parent in reloaded.isomeric_branching_targets
 
 
 def test_default_keeps_all_siblings():
