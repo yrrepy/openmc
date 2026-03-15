@@ -473,11 +473,8 @@ class IndependentOperator(OpenMCOperator):
         """
         self._isomeric_branching = None
 
-        # Check if chain has isomeric branching data
-        if not hasattr(self.chain, 'isomeric_branching'):
-            return
-
-        if self.chain.isomeric_branching is None:
+        # Check if chain has isomeric branching targets
+        if not self.chain.isomeric_branching_targets:
             return
 
         # Helper for handling errors/warnings based on require_isomeric_branching
