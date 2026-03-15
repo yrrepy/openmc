@@ -239,6 +239,15 @@ def build_parser():
              "regardless of this flag. Default: keep all isomeric yields."
     )
 
+    parser.add_argument(
+        '--mode',
+        choices=['flags_only', 'embedded'],
+        default='flags_only',
+        help="Output mode: 'flags_only' (default) writes target names only as "
+             "<isomeric_branching targets='...'/> elements. 'embedded' writes full "
+             "energy-dependent ratios as <isomeric_yields> (legacy/informational)."
+    )
+
     return parser
 
 
@@ -614,7 +623,8 @@ def _determine_single_target_reason(branching, valid_products, missing_products,
 
 def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                          chain, verbose=True, prune_nn_prime_self_loops=False,
-                         suppress_single_target_yields=False):
+                         suppress_single_target_yields=False,
+                         mode='flags_only'):
     """Add branching data to chain XML.
 
     Parameters
@@ -778,29 +788,36 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     summary['skipped'] += 1
                     continue
 
-            # Add to XML
-            existing = rx_elem.find('isomeric_yields')
-            if existing is not None:
-                rx_elem.remove(existing)
-
-            yields_elem = ET.SubElement(rx_elem, 'isomeric_yields')
-            yields_elem.set('type', 'energy_dependent')
+            # Remove any existing isomeric elements
+            for tag in ('isomeric_yields', 'isomeric_branching'):
+                existing = rx_elem.find(tag)
+                if existing is not None:
+                    rx_elem.remove(existing)
 
             products = list(valid_products)
             energies = sorted(energy_yields.keys())
 
-            energies_elem = ET.SubElement(yields_elem, 'energies')
-            energies_elem.text = ' '.join(f'{e:.6e}' for e in energies)
+            if mode == 'flags_only':
+                # Write <isomeric_branching targets="A B C"/>
+                iso_elem = ET.SubElement(rx_elem, 'isomeric_branching')
+                iso_elem.set('targets', ' '.join(products))
+            else:
+                # Write full <isomeric_yields> (embedded/informational)
+                yields_elem = ET.SubElement(rx_elem, 'isomeric_yields')
+                yields_elem.set('type', 'energy_dependent')
 
-            targets_elem = ET.SubElement(yields_elem, 'targets')
-            targets_elem.text = ' '.join(products)
+                energies_elem = ET.SubElement(yields_elem, 'energies')
+                energies_elem.text = ' '.join(f'{e:.6e}' for e in energies)
 
-            ratios_elem = ET.SubElement(yields_elem, 'branching_ratios')
-            ratios_lines = []
-            for product in products:
-                ratios = [energy_yields[e].get(product, 0.0) for e in energies]
-                ratios_lines.append('          ' + ' '.join(f'{r:.6e}' for r in ratios))
-            ratios_elem.text = '\n' + '\n'.join(ratios_lines) + '\n        '
+                targets_elem = ET.SubElement(yields_elem, 'targets')
+                targets_elem.text = ' '.join(products)
+
+                ratios_elem = ET.SubElement(yields_elem, 'branching_ratios')
+                ratios_lines = []
+                for product in products:
+                    ratios = [energy_yields[e].get(product, 0.0) for e in energies]
+                    ratios_lines.append('          ' + ' '.join(f'{r:.6e}' for r in ratios))
+                ratios_elem.text = '\n' + '\n'.join(ratios_lines) + '\n        '
 
             summary['added'] += 1
             summary['nuclides_with_branching_added'].add(nuclide_name)
@@ -1562,7 +1579,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
          isomer_mapping_log_file=None,
          renormalization_log_file=None,
          prune_nn_prime_self_loops=False,
-         suppress_single_target_yields=False):
+         suppress_single_target_yields=False,
+         mode='flags_only'):
     """
     Main workflow: GENDF MF=10 → OpenMC chain with isomeric branching.
 
@@ -1705,7 +1723,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         chain=chain,
         verbose=verbose,
         prune_nn_prime_self_loops=prune_nn_prime_self_loops,
-        suppress_single_target_yields=suppress_single_target_yields
+        suppress_single_target_yields=suppress_single_target_yields,
+        mode=mode
     )
 
     if summary['renormalizations']:
@@ -1785,6 +1804,7 @@ if __name__ == '__main__':
         print("Prune (n,n') self-loops: ENABLED")
     if args.suppress_single_target_yields:
         print("Suppress single-target yields: ENABLED")
+    print(f"Output mode:  {args.mode}")
     print(f"\nInput chain:  {config['base_chain']}")
     print(f"Output chain: {output_chain}")
     print(f"Mapping log:  {log_file}")
@@ -1802,7 +1822,8 @@ if __name__ == '__main__':
         verbose=verbose,
         isomer_mapping_log_file=log_file,
         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
-        suppress_single_target_yields=args.suppress_single_target_yields
+        suppress_single_target_yields=args.suppress_single_target_yields,
+        mode=args.mode
     )
 
     print("\n" + "=" * 70)

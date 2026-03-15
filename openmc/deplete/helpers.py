@@ -1218,73 +1218,87 @@ class IsomericBranchingHelper:
             raise ValueError("gendf_library is required for IsomericBranchingHelper")
 
         self.chain: 'Chain' = chain
-        self.isomeric_data: Optional[Dict] = chain.isomeric_branching
+        self.isomeric_targets: Optional[Dict] = chain.isomeric_branching_targets
+        self._branching_cache: Dict = {}
         self.gendf_library = gendf_library
         self.energy_structure: str = gendf_library.energy_structure
         self.expected_energies: np.ndarray = gendf_library.energy_bounds.copy()
         self.n_groups: int = len(self.expected_energies) - 1
     
+    def _get_branching_data(self, nuclide, reaction):
+        """Cached GENDF branching ratio lookup."""
+        key = (nuclide, reaction)
+        if key not in self._branching_cache:
+            mt = REACTION_TO_MT.get(reaction)
+            if mt is None:
+                self._branching_cache[key] = None
+            else:
+                self._branching_cache[key] = \
+                    self.gendf_library.get_branching_ratios(nuclide, mt)
+        return self._branching_cache[key]
+
     def weighted_branching_ratios(
         self,
         flux_spectrum: np.ndarray,
         energy_bins: np.ndarray
     ) -> Dict[str, Dict[str, Dict[str, float]]]:
-        """Calculate σ×φ-weighted branching ratios with strict validation.
+        """Calculate σ×φ-weighted branching ratios from GENDF at runtime.
 
-        Computes the effective isomeric branching ratios to metastable states by
-        weighting the energy-dependent branching data with the reaction rate
-        spectrum (σ×φ). No interpolation is performed between energy points, 
-        flux flat-in-bin. Consistent with the GENDF group cross-sections.
+        Fetches energy-dependent branching ratios from the GENDF library,
+        filters to targets present in the chain, and computes σ×φ-weighted
+        effective ratios.
 
         Parameters
         ----------
         flux_spectrum : numpy.ndarray
             Neutron flux in each energy group [n-cm/src].
-            Must use full energy structure (typically CCFE-709 or UKAEA-1102).
         energy_bins : numpy.ndarray
-            Energy bin boundaries in [eV]. Must match the full expected
-            energy structure exactly.
+            Energy bin boundaries in [eV].
 
         Returns
         -------
         dict
-            Nested dictionary with structure:
-            {nuclide: {reaction: {target: weighted_ratio}}}
-            Returns empty dict if no isomeric data available.
-            Reactions not found in GENDF are skipped (empty dict for that reaction).
-
-        Raises
-        ------
-        ValueError
-            If flux spectrum dimensions don't match expected energy structure,
-        RuntimeError
-            If energy bin boundaries don't match expected structure within
-            tolerance (rtol=1e-6)
+            ``{nuclide: {reaction: {target: weighted_ratio}}}``
         """
         result = defaultdict(lambda: defaultdict(dict))
 
-        if self.isomeric_data is None:
+        if self.isomeric_targets is None:
             return {}
 
-        # Verify energy bin boundaries match (within tolerance)
-        # Relaxed tolerance to accommodate FISPACT flux files which have slightly
-        # different precision than OpenMC's GROUP_STRUCTURES definition.
-        # Max observed difference: 48 eV at ~3 MeV (1.6e-5 relative).
-        # Using rtol=2e-5 + atol=50 eV to handle both relative and absolute differences.
+        # Verify energy bin boundaries match
         if not np.allclose(energy_bins, self.expected_energies, rtol=2e-5, atol=50.0):
             raise ValueError(
                 f"Energy bins do not match {self.energy_structure} structure"
             )
-  
+
         if len(flux_spectrum) != len(energy_bins) - 1:
             raise ValueError(
-                f"Flux has {len(flux_spectrum)} groups, energy bins define {len(energy_bins) - 1}"
+                f"Flux has {len(flux_spectrum)} groups, "
+                f"energy bins define {len(energy_bins) - 1}"
             )
 
-        # Process each nuclide with isomeric data
-        for nuclide, reactions in self.isomeric_data.items():
-            for reaction, data in reactions.items():
-                # Calculate σ×φ-weighted ratios for this reaction
+        for nuclide, reactions in self.isomeric_targets.items():
+            for reaction, target_list in reactions.items():
+                br = self._get_branching_data(nuclide, reaction)
+                if br is None:
+                    continue
+
+                # Filter GENDF products to chain's target list
+                chain_target_set = set(target_list)
+                data = {
+                    'energies': br.energies,
+                    'targets': [p for p in br.products
+                                if p in chain_target_set],
+                    'branching_ratios': {
+                        br.products[i]: br.branching_ratios[i]
+                        for i, p in enumerate(br.products)
+                        if p in chain_target_set
+                    }
+                }
+
+                if not data['targets']:
+                    continue
+
                 weighted = self._calculate_weighted(
                     data, flux_spectrum, energy_bins, nuclide, reaction
                 )

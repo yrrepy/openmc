@@ -153,155 +153,90 @@ def _parse_isomeric_state(nuclide: str) -> tuple:
     return nuclide, 0
 
 
-def _load_isomeric_branching(root):
-    """Load isomeric branching data from XML root.
-    
+def _load_isomeric_branching_targets(root):
+    """Load isomeric branching target names from XML root.
+
+    Reads the new ``<isomeric_branching targets="..."/>`` format.
+    Falls back to legacy ``<isomeric_yields>`` elements (extracts target
+    names only, discards energy-dependent ratio arrays).
+
     Parameters
     ----------
     root : xml.etree.ElementTree
         Root of chain XML
-        
+
     Returns
     -------
     dict or None
-        Isomeric branching data or None if not present
+        ``{nuclide: {reaction: [target_names]}}`` or None
     """
     from openmc._xml import get_text
-    import numpy as np
-    
-    isomeric_data = {}
-    
+
+    targets_data = {}
+
     for nuclide_elem in root.findall('nuclide'):
         nuc_name = get_text(nuclide_elem, 'name')
         if not nuc_name:
             continue
-        
+
         nuc_reactions = {}
-        
+
         for reaction_elem in nuclide_elem.findall('reaction'):
             rx_type = reaction_elem.get('type')
             if not rx_type:
                 continue
-            
-            iso_elem = reaction_elem.find('isomeric_yields')
-            if iso_elem is None:
+
+            # New format: <isomeric_branching targets="A B C"/>
+            iso_elem = reaction_elem.find('isomeric_branching')
+            if iso_elem is not None:
+                targets_attr = iso_elem.get('targets', '')
+                targets = targets_attr.split()
+                if targets:
+                    nuc_reactions[rx_type] = targets
                 continue
-            
-            iso_type = iso_elem.get('type', 'energy_dependent')
-            
-            if iso_type == 'energy_dependent':
-                # Parse energies
-                energies_elem = iso_elem.find('energies')
-                if energies_elem is None or energies_elem.text is None:
-                    continue
-                
-                try:
-                    energies = np.array([float(e) for e in energies_elem.text.split()])
-                except (ValueError, AttributeError):
-                    continue
-                
-                # Parse targets
-                targets_elem = iso_elem.find('targets')
-                if targets_elem is None or targets_elem.text is None:
-                    continue
-                targets = targets_elem.text.split()
-                
-                # Parse branching ratios
-                branching_elem = iso_elem.find('branching_ratios')
-                if branching_elem is None or branching_elem.text is None:
-                    continue
-                
-                lines = []
-                for line in branching_elem.text.strip().split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('<!--'):
-                        if '<!--' in line:
-                            line = line[:line.index('<!--')].strip()
-                        if line:
-                            lines.append(line)
-                
-                if len(lines) != len(targets):
-                    continue
-                
-                branching_ratios = {}
-                for target, line in zip(targets, lines):
-                    try:
-                        ratios = np.array([float(r) for r in line.split()])
-                        if len(ratios) == len(energies):
-                            branching_ratios[target] = ratios
-                    except ValueError:
-                        continue
-                
-                if branching_ratios:
-                    nuc_reactions[rx_type] = {
-                        'energies': energies,
-                        'targets': targets,
-                        'branching_ratios': branching_ratios
-                    }
-        
+
+            # Legacy format: <isomeric_yields> with <targets> child
+            legacy_elem = reaction_elem.find('isomeric_yields')
+            if legacy_elem is not None:
+                targets_elem = legacy_elem.find('targets')
+                if targets_elem is not None and targets_elem.text:
+                    targets = targets_elem.text.split()
+                    if targets:
+                        nuc_reactions[rx_type] = targets
+
         if nuc_reactions:
-            isomeric_data[nuc_name] = nuc_reactions
-    
-    return isomeric_data if isomeric_data else None
+            targets_data[nuc_name] = nuc_reactions
+
+    return targets_data if targets_data else None
 
 
-def _write_isomeric_branching(root_elem, isomeric_data):
-    """Write isomeric branching data to depletion chain XML.
+def _write_isomeric_branching_targets(root_elem, targets_data):
+    """Write isomeric branching targets to depletion chain XML.
 
     Parameters
     ----------
     root_elem : lxml.etree._Element
         Root element of chain XML (already containing nuclide elements)
-    isomeric_data : dict
-        Isomeric branching data structure with format:
-        {nuclide_name: {reaction_type: {'energies': array, 'targets': list, 'branching_ratios': dict}}}
+    targets_data : dict
+        ``{nuclide_name: {reaction_type: [target_names]}}``
     """
-    if isomeric_data is None:
+    if targets_data is None:
         return
 
-    # Iterate all nuclides in the XML tree
     for nuclide_elem in root_elem.findall('nuclide'):
         nuc_name = nuclide_elem.get('name')
-        if not nuc_name or nuc_name not in isomeric_data:
+        if not nuc_name or nuc_name not in targets_data:
             continue
 
-        nuc_iso_data = isomeric_data[nuc_name]
+        nuc_targets = targets_data[nuc_name]
 
-        # Iterate all reactions in this nuclide
         for reaction_elem in nuclide_elem.findall('reaction'):
             rx_type = reaction_elem.get('type')
-            if not rx_type or rx_type not in nuc_iso_data:
+            if not rx_type or rx_type not in nuc_targets:
                 continue
 
-            iso_info = nuc_iso_data[rx_type]
-
-            # Validate data structure
-            if not all(key in iso_info for key in ['energies', 'targets', 'branching_ratios']):
-                continue
-
-            # Create isomeric_yields sub-element
-            iso_elem = ET.SubElement(reaction_elem, 'isomeric_yields')
-            iso_elem.set('type', 'energy_dependent')
-
-            # Write energies
-            energies_elem = ET.SubElement(iso_elem, 'energies')
-            energies_elem.text = ' '.join(f'{e:.10e}' for e in iso_info['energies'])
-
-            # Write targets
-            targets_elem = ET.SubElement(iso_elem, 'targets')
-            targets_elem.text = ' '.join(iso_info['targets'])
-
-            # Write branching ratios (one row per target)
-            branching_elem = ET.SubElement(iso_elem, 'branching_ratios')
-            ratio_lines = []
-            for target in iso_info['targets']:
-                if target in iso_info['branching_ratios']:
-                    ratios = iso_info['branching_ratios'][target]
-                    ratio_line = ' '.join(f'{r:.10f}' for r in ratios)
-                    ratio_lines.append(' ' + ratio_line)
-
-            if ratio_lines:
-                branching_elem.text = '\n' + '\n'.join(ratio_lines) + '\n'
+            iso_elem = ET.SubElement(reaction_elem, 'isomeric_branching')
+            iso_elem.set('targets', ' '.join(nuc_targets[rx_type]))
 
 
 def replace_missing(product, decay_data):
@@ -453,7 +388,8 @@ class Chain:
         self.reactions = []
         self.nuclide_dict = {}
         self._fission_yields = None
-        self.isomeric_branching = None
+        self.isomeric_branching_targets = None
+        self.reduce_pruned_targets = None
 
     def __contains__(self, nuclide):
         return nuclide in self.nuclide_dict
@@ -749,7 +685,7 @@ class Chain:
         chain._xml_path = str(Path(filename).resolve())
 
         # Load isomeric branching data if present
-        chain.isomeric_branching = _load_isomeric_branching(root)
+        chain.isomeric_branching_targets = _load_isomeric_branching_targets(root)
 
         # Pre-compute isomeric families cache for faster reduction operations
         chain._build_isomeric_families_cache()
@@ -759,37 +695,20 @@ class Chain:
     def export_to_xml(self, filename):
         """Writes a depletion chain XML file.
 
-        This method exports the complete depletion chain to XML format,
-        including all nuclides, reactions, decay modes, fission yields,
-        and energy-dependent isomeric branching data (if present).
-
-        .. versionadded:: 0.15.4
-            Isomeric branching data is now included in exported XML files.
-            The exported chain can be reloaded with full fidelity, including
-            any renormalized branching ratios from chain reduction operations.
-
         Parameters
         ----------
         filename : str
             The path to the depletion chain XML file.
-
-        Notes
-        -----
-        If the chain contains ``isomeric_branching`` data, it will be written
-        into the appropriate reaction elements as ``<isomeric_yields>``
-        sub-elements with energy-dependent branching ratios. This ensures
-        round-trip compatibility: a chain loaded from XML, exported, and
-        reloaded will have identical isomeric branching data.
-
         """
 
         root_elem = ET.Element('depletion_chain')
         for nuclide in self.nuclides:
             root_elem.append(nuclide.to_xml_element())
 
-        # Write isomeric branching data if present
-        if self.isomeric_branching is not None:
-            _write_isomeric_branching(root_elem, self.isomeric_branching)
+        # Write isomeric branching targets if present
+        if self.isomeric_branching_targets is not None:
+            _write_isomeric_branching_targets(root_elem,
+                                              self.isomeric_branching_targets)
 
         tree = ET.ElementTree(root_elem)
         tree.write(str(filename), encoding='utf-8', pretty_print=True)
@@ -1474,7 +1393,7 @@ class Chain:
   
         This method adds:
         1. All isomeric siblings for every nuclide in the set
-        2. If isomeric_branching exists: all branching targets and their siblings
+        2. If isomeric_branching_targets exists: all branching targets and their siblings
   
         This ensures that when ``keep_isomeric_siblings=True`` is used during
         chain reduction, no isomeric branching targets are excluded, which would
@@ -1507,157 +1426,20 @@ class Chain:
                     isotope_set.add(sibling)
                     to_check.append(sibling)
   
-            # If isomeric branching exists, also add targets and their siblings
-            if self.isomeric_branching and nuc_name in self.isomeric_branching:
-                for rx_type, iso_data in self.isomeric_branching[nuc_name].items():
-                    if 'targets' in iso_data:
-                        for target in iso_data['targets']:
-                            if target in self.nuclide_dict and target not in isotope_set:
-                                isotope_set.add(target)
-                                to_check.append(target)
-                            # Add siblings for target
-                            for sibling in self._get_isomeric_siblings(target):
-                                if sibling in self.nuclide_dict and sibling not in isotope_set:
-                                    isotope_set.add(sibling)
-                                    to_check.append(sibling)
+            # If isomeric branching targets exist, also add targets and their siblings
+            if self.isomeric_branching_targets and nuc_name in self.isomeric_branching_targets:
+                for rx_type, targets in self.isomeric_branching_targets[nuc_name].items():
+                    for target in targets:
+                        if target in self.nuclide_dict and target not in isotope_set:
+                            isotope_set.add(target)
+                            to_check.append(target)
+                        # Add siblings for target
+                        for sibling in self._get_isomeric_siblings(target):
+                            if sibling in self.nuclide_dict and sibling not in isotope_set:
+                                isotope_set.add(sibling)
+                                to_check.append(sibling)
   
         return isotope_set
-
-    def _filter_and_renormalize_isomeric_branching(self, retained_isotopes):
-        """Filter isomeric branching data with target renormalization.
-
-        This method creates a filtered copy of the chain's isomeric branching
-        data, keeping only entries where the parent nuclide is in the retained
-        set. For reactions where some (but not all) targets are excluded, the
-        branching ratios are renormalized to sum to 1.0 to preserve mass
-        conservation.
-
-        Use this method when ``keep_isomeric_siblings=False``, where isomeric
-        branching targets may not be in the retained set.
-
-        Parameters
-        ----------
-        retained_isotopes : set of str
-            Set of nuclide names that will be included in the reduced chain.
-
-        Returns
-        -------
-        dict or None
-            Filtered isomeric branching data structure, or None if no data
-            remains after filtering.
-
-        Notes
-        -----
-        Three cases are handled for each reaction's isomeric branching:
-
-        1. **All targets retained**: Branching ratios preserved unchanged.
-        2. **All targets excluded**: Reaction's isomeric branching entry dropped.
-        3. **Partial exclusion**: Branching ratios renormalized to sum to 1.0.
-
-        The renormalization formula at each energy point is::
-
-            new_ratio[target] = old_ratio[target] / sum(old_ratios for retained)
-
-        This is analogous to how fission yields are implicitly renormalized
-        when fission products are excluded from a reduced chain.
-
-        Example:
-        --------
-                keep_isomeric_siblings=False:
-                Original: Ir191(n,γ) -> 60% Ir192, 30% Ir192_m1, 10% Ir192_m2
-                Only Ir192 reachable via _follow()
-                Renormalized: Ir191(n,γ) -> 100% Ir192
-
-        """
-        if self.isomeric_branching is None:
-            return None
-
-        new_isomeric_branching = {}
-
-        for parent_name, reactions_dict in self.isomeric_branching.items():
-            # Skip if parent nuclide not in reduced chain
-            if parent_name not in retained_isotopes:
-                continue
-
-            new_reactions_dict = {}
-
-            for rx_type, iso_data in reactions_dict.items():
-                # Validate data structure
-                required_keys = ('energies', 'targets', 'branching_ratios')
-                if not all(key in iso_data for key in required_keys):
-                    warn(f"Malformed isomeric data for {parent_name} {rx_type}, "
-                         f"skipping")
-                    continue
-
-                original_targets = iso_data['targets']
-                energies = iso_data['energies']
-                original_ratios = iso_data['branching_ratios']
-
-                # Filter targets that remain in reduced chain
-                remaining_targets = [t for t in original_targets
-                                     if t in retained_isotopes]
-
-                if not remaining_targets:
-                    # All targets excluded - drop this reaction's branching
-                    continue
-
-                if len(remaining_targets) == len(original_targets):
-                    # All targets retained - copy unchanged
-                    new_reactions_dict[rx_type] = {
-                        'energies': energies,
-                        'targets': list(remaining_targets),
-                        'branching_ratios': {t: r.copy()
-                                             for t, r in original_ratios.items()}
-                    }
-                else:
-                    # Partial exclusion - renormalize branching ratios
-                    new_ratios = {}
-
-                    # Extract ratios for remaining targets
-                    remaining_ratio_arrays = [original_ratios[target]
-                                              for target in remaining_targets]
-
-                    # Sum across targets at each energy point
-                    total_per_energy = np.sum(remaining_ratio_arrays, axis=0)
-
-                    # Renormalize each target's ratios
-                    for target, ratio_array in zip(remaining_targets,
-                                                   remaining_ratio_arrays):
-                        with np.errstate(divide='ignore', invalid='ignore'):
-                            renormalized = ratio_array / total_per_energy
-                            renormalized = np.nan_to_num(
-                                renormalized, nan=0.0, posinf=0.0, neginf=0.0)
-                        new_ratios[target] = renormalized
-
-                    new_reactions_dict[rx_type] = {
-                        'energies': energies,
-                        'targets': list(remaining_targets),
-                        'branching_ratios': new_ratios
-                    }
-
-                    # Validation: check renormalized ratios sum to ~1.0
-                    renorm_total = np.sum(list(new_ratios.values()), axis=0)
-                    valid_energies = total_per_energy > 0
-                    if (valid_energies.any() and
-                        not np.allclose(renorm_total[valid_energies], 1.0,
-                                        rtol=1e-6)):
-                        warn(f"Chain.reduce(): Renormalized isomeric branching "
-                             f"for {parent_name} {rx_type} does not sum to 1.0 "
-                             f"(range: {renorm_total[valid_energies].min():.6f}"
-                             f" - {renorm_total[valid_energies].max():.6f}). "
-                             f"This may indicate malformed input data.")
-
-                    # Informational warning about renormalization
-                    excluded = set(original_targets) - set(remaining_targets)
-                    warn(f"Chain.reduce(): Renormalized isomeric branching for "
-                         f"{parent_name} {rx_type} after excluding targets "
-                         f"{excluded}. Branching ratios adjusted to preserve "
-                         f"mass conservation.")
-
-            if new_reactions_dict:
-                new_isomeric_branching[parent_name] = new_reactions_dict
-
-        return new_isomeric_branching if new_isomeric_branching else None
 
     def reduce(self, initial_isotopes, level=None, keep_isomeric_siblings=True):
         """Reduce the size of the chain by following transmutation paths
@@ -1807,21 +1589,31 @@ class Chain:
         # just the contents
         new_chain.reactions = sorted(new_chain.reactions)
 
-        # Filter isomeric branching data for reduced chain
-        if self.isomeric_branching:
-            if keep_isomeric_siblings:
-                # All targets guaranteed retained - copy parent data
-                new_chain.isomeric_branching = {
-                    parent: reactions
-                    for parent, reactions in self.isomeric_branching.items()
-                    if parent in all_isotopes
-                }
-            else:
-                # Targets may be excluded - filter and renormalize
-                new_chain.isomeric_branching = self._filter_and_renormalize_isomeric_branching(
-                    all_isotopes)
+        # Filter isomeric branching targets for reduced chain
+        if self.isomeric_branching_targets:
+            new_targets = {}
+            pruned = {}
+            for parent, reactions in self.isomeric_branching_targets.items():
+                if parent not in all_isotopes:
+                    continue
+                new_reactions = {}
+                pruned_reactions = {}
+                for rx_type, target_list in reactions.items():
+                    retained = [t for t in target_list if t in all_isotopes]
+                    removed = [t for t in target_list if t not in all_isotopes]
+                    if retained:
+                        new_reactions[rx_type] = retained
+                    if removed:
+                        pruned_reactions[rx_type] = removed
+                if new_reactions:
+                    new_targets[parent] = new_reactions
+                if pruned_reactions:
+                    pruned[parent] = pruned_reactions
+            new_chain.isomeric_branching_targets = new_targets or None
+            new_chain.reduce_pruned_targets = pruned or None
         else:
-            new_chain.isomeric_branching = None
+            new_chain.isomeric_branching_targets = None
+            new_chain.reduce_pruned_targets = None
 
         # Pre-compute isomeric families cache for the reduced chain
         new_chain._build_isomeric_families_cache()
@@ -1892,35 +1684,21 @@ class Chain:
                         next_iso.add(product)
 
                     # Follow isomeric branching targets (co-products at same depth)
-                    # Only include them if include_isomeric_targets is True
                     if (include_isomeric_targets
-                        and self.isomeric_branching is not None
-                        and iso in self.isomeric_branching
-                        and rxn.type in self.isomeric_branching[iso]):
+                        and self.isomeric_branching_targets is not None
+                        and iso in self.isomeric_branching_targets
+                        and rxn.type in self.isomeric_branching_targets[iso]):
 
-                        iso_data = self.isomeric_branching[iso][rxn.type]
-
-                        # Extract targets list (ground + metastable states)
-                        if ('targets' in iso_data
-                            and isinstance(iso_data['targets'], (list, tuple))):
-
-                            for iso_target in iso_data['targets']:
-                                # Validate target exists in full chain
-                                if iso_target not in self:
-                                    continue
-
-                                # Skip the primary target (already added via rxn.target)
-                                if iso_target == rxn.target:
-                                    continue
-
-                                # Skip if already discovered at current or previous levels
-                                if (iso_target in next_iso
-                                    or iso_target in found
-                                    or iso_target in isotopes):
-                                    continue
-
-                                # Add to next depth level
-                                next_iso.add(iso_target)
+                        for iso_target in self.isomeric_branching_targets[iso][rxn.type]:
+                            if iso_target not in self:
+                                continue
+                            if iso_target == rxn.target:
+                                continue
+                            if (iso_target in next_iso
+                                or iso_target in found
+                                or iso_target in isotopes):
+                                continue
+                            next_iso.add(iso_target)
 
                 if nuclide.yield_data is not None:
                     for product in nuclide.yield_data.products:
