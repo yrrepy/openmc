@@ -141,7 +141,6 @@ class IndependentOperator(OpenMCOperator):
                  reduce_chain_level=None,
                  keep_isomeric_siblings=True,
                  fission_yield_opts=None,
-                 require_isomeric_branching=True,
                  gendf_library=None,
                  _prefiltered=False):
         # Validate micro-xs parameters
@@ -207,8 +206,6 @@ class IndependentOperator(OpenMCOperator):
             self.materials = openmc.Materials(
                 [m for m in self.materials if str(m.id) in local_set])
 
-        # Store parameters for isomeric branching setup
-        self._require_isomeric_branching = require_isomeric_branching
         self._gendf_library = gendf_library
 
         # Setup isomeric branching after initialization
@@ -232,7 +229,6 @@ class IndependentOperator(OpenMCOperator):
                       reduce_chain_level=None,
                       keep_isomeric_siblings=True,
                       fission_yield_opts=None,
-                      require_isomeric_branching=True,
                       gendf_library=None):
         """
         Alternate constructor from a dictionary of nuclide concentrations
@@ -285,12 +281,6 @@ class IndependentOperator(OpenMCOperator):
             :class:`openmc.deplete.helpers.FissionYieldHelper` class. Will be
             passed directly on to the helper. Passing a value of None will use
             the defaults for the associated helper.
-        require_isomeric_branching : bool, optional
-            If True (default), raises RuntimeError when isomeric branching data
-            exists in the chain but cannot be used (missing flux spectra or
-            unsupported energy structure). If False, issues a warning and
-            proceeds without isomeric branching.
-            ** Maybe can be wholly removed **
         gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
             GENDF library for on-the-fly multigroup cross-section lookup.
             Default is None.
@@ -311,7 +301,6 @@ class IndependentOperator(OpenMCOperator):
                    reduce_chain_level=reduce_chain_level,
                    keep_isomeric_siblings=keep_isomeric_siblings,
                    fission_yield_opts=fission_yield_opts,
-                   require_isomeric_branching=require_isomeric_branching,
                    gendf_library=gendf_library)
 
     @classmethod
@@ -461,53 +450,27 @@ class IndependentOperator(OpenMCOperator):
                 self.prev_res.append(new_res)
 
     def _setup_isomeric_branching(self):
-        """Set up isomeric branching helper if data exists.
-
-        Raises
-        ------
-        RuntimeError
-            If isomeric branching data exists but flux spectra or energy bins
-            are missing, or if energy structure cannot be determined, and
-            ``require_isomeric_branching=True`` (default).
-
-        Notes
-        -----
-        If ``require_isomeric_branching=False`` was passed to ``__init__``,
-        warnings are issued instead of errors, and isomeric branching is
-        disabled for this operator.
-        """
+        """Set up isomeric branching helper if chain has targets and GENDF library is available."""
         self._isomeric_branching = None
 
-        # Check if chain has isomeric branching targets
         if not self.chain.isomeric_branching_targets:
             return
 
-        # Helper for handling errors/warnings based on require_isomeric_branching
-        def _handle_issue(message):
-            if self._require_isomeric_branching:
-                raise RuntimeError(message)
-            else:
-                warnings.warn(
-                    f"{message} Isomeric branching will be disabled.",
-                    UserWarning
-                )
-                return True  # Signal to return early
-
         if self._gendf_library is None:
-            if _handle_issue(
-                "Isomeric branching data is present in chain but no GENDF "
-                "library was provided."
-            ):
-                return
+            warnings.warn(
+                "Chain has isomeric branching targets but no GENDF library "
+                "was provided. Isomeric branching will be disabled.",
+                UserWarning
+            )
+            return
 
-        # Check flux spectra and energy bins
-        if len(self._flux_with_energy) == 0 or self._energy_bins is None or len(self._energy_bins) == 0:
-            if _handle_issue(
-                "Isomeric branching data is present in chain but flux spectra "
-                "or energy bins are missing. Energy-dependent isomeric branching "
-                "requires flux spectra with energy information."
-            ):
-                return
+        if not self._flux_with_energy or self._energy_bins is None or len(self._energy_bins) == 0:
+            warnings.warn(
+                "Chain has isomeric branching targets but flux spectra or "
+                "energy bins are missing. Isomeric branching will be disabled.",
+                UserWarning
+            )
+            return
 
         helper = IsomericBranchingHelper(
             self.chain,
