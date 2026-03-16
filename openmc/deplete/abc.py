@@ -592,6 +592,15 @@ class Integrator(ABC):
         `source_rates` should be the same as the initial run.
 
         .. versionadded:: 0.15.1
+    clip_min_atom_density : float, optional
+        Minimum atom density threshold [atoms/b-cm]. After each CRAM
+        solve, nuclides with density below this value are clipped to
+        zero. CRAM can produce small negative values for nearly-depleted
+        nuclides; setting this to 0.0 clips only negatives. A typical
+        value is 1e-20. For multi-stage integrators (CE/CM, CF4, etc.),
+        clipping is applied after each CRAM sub-step.
+
+        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -628,6 +637,10 @@ class Integrator(ABC):
         External source rates for the depletion system.
 
         .. versionadded:: 0.15.3
+    clip_min_atom_density : float or None
+        Minimum atom density threshold [atoms/b-cm] for clipping.
+
+        .. versionadded:: 0.15.4
 
     """)
 
@@ -641,6 +654,7 @@ class Integrator(ABC):
             timestep_units: str = 's',
             solver: str = "cram48",
             continue_timesteps: bool = False,
+            clip_min_atom_density: Optional[float] = None,
         ):
         if continue_timesteps and operator.prev_res is None:
             raise ValueError("Continuation run requires passing prev_results.")
@@ -692,6 +706,14 @@ class Integrator(ABC):
 
         self.timesteps = np.asarray(seconds)
         self.source_rates = np.asarray(source_rates)
+
+        if clip_min_atom_density is not None:
+            check_type("clip_min_atom_density", clip_min_atom_density, Real)
+            check_greater_than("clip_min_atom_density",
+                               clip_min_atom_density, 0.0, equality=True)
+        self.clip_min_atom_density = clip_min_atom_density
+        self._warned_negative_density = False
+        self._warned_sub_threshold = False
 
         self.transfer_rates = None
         self.external_source_rates = None
@@ -745,6 +767,31 @@ class Integrator(ABC):
         results = deplete(
             self._solver, self.chain, n, rates, dt, i, matrix_func,
             self.transfer_rates, self.external_source_rates, self.operator)
+        if self.clip_min_atom_density is not None:
+            volumes = self.operator.number.volume
+            for j, r in enumerate(results):
+                threshold = self.clip_min_atom_density * 1e24 * volumes[j]
+                if not self._warned_negative_density:
+                    neg_mask = r < 0
+                    if neg_mask.any():
+                        idx = np.argmin(r)
+                        nuc_list = list(
+                            self.operator.number.burnable_nuclides)
+                        nuc = nuc_list[idx]
+                        density = r[idx] / (1e24 * volumes[j])
+                        warn(f"Clipping {neg_mask.sum()} negative atom "
+                             f"densities (worst: {nuc} = "
+                             f"{density:.4e} atoms/b-cm)")
+                        self._warned_negative_density = True
+                if not self._warned_sub_threshold and threshold > 0:
+                    sub_mask = (r >= 0) & (r < threshold)
+                    if sub_mask.any():
+                        warn(f"Clipping {sub_mask.sum()} sub-threshold "
+                             f"atom densities (threshold: "
+                             f"{self.clip_min_atom_density:.4e} "
+                             f"atoms/b-cm)")
+                        self._warned_sub_threshold = True
+                results[j] = np.where(r < threshold, 0.0, r)
         return time.time() - start, results
 
     @abstractmethod
@@ -1132,6 +1179,15 @@ class SIIntegrator(Integrator):
         `source_rates` should be the same as the initial run.
 
         .. versionadded:: 0.15.1
+    clip_min_atom_density : float, optional
+        Minimum atom density threshold [atoms/b-cm]. After each CRAM
+        solve, nuclides with density below this value are clipped to
+        zero. CRAM can produce small negative values for nearly-depleted
+        nuclides; setting this to 0.0 clips only negatives. A typical
+        value is 1e-20. For multi-stage integrators (CE/CM, CF4, etc.),
+        clipping is applied after each CRAM sub-step.
+
+        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -1161,6 +1217,10 @@ class SIIntegrator(Integrator):
               next time step. Expected to be of the same shape as ``n0``
 
         .. versionadded:: 0.12
+    clip_min_atom_density : float or None
+        Minimum atom density threshold [atoms/b-cm] for clipping.
+
+        .. versionadded:: 0.15.4
 
     """)
 
@@ -1175,12 +1235,15 @@ class SIIntegrator(Integrator):
             n_steps: int = 10,
             solver: str = "cram48",
             continue_timesteps: bool = False,
+            clip_min_atom_density: Optional[float] = None,
         ):
         check_type("n_steps", n_steps, Integral)
         check_greater_than("n_steps", n_steps, 0)
         super().__init__(
             operator, timesteps, power, power_density, source_rates,
-            timestep_units=timestep_units, solver=solver, continue_timesteps=continue_timesteps)
+            timestep_units=timestep_units, solver=solver,
+            continue_timesteps=continue_timesteps,
+            clip_min_atom_density=clip_min_atom_density)
         self.n_steps = n_steps
 
     def _get_bos_data_from_operator(self, step_index, step_power, n_bos):
