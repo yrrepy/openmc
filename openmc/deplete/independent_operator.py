@@ -142,11 +142,20 @@ class IndependentOperator(OpenMCOperator):
                  keep_isomeric_siblings=True,
                  fission_yield_opts=None,
                  gendf_library=None,
-                 _prefiltered=False):
+                 _prefiltered=False,
+                 _precomputed_metadata=None):
         # Validate micro-xs parameters
         check_type('materials', materials, Iterable, openmc.Material)
         check_type('micros', micros, Iterable, MicroXS)
         materials = openmc.Materials(materials)
+
+        # Store before super().__init__() so _get_burnable_mats() override sees it
+        self._precomputed_metadata = _precomputed_metadata
+
+        if _prefiltered and reduce_chain_level is not None:
+            raise ValueError(
+                "reduce_chain_level is not supported with from_microxs_file "
+                "(materials are pre-filtered to local-only)")
 
         if not _prefiltered:
             if not (len(fluxes) == len(micros) == len(materials)):
@@ -199,12 +208,14 @@ class IndependentOperator(OpenMCOperator):
                 self.cross_sections = [self.cross_sections[i] for i in local_indices]
                 self._flux_with_energy = [self._flux_with_energy[i] for i in local_indices]
 
-            # Remap to 0-based local indices; drop non-local materials
+            # Remap to 0-based local indices
             self._mat_index_map = {
                 lm: i for i, lm in enumerate(self.local_mats)}
-            local_set = set(self.local_mats)
-            self.materials = openmc.Materials(
-                [m for m in self.materials if str(m.id) in local_set])
+            # Filter materials if not already local-only
+            if self._precomputed_metadata is None:
+                local_set = set(self.local_mats)
+                self.materials = openmc.Materials(
+                    [m for m in self.materials if str(m.id) in local_set])
 
         self._gendf_library = gendf_library
 
@@ -366,10 +377,26 @@ class IndependentOperator(OpenMCOperator):
         check_type('materials', materials, Iterable, openmc.Material)
         materials_obj = openmc.Materials(materials)
 
-        # Determine burnable materials in sorted order (same logic as
-        # OpenMCOperator._get_burnable_mats)
-        burnable_mats = sorted(
-            [str(mat.id) for mat in materials_obj if mat.depletable], key=int)
+        # Pre-compute global metadata before filtering materials
+        all_depletable = sorted(
+            [m for m in materials_obj if m.depletable],
+            key=lambda m: int(m.id))
+        burnable_mats = [str(m.id) for m in all_depletable]
+        if not burnable_mats:
+            raise RuntimeError(
+                "No depletable materials were found in the model.")
+        volume = {}
+        heavy_metal = 0.0
+        for m in all_depletable:
+            if m.volume is None:
+                name_str = f" Name={m.name}" if m.name else ""
+                raise RuntimeError(
+                    f"Volume not specified for depletable material "
+                    f"with ID={m.id}{name_str}.")
+            volume[str(m.id)] = m.volume
+            heavy_metal += m.fissionable_mass
+        name_list = [m.name for m in all_depletable]
+
         local_mats = _distribute(burnable_mats)
 
         local_micros, local_flux_with_energy = read_local_microxs_hdf5(
@@ -384,8 +411,13 @@ class IndependentOperator(OpenMCOperator):
             n_groups = local_micros[0].data.shape[2] if local_micros else 1
             local_fluxes = [np.ones(n_groups) for _ in local_mats]
 
+        # Filter materials to local-only before passing to __init__
+        local_set = set(local_mats)
+        local_materials = openmc.Materials(
+            [m for m in materials_obj if str(m.id) in local_set])
+
         op = cls(
-            materials_obj,
+            local_materials,
             local_fluxes,
             local_micros,
             chain_file=chain_file,
@@ -398,12 +430,13 @@ class IndependentOperator(OpenMCOperator):
             fission_yield_opts=fission_yield_opts,
             gendf_library=gendf_library,
             _prefiltered=True,
+            _precomputed_metadata={
+                'heavy_metal': heavy_metal,
+                'burnable_mats': burnable_mats,
+                'volume': volume,
+                'name_list': name_list,
+            },
         )
-
-        # Verify _distribute agreement between from_microxs_file and __init__
-        assert list(op.local_mats) == list(local_mats), (
-            f"_distribute mismatch: from_microxs_file got {local_mats}, "
-            f"but __init__ computed {op.local_mats}")
 
         return op
 
@@ -504,6 +537,25 @@ class IndependentOperator(OpenMCOperator):
                 UserWarning
             )
             self._isomeric_branching = None
+
+    def _get_burnable_mats(self):
+        """Override to use pre-computed metadata when materials are pre-filtered."""
+        if self._precomputed_metadata is not None:
+            meta = self._precomputed_metadata
+            self.heavy_metal = meta['heavy_metal']
+            self.name_list = meta['name_list']
+            # model_nuclides from local mats only (safe: _extract_number is local-only)
+            model_nuclides = set()
+            for mat in self.materials:
+                for nuc in mat.get_nuclides():
+                    if nuc in self.nuclides_with_data or self._decay_nucs:
+                        model_nuclides.add(nuc)
+            nuclides = list(self.chain.nuclide_dict)
+            for nuc in sorted(model_nuclides):
+                if nuc not in nuclides:
+                    nuclides.append(nuc)
+            return meta['burnable_mats'], meta['volume'], nuclides
+        return super()._get_burnable_mats()
 
     def _get_nuclides_with_data(self, cross_sections: list[MicroXS]) -> set[str]:
         """Finds nuclides with cross section data
