@@ -316,7 +316,6 @@ class IndependentOperator(OpenMCOperator):
         reduce_chain_level=None,
         keep_isomeric_siblings=True,
         fission_yield_opts=None,
-        require_isomeric_branching=True,
         gendf_library=None,
     ):
         """Construct operator from a pre-written MicroXS HDF5 file.
@@ -351,8 +350,6 @@ class IndependentOperator(OpenMCOperator):
             Whether to keep isomeric siblings. Defaults to True.
         fission_yield_opts : dict, optional
             Arguments for the FissionYieldHelper.
-        require_isomeric_branching : bool, optional
-            If True, require isomeric branching ratios. Defaults to True.
         gendf_library : GENDFLibrary, optional
             GENDF library for isomeric branching ratios.
 
@@ -399,7 +396,6 @@ class IndependentOperator(OpenMCOperator):
             reduce_chain_level=reduce_chain_level,
             keep_isomeric_siblings=keep_isomeric_siblings,
             fission_yield_opts=fission_yield_opts,
-            require_isomeric_branching=require_isomeric_branching,
             gendf_library=gendf_library,
             _prefiltered=True,
         )
