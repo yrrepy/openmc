@@ -1061,6 +1061,7 @@ def write_global_microxs_hdf5(
     fluxes: Sequence | None = None,
     dtype: str = 'float64',
     compression: bool | tuple = True,
+    write_sidecar: bool = False,
 ) -> None:
     """Write all MicroXS to a single rank-independent HDF5 file.
 
@@ -1090,6 +1091,10 @@ def write_global_microxs_hdf5(
     compression : bool or tuple, optional
         HDF5 compression. Default ``True`` uses lzf. ``False`` disables
         compression. A tuple ``('gzip', level)`` uses gzip.
+    write_sidecar : bool, optional
+        Write a ``.microxs.npy`` sidecar file for memory-mapped reading.
+        Default ``False``. The sidecar enables ``mmap=True`` in
+        :func:`read_local_microxs_hdf5` for zero-copy XS access.
 
     See Also
     --------
@@ -1164,11 +1169,16 @@ def write_global_microxs_hdf5(
             _write_flux_data(f, fluxes, dtype=dtype,
                              compression=comp, compression_opts=comp_opts)
 
+    if write_sidecar:
+        sidecar_path = Path(filename).with_suffix('.microxs.npy')
+        np.save(sidecar_path, stacked)
+
 
 def read_local_microxs_hdf5(
     filename: PathLike,
     local_mat_ids: Sequence[str],
-) -> tuple[list[MicroXS], list[tuple] | None]:
+    mmap: bool = False,
+) -> tuple[list[MicroXS], list[tuple] | None, np.ndarray | None]:
     """Read local material slices from a global MicroXS HDF5 file.
 
     Reads only the rows corresponding to ``local_mat_ids`` from the stacked
@@ -1183,6 +1193,11 @@ def read_local_microxs_hdf5(
         Path to HDF5 file written by :func:`write_global_microxs_hdf5`.
     local_mat_ids : list of str
         Material IDs for this MPI rank.
+    mmap : bool, optional
+        Use memory-mapped sidecar file instead of reading into heap.
+        Requires a ``.microxs.npy`` sidecar written by
+        :func:`write_global_microxs_hdf5` with ``write_sidecar=True``.
+        Default ``False``.
 
     Returns
     -------
@@ -1192,6 +1207,9 @@ def read_local_microxs_hdf5(
         If flux data exists in the file, a list of
         ``(flux_array, energy_bounds)`` tuples. Returns ``None`` if no
         flux data in file.
+    mmap_ref : numpy.ndarray or None
+        Reference to the memory-mapped array when ``mmap=True``, to
+        prevent garbage collection. ``None`` otherwise.
 
     See Also
     --------
@@ -1199,7 +1217,7 @@ def read_local_microxs_hdf5(
 
     """
     if len(local_mat_ids) == 0:
-        return [], None
+        return [], None, None
 
     with h5py.File(filename, 'r') as f:
         version = f.attrs.get('version', None)
@@ -1225,15 +1243,26 @@ def read_local_microxs_hdf5(
 
         # h5py requires fancy indices to be strictly sorted ascending
         sorted_rows = sorted(local_rows)
-        xs_block = f['xs_data'][sorted_rows]
-
-        # Reorder to match local_mat_ids order
         sort_map = {row: pos for pos, row in enumerate(sorted_rows)}
         reorder = [sort_map[r] for r in local_rows]
-        xs_block = xs_block[reorder]
 
-        micros = [MicroXS(xs_block[i], nuclides, reactions)
-                  for i in range(len(local_mat_ids))]
+        # Build MicroXS from mmap sidecar or HDF5 data
+        mmap_ref = None
+        if mmap:
+            sidecar_path = Path(filename).with_suffix('.microxs.npy')
+            if not sidecar_path.exists():
+                raise FileNotFoundError(
+                    f"Sidecar file {sidecar_path} not found. Re-run "
+                    f"write_global_microxs_hdf5 with write_sidecar=True.")
+            global_xs = np.load(str(sidecar_path), mmap_mode='r')
+            micros = [MicroXS(global_xs[row], nuclides, reactions)
+                      for row in local_rows]
+            mmap_ref = global_xs
+        else:
+            xs_block = f['xs_data'][sorted_rows]
+            xs_block = xs_block[reorder]
+            micros = [MicroXS(xs_block[i], nuclides, reactions)
+                      for i in range(len(local_mat_ids))]
 
         flux_with_energy = None
         if 'fluxes' in f:
@@ -1248,4 +1277,4 @@ def read_local_microxs_hdf5(
                 for i in range(len(local_mat_ids))
             ]
 
-    return micros, flux_with_energy
+    return micros, flux_with_energy, mmap_ref

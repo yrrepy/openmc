@@ -324,6 +324,7 @@ class IndependentOperator(OpenMCOperator):
         keep_isomeric_siblings=True,
         fission_yield_opts=None,
         gendf_library=None,
+        mmap=False,
     ):
         """Construct operator from a pre-written MicroXS HDF5 file.
 
@@ -359,6 +360,10 @@ class IndependentOperator(OpenMCOperator):
             Arguments for the FissionYieldHelper.
         gendf_library : GENDFLibrary, optional
             GENDF library for isomeric branching ratios.
+        mmap : bool, optional
+            Use memory-mapped sidecar for zero-copy XS access. Requires
+            ``.microxs.npy`` written with ``write_sidecar=True``.
+            Reduces per-rank RAM. Default ``False``.
 
         Returns
         -------
@@ -395,8 +400,8 @@ class IndependentOperator(OpenMCOperator):
 
         local_mats = _distribute(burnable_mats)
 
-        local_micros, local_flux_with_energy = read_local_microxs_hdf5(
-            microxs_file, local_mats)
+        local_micros, local_flux_with_energy, mmap_ref = read_local_microxs_hdf5(
+            microxs_file, local_mats, mmap=mmap)
 
         # Build fluxes list from HDF5 data or default to unit flux.
         # Pass full (flux, energy_bounds) tuples so __init__ populates
@@ -433,6 +438,8 @@ class IndependentOperator(OpenMCOperator):
                 'name_list': name_list,
             },
         )
+
+        op._microxs_mmap = mmap_ref  # prevent GC of memory-mapped array
 
         return op
 

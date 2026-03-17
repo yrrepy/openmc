@@ -41,7 +41,7 @@ def test_roundtrip_all(tmp_path):
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids)
-    result, flux_data = read_local_microxs_hdf5(fname, mat_ids)
+    result, flux_data, _ = read_local_microxs_hdf5(fname, mat_ids)
 
     assert len(result) == 5
     assert flux_data is None
@@ -60,7 +60,7 @@ def test_subset_read(tmp_path):
     write_global_microxs_hdf5(micros, fname, mat_ids)
 
     local_ids = ['3', '6', '8']
-    result, _ = read_local_microxs_hdf5(fname, local_ids)
+    result, _, _ = read_local_microxs_hdf5(fname, local_ids)
 
     assert len(result) == 3
     for local_id, loaded in zip(local_ids, result):
@@ -78,7 +78,7 @@ def test_ordering_preserved(tmp_path):
 
     # Request in reverse-ish order
     local_ids = ['5', '2', '4']
-    result, _ = read_local_microxs_hdf5(fname, local_ids)
+    result, _, _ = read_local_microxs_hdf5(fname, local_ids)
 
     assert len(result) == 3
     for local_id, loaded in zip(local_ids, result):
@@ -97,7 +97,7 @@ def test_flux_roundtrip(tmp_path):
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids, fluxes=fluxes)
-    _, flux_data = read_local_microxs_hdf5(fname, mat_ids)
+    _, flux_data, _ = read_local_microxs_hdf5(fname, mat_ids)
 
     assert flux_data is not None
     assert len(flux_data) == 3
@@ -114,7 +114,7 @@ def test_flux_plain_arrays(tmp_path):
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids, fluxes=fluxes)
-    _, flux_data = read_local_microxs_hdf5(fname, mat_ids)
+    _, flux_data, _ = read_local_microxs_hdf5(fname, mat_ids)
 
     assert flux_data is not None
     for flux_arr, e_bounds in flux_data:
@@ -129,7 +129,7 @@ def test_no_flux(tmp_path):
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids)
-    _, flux_data = read_local_microxs_hdf5(fname, mat_ids)
+    _, flux_data, _ = read_local_microxs_hdf5(fname, mat_ids)
 
     assert flux_data is None
 
@@ -143,7 +143,7 @@ def test_empty_local_mat_ids(tmp_path):
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids)
-    result, flux_data = read_local_microxs_hdf5(fname, [])
+    result, flux_data, _ = read_local_microxs_hdf5(fname, [])
 
     assert result == []
     assert flux_data is None
@@ -228,7 +228,7 @@ def test_float32_roundtrip(tmp_path):
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids, dtype='float32')
-    result, _ = read_local_microxs_hdf5(fname, mat_ids)
+    result, _, _ = read_local_microxs_hdf5(fname, mat_ids)
 
     assert result[0].data.dtype == np.float32
     for orig, loaded in zip(micros, result):
@@ -254,13 +254,13 @@ def test_dtype_autodetect(tmp_path):
     # float32
     f32 = tmp_path / 'f32.h5'
     write_global_microxs_hdf5(micros, f32, mat_ids, dtype='float32')
-    result32, _ = read_local_microxs_hdf5(f32, mat_ids)
+    result32, _, _ = read_local_microxs_hdf5(f32, mat_ids)
     assert result32[0].data.dtype == np.float32
 
     # float64
     f64 = tmp_path / 'f64.h5'
     write_global_microxs_hdf5(micros, f64, mat_ids, dtype='float64')
-    result64, _ = read_local_microxs_hdf5(f64, mat_ids)
+    result64, _, _ = read_local_microxs_hdf5(f64, mat_ids)
     assert result64[0].data.dtype == np.float64
 
 
@@ -282,7 +282,7 @@ def test_compression_options(tmp_path):
     for comp, label in [(True, 'lzf'), (False, 'none'), (('gzip', 4), 'gzip')]:
         fname = tmp_path / f'{label}.h5'
         write_global_microxs_hdf5(micros, fname, mat_ids, compression=comp)
-        result, _ = read_local_microxs_hdf5(fname, mat_ids)
+        result, _, _ = read_local_microxs_hdf5(fname, mat_ids)
         for orig, loaded in zip(micros, result):
             np.testing.assert_array_equal(loaded.data, orig.data)
 
