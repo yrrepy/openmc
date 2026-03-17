@@ -84,8 +84,7 @@ def test_from_microxs_file(tmp_path):
         [micro_xs] * n_mats, fname, mat_ids)
 
     op = IndependentOperator.from_microxs_file(
-        materials, fname, chain_file=CHAIN_PATH,
-        require_isomeric_branching=False)
+        materials, fname, chain_file=CHAIN_PATH)
 
     assert len(op.cross_sections) == n_mats
     assert len(op.fluxes) == n_mats
@@ -109,8 +108,7 @@ def test_from_microxs_file_with_flux(tmp_path):
         [micro_xs] * n_mats, fname, mat_ids, fluxes=fluxes)
 
     op = IndependentOperator.from_microxs_file(
-        materials, fname, chain_file=CHAIN_PATH,
-        require_isomeric_branching=False)
+        materials, fname, chain_file=CHAIN_PATH)
 
     # Fluxes should be plain arrays, not tuples
     for f in op.fluxes:
@@ -130,7 +128,6 @@ def test_prefiltered_skips_validation(tmp_path):
         [np.ones(1), np.ones(1)],
         [micro_xs, micro_xs],
         chain_file=CHAIN_PATH,
-        require_isomeric_branching=False,
         _prefiltered=True,
     )
     assert len(op.cross_sections) == 2
