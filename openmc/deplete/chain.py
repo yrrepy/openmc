@@ -839,20 +839,20 @@ class Chain:
                                 # distribution (sums to 1.0)
                                 total_ratio = 0.0
                                 missing_targets = []
-                                for iso_target, br in nuc_iso[r_type].items():
+                                for iso_target, iso_br in nuc_iso[r_type].items():
                                     # Validate ratio value (guard against NaN/Inf from data corruption)
-                                    if not math.isfinite(br):
+                                    if not math.isfinite(iso_br):
                                         warn(f"Invalid isomeric branching ratio for {nuc.name} {r_type} -> "
-                                             f"{iso_target}: {br}. Treating as 0.0.")
-                                        br = 0.0
+                                             f"{iso_target}: {iso_br}. Treating as 0.0.")
+                                        iso_br = 0.0
 
                                     if iso_target not in self.nuclide_dict:
                                         # Critical error - missing target will cause mass conservation violation
                                         missing_targets.append(iso_target)
                                     else:
                                         k = self.nuclide_dict[iso_target]
-                                        setval(k, i, path_rate * br)
-                                        total_ratio += br
+                                        setval(k, i, path_rate * iso_br)
+                                        total_ratio += iso_br
 
                                 # Raise error if any targets are missing
                                 if missing_targets:
