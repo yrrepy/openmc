@@ -39,12 +39,16 @@ class MockGENDFLibrary:
             raise KeyError(f"Nuclide {nuclide} not in GENDF library")
         return np.ones(709) * 1.0  # 1 barn for all groups
 
-    def get_all_xs(self, nuclide):
+    def get_all_xs(self, nuclide, mts=None):
         """Return all reactions for a nuclide."""
         if nuclide not in self._available:
             raise KeyError(f"Nuclide {nuclide} not in GENDF library")
         # MT 102 = (n,gamma), MT 18 = fission
-        return {102: np.ones(709) * 1.0, 18: np.ones(709) * 1.0}
+        all_xs = {102: np.ones(709) * 1.0, 18: np.ones(709) * 1.0}
+        if mts is not None:
+            mts_set = set(mts)
+            return {mt: xs for mt, xs in all_xs.items() if mt in mts_set}
+        return all_xs
 
 
 class MockChain:
