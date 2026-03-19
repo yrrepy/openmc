@@ -1220,6 +1220,7 @@ class IsomericBranchingHelper:
         self.chain: 'Chain' = chain
         self.isomeric_targets: Optional[Dict] = chain.isomeric_branching_targets
         self._branching_cache: Dict = {}
+        self._energy_validated: bool = False
         self.gendf_library = gendf_library
         self.energy_structure: str = gendf_library.energy_structure
         self.expected_energies: np.ndarray = gendf_library.energy_bounds.copy()
@@ -1265,11 +1266,13 @@ class IsomericBranchingHelper:
         if self.isomeric_targets is None:
             return {}
 
-        # Verify energy bin boundaries match
-        if not np.allclose(energy_bins, self.expected_energies, rtol=2e-5, atol=50.0):
-            raise ValueError(
-                f"Energy bins do not match {self.energy_structure} structure"
-            )
+        # Verify energy bin boundaries match (skip after first successful check)
+        if not self._energy_validated:
+            if not np.allclose(energy_bins, self.expected_energies, rtol=2e-5, atol=50.0):
+                raise ValueError(
+                    f"Energy bins do not match {self.energy_structure} structure"
+                )
+            self._energy_validated = True
 
         if len(flux_spectrum) != len(energy_bins) - 1:
             raise ValueError(
@@ -1306,7 +1309,39 @@ class IsomericBranchingHelper:
                     result[nuclide][reaction] = weighted
 
         return dict(result)
-    
+
+    def compute_for_materials(self, flux_energy_pairs):
+        """Compute σ×φ-weighted branching for a list of materials.
+
+        Parameters
+        ----------
+        flux_energy_pairs : list of (numpy.ndarray, numpy.ndarray)
+            Each element is (flux_spectrum, energy_bins) for one material.
+
+        Returns
+        -------
+        list of dict or None
+            Weighted branching dicts per material, or None if no branching.
+        """
+        results = []
+        for flux_spectrum, energy_bins in flux_energy_pairs:
+            weighted = self.weighted_branching_ratios(flux_spectrum, energy_bins)
+            results.append(weighted)
+
+        if not any(bool(d) for d in results):
+            warnings.warn(
+                "Isomeric branching data exists in chain but σ×φ-weighted ratios "
+                "could not be calculated. MicroXS stores flux-collapsed single-group "
+                "cross-sections and cannot provide spectral information for weighting.\n"
+                "To enable isomeric branching, provide gendf_library parameter with "
+                "GENDF files containing multigroup cross-sections.\n"
+                "Proceeding without isomeric branching.",
+                UserWarning
+            )
+            return None
+
+        return results
+
     def _compute_isomeric_indices(
         self,
         iso_energies: np.ndarray,
