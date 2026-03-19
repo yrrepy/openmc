@@ -1053,7 +1053,8 @@ class _PythonGENDFLibrary:
     def get_all_xs(
         self,
         nuclide_name: str,
-        strict_alignment: bool = True
+        strict_alignment: bool = True,
+        mts: Optional[List[int]] = None
     ) -> dict[int, np.ndarray]:
         """Get all available cross-sections for a nuclide.
 
@@ -1067,6 +1068,8 @@ class _PythonGENDFLibrary:
         strict_alignment : bool, optional
             If True (default), raise ValueError for threshold alignment
             failures. See :meth:`get_xs` for details.
+        mts : list of int, optional
+            If provided, only extract these MT numbers. Default: all MF=3.
 
         Returns
         -------
@@ -1075,9 +1078,12 @@ class _PythonGENDFLibrary:
             Each array has length n_groups.
         """
         material = self._load_material(nuclide_name)
+        mts_set = set(mts) if mts is not None else None
         result = {}
         for (mf, mt), xs_data in material.section_data.items():
             if mf != 3:
+                continue
+            if mts_set is not None and mt not in mts_set:
                 continue
             if 'sigma' not in xs_data:
                 continue
