@@ -495,14 +495,9 @@ def _build_sparse_xs_table(
     rxn_idx_list = []
 
     mt_to_rxn_idx = {mt: i for i, mt in enumerate(mts)}
-    is_cpp = (_CppGENDFLibrary is not None
-              and isinstance(gendf_library, _CppGENDFLibrary))
 
     for nuc_idx, nuc in enumerate(nuclides):
-        if is_cpp:
-            all_xs = gendf_library.get_all_xs(nuc, mts=mts)
-        else:
-            all_xs = gendf_library.get_all_xs(nuc)
+        all_xs = gendf_library.get_all_xs(nuc, mts=mts)
         for mt, xs_arr in all_xs.items():
             if mt not in mt_to_rxn_idx:
                 continue
