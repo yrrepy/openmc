@@ -61,7 +61,7 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/Activation/DecayData/jendl5dd/',
         'base_chain': '//home/perry/NukeData/openmc_data/src/openmc_data/depletion/JENDL50/Chain_JENDL50.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JENDL50/',
-        'output_prefix': 'Chain_JENDL50-Iso',
+        'output_prefix': 'Chain_JENDL50-IsoFlag',
         'log_prefix': 'JENDL50_isomer_mapping',
     },
     'cendl32': {
@@ -79,7 +79,7 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/endf-b8.0-endf/decay/ENDF-B-VIII.0_decay/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/Chain_ENDFB80.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/',
-        'output_prefix': 'Chain_ENDFB80-Iso',
+        'output_prefix': 'Chain_ENDFB80-IsoFlag',
         'log_prefix': 'ENDFB80_isomer_mapping',
     },
     'endfb81': {
@@ -88,7 +88,7 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/decay/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/Chain_ENDFB81.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/',
-        'output_prefix': 'Chain_ENDFB81-Iso',
+        'output_prefix': 'Chain_ENDFB81-IsoFlag',
         'log_prefix': 'ENDFB81_isomer_mapping',
     },
     'tendl2017': {
@@ -97,7 +97,7 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017/Chain_TENDL2017.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017/',
-        'output_prefix': 'Chain_TENDL2017-Iso',
+        'output_prefix': 'Chain_TENDL2017-IsoFlag',
         'log_prefix': 'TENDL2017_isomer_mapping',
     },
     'tendl2019': {
@@ -106,7 +106,7 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/Activation/DecayData/decay_2020/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2019/Chain_TENDL2019.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2019/',
-        'output_prefix': 'Chain_TENDL2019-Iso',
+        'output_prefix': 'Chain_TENDL2019-IsoFlag',
         'log_prefix': 'TENDL2019_isomer_mapping',
     },
     'tendl2021': {
@@ -115,7 +115,7 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/Activation/DecayData/decay_2020/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2021/Chain_TENDL2021.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2021/',
-        'output_prefix': 'Chain_TENDL2021-Iso',
+        'output_prefix': 'Chain_TENDL2021-IsoFlag',
         'log_prefix': 'TENDL2021_isomer_mapping',
     },
     'jeff33': {
@@ -124,16 +124,16 @@ LIBRARY_CONFIGS = {
         'decay_file': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/jeff-3.3-endf/decay/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/Chain_JEFF33.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/',
-        'output_prefix': 'Chain_JEFF33-Iso',
+        'output_prefix': 'Chain_JEFF33-IsoFlag',
         'log_prefix': 'JEFF33_isomer_mapping',
     },
     'jeff40': {
         'description':   'JEFF-4.0 (Native pairing) - UKAEA-1102',
-        'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/JEFF40-Processed-PREPRO-GENDF/',
+        'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/JEFF4data/jeff4-n/gxs-1102/',
         'decay_file':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/jeff-4.0-endf/decay/Radioactive_Decay_Data_JEFF-40.txt',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/Chain_JEFF40.xml',
         'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/',
-        'output_prefix': 'Chain_JEFF40-Iso',
+        'output_prefix': 'Chain_JEFF40-IsoFlag',
         'log_prefix':    'JEFF40_isomer_mapping',
     },
     'eaf2010': {
@@ -142,7 +142,7 @@ LIBRARY_CONFIGS = {
         'decay_file':    '/home/perry/NukeData/Activation/DecayData/JEFF311RDD_ALL.OUT',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/EAF2010/Chain_EAF2010.xml',
         'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/EAF2010/',
-        'output_prefix': 'Chain_EAF2010-Iso',
+        'output_prefix': 'Chain_EAF2010-IsoFlag',
         'log_prefix':    'EAF2010_isomer_mapping',
     },
     'scale631': {
@@ -151,7 +151,7 @@ LIBRARY_CONFIGS = {
         'decay_file':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/jeff-SCALE-6.1.3-endf/decay/decay/',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/Chain_SCALE613.xml',
         'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/',
-        'output_prefix': 'Chain_SCALE613-Iso',
+        'output_prefix': 'Chain_SCALE613-IsoFlag',
         'log_prefix':    'SCALE613_isomer_mapping',
     },
 }
@@ -841,9 +841,10 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 
                     # Check if it's a self-loop (target base matches nuclide base)
                     if target_base == base_name:
-                        # Check if no isomeric_yields element exists
-                        isomeric_yields = rx_elem.find('isomeric_yields')
-                        if isomeric_yields is None:
+                        # Check if no isomeric branching element exists
+                        has_branching = (rx_elem.find('isomeric_branching') is not None
+                                         or rx_elem.find('isomeric_yields') is not None)
+                        if not has_branching:
                             reactions_to_remove.append((rx_elem, rx_type, target))
 
             # Remove the identified reactions
