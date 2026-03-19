@@ -350,42 +350,16 @@ class CoupledOperator(OpenMCOperator):
         )
 
     def _calculate_isomeric_branching(self):
-        """Calculate σ×φ-weighted isomeric branching ratios.
-
-        Uses the flux spectrum tallied by ``DirectWithFluxHelper`` and
-        cross-sections from the GENDF library to compute weighted branching
-        ratios for each burnable material.
-
-        Returns
-        -------
-        list of dict or None
-            List of weighted branching dictionaries, one per burnable material.
-            Each dict has structure: {nuclide: {reaction: {target: ratio}}}.
-            Returns None if isomeric branching is disabled.
-        """
+        """Calculate σ×φ-weighted isomeric branching from tallied flux spectra."""
         if self._isomeric_helper is None:
             return None
-
         if not isinstance(self._rate_helper, DirectWithFluxHelper):
             return None
 
-        isomeric_branching = []
-
-        # Get energy boundaries from the rate helper
         energy_bins = self._rate_helper.energies
-
-        # Calculate weighted branching for each burnable material
-        for i, mat_id in enumerate(self.local_mats):
-            # Get the flux spectrum for this material from the tally
-            flux_spectrum = self._rate_helper.get_flux_spectrum(i)
-
-            # Calculate σ×φ-weighted branching
-            weighted = self._isomeric_helper.weighted_branching_ratios(
-                flux_spectrum, energy_bins
-            )
-            isomeric_branching.append(weighted)
-
-        return isomeric_branching
+        pairs = [(self._rate_helper.get_flux_spectrum(i), energy_bins)
+                 for i in range(len(self.local_mats))]
+        return self._isomeric_helper.compute_for_materials(pairs)
 
     def _differentiate_burnable_mats(self):
         """Assign distribmats for each burnable material"""

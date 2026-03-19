@@ -362,11 +362,9 @@ class IndependentOperator(OpenMCOperator):
             self.chain,
             self._gendf_library,
         )
-        self._isomeric_branching = []
 
-        # Calculate σ×φ-weighted branching for each material
+        # Validate all materials have energy information
         for i, (flux_spectrum, energy) in enumerate(self._flux_with_energy):
-            # All materials must have energy information
             if energy is None or not isinstance(flux_spectrum, np.ndarray):
                 raise RuntimeError(
                     f"Material {i} is missing flux spectrum or energy information. "
@@ -375,25 +373,9 @@ class IndependentOperator(OpenMCOperator):
                     f"energy-dependent isomeric branching."
                 )
 
-            # Calculate σ×φ-weighted branching
-            # The helper will perform strict validation and raise errors if mismatched
-            weighted = helper.weighted_branching_ratios(flux_spectrum, energy)
-
-            self._isomeric_branching.append(weighted)
-
-        # Validate that branching was actually calculated
-        has_branching = any(bool(d) for d in self._isomeric_branching)
-        if not has_branching:
-            warnings.warn(
-                "Isomeric branching data exists in chain but σ×φ-weighted ratios "
-                "could not be calculated. MicroXS stores flux-collapsed single-group "
-                "cross-sections and cannot provide spectral information for weighting.\n"
-                "To enable isomeric branching, provide gendf_library parameter with "
-                "GENDF files containing multigroup cross-sections.\n"
-                "Proceeding without isomeric branching.",
-                UserWarning
-            )
-            self._isomeric_branching = None
+        self._isomeric_branching = helper.compute_for_materials(
+            self._flux_with_energy
+        )
 
     def _get_nuclides_with_data(self, cross_sections: list[MicroXS]) -> set[str]:
         """Finds nuclides with cross section data
