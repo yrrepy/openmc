@@ -413,7 +413,7 @@ def get_gendfxs_and_flux(
 
     # Build sparse XS table once (GENDF XS are domain-independent)
     mts = [REACTION_MT[name] for name in reactions]
-    table, _ = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
+    table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
 
     # Collapse per domain
     micros = []
@@ -443,8 +443,7 @@ class _SparseXSTable:
 
     Stores only non-zero (nuclide, reaction) pairs. xs_matrix has shape
     (nnz, n_groups); nuc_indices and rxn_indices map rows to positions
-    in the dense (n_nuclides, n_reactions) result. row_lookup provides
-    O(1) access to specific (nuclide_idx, reaction_idx) rows.
+    in the dense (n_nuclides, n_reactions) result.
     """
     nuclides: list[str]
     reactions: list[str]
@@ -452,7 +451,6 @@ class _SparseXSTable:
     xs_matrix: np.ndarray
     nuc_indices: np.ndarray
     rxn_indices: np.ndarray
-    row_lookup: dict = None  # {(nuc_idx, rxn_idx): row_index}
 
     def collapse(self, phi_norm: np.ndarray) -> np.ndarray:
         """Collapse to one-group XS. phi_norm must sum to 1."""
@@ -466,11 +464,9 @@ def _build_sparse_xs_table(
     gendf_library,
     nuclides: list[str],
     reactions: list[str],
-    mts: list[int],
-    isomeric_branching_targets=None,
-    isomeric_branching_lfs=None
-):
-    """Build a sparse XS table, optionally collecting branching data.
+    mts: list[int]
+) -> _SparseXSTable:
+    """Build a sparse XS table from a GENDF library.
 
     Parameters
     ----------
@@ -482,85 +478,46 @@ def _build_sparse_xs_table(
         Reaction names (parallel to mts)
     mts : list of int
         MT numbers corresponding to reactions
-    isomeric_branching_targets : dict, optional
-        Chain's ``{nuclide: {reaction: [targets]}}``
-    isomeric_branching_lfs : dict, optional
-        Chain's ``{nuclide: {reaction: [lfs_ints]}}``
 
     Returns
     -------
-    tuple of (_SparseXSTable, dict or None)
-        Sparse table and branching cache ``{(nuc, reaction): IsomericBranching}``
-        (None if isomeric_branching_targets not provided)
+    _SparseXSTable
+        Sparse table ready for vectorized collapse
     """
     if len(reactions) != len(mts):
         raise ValueError(
             f"reactions ({len(reactions)}) and mts ({len(mts)}) "
             f"must have same length")
 
-    from openmc.deplete.gendf import REACTION_TO_MT
-
     n_groups = gendf_library.n_groups
     rows = []
     nuc_idx_list = []
     rxn_idx_list = []
-    row_lookup = {}
 
     mt_to_rxn_idx = {mt: i for i, mt in enumerate(mts)}
-    mt_to_reaction = {mt: rx for rx, mt in zip(reactions, mts)}
-
-    collect_branching = (isomeric_branching_targets is not None
-                         and hasattr(gendf_library, 'get_branching_ratios'))
-    branching_cache = {} if collect_branching else None
 
     for nuc_idx, nuc in enumerate(nuclides):
         all_xs = gendf_library.get_all_xs(nuc, mts=mts)
         for mt, xs_arr in all_xs.items():
             if mt not in mt_to_rxn_idx:
                 continue
-            rxn_idx = mt_to_rxn_idx[mt]
-            row_lookup[(nuc_idx, rxn_idx)] = len(rows)
             rows.append(xs_arr)
             nuc_idx_list.append(nuc_idx)
-            rxn_idx_list.append(rxn_idx)
-
-        # Collect branching data in the same nuclide loop
-        if collect_branching and nuc in isomeric_branching_targets:
-            for rx_type, target_list in isomeric_branching_targets[nuc].items():
-                rx_mt = REACTION_TO_MT.get(rx_type)
-                if rx_mt is None:
-                    continue
-                lfs_list = None
-                if (isomeric_branching_lfs
-                        and nuc in isomeric_branching_lfs
-                        and rx_type in isomeric_branching_lfs[nuc]):
-                    lfs_list = isomeric_branching_lfs[nuc][rx_type]
-                try:
-                    br = gendf_library.get_branching_ratios(
-                        nuc, rx_mt,
-                        target_names=target_list,
-                        lfs_values=lfs_list)
-                    if br is not None:
-                        branching_cache[(nuc, rx_type)] = br
-                except (KeyError, ValueError, NotImplementedError):
-                    pass
+            rxn_idx_list.append(mt_to_rxn_idx[mt])
 
     if rows:
         xs_matrix = np.vstack(rows)
     else:
         xs_matrix = np.empty((0, n_groups))
 
-    table = _SparseXSTable(
+    return _SparseXSTable(
         nuclides=nuclides,
         reactions=reactions,
         n_groups=n_groups,
         xs_matrix=xs_matrix,
         nuc_indices=np.array(nuc_idx_list, dtype=np.int32),
         rxn_indices=np.array(rxn_idx_list, dtype=np.int32),
-        row_lookup=row_lookup,
     )
-
-    return table, branching_cache
 
 
 class MicroXS:
@@ -802,7 +759,7 @@ class MicroXS:
                        nuclides, reactions)
 
         # Build sparse table and collapse with normalized flux
-        table, _ = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
+        table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
         collapsed = table.collapse(multigroup_flux / flux_sum)
 
         return cls(collapsed[:, :, np.newaxis], nuclides, reactions)
