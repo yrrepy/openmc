@@ -346,6 +346,17 @@ class CoupledOperator(OpenMCOperator):
             self._isomeric_branching = None
             return
 
+        if not hasattr(self._gendf_library, 'get_branching_ratios'):
+            warn(
+                "GENDF library backend does not support get_branching_ratios(). "
+                "Isomeric branching will be disabled. Re-patch chain with "
+                "updated patcher tool to add gendf_lfs attribute, or use "
+                "Python backend with decay_file."
+            )
+            self._isomeric_helper = None
+            self._isomeric_branching = None
+            return
+
         self._isomeric_helper = IsomericBranchingHelper(
             self.chain,
             self._gendf_library,
