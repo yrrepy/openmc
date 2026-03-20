@@ -530,7 +530,7 @@ class GENDFLibrary:
                        in zip(target_names, lfs_values) if lfs > 0}
 
         return IsomericBranching(
-            energies=self.energy_bounds,
+            energies=self.energy_bounds[:-1].copy(),
             products=list(target_names),
             branching_ratios=br,
             parent_nuclide=nuclide,

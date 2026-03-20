@@ -16,7 +16,7 @@ The module supports:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Union, Optional, Dict, List, Tuple
+from typing import Any, Optional
 from dataclasses import dataclass, field
 from collections import defaultdict
 import warnings
@@ -294,13 +294,13 @@ class IsomericBranching:
 
     """
     energies: np.ndarray
-    products: List[str]
+    products: list[str]
     branching_ratios: np.ndarray
     parent_nuclide: str
     reaction: str
     mt: int
-    lfs_mapping: Optional[Dict[str, int]] = None
-    elis_mapping: Optional[Dict[str, Dict[str, Any]]] = None
+    lfs_mapping: Optional[dict[str, int]] = None
+    elis_mapping: Optional[dict[str, dict[str, Any]]] = None
 
 
     def to_dict(self) -> dict:
@@ -797,6 +797,8 @@ class _PythonGENDFLibrary:
                 del self._file_index[preliminary_name]
                 # Add with correct name
                 self._file_index[correct_name] = filepath
+                # Invalidate nuclides set cache (keys changed)
+                self._nuclides_set_cache = None
 
                 # If we already had this in cache under wrong name, update it
                 if preliminary_name in self._material_cache:
@@ -1054,7 +1056,7 @@ class _PythonGENDFLibrary:
         self,
         nuclide_name: str,
         strict_alignment: bool = True,
-        mts: Optional[List[int]] = None
+        mts: Optional[list[int]] = None
     ) -> dict[int, np.ndarray]:
         """Get all available cross-sections for a nuclide.
 
@@ -1451,7 +1453,7 @@ class _PythonGENDFLibrary:
         # ==============================================================
         # Second pass: Assign names based on status
         # ==============================================================
-        for order_idx, (meta, elis, liso_result) in enumerate(elis_results, start=1):
+        for meta, elis, liso_result in elis_results:
             lfs = meta['lfs']
             sigma = meta['sigma']
             z = meta['z']
@@ -1838,6 +1840,12 @@ class _PythonGENDFLibrary:
         energies_array = np.array(energies_list)
         branching_array = np.array(ratios_per_product)  # Shape: [n_products, n_energies]
 
+        if len(energies_list) > 0 and branching_array.shape[0] != n_products:
+            raise AssertionError(
+                f"Product count mismatch for {nuclide_name} MT={mt}: "
+                f"{n_products} products but branching_array has "
+                f"{branching_array.shape[0]} rows")
+
         # Validate computed branching ratios
         if len(energies_list) == 0:
             warnings.warn(
@@ -2115,7 +2123,7 @@ class _PythonGENDFLibrary:
                            in zip(target_names, lfs_values) if lfs > 0}
 
             return IsomericBranching(
-                energies=self.energy_bounds.copy(),
+                energies=self.energy_bounds[:-1].copy(),
                 products=list(target_names),
                 branching_ratios=br,
                 parent_nuclide=nuclide_name,
@@ -2124,7 +2132,13 @@ class _PythonGENDFLibrary:
                 lfs_mapping=lfs_mapping,
             )
 
-        # Patcher mode — ELIS/LFS-order mapping (existing behavior)
+        # Patcher mode — ELIS/LFS-order mapping (requires decay file)
+        if self.decay_lookup is None:
+            raise ValueError(
+                "Patcher mode requires decay_file for ELIS/LFS-order mapping. "
+                "Either pass decay_file to GENDFLibrary(), or use runtime mode "
+                "with target_names and lfs_values from a patched chain.")
+
         mf10_result = self._load_mf10_data(nuclide_name, mt)
         if mf10_result is None:
             return None
@@ -2154,11 +2168,11 @@ class _PythonGENDFLibrary:
 
     def process_library_for_branching(
         self,
-        mt_list: Optional[List[int]] = None,
+        mt_list: Optional[list[int]] = None,
         progress_callback: Optional[callable] = None,
         verbose: bool = False,
         chain: Optional['Chain'] = None
-    ) -> Dict[str, Dict[str, IsomericBranching]]:
+    ) -> dict[str, dict[str, IsomericBranching]]:
         """Process entire GENDF library for isomeric branching data.
 
         Scans all nuclides in the library and extracts energy-dependent
@@ -2328,7 +2342,7 @@ class _PythonGENDFLibrary:
         """
         return getattr(self, '_unmatched_mts', [])
 
-    def _build_chain_reaction_lookup(self, chain) -> Dict[str, set]:
+    def _build_chain_reaction_lookup(self, chain) -> dict[str, set]:
         """Build lookup dict mapping nuclide names to their reaction types.
 
         Parameters
@@ -2352,7 +2366,7 @@ class _PythonGENDFLibrary:
         self,
         nuclide_name: str,
         reaction_name: str,
-        chain_reactions: Dict[str, set]
+        chain_reactions: dict[str, set]
     ) -> bool:
         """Check if a reaction exists for a nuclide in the chain.
 
@@ -2467,6 +2481,14 @@ def GENDFLibrary(
     use_cpp = _CppGENDFLibrary is not None and decay_file is None
 
     if use_cpp:
+        if mapping_mode != 'elis':
+            warnings.warn(
+                f"mapping_mode='{mapping_mode}' ignored for C++ backend. "
+                f"C++ backend uses runtime mode with pre-resolved LFS values "
+                f"from the chain. Pass decay_file to use Python backend with "
+                f"'{mapping_mode}' mapping.",
+                UserWarning
+            )
         energy_bounds = GROUP_STRUCTURES[energy_structure]
         return _CppGENDFLibrary(
             str(library_path),

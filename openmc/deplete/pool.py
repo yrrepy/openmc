@@ -107,61 +107,43 @@ def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
     # Get isomeric branching from operator if available
     isomeric_branching = None
     if operator is not None:
-        # Extract isomeric branching data from operator
         isomeric_branching = getattr(operator, '_isomeric_branching', None)
 
         if isomeric_branching is not None:
             if len(isomeric_branching) == 1:
                 isomeric_branching = repeat(isomeric_branching[0])
             elif len(isomeric_branching) != len(n):
-                # Size mismatch - disable isomeric branching. May be redundant and can be refactored (or removed)
-                operator_type = type(operator).__name__
-                chain_size = len(chain) if hasattr(chain, '__len__') else 'unknown'
                 warnings.warn(
                     f"Isomeric branching list length ({len(isomeric_branching)}) "
-                    f"does not match number of materials ({len(n)}). "
-                    f"Operator: {operator_type}, Chain size: {chain_size} nuclides. "
-                    f"Disabling isomeric branching for safety. This may indicate "
-                    f"an internal error or manual modification of operator state.",
+                    f"!= materials ({len(n)}). Disabling isomeric branching.",
                     UserWarning
                 )
                 isomeric_branching = None
 
-
-    # Form matrices with isomeric branching if available
     if matrix_func is None:
         if isomeric_branching is not None:
-            # Use isomeric branching in matrix formation
             matrices = []
             for rate, fy, iso in zip(rates, fission_yields, isomeric_branching):
                 matrix = chain.form_matrix(rate, fy, iso)
                 matrices.append(matrix)
         else:
-            # Original behavior - no isomeric branching
             matrices = []
             for rate, fy in zip(rates, fission_yields):
                 matrix = chain.form_matrix(rate, fy)
                 matrices.append(matrix)
     else:
-        # Custom matrix function - need to handle both with and without isomeric branching
         if isomeric_branching is not None:
-            # Try to pass isomeric branching to custom matrix function
+            sig = inspect.signature(matrix_func)
+            accepts_iso = 'isomeric_branching' in sig.parameters
             matrices = []
             for c, r, fy, iso in zip(repeat(chain), rates,
                                     fission_yields, isomeric_branching):
-                # Check if the custom matrix function accepts isomeric_branching. May be redundant and can be refactored (or removed)
-                sig = inspect.signature(matrix_func)
-                params = list(sig.parameters.keys())
-                
-                # If function accepts 4 or more parameters, pass isomeric_branching. May be redundant and can be refactored (or removed)
-                if len(params) >= 4:
+                if accepts_iso:
                     m = matrix_func(c, r, fy, iso, *matrix_args)
                 else:
-                    # Function doesn't accept isomeric_branching - use old signature
                     m = matrix_func(c, r, fy, *matrix_args)
                 matrices.append(m)
         else:
-            # Original behavior - no isomeric branching
             matrices = []
             for c, r, fy in zip(repeat(chain), rates, fission_yields):
                 m = matrix_func(c, r, fy, *matrix_args)
