@@ -26,6 +26,7 @@ def create_mock_chain_with_isomeric_targets():
             '(n,gamma)': ['Ag110', 'Ag110_m1']
         }
     }
+    chain.isomeric_branching_lfs = None
     return chain
 
 
@@ -191,8 +192,11 @@ def test_gendf_branching_ratios_called():
     flux_spectrum = np.ones(n_groups)
     helper.weighted_branching_ratios(flux_spectrum, energy_bins)
 
-    # get_branching_ratios should be called with ('Ag109', 102)
-    mock_gendf.get_branching_ratios.assert_called_once_with('Ag109', 102)
+    # get_branching_ratios should be called with runtime mode args
+    mock_gendf.get_branching_ratios.assert_called_once_with(
+        'Ag109', 102,
+        target_names=['Ag110', 'Ag110_m1'],
+        lfs_values=None)
 
 
 def test_branching_cache():
@@ -335,6 +339,7 @@ def test_target_filtering_with_reduced_chain():
             '(n,gamma)': ['Ag110']  # Ag110_m1 was pruned
         }
     }
+    chain.isomeric_branching_lfs = None
 
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709

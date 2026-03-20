@@ -2032,99 +2032,121 @@ class _PythonGENDFLibrary:
         mt_numbers = [mt for mf, mt in material.section_data.keys() if mf == 3]
         return sorted(mt_numbers)
 
+    def _get_production_xs(self, nuclide_name: str, mt: int):
+        """Get raw MF=10 production XS without name mapping.
+
+        Returns list of (lfs, izap, xs_array) sorted by LFS ascending.
+        """
+        mf10_result = self._load_mf10_data(nuclide_name, mt)
+        if mf10_result is None:
+            return []
+        mf10_data, _ = mf10_result
+
+        levels = []
+        for level in mf10_data['levels']:
+            lfs = level['LFS']
+            izap = level['IZAP']
+            sigma = level['sigma']
+            if izap == 0:
+                continue
+            # pyENDF returns Tabulated1D; extract y values as numpy array
+            # Tabulated1D may have n_groups+1 values; trim to n_groups
+            xs = np.asarray(sigma.y) if hasattr(sigma, 'y') else np.asarray(sigma)
+            if len(xs) > self.n_groups:
+                xs = xs[:self.n_groups]
+            levels.append((lfs, izap, xs))
+
+        levels.sort(key=lambda x: x[0])
+        return levels
+
     def get_branching_ratios(
         self,
         nuclide_name: str,
-        mt: int
+        mt: int,
+        target_names=None,
+        lfs_values=None
     ) -> Optional[IsomericBranching]:
         """Extract energy-dependent isomeric branching ratios from MF=10.
 
-        Reads ENDF MF=10 (production cross-sections) data to determine
-        how products are distributed among ground and excited states
-        as a function of incident neutron energy.
+        Two modes:
+        - Patcher mode (target_names=None): ELIS/LFS-order mapping using
+          decay file. Used at chain-creation time.
+        - Runtime mode (target_names + lfs_values provided): fetch
+          production XS by LFS, pair with pre-resolved names. No decay
+          file needed.
 
         Parameters
         ----------
         nuclide_name : str
-            Nuclide name in OpenMC format (e.g., 'Rh103', 'U235')
+            Nuclide name in OpenMC format
         mt : int
-            ENDF MT number for the reaction (e.g., 102 for n,gamma, 16 for n,2n)
-
-        Returns
-        -------
-        IsomericBranching or None
-            Energy-dependent branching data if isomeric branching exists,
-            None if only ground state is produced or MF=10 data is absent
-
-        Raises
-        ------
-        KeyError
-            If nuclide not found in library
-        ValueError
-            If MF=10 data has metastable state but no ground state
-            (indicates corrupted GENDF data)
-
-        Notes
-        -----
-        **Metastable Product Mapping**:
-
-        The mapping of GENDF MF=10 metastable products to OpenMC ``_m{n}`` naming
-        depends on whether a decay file was provided:
-
-        With decay_file (ELIS-based mapping, recommended):
-
-        - Calculate excitation energy (ELIF) from GENDF: ``ELIF = QM - QI``
-        - Look up LISO in decay library by matching GENDF-ELIF with DK-ELIS,
-          within tolerance
-        - Use decay library's LISO for naming (e.g., LISO=1 -> ``_m1``)
-        - If no match within rtol/atol: skip product, warn, renormalize remaining
-        - If no metastable states in decay library: skip product, warn, renormalize
-
-        Decay_file is required for isomeric branching. Without it,
-        get_branching_ratios() will raise ValueError.
-
-        Example with ELIS mapping (Ir191(n,gamma) -> Ir192):
-        - GENDF: LFS=3, ELFS=QM-QI=56720 eV; LFS=15, ELFS=QM-QI=168140 eV
-        - Decay: Ir192m (LISO=1, ELIS=56720); Ir192n (LISO=2, ELIS=168140)
-        - Result: LFS=3 -> Ir192_m1, LFS=15 -> Ir192_m2 (mapped by ELIS)
-
-        See Also
-        --------
-        parse_decay_isomeric_levels : Parse decay library for ELIS data
-        lookup_liso : Find LISO for given excitation energy
+            ENDF MT number
+        target_names : list of str, optional
+            Product names from chain (runtime mode)
+        lfs_values : list of int, optional
+            LFS values from chain (runtime mode)
         """
-        # Load MF=10 data
+        # Runtime mode — no decay file needed
+        if target_names is not None:
+            if lfs_values is None:
+                raise ValueError("lfs_values required with target_names")
+
+            levels = self._get_production_xs(nuclide_name, mt)
+            if not levels:
+                return None
+
+            lfs_to_xs = {lfs: xs for lfs, izap, xs in levels}
+            n_groups = self.n_groups
+
+            prod_xs = []
+            for lfs in lfs_values:
+                if lfs in lfs_to_xs:
+                    prod_xs.append(lfs_to_xs[lfs])
+                else:
+                    prod_xs.append(np.zeros(n_groups))
+
+            prod_xs = np.array(prod_xs)
+            total = prod_xs.sum(axis=0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                br = np.where(total > 0, prod_xs / total, 0.0)
+
+            reaction = MT_TO_REACTION.get(mt, f'MT{mt}')
+            lfs_mapping = {name: lfs for name, lfs
+                           in zip(target_names, lfs_values) if lfs > 0}
+
+            return IsomericBranching(
+                energies=self.energy_bounds.copy(),
+                products=list(target_names),
+                branching_ratios=br,
+                parent_nuclide=nuclide_name,
+                reaction=reaction,
+                mt=mt,
+                lfs_mapping=lfs_mapping,
+            )
+
+        # Patcher mode — ELIS/LFS-order mapping (existing behavior)
         mf10_result = self._load_mf10_data(nuclide_name, mt)
         if mf10_result is None:
             return None
         mf10_data, qm_section = mf10_result
 
-        # Categorize product levels into ground and metastable
         levels_result = self._categorize_mf10_levels(mf10_data, nuclide_name, mt)
         if levels_result is None:
             return None
         ground_data, ground_product, all_meta_levels, base_nuclide = levels_result
 
-        # ============================================================
-        # Metastable Mapping: ELIS-based or LFS-order
-        # ============================================================
-
         reaction_name = MT_TO_REACTION.get(mt, f'MT{mt}')
 
         if self._mapping_mode == 'elis':
-            # ELIS-based mapping using decay library
             mapped_meta_levels, lfs_mapping = self._map_via_elis(
                 all_meta_levels, qm_section, ground_data,
                 nuclide_name, reaction_name, mt, base_nuclide
             )
-
         elif self._mapping_mode == 'lfs_order':
-            # LFS-ORDER MAPPING: FISPACT-like positional mapping
             mapped_meta_levels, lfs_mapping = self._map_via_lfs_order(
                 all_meta_levels, qm_section, nuclide_name, reaction_name, mt, base_nuclide
             )
 
-        # Build and return IsomericBranching result
         return self._build_branching_result(
             ground_data, ground_product, mapped_meta_levels,
             lfs_mapping, nuclide_name, mt

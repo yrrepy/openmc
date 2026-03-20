@@ -1198,6 +1198,8 @@ class IsomericBranchingHelper:
         self,
         chain: 'Chain',
         gendf_library,
+        branching_cache=None,
+        sparse_table=None,
     ) -> None:
         """Initialize with a depletion chain and GENDF library.
 
@@ -1207,25 +1209,33 @@ class IsomericBranchingHelper:
             Chain containing isomeric branching data
         gendf_library : GENDFLibrary
             GENDF library for on-the-fly multigroup cross-section lookup.
-            Energy structure is read from the library.
-
-        Raises
-        ------
-        ValueError
-            If gendf_library is None
+        branching_cache : dict, optional
+            Pre-fetched ``{(nuc, reaction): IsomericBranching}`` from
+            combined acquisition in _build_sparse_xs_table.
+        sparse_table : _SparseXSTable, optional
+            Sparse XS table for O(1) multigroup XS lookup, avoiding
+            redundant get_xs() calls in _calculate_weighted.
         """
         if gendf_library is None:
             raise ValueError("gendf_library is required for IsomericBranchingHelper")
 
         self.chain: 'Chain' = chain
         self.isomeric_targets: Optional[Dict] = chain.isomeric_branching_targets
-        self._branching_cache: Dict = {}
+        self._branching_cache: Dict = branching_cache or {}
         self._energy_validated: bool = False
         self.gendf_library = gendf_library
         self.energy_structure: str = gendf_library.energy_structure
         self.expected_energies: np.ndarray = gendf_library.energy_bounds.copy()
         self.n_groups: int = len(self.expected_energies) - 1
-    
+        self._sparse_table = sparse_table
+        # Pre-build nuclide/reaction index dicts for O(1) sparse table lookup
+        if sparse_table is not None:
+            self._nuc_to_idx = {n: i for i, n in enumerate(sparse_table.nuclides)}
+            self._rxn_to_idx = {r: i for i, r in enumerate(sparse_table.reactions)}
+        else:
+            self._nuc_to_idx = {}
+            self._rxn_to_idx = {}
+
     def _get_branching_data(self, nuclide, reaction):
         """Cached GENDF branching ratio lookup."""
         key = (nuclide, reaction)
@@ -1234,8 +1244,22 @@ class IsomericBranchingHelper:
             if mt is None:
                 self._branching_cache[key] = None
             else:
+                # Use runtime mode with target_names/lfs_values from chain
+                target_names = None
+                lfs_values = None
+                if (self.chain.isomeric_branching_targets
+                        and nuclide in self.chain.isomeric_branching_targets
+                        and reaction in self.chain.isomeric_branching_targets[nuclide]):
+                    target_names = self.chain.isomeric_branching_targets[nuclide][reaction]
+                    if (self.chain.isomeric_branching_lfs
+                            and nuclide in self.chain.isomeric_branching_lfs
+                            and reaction in self.chain.isomeric_branching_lfs[nuclide]):
+                        lfs_values = self.chain.isomeric_branching_lfs[nuclide][reaction]
                 self._branching_cache[key] = \
-                    self.gendf_library.get_branching_ratios(nuclide, mt)
+                    self.gendf_library.get_branching_ratios(
+                        nuclide, mt,
+                        target_names=target_names,
+                        lfs_values=lfs_values)
         return self._branching_cache[key]
 
     def weighted_branching_ratios(
@@ -1578,11 +1602,23 @@ class IsomericBranchingHelper:
         mt = REACTION_TO_MT.get(reaction)
         if mt is None:
             return {}
-    
-        try:
-            sigma_g = self.gendf_library.get_xs(nuclide, mt, energy_bins)
-        except (KeyError, ValueError):
-            return {}
+
+        # Use sparse table for O(1) XS lookup if available
+        sigma_g = None
+        if (self._sparse_table is not None
+                and self._sparse_table.row_lookup is not None):
+            nuc_idx = self._nuc_to_idx.get(nuclide)
+            rxn_idx = self._rxn_to_idx.get(reaction)
+            if nuc_idx is not None and rxn_idx is not None:
+                row = self._sparse_table.row_lookup.get((nuc_idx, rxn_idx))
+                if row is not None:
+                    sigma_g = self._sparse_table.xs_matrix[row]
+
+        if sigma_g is None:
+            try:
+                sigma_g = self.gendf_library.get_xs(nuclide, mt, energy_bins)
+            except (KeyError, ValueError):
+                return {}
     
         if len(sigma_g) != n_flux_groups:
             raise ValueError(
