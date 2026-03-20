@@ -154,25 +154,9 @@ def _parse_isomeric_state(nuclide: str) -> tuple:
 
 
 def _load_isomeric_branching_targets(root):
-    """Load isomeric branching target names, LFS values, and embedded ratios.
+    """Load isomeric branching targets, LFS values, and embedded ratios from XML.
 
-    Reads ``<isomeric_branching targets="..." gendf_lfs="..."/>`` format.
-    For legacy ``<isomeric_yields>``, parses both target names and
-    energy-dependent branching ratios (if present).
-
-    Parameters
-    ----------
-    root : xml.etree.ElementTree
-        Root of chain XML
-
-    Returns
-    -------
-    tuple of (dict or None, dict or None, dict or None)
-        (targets_data, lfs_data, embedded_data) where:
-        targets_data: ``{nuclide: {reaction: [target_names]}}``
-        lfs_data: ``{nuclide: {reaction: [lfs_ints]}}``
-        embedded_data: ``{(nuclide, reaction): {'energies': array,
-            'targets': list, 'branching_ratios': {target: array}}}``
+    Returns (targets_data, lfs_data, embedded_data), each dict or None.
     """
     from openmc._xml import get_text
 
@@ -193,14 +177,12 @@ def _load_isomeric_branching_targets(root):
             if not rx_type:
                 continue
 
-            # New format: <isomeric_branching targets="A B C" gendf_lfs="0 3 15"/>
             iso_elem = reaction_elem.find('isomeric_branching')
             if iso_elem is not None:
                 targets_attr = iso_elem.get('targets', '')
                 targets = targets_attr.split()
                 if targets:
                     nuc_reactions[rx_type] = targets
-                    # Parse gendf_lfs if present
                     lfs_attr = iso_elem.get('gendf_lfs', '')
                     if lfs_attr:
                         lfs_vals = [int(v) for v in lfs_attr.split()]
@@ -213,7 +195,7 @@ def _load_isomeric_branching_targets(root):
                                 f"{nuc_name}/{rx_type}, ignoring LFS")
                 continue
 
-            # Legacy format: <isomeric_yields> with embedded ratios
+            # Legacy <isomeric_yields> with embedded ratios
             legacy_elem = reaction_elem.find('isomeric_yields')
             if legacy_elem is not None:
                 targets_elem = legacy_elem.find('targets')
@@ -224,7 +206,6 @@ def _load_isomeric_branching_targets(root):
                     continue
                 nuc_reactions[rx_type] = targets
 
-                # Parse embedded energy-dependent ratios if present
                 energies_elem = legacy_elem.find('energies')
                 branching_elem = legacy_elem.find('branching_ratios')
                 if (energies_elem is not None and energies_elem.text
@@ -268,17 +249,7 @@ def _load_isomeric_branching_targets(root):
 
 
 def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
-    """Write isomeric branching targets and LFS values to chain XML.
-
-    Parameters
-    ----------
-    root_elem : lxml.etree._Element
-        Root element of chain XML (already containing nuclide elements)
-    targets_data : dict
-        ``{nuclide_name: {reaction_type: [target_names]}}``
-    lfs_data : dict, optional
-        ``{nuclide_name: {reaction_type: [lfs_ints]}}``
-    """
+    """Write isomeric branching targets and LFS values to chain XML."""
     if targets_data is None:
         return
 
@@ -296,7 +267,7 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
 
             iso_elem = ET.SubElement(reaction_elem, 'isomeric_branching')
             iso_elem.set('targets', ' '.join(nuc_targets[rx_type]))
-            # Write gendf_lfs if available
+            # Write gendf_lfs
             if (lfs_data is not None
                     and nuc_name in lfs_data
                     and rx_type in lfs_data[nuc_name]):
@@ -1968,7 +1939,7 @@ class Chain:
                     removed = [t for t in target_list if t not in all_isotopes]
                     if retained:
                         new_reactions[rx_type] = retained
-                        # Keep LFS in sync if available
+                        # Keep LFS in sync
                         if (self.isomeric_branching_lfs
                                 and parent in self.isomeric_branching_lfs
                                 and rx_type in self.isomeric_branching_lfs[parent]):
@@ -1990,6 +1961,26 @@ class Chain:
             new_chain.isomeric_branching_targets = None
             new_chain.isomeric_branching_lfs = None
             new_chain.reduce_pruned_targets = None
+
+        # Filter embedded branching ratios for reduced chain
+        if self.isomeric_branching_embedded:
+            new_embedded = {}
+            for (parent, rx_type), data in self.isomeric_branching_embedded.items():
+                if parent not in all_isotopes:
+                    continue
+                retained = [t for t in data['targets'] if t in all_isotopes]
+                if not retained:
+                    continue
+                new_embedded[(parent, rx_type)] = {
+                    'energies': data['energies'],
+                    'targets': retained,
+                    'branching_ratios': {t: data['branching_ratios'][t]
+                                         for t in retained
+                                         if t in data['branching_ratios']}
+                }
+            new_chain.isomeric_branching_embedded = new_embedded or None
+        else:
+            new_chain.isomeric_branching_embedded = None
 
         # Pre-compute isomeric families cache for the reduced chain
         new_chain._build_isomeric_families_cache()
