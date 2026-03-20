@@ -154,11 +154,10 @@ def _parse_isomeric_state(nuclide: str) -> tuple:
 
 
 def _load_isomeric_branching_targets(root):
-    """Load isomeric branching target names from XML root.
+    """Load isomeric branching target names and LFS values from XML root.
 
-    Reads the new ``<isomeric_branching targets="..."/>`` format.
-    Falls back to legacy ``<isomeric_yields>`` elements (extracts target
-    names only, discards energy-dependent ratio arrays).
+    Reads ``<isomeric_branching targets="..." gendf_lfs="..."/>`` format.
+    Falls back to legacy ``<isomeric_yields>`` (extracts target names only).
 
     Parameters
     ----------
@@ -167,12 +166,15 @@ def _load_isomeric_branching_targets(root):
 
     Returns
     -------
-    dict or None
-        ``{nuclide: {reaction: [target_names]}}`` or None
+    tuple of (dict or None, dict or None)
+        (targets_data, lfs_data) where:
+        targets_data: ``{nuclide: {reaction: [target_names]}}`` or None
+        lfs_data: ``{nuclide: {reaction: [lfs_ints]}}`` or None
     """
     from openmc._xml import get_text
 
     targets_data = {}
+    lfs_data = {}
 
     for nuclide_elem in root.findall('nuclide'):
         nuc_name = get_text(nuclide_elem, 'name')
@@ -180,19 +182,26 @@ def _load_isomeric_branching_targets(root):
             continue
 
         nuc_reactions = {}
+        nuc_lfs = {}
 
         for reaction_elem in nuclide_elem.findall('reaction'):
             rx_type = reaction_elem.get('type')
             if not rx_type:
                 continue
 
-            # New format: <isomeric_branching targets="A B C"/>
+            # New format: <isomeric_branching targets="A B C" gendf_lfs="0 3 15"/>
             iso_elem = reaction_elem.find('isomeric_branching')
             if iso_elem is not None:
                 targets_attr = iso_elem.get('targets', '')
                 targets = targets_attr.split()
                 if targets:
                     nuc_reactions[rx_type] = targets
+                    # Parse gendf_lfs if present
+                    lfs_attr = iso_elem.get('gendf_lfs', '')
+                    if lfs_attr:
+                        lfs_vals = [int(v) for v in lfs_attr.split()]
+                        if len(lfs_vals) == len(targets):
+                            nuc_lfs[rx_type] = lfs_vals
                 continue
 
             # Legacy format: <isomeric_yields> with <targets> child
@@ -206,12 +215,16 @@ def _load_isomeric_branching_targets(root):
 
         if nuc_reactions:
             targets_data[nuc_name] = nuc_reactions
+        if nuc_lfs:
+            lfs_data[nuc_name] = nuc_lfs
 
-    return targets_data if targets_data else None
+    targets_out = targets_data if targets_data else None
+    lfs_out = lfs_data if lfs_data else None
+    return targets_out, lfs_out
 
 
-def _write_isomeric_branching_targets(root_elem, targets_data):
-    """Write isomeric branching targets to depletion chain XML.
+def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
+    """Write isomeric branching targets and LFS values to chain XML.
 
     Parameters
     ----------
@@ -219,6 +232,8 @@ def _write_isomeric_branching_targets(root_elem, targets_data):
         Root element of chain XML (already containing nuclide elements)
     targets_data : dict
         ``{nuclide_name: {reaction_type: [target_names]}}``
+    lfs_data : dict, optional
+        ``{nuclide_name: {reaction_type: [lfs_ints]}}``
     """
     if targets_data is None:
         return
@@ -237,6 +252,13 @@ def _write_isomeric_branching_targets(root_elem, targets_data):
 
             iso_elem = ET.SubElement(reaction_elem, 'isomeric_branching')
             iso_elem.set('targets', ' '.join(nuc_targets[rx_type]))
+            # Write gendf_lfs if available
+            if (lfs_data is not None
+                    and nuc_name in lfs_data
+                    and rx_type in lfs_data[nuc_name]):
+                lfs_vals = lfs_data[nuc_name][rx_type]
+                iso_elem.set('gendf_lfs',
+                             ' '.join(str(v) for v in lfs_vals))
 
 
 def replace_missing(product, decay_data):
@@ -389,6 +411,7 @@ class Chain:
         self.nuclide_dict = {}
         self._fission_yields = None
         self.isomeric_branching_targets = None
+        self.isomeric_branching_lfs = None
         self.reduce_pruned_targets = None
 
     def __contains__(self, nuclide):
@@ -685,7 +708,8 @@ class Chain:
         chain._xml_path = str(Path(filename).resolve())
 
         # Load isomeric branching data if present
-        chain.isomeric_branching_targets = _load_isomeric_branching_targets(root)
+        chain.isomeric_branching_targets, chain.isomeric_branching_lfs = \
+            _load_isomeric_branching_targets(root)
 
         # Pre-compute isomeric families cache for faster reduction operations
         chain._build_isomeric_families_cache()
@@ -708,7 +732,8 @@ class Chain:
         # Write isomeric branching targets if present
         if self.isomeric_branching_targets is not None:
             _write_isomeric_branching_targets(root_elem,
-                                              self.isomeric_branching_targets)
+                                              self.isomeric_branching_targets,
+                                              self.isomeric_branching_lfs)
 
         tree = ET.ElementTree(root_elem)
         tree.write(str(filename), encoding='utf-8', pretty_print=True)
@@ -1592,27 +1617,42 @@ class Chain:
         # Filter isomeric branching targets for reduced chain
         if self.isomeric_branching_targets:
             new_targets = {}
+            new_lfs = {}
             pruned = {}
             for parent, reactions in self.isomeric_branching_targets.items():
                 if parent not in all_isotopes:
                     continue
                 new_reactions = {}
+                new_lfs_reactions = {}
                 pruned_reactions = {}
                 for rx_type, target_list in reactions.items():
-                    retained = [t for t in target_list if t in all_isotopes]
+                    retained_indices = [i for i, t in enumerate(target_list)
+                                        if t in all_isotopes]
+                    retained = [target_list[i] for i in retained_indices]
                     removed = [t for t in target_list if t not in all_isotopes]
                     if retained:
                         new_reactions[rx_type] = retained
+                        # Keep LFS in sync if available
+                        if (self.isomeric_branching_lfs
+                                and parent in self.isomeric_branching_lfs
+                                and rx_type in self.isomeric_branching_lfs[parent]):
+                            lfs_list = self.isomeric_branching_lfs[parent][rx_type]
+                            new_lfs_reactions[rx_type] = [lfs_list[i]
+                                                          for i in retained_indices]
                     if removed:
                         pruned_reactions[rx_type] = removed
                 if new_reactions:
                     new_targets[parent] = new_reactions
+                if new_lfs_reactions:
+                    new_lfs[parent] = new_lfs_reactions
                 if pruned_reactions:
                     pruned[parent] = pruned_reactions
             new_chain.isomeric_branching_targets = new_targets or None
+            new_chain.isomeric_branching_lfs = new_lfs or None
             new_chain.reduce_pruned_targets = pruned or None
         else:
             new_chain.isomeric_branching_targets = None
+            new_chain.isomeric_branching_lfs = None
             new_chain.reduce_pruned_targets = None
 
         # Pre-compute isomeric families cache for the reduced chain

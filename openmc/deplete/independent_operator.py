@@ -500,6 +500,16 @@ class IndependentOperator(OpenMCOperator):
             )
             return
 
+        if not hasattr(self._gendf_library, 'get_branching_ratios'):
+            warnings.warn(
+                "GENDF library backend does not support get_branching_ratios(). "
+                "Isomeric branching will be disabled. Re-patch chain with "
+                "updated patcher tool to add gendf_lfs attribute, or use "
+                "Python backend with decay_file.",
+                UserWarning
+            )
+            return
+
         if not self._flux_with_energy or self._energy_bins is None or len(self._energy_bins) == 0:
             warnings.warn(
                 "Chain has isomeric branching targets but flux spectra or "
