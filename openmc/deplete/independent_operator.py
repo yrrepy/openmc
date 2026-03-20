@@ -517,6 +517,8 @@ class IndependentOperator(OpenMCOperator):
         helper = IsomericBranchingHelper(
             self.chain,
             self._gendf_library,
+            branching_cache=getattr(self, '_branching_cache', None),
+            sparse_table=getattr(self, '_sparse_table', None),
         )
 
         # Validate all materials have energy information
