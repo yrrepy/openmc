@@ -1237,29 +1237,34 @@ class IsomericBranchingHelper:
             self._rxn_to_idx = {}
 
     def _get_branching_data(self, nuclide, reaction):
-        """Cached GENDF branching ratio lookup."""
+        """Cached branching ratio lookup. Checks chain-embedded first, then GENDF."""
         key = (nuclide, reaction)
         if key not in self._branching_cache:
-            mt = REACTION_TO_MT.get(reaction)
-            if mt is None:
-                self._branching_cache[key] = None
+            # Check chain-embedded ratios first (from legacy <isomeric_yields>)
+            if (self.chain.isomeric_branching_embedded
+                    and key in self.chain.isomeric_branching_embedded):
+                self._branching_cache[key] = self.chain.isomeric_branching_embedded[key]
             else:
-                # Use runtime mode with target_names/lfs_values from chain
-                target_names = None
-                lfs_values = None
-                if (self.chain.isomeric_branching_targets
-                        and nuclide in self.chain.isomeric_branching_targets
-                        and reaction in self.chain.isomeric_branching_targets[nuclide]):
-                    target_names = self.chain.isomeric_branching_targets[nuclide][reaction]
-                    if (self.chain.isomeric_branching_lfs
-                            and nuclide in self.chain.isomeric_branching_lfs
-                            and reaction in self.chain.isomeric_branching_lfs[nuclide]):
-                        lfs_values = self.chain.isomeric_branching_lfs[nuclide][reaction]
-                self._branching_cache[key] = \
-                    self.gendf_library.get_branching_ratios(
-                        nuclide, mt,
-                        target_names=target_names,
-                        lfs_values=lfs_values)
+                mt = REACTION_TO_MT.get(reaction)
+                if mt is None:
+                    self._branching_cache[key] = None
+                else:
+                    # Use runtime mode with target_names/lfs_values from chain
+                    target_names = None
+                    lfs_values = None
+                    if (self.chain.isomeric_branching_targets
+                            and nuclide in self.chain.isomeric_branching_targets
+                            and reaction in self.chain.isomeric_branching_targets[nuclide]):
+                        target_names = self.chain.isomeric_branching_targets[nuclide][reaction]
+                        if (self.chain.isomeric_branching_lfs
+                                and nuclide in self.chain.isomeric_branching_lfs
+                                and reaction in self.chain.isomeric_branching_lfs[nuclide]):
+                            lfs_values = self.chain.isomeric_branching_lfs[nuclide][reaction]
+                    self._branching_cache[key] = \
+                        self.gendf_library.get_branching_ratios(
+                            nuclide, mt,
+                            target_names=target_names,
+                            lfs_values=lfs_values)
         return self._branching_cache[key]
 
     def weighted_branching_ratios(
@@ -1310,18 +1315,33 @@ class IsomericBranchingHelper:
                 if br is None:
                     continue
 
-                # Filter GENDF products to chain's target list
                 chain_target_set = set(target_list)
-                data = {
-                    'energies': br.energies,
-                    'targets': [p for p in br.products
-                                if p in chain_target_set],
-                    'branching_ratios': {
-                        br.products[i]: br.branching_ratios[i]
-                        for i, p in enumerate(br.products)
-                        if p in chain_target_set
+
+                if isinstance(br, dict):
+                    # Chain-embedded ratios (legacy <isomeric_yields>)
+                    data = {
+                        'energies': br['energies'],
+                        'targets': [t for t in br['targets']
+                                    if t in chain_target_set],
+                        'branching_ratios': {
+                            t: br['branching_ratios'][t]
+                            for t in br['targets']
+                            if t in chain_target_set
+                            and t in br['branching_ratios']
+                        }
                     }
-                }
+                else:
+                    # IsomericBranching from GENDF
+                    data = {
+                        'energies': br.energies,
+                        'targets': [p for p in br.products
+                                    if p in chain_target_set],
+                        'branching_ratios': {
+                            br.products[i]: br.branching_ratios[i]
+                            for i, p in enumerate(br.products)
+                            if p in chain_target_set
+                        }
+                    }
 
                 if not data['targets']:
                     continue

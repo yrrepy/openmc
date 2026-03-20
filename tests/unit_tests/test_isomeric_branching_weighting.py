@@ -27,6 +27,7 @@ def create_mock_chain_with_isomeric_targets():
         }
     }
     chain.isomeric_branching_lfs = None
+    chain.isomeric_branching_embedded = None
     return chain
 
 
@@ -340,6 +341,7 @@ def test_target_filtering_with_reduced_chain():
         }
     }
     chain.isomeric_branching_lfs = None
+    chain.isomeric_branching_embedded = None
 
     energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709

@@ -154,10 +154,11 @@ def _parse_isomeric_state(nuclide: str) -> tuple:
 
 
 def _load_isomeric_branching_targets(root):
-    """Load isomeric branching target names and LFS values from XML root.
+    """Load isomeric branching target names, LFS values, and embedded ratios.
 
     Reads ``<isomeric_branching targets="..." gendf_lfs="..."/>`` format.
-    Falls back to legacy ``<isomeric_yields>`` (extracts target names only).
+    For legacy ``<isomeric_yields>``, parses both target names and
+    energy-dependent branching ratios (if present).
 
     Parameters
     ----------
@@ -166,15 +167,18 @@ def _load_isomeric_branching_targets(root):
 
     Returns
     -------
-    tuple of (dict or None, dict or None)
-        (targets_data, lfs_data) where:
-        targets_data: ``{nuclide: {reaction: [target_names]}}`` or None
-        lfs_data: ``{nuclide: {reaction: [lfs_ints]}}`` or None
+    tuple of (dict or None, dict or None, dict or None)
+        (targets_data, lfs_data, embedded_data) where:
+        targets_data: ``{nuclide: {reaction: [target_names]}}``
+        lfs_data: ``{nuclide: {reaction: [lfs_ints]}}``
+        embedded_data: ``{(nuclide, reaction): {'energies': array,
+            'targets': list, 'branching_ratios': {target: array}}}``
     """
     from openmc._xml import get_text
 
     targets_data = {}
     lfs_data = {}
+    embedded_data = {}
 
     for nuclide_elem in root.findall('nuclide'):
         nuc_name = get_text(nuclide_elem, 'name')
@@ -209,14 +213,48 @@ def _load_isomeric_branching_targets(root):
                                 f"{nuc_name}/{rx_type}, ignoring LFS")
                 continue
 
-            # Legacy format: <isomeric_yields> with <targets> child
+            # Legacy format: <isomeric_yields> with embedded ratios
             legacy_elem = reaction_elem.find('isomeric_yields')
             if legacy_elem is not None:
                 targets_elem = legacy_elem.find('targets')
-                if targets_elem is not None and targets_elem.text:
-                    targets = targets_elem.text.split()
-                    if targets:
-                        nuc_reactions[rx_type] = targets
+                if targets_elem is None or not targets_elem.text:
+                    continue
+                targets = targets_elem.text.split()
+                if not targets:
+                    continue
+                nuc_reactions[rx_type] = targets
+
+                # Parse embedded energy-dependent ratios if present
+                energies_elem = legacy_elem.find('energies')
+                branching_elem = legacy_elem.find('branching_ratios')
+                if (energies_elem is not None and energies_elem.text
+                        and branching_elem is not None and branching_elem.text):
+                    try:
+                        energies = np.array([float(e) for e in
+                                             energies_elem.text.split()])
+                        lines = []
+                        for line in branching_elem.text.strip().split('\n'):
+                            line = line.strip()
+                            if line and not line.startswith('<!--'):
+                                if '<!--' in line:
+                                    line = line[:line.index('<!--')].strip()
+                                if line:
+                                    lines.append(line)
+                        if len(lines) == len(targets):
+                            br = {}
+                            for target, line in zip(targets, lines):
+                                ratios = np.array([float(r) for r in
+                                                   line.split()])
+                                if len(ratios) == len(energies):
+                                    br[target] = ratios
+                            if br:
+                                embedded_data[(nuc_name, rx_type)] = {
+                                    'energies': energies,
+                                    'targets': targets,
+                                    'branching_ratios': br
+                                }
+                    except (ValueError, AttributeError):
+                        pass
 
         if nuc_reactions:
             targets_data[nuc_name] = nuc_reactions
@@ -225,7 +263,8 @@ def _load_isomeric_branching_targets(root):
 
     targets_out = targets_data if targets_data else None
     lfs_out = lfs_data if lfs_data else None
-    return targets_out, lfs_out
+    embedded_out = embedded_data if embedded_data else None
+    return targets_out, lfs_out, embedded_out
 
 
 def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
@@ -417,6 +456,7 @@ class Chain:
         self._fission_yields = None
         self.isomeric_branching_targets = None
         self.isomeric_branching_lfs = None
+        self.isomeric_branching_embedded = None
         self.reduce_pruned_targets = None
 
     def __contains__(self, nuclide):
@@ -713,7 +753,8 @@ class Chain:
         chain._xml_path = str(Path(filename).resolve())
 
         # Load isomeric branching data if present
-        chain.isomeric_branching_targets, chain.isomeric_branching_lfs = \
+        chain.isomeric_branching_targets, chain.isomeric_branching_lfs, \
+            chain.isomeric_branching_embedded = \
             _load_isomeric_branching_targets(root)
 
         # Pre-compute isomeric families cache for faster reduction operations
