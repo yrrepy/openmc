@@ -798,9 +798,19 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
             energies = sorted(energy_yields.keys())
 
             if mode == 'flags_only':
-                # Write <isomeric_branching targets="A B C"/>
+                # Write <isomeric_branching targets="A B C" gendf_lfs="0 3 15"/>
                 iso_elem = ET.SubElement(rx_elem, 'isomeric_branching')
                 iso_elem.set('targets', ' '.join(products))
+                # Write LFS values from branching.lfs_mapping
+                lfs_values = [0]  # ground state always LFS=0
+                for p in products[1:]:
+                    lfs = branching.lfs_mapping.get(p) if branching.lfs_mapping else None
+                    if lfs is None:
+                        raise ValueError(
+                            f"No LFS mapping for product {p} of "
+                            f"{nuclide_name} {reaction_type}")
+                    lfs_values.append(lfs)
+                iso_elem.set('gendf_lfs', ' '.join(str(v) for v in lfs_values))
             else:
                 # Write full <isomeric_yields> (embedded/informational)
                 yields_elem = ET.SubElement(rx_elem, 'isomeric_yields')
