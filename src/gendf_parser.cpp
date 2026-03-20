@@ -404,15 +404,12 @@ GENDFParseResult parse_gendf_validated(
       }
     }
 
-    // Parse MF=10 production cross-section data
-    // Same TAB1 format as MF=3 but multiple subsections per MT (one per LFS).
-    // Level HEAD record: [QM, QI, IZAP, LFS, NR, NP]
+    // MF=10: multiple subsections per MT, one per LFS
     if (mf == 10) {
       if (!mf10_in_data && line.length() >= 55) {
-        // Check for subsection HEAD record (has NP > 0 in cols 55-65)
         auto np_result = extract_int_safe(line, 55, 11);
         if (np_result.success && np_result.value > 0) {
-          // Save previous subsection if any
+          // Save previous subsection
           if (!mf10_current_xs.empty()) {
             int key = current_mt * 1000 + mf10_current_lfs;
             result.prod_xs_data[key] = std::move(mf10_current_xs);
@@ -421,7 +418,6 @@ GENDFParseResult parse_gendf_validated(
             mf10_current_energies.clear();
           }
 
-          // Parse HEAD fields: IZAP (cols 22-32), LFS (cols 33-43)
           auto izap_result = extract_int_safe(line, 22, 11);
           auto lfs_result = extract_int_safe(line, 33, 11);
           auto nr_result = extract_int_safe(line, 44, 11);
@@ -431,7 +427,7 @@ GENDFParseResult parse_gendf_validated(
           mf10_n_groups = np_result.value;
           mf10_nr_skip = nr_result.success ? nr_result.value : 0;
 
-          // Skip subsections with IZAP=0 (known data quality issue)
+          // Skip IZAP=0 (data quality issue)
           if (mf10_current_izap == 0) {
             result.warnings.push_back(
               "Skipping MF=10 level in " + basename + " MT=" +
@@ -440,7 +436,6 @@ GENDFParseResult parse_gendf_validated(
             continue;
           }
 
-          // Validate IZAP
           if (options.validate_za) {
             std::string izap_error;
             if (!validate_za(mf10_current_izap, izap_error)) {
@@ -465,18 +460,15 @@ GENDFParseResult parse_gendf_validated(
         continue;
       }
 
-      // Parse energy/XS pairs (same format as MF=3)
       if (mf10_in_data && mf10_nr_skip == 0 && line.length() >= 66) {
         for (int i = 0; i < 6 && mf10_current_xs.size() < static_cast<size_t>(mf10_n_groups); ++i) {
           int col_start = i * 11;
           if (col_start + 11 <= 66) {
             auto val_result = extract_double_safe(line, col_start, 11);
             if (i % 2 == 0) {
-              // Energy
               mf10_current_energies.push_back(
                   val_result.success ? val_result.value : 0.0);
             } else {
-              // Production XS
               double xs_val = val_result.success ? val_result.value : 0.0;
               if (options.validate_xs_positive && xs_val < 0) {
                 xs_val = 0.0;
@@ -486,7 +478,7 @@ GENDFParseResult parse_gendf_validated(
           }
         }
 
-        // When subsection is complete, reset so next HEAD is detected
+        // Reset when subsection complete
         if (mf10_current_xs.size() >= static_cast<size_t>(mf10_n_groups)) {
           mf10_in_data = false;
         }
