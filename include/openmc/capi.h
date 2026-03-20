@@ -349,6 +349,14 @@ void openmc_gendf_free_xs(double* xs_data);
 //! \note Safe to call with NULL pointer or n=0
 void openmc_gendf_free_nuclides(char** nuclides, int n);
 
+//! Get MF=10 production cross-sections for all levels of a reaction
+int openmc_gendf_get_production_xs(int32_t lib_id, const char* nuclide,
+  int32_t mt, int* n_levels, int* n_groups,
+  int** lfs_out, int** izap_out, double** xs_out);
+
+//! Free arrays allocated by openmc_gendf_get_production_xs
+void openmc_gendf_free_production_xs(int* lfs, int* izap, double* xs);
+
 // Error codes
 extern int OPENMC_E_UNASSIGNED;
 extern int OPENMC_E_ALLOCATE;

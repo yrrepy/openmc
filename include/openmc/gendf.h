@@ -36,6 +36,7 @@ struct GENDFParserOptions {
   bool validate_xs_positive {true};  //!< Check XS values are non-negative
   bool warn_short_lines {true};      //!< Warn about skipped short lines
   bool require_mf1_header {true};    //!< Require MF=1, MT=451 header
+  bool parse_mf10 {true};           //!< Also parse MF=10 production XS
   int min_file_lines {10};           //!< Minimum expected lines in file
 };
 
@@ -45,6 +46,12 @@ struct GENDFParseResult {
   int zam {0};                                          //!< Z*1000 + A + isomeric state
   std::unordered_map<int, vector<double>> xs_data;      //!< MT -> cross-sections
   std::unordered_map<int, vector<double>> energy_data;  //!< MT -> energy boundaries
+
+  //! MF=10 production XS: key = MT*1000 + LFS (MT<=891, LFS<=50, no collision)
+  std::unordered_map<int, vector<double>> prod_xs_data;
+  //! MF=10 metadata: key = MT*1000 + LFS -> IZAP (Z*1000+A of product)
+  std::unordered_map<int, int> prod_izap_data;
+
   int lines_read {0};                                   //!< Total lines read
   int lines_skipped {0};                                //!< Lines skipped (too short)
   int negative_xs_count {0};                            //!< Count of negative XS clamped
@@ -54,7 +61,17 @@ struct GENDFParseResult {
 };
 
 //==============================================================================
-//! Material data from a single GENDF file (MF=3 cross-sections only)
+//! Single MF=10 production level (LFS, IZAP, cross-sections)
+//==============================================================================
+
+struct ProductionLevel {
+  int lfs;               //!< Level flag (0=ground, >0=metastable)
+  int izap;              //!< Product Z*1000 + A
+  vector<double> xs;     //!< Production cross-sections per group
+};
+
+//==============================================================================
+//! Material data from a single GENDF file
 //==============================================================================
 
 class GENDFMaterial {
@@ -79,19 +96,24 @@ public:
   //! \return Vector of cross-section values (one per group)
   vector<double> get_xs(int mt, int n_groups, const vector<double>& library_bounds) const;
 
-  //! Check if MT reaction exists in this material
+  //! Get MF=10 production XS for all levels of a given MT
   //! \param[in] mt ENDF MT reaction number
-  //! \return True if reaction exists
+  //! \param[in] n_groups Number of energy groups in library
+  //! \param[in] library_bounds Library energy group boundaries for alignment
+  //! \return Vector of ProductionLevel sorted by LFS ascending
+  vector<ProductionLevel> get_production_xs(int mt, int n_groups,
+      const vector<double>& library_bounds) const;
+
+  //! Check if MT reaction exists in this material (MF=3)
   bool has_mt(int mt) const;
 
+  //! Check if MT has MF=10 production data
+  bool has_mf10(int mt) const;
+
   //! Get energy boundaries for specific MT number
-  //! \param[in] mt ENDF MT reaction number
-  //! \return Vector of energy boundaries for this reaction
   const vector<double>& get_energies(int mt) const;
 
   //! Check if MT has energy data
-  //! \param[in] mt ENDF MT reaction number
-  //! \return True if energy data exists
   bool has_energies(int mt) const;
 
   // Accessors
@@ -105,11 +127,17 @@ private:
   int za_ {0};                         //!< Z*1000 + A
   int zam_ {0};                        //!< Z*1000 + A + isomeric state
 
-  //! Cross-section data: map MT -> vector<double> (one value per group)
+  //! MF=3 cross-section data: map MT -> vector<double> (one value per group)
   std::unordered_map<int, vector<double>> xs_data_;
 
-  //! Energy data: map MT -> vector<double> (energy boundaries for threshold alignment)
+  //! MF=3 energy data: map MT -> vector<double> (energy boundaries)
   std::unordered_map<int, vector<double>> energy_data_;
+
+  //! MF=10 production XS: key = MT*1000 + LFS -> production XS per group
+  std::unordered_map<int, vector<double>> prod_xs_data_;
+
+  //! MF=10 metadata: key = MT*1000 + LFS -> IZAP
+  std::unordered_map<int, int> prod_izap_data_;
 
   // Parsing methods
 
@@ -146,6 +174,14 @@ public:
     const std::string& nuclide,
     int mt,
     const vector<double>& energy_bounds);
+
+  //! Get MF=10 production XS for all levels of a given MT
+  //! \param[in] nuclide Nuclide name
+  //! \param[in] mt ENDF MT reaction number
+  //! \return Vector of ProductionLevel sorted by LFS ascending
+  vector<ProductionLevel> get_production_xs(
+    const std::string& nuclide,
+    int mt);
 
   //! Check if nuclide is available in library
   //! \param[in] nuclide Nuclide name
