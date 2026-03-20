@@ -84,6 +84,24 @@ _dll.openmc_gendf_free_xs.restype = None
 _dll.openmc_gendf_free_nuclides.argtypes = [POINTER(c_char_p), c_int]
 _dll.openmc_gendf_free_nuclides.restype = None
 
+# MF=10 production cross-section retrieval
+_dll.openmc_gendf_get_production_xs.argtypes = [
+    c_int32,                     # lib_id
+    c_char_p,                    # nuclide
+    c_int32,                     # mt
+    POINTER(c_int),              # n_levels (output)
+    POINTER(c_int),              # n_groups (output)
+    POINTER(POINTER(c_int)),     # lfs_out (output)
+    POINTER(POINTER(c_int)),     # izap_out (output)
+    POINTER(POINTER(c_double)),  # xs_out (output)
+]
+_dll.openmc_gendf_get_production_xs.restype = c_int
+_dll.openmc_gendf_get_production_xs.errcheck = _error_handler
+
+_dll.openmc_gendf_free_production_xs.argtypes = [
+    POINTER(c_int), POINTER(c_int), POINTER(c_double)]
+_dll.openmc_gendf_free_production_xs.restype = None
+
 
 # =============================================================================
 # Python wrapper class
@@ -421,6 +439,105 @@ class GENDFLibrary:
             except OpenMCError:
                 pass
         return result
+
+    def _get_production_xs(self, nuclide: str, mt: int):
+        """Get raw MF=10 production XS for all levels of a reaction."""
+        nuclide_bytes = nuclide.encode('utf-8')
+        n_levels = c_int()
+        n_groups = c_int()
+        lfs_ptr = POINTER(c_int)()
+        izap_ptr = POINTER(c_int)()
+        xs_ptr = POINTER(c_double)()
+
+        _dll.openmc_gendf_get_production_xs(
+            self._lib_id, nuclide_bytes, mt,
+            pointer(n_levels), pointer(n_groups),
+            pointer(lfs_ptr), pointer(izap_ptr), pointer(xs_ptr))
+
+        nl = n_levels.value
+        ng = n_groups.value
+
+        if nl == 0:
+            return []
+
+        result = []
+        xs_flat = np.ctypeslib.as_array(xs_ptr, shape=(nl * ng,)).copy()
+        for i in range(nl):
+            result.append((
+                lfs_ptr[i],
+                izap_ptr[i],
+                xs_flat[i * ng : (i + 1) * ng]
+            ))
+
+        _dll.openmc_gendf_free_production_xs(lfs_ptr, izap_ptr, xs_ptr)
+        return result
+
+    def get_branching_ratios(self, nuclide: str, mt: int,
+                             target_names=None, lfs_values=None):
+        """Get isomeric branching ratios from MF=10 production cross-sections.
+
+        Parameters
+        ----------
+        nuclide : str
+            Nuclide name
+        mt : int
+            ENDF MT number
+        target_names : list of str, optional
+            Product names from chain. Required for runtime mode.
+        lfs_values : list of int, optional
+            LFS values corresponding to target_names. Required for runtime mode.
+
+        Returns
+        -------
+        IsomericBranching or None
+        """
+        if target_names is None:
+            raise NotImplementedError(
+                "C++ backend does not support ELIS mapping. Use Python "
+                "backend with decay_file for chain patching.")
+
+        if lfs_values is None:
+            raise ValueError("lfs_values required with target_names")
+
+        from openmc.deplete.gendf import IsomericBranching, MT_TO_REACTION
+
+        levels = self._get_production_xs(nuclide, mt)
+        if not levels:
+            return None
+
+        # Build LFS→XS lookup from C++ results
+        lfs_to_xs = {lfs: xs for lfs, izap, xs in levels}
+
+        # Filter to requested LFS values
+        n_groups = self.n_groups
+        prod_xs = []
+        for lfs in lfs_values:
+            if lfs in lfs_to_xs:
+                prod_xs.append(lfs_to_xs[lfs])
+            else:
+                # LFS not found in GENDF — zero production
+                prod_xs.append(np.zeros(n_groups))
+
+        prod_xs = np.array(prod_xs)  # (n_targets, n_groups)
+
+        # Compute branching ratios: BR_i = σ_prod_i / Σ σ_prod_j
+        total = prod_xs.sum(axis=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            br = np.where(total > 0, prod_xs / total, 0.0)
+
+        reaction = MT_TO_REACTION.get(mt, f'MT{mt}')
+        lfs_mapping = {name: lfs for name, lfs
+                       in zip(target_names, lfs_values) if lfs > 0}
+
+        return IsomericBranching(
+            energies=self.energy_bounds,
+            products=list(target_names),
+            branching_ratios=br,
+            parent_nuclide=nuclide,
+            reaction=reaction,
+            mt=mt,
+            lfs_mapping=lfs_mapping,
+        )
 
     def __repr__(self):
         return (f"GENDFLibrary(lib_id={self._lib_id}, "

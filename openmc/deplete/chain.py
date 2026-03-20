@@ -202,6 +202,11 @@ def _load_isomeric_branching_targets(root):
                         lfs_vals = [int(v) for v in lfs_attr.split()]
                         if len(lfs_vals) == len(targets):
                             nuc_lfs[rx_type] = lfs_vals
+                        else:
+                            warn(
+                                f"gendf_lfs count ({len(lfs_vals)}) != "
+                                f"target count ({len(targets)}) for "
+                                f"{nuc_name}/{rx_type}, ignoring LFS")
                 continue
 
             # Legacy format: <isomeric_yields> with <targets> child

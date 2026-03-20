@@ -39,7 +39,25 @@ GENDFMaterial::GENDFMaterial(const std::string& filename)
 
 void GENDFMaterial::load_from_file(const std::string& filename)
 {
-  parse_mf3_only(filename);
+  // Use full validated parser to get both MF=3 and MF=10 data
+  std::filesystem::path p(filename);
+  nuclide_name_ = convert_gendf_to_openmc_name(p.stem().string());
+
+  GENDFParserOptions opts;
+  opts.warn_short_lines = false;
+  opts.parse_mf10 = true;
+
+  GENDFParseResult result = parse_gendf_validated(filename, opts);
+  if (!result.success) {
+    throw std::runtime_error(result.error_message);
+  }
+
+  za_ = result.za;
+  zam_ = result.zam;
+  xs_data_ = std::move(result.xs_data);
+  energy_data_ = std::move(result.energy_data);
+  prod_xs_data_ = std::move(result.prod_xs_data);
+  prod_izap_data_ = std::move(result.prod_izap_data);
 }
 
 vector<double> GENDFMaterial::get_xs(int mt, int n_groups,
@@ -144,6 +162,60 @@ const vector<double>& GENDFMaterial::get_energies(int mt) const
 bool GENDFMaterial::has_energies(int mt) const
 {
   return energy_data_.find(mt) != energy_data_.end();
+}
+
+bool GENDFMaterial::has_mf10(int mt) const
+{
+  // Check if any key in range [MT*1000, MT*1000+999] exists
+  int base = mt * 1000;
+  for (const auto& kv : prod_xs_data_) {
+    if (kv.first >= base && kv.first < base + 1000) return true;
+  }
+  return false;
+}
+
+vector<ProductionLevel> GENDFMaterial::get_production_xs(
+    int mt, int n_groups, const vector<double>& library_bounds) const
+{
+  vector<ProductionLevel> levels;
+  int base = mt * 1000;
+
+  for (const auto& kv : prod_xs_data_) {
+    if (kv.first < base || kv.first >= base + 1000) continue;
+
+    int lfs = kv.first - base;
+    const auto& raw_xs = kv.second;
+
+    // Look up IZAP
+    int izap = 0;
+    auto izap_it = prod_izap_data_.find(kv.first);
+    if (izap_it != prod_izap_data_.end()) {
+      izap = izap_it->second;
+    }
+
+    // Align to library energy grid (same logic as get_xs for threshold reactions)
+    vector<double> aligned_xs(n_groups, 0.0);
+
+    if (raw_xs.size() == static_cast<size_t>(n_groups)) {
+      aligned_xs.assign(raw_xs.begin(), raw_xs.end());
+    } else if (raw_xs.size() == static_cast<size_t>(n_groups + 1)) {
+      aligned_xs.assign(raw_xs.begin(), raw_xs.begin() + n_groups);
+    } else if (raw_xs.size() < static_cast<size_t>(n_groups)) {
+      // Threshold — place at high-energy end
+      size_t offset = n_groups - raw_xs.size();
+      std::copy(raw_xs.begin(), raw_xs.end(), aligned_xs.begin() + offset);
+    }
+
+    levels.push_back({lfs, izap, std::move(aligned_xs)});
+  }
+
+  // Sort by LFS ascending
+  std::sort(levels.begin(), levels.end(),
+            [](const ProductionLevel& a, const ProductionLevel& b) {
+              return a.lfs < b.lfs;
+            });
+
+  return levels;
 }
 
 void GENDFMaterial::parse_mf3_only(const std::string& filename)
@@ -354,6 +426,14 @@ vector<double> GENDFLibrary::get_xs(
 
   auto& material = load_material(nuclide);
   return material.get_xs(mt, n_groups_, energy_bounds_);
+}
+
+vector<ProductionLevel> GENDFLibrary::get_production_xs(
+  const std::string& nuclide,
+  int mt)
+{
+  auto& material = load_material(nuclide);
+  return material.get_production_xs(mt, n_groups_, energy_bounds_);
 }
 
 //==============================================================================
@@ -588,6 +668,66 @@ void openmc_gendf_free_nuclides(char** nuclides, int n)
 
   // Free the array itself
   free(nuclides);
+}
+
+int openmc_gendf_get_production_xs(int32_t lib_id, const char* nuclide,
+  int32_t mt, int* n_levels, int* n_groups,
+  int** lfs_out, int** izap_out, double** xs_out)
+{
+  if (!nuclide || !n_levels || !n_groups || !lfs_out || !izap_out || !xs_out) {
+    set_errmsg("Null pointer argument to openmc_gendf_get_production_xs");
+    return OPENMC_E_INVALID_ARGUMENT;
+  }
+
+  GENDFLibrary* lib = get_library(lib_id);
+  if (!lib)
+    return OPENMC_E_INVALID_ID;
+
+  try {
+    auto levels = lib->get_production_xs(nuclide, mt);
+    *n_levels = levels.size();
+    *n_groups = lib->n_groups();
+
+    if (levels.empty()) {
+      *lfs_out = nullptr;
+      *izap_out = nullptr;
+      *xs_out = nullptr;
+      return 0;
+    }
+
+    int nl = levels.size();
+    int ng = *n_groups;
+
+    *lfs_out = (int*)malloc(nl * sizeof(int));
+    *izap_out = (int*)malloc(nl * sizeof(int));
+    *xs_out = (double*)malloc(nl * ng * sizeof(double));
+
+    if (!*lfs_out || !*izap_out || !*xs_out) {
+      free(*lfs_out); free(*izap_out); free(*xs_out);
+      set_errmsg("Failed to allocate memory for production XS data");
+      return OPENMC_E_ALLOCATE;
+    }
+
+    for (int i = 0; i < nl; ++i) {
+      (*lfs_out)[i] = levels[i].lfs;
+      (*izap_out)[i] = levels[i].izap;
+      std::copy(levels[i].xs.begin(), levels[i].xs.end(),
+                *xs_out + i * ng);
+    }
+
+    return 0;
+
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
+}
+
+void openmc_gendf_free_production_xs(int* lfs, int* izap, double* xs)
+{
+  if (lfs) free(lfs);
+  if (izap) free(izap);
+  if (xs) free(xs);
 }
 
 } // extern "C"
