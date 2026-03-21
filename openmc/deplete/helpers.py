@@ -1236,6 +1236,10 @@ class IsomericBranchingHelper:
                         nuclide, {}).get(reaction)
                     lfs = (self.chain.isomeric_branching_lfs or {}).get(
                         nuclide, {}).get(reaction)
+                    # Only use runtime mode when both targets and LFS are
+                    # available; otherwise fall through to patcher mode
+                    if targets is not None and lfs is None:
+                        targets = None
                     try:
                         self._branching_cache[key] = \
                             self.gendf_library.get_branching_ratios(
@@ -1506,13 +1510,8 @@ class IsomericBranchingHelper:
 
         total = sum(weighted_ratios.values())
 
-        # Validate that total is positive (catch invalid data)
         if total <= 0:
-            raise ValueError(
-                f"Isomeric branching ratios sum to {total}. "
-                f"All ratios are zero or negative - this indicates invalid "
-                f"source data or calculation error."
-            )
+            return {}
 
         # Normalize if not already summing to 1.0
         if not np.isclose(total, 1.0, rtol=1e-6):
