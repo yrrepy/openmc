@@ -287,6 +287,7 @@ GENDFParseResult parse_gendf_validated(
         if (current_mf == 10 && !mf10_current_xs.empty()) {
           int key = current_mt * 1000 + mf10_current_lfs;
           result.prod_xs_data[key] = std::move(mf10_current_xs);
+          result.prod_energy_data[key] = std::move(mf10_current_energies);
           result.prod_izap_data[key] = mf10_current_izap;
           mf10_current_xs.clear();
           mf10_current_energies.clear();
@@ -413,6 +414,7 @@ GENDFParseResult parse_gendf_validated(
           if (!mf10_current_xs.empty()) {
             int key = current_mt * 1000 + mf10_current_lfs;
             result.prod_xs_data[key] = std::move(mf10_current_xs);
+            result.prod_energy_data[key] = std::move(mf10_current_energies);
             result.prod_izap_data[key] = mf10_current_izap;
             mf10_current_xs.clear();
             mf10_current_energies.clear();
@@ -495,6 +497,7 @@ GENDFParseResult parse_gendf_validated(
   if (current_mf == 10 && !mf10_current_xs.empty()) {
     int key = current_mt * 1000 + mf10_current_lfs;
     result.prod_xs_data[key] = std::move(mf10_current_xs);
+    result.prod_energy_data[key] = std::move(mf10_current_energies);
     result.prod_izap_data[key] = mf10_current_izap;
   }
 

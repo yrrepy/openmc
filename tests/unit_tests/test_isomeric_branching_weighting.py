@@ -193,10 +193,10 @@ def test_gendf_branching_ratios_called():
     flux_spectrum = np.ones(n_groups)
     helper.weighted_branching_ratios(flux_spectrum, energy_bins)
 
-    # get_branching_ratios should be called with runtime mode args
+    # No LFS on chain → patcher mode (target_names=None)
     mock_gendf.get_branching_ratios.assert_called_once_with(
         'Ag109', 102,
-        target_names=['Ag110', 'Ag110_m1'],
+        target_names=None,
         lfs_values=None)
 
 

@@ -49,6 +49,8 @@ struct GENDFParseResult {
 
   //! MF=10 production XS: key = MT*1000 + LFS (MT<=891, LFS<=50, no collision)
   std::unordered_map<int, vector<double>> prod_xs_data;
+  //! MF=10 energy boundaries: key = MT*1000 + LFS
+  std::unordered_map<int, vector<double>> prod_energy_data;
   //! MF=10 metadata: key = MT*1000 + LFS -> IZAP (Z*1000+A of product)
   std::unordered_map<int, int> prod_izap_data;
 
@@ -135,6 +137,9 @@ private:
 
   //! MF=10 production XS: key = MT*1000 + LFS -> production XS per group
   std::unordered_map<int, vector<double>> prod_xs_data_;
+
+  //! MF=10 energy boundaries: key = MT*1000 + LFS
+  std::unordered_map<int, vector<double>> prod_energy_data_;
 
   //! MF=10 metadata: key = MT*1000 + LFS -> IZAP
   std::unordered_map<int, int> prod_izap_data_;
