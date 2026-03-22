@@ -601,6 +601,10 @@ class Integrator(ABC):
         clipping is applied after each CRAM sub-step.
 
         .. versionadded:: 0.15.4
+    hdf5_dtype : str, optional
+        dtype for number and reaction rate datasets, float32 or float64 (default)
+
+        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -655,7 +659,12 @@ class Integrator(ABC):
             solver: str = "cram48",
             continue_timesteps: bool = False,
             clip_min_atom_density: Optional[float] = None,
+            hdf5_dtype: str = 'float64',
         ):
+        if hdf5_dtype not in ('float32', 'float64'):
+            raise ValueError(
+                f"hdf5_dtype must be 'float32' or 'float64', got '{hdf5_dtype}'")
+        self.hdf5_dtype = hdf5_dtype
         if continue_timesteps and operator.prev_res is None:
             raise ValueError("Continuation run requires passing prev_results.")
         self.operator = operator
@@ -958,7 +967,8 @@ class Integrator(ABC):
                     self._i_res + i,
                     proc_time,
                     write_rates=write_rates,
-                    path=path
+                    path=path,
+                    hdf5_dtype=self.hdf5_dtype,
                 )
 
                 # Update for next step
@@ -981,7 +991,8 @@ class Integrator(ABC):
                 self._i_res + len(self),
                 proc_time,
                 write_rates=write_rates,
-                path=path
+                path=path,
+                hdf5_dtype=self.hdf5_dtype,
             )
             self.operator.write_bos_data(len(self) + self._i_res)
 
@@ -1188,6 +1199,10 @@ class SIIntegrator(Integrator):
         clipping is applied after each CRAM sub-step.
 
         .. versionadded:: 0.15.4
+    hdf5_dtype : str, optional
+        dtype for number and reaction rate datasets, float32 or float64 (default)
+
+        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -1236,6 +1251,7 @@ class SIIntegrator(Integrator):
             solver: str = "cram48",
             continue_timesteps: bool = False,
             clip_min_atom_density: Optional[float] = None,
+            hdf5_dtype: str = 'float64',
         ):
         check_type("n_steps", n_steps, Integral)
         check_greater_than("n_steps", n_steps, 0)
@@ -1243,7 +1259,8 @@ class SIIntegrator(Integrator):
             operator, timesteps, power, power_density, source_rates,
             timestep_units=timestep_units, solver=solver,
             continue_timesteps=continue_timesteps,
-            clip_min_atom_density=clip_min_atom_density)
+            clip_min_atom_density=clip_min_atom_density,
+            hdf5_dtype=hdf5_dtype)
         self.n_steps = n_steps
 
     def _get_bos_data_from_operator(self, step_index, step_power, n_bos):
@@ -1334,7 +1351,8 @@ class SIIntegrator(Integrator):
                     self._i_res + i,
                     proc_time,
                     write_rates=write_rates,
-                    path=path
+                    path=path,
+                    hdf5_dtype=self.hdf5_dtype,
                 )
 
                 # Update for next step
@@ -1352,7 +1370,8 @@ class SIIntegrator(Integrator):
                 self._i_res + len(self),
                 proc_time,
                 write_rates=write_rates,
-                path=path
+                path=path,
+                hdf5_dtype=self.hdf5_dtype,
             )
             self.operator.write_bos_data(self._i_res + len(self))
 
