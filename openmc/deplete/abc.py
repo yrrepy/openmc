@@ -581,6 +581,14 @@ class Integrator(ABC):
         :attr:`solver`.
 
         .. versionadded:: 0.12
+    substeps : int, optional
+        Number of substeps per depletion interval. When greater than 1,
+        each interval is subdivided into `substeps` identical sub-intervals
+        and LU factorizations are reused across them, improving accuracy
+        for nuclides with large decay-constant × timestep products.
+        Only used when `solver` is ``cram48"`` or ``cram16``.
+
+        .. versionadded:: 0.15.3
     continue_timesteps : bool, optional
         Whether or not to treat the current solve as a continuation of a
         previous simulation. Defaults to `False`. When `False`, the depletion
@@ -662,6 +670,7 @@ class Integrator(ABC):
             source_rates: Optional[Union[float, Sequence[float]]] = None,
             timestep_units: str = 's',
             solver: str = "cram48",
+            substeps: int = 1,
             continue_timesteps: bool = False,
             clip_min_atom_density: Optional[float] = None,
             hdf5_dtype: str = 'float64',
@@ -741,15 +750,23 @@ class Integrator(ABC):
         if isinstance(solver, str):
             # Delay importing of cram module, which requires this file
             if solver == "cram48":
-                from .cram import CRAM48
-                self._solver = CRAM48
+                from .cram import CRAM48 as _default, Cram48Solver as _base
             elif solver == "cram16":
-                from .cram import CRAM16
-                self._solver = CRAM16
+                from .cram import CRAM16 as _default, Cram16Solver as _base
             else:
                 raise ValueError(
                     f"Solver {solver} not understood. Expected 'cram48' or 'cram16'")
+
+            if substeps > 1:
+                from .cram import IPFCramSolver
+                self._solver = IPFCramSolver(
+                    _base.alpha, _base.theta, _base.alpha0,
+                    substeps=substeps)
+            else:
+                self._solver = _default
         else:
+            if substeps > 1:
+                warn("substeps is ignored when a custom solver is provided")
             self.solver = solver
 
     @property
@@ -1191,6 +1208,14 @@ class SIIntegrator(Integrator):
         :attr:`solver`.
 
         .. versionadded:: 0.12
+    substeps : int, optional
+        Number of substeps per depletion interval. When greater than 1,
+        each interval is subdivided into `substeps` identical sub-intervals
+        and LU factorizations are reused across them, improving accuracy
+        for nuclides with large decay-constant × timestep products.
+        Only used when `solver` is ``cram48`` or ``cram16``.
+
+        .. versionadded:: 0.15.3
     continue_timesteps : bool, optional
         Whether or not to treat the current solve as a continuation of a
         previous simulation. Defaults to `False`. If `False`, all time
@@ -1268,6 +1293,7 @@ class SIIntegrator(Integrator):
             timestep_units: str = 's',
             n_steps: int = 10,
             solver: str = "cram48",
+            substeps: int = 1,
             continue_timesteps: bool = False,
             clip_min_atom_density: Optional[float] = None,
             hdf5_dtype: str = 'float64',
@@ -1278,6 +1304,7 @@ class SIIntegrator(Integrator):
         super().__init__(
             operator, timesteps, power, power_density, source_rates,
             timestep_units=timestep_units, solver=solver,
+            substeps=substeps,
             continue_timesteps=continue_timesteps,
             clip_min_atom_density=clip_min_atom_density,
             hdf5_dtype=hdf5_dtype,
