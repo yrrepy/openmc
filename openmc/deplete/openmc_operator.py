@@ -182,8 +182,10 @@ class OpenMCOperator(TransportOperator):
                              self.prev_res)
 
         # Create reaction rates array
+        dtype = getattr(self, '_depletion_dtype', None)
         self.reaction_rates = ReactionRates(
-            self.local_mats, self._burnable_nucs, self.chain.reactions)
+            self.local_mats, self._burnable_nucs, self.chain.reactions,
+            dtype=dtype)
 
         self._get_helper_classes(helper_kwargs)
 
@@ -282,7 +284,9 @@ class OpenMCOperator(TransportOperator):
             Results from a previous depletion calculation
 
         """
-        self.number = AtomNumber(local_mats, all_nuclides, volume, len(self.chain))
+        dtype = getattr(self, '_depletion_dtype', None)
+        self.number = AtomNumber(local_mats, all_nuclides, volume,
+                                 len(self.chain), dtype=dtype)
 
         # Now extract and store the number densities
         # From the geometry if no previous depletion results

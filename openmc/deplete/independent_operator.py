@@ -171,6 +171,12 @@ class IndependentOperator(OpenMCOperator):
         helper_kwargs = {'normalization_mode': normalization_mode,
                          'fission_yield_opts': fission_yield_opts}
 
+        # Detect dtype from MicroXS data (e.g. float32 from HDF5)
+        if micros and hasattr(micros[0], 'data'):
+            self._depletion_dtype = micros[0].data.dtype
+        else:
+            self._depletion_dtype = None
+
         if not _prefiltered:
             # Sort fluxes and micros in same order that materials get sorted
             index_sort = np.argsort([mat.id for mat in materials])

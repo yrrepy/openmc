@@ -44,7 +44,7 @@ class AtomNumber:
         Number of nuclides.
 
     """
-    def __init__(self, local_mats, nuclides, volume, n_nuc_burn):
+    def __init__(self, local_mats, nuclides, volume, n_nuc_burn, dtype=None):
         self.index_mat = {mat: i for i, mat in enumerate(local_mats)}
         self.index_nuc = {nuc: i for i, nuc in enumerate(nuclides)}
 
@@ -56,7 +56,8 @@ class AtomNumber:
 
         self.n_nuc_burn = n_nuc_burn
 
-        self.number = np.zeros((len(local_mats), len(nuclides)))
+        self.number = np.zeros((len(local_mats), len(nuclides)),
+                               dtype=dtype or np.float64)
 
     def _get_mat_index(self, mat):
         """Helper method for getting material index"""
