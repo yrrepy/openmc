@@ -56,10 +56,11 @@ class ReactionRates(np.ndarray):
     index_nuc: dict[str, int]
     index_rx: dict[str, int]
 
-    def __new__(cls, local_mats, nuclides, reactions, from_results=False):
+    def __new__(cls, local_mats, nuclides, reactions, from_results=False,
+                dtype=None):
         # Create appropriately-sized zeroed-out ndarray
         shape = (len(local_mats), len(nuclides), len(reactions))
-        obj = super().__new__(cls, shape)
+        obj = super().__new__(cls, shape, dtype=dtype or np.float64)
         obj[:] = 0.0
 
         # Add mapping attributes, keep same indexing if from depletion_results

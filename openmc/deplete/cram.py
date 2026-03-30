@@ -76,11 +76,13 @@ class IPFCramSolver(DepSystemSolver):
 
         """
         A = dt * csc_array(A, dtype=np.float64)
-        y = n0.copy()
+        orig_dtype = n0.dtype
+        y = np.array(n0, dtype=np.float64)
         ident = eye_array(A.shape[0], format='csc')
         for alpha, theta in zip(self.alpha, self.theta):
             y += 2*np.real(alpha*sla.spsolve(A - theta*ident, y))
-        return y * self.alpha0
+        y *= self.alpha0
+        return y.astype(orig_dtype, copy=False)
 
 
 # Coefficients for IPF Cram 16
