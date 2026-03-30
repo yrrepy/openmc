@@ -65,6 +65,15 @@ ATOMIC_SYMBOL = {
     91: 'Pa', 92: 'U', 93: 'Np', 94: 'Pu', 95: 'Am', 96: 'Cm', 97: 'Bk', 98: 'Cf', 99: 'Es', 100: 'Fm'
 }
 
+def _parse_endf_material(filepath):
+    """Parse an ENDF-format file, suppressing benign MF/MT warnings."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=r"MF=\d+, MT=\d+ ignored", category=UserWarning
+        )
+        return endf.Material(str(filepath))
+
+
 def _build_mt_to_reaction():
     """Build MT to reaction name mapping from chain.py REACTIONS dict.
 
@@ -230,7 +239,7 @@ def detect_energy_structure(library_path: PathLike) -> str:
 
     for sample_file in files_to_try:
         try:
-            material = endf.Material(str(sample_file))
+            material = _parse_endf_material(sample_file)
             mf3 = [(mf, mt) for mf, mt in material.section_data if mf == 3]
             if not mf3:
                 continue
@@ -788,7 +797,7 @@ class _PythonGENDFLibrary:
         try:
             # Load material to get accurate naming from metadata
             # Use full parser to ensure MF=1, MT=451 is available
-            material = endf.Material(str(filepath))
+            material = _parse_endf_material(filepath)
             correct_name = get_target_name(material)
 
             # Update index if name changed
@@ -901,7 +910,7 @@ class _PythonGENDFLibrary:
             if require_full_parser:
                 # Use full endf.Material parser (slower but complete)
                 # Required for MF=10 (isomeric branching) data
-                material = endf.Material(str(filepath))
+                material = _parse_endf_material(filepath)
 
                 # Validate energy grid if requested
                 if self._validate_energy_grid:
