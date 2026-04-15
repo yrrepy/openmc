@@ -227,15 +227,15 @@ class Element(str):
                         abundances['O16'] += NATURAL_ABUNDANCE[nuclide]
                     elif nuclide == 'Ta180_m1' and 'Ta181' in mutual_nuclides:
                             abundances['Ta181'] += NATURAL_ABUNDANCE[nuclide]
-                        elif nuclide == 'W180' and 'W182' in mutual_nuclides:
-                            abundances['W182'] += NATURAL_ABUNDANCE[nuclide]
-                        else:
-                            msg = 'Unsure how to partition natural abundance of ' \
-                                  'isotope {0} into other natural isotopes of ' \
-                                  'this element that are present in the cross ' \
-                                  'section library provided. Consider adding ' \
-                                  'the isotopes of this element individually.'
-                            raise ValueError(msg)
+                    elif nuclide == 'W180' and 'W182' in mutual_nuclides:
+                        abundances['W182'] += NATURAL_ABUNDANCE[nuclide]
+                    else:
+                        msg = 'Unsure how to partition natural abundance of ' \
+                              'isotope {0} into other natural isotopes of ' \
+                              'this element that are present in the cross ' \
+                              'section library provided. Consider adding ' \
+                              'the isotopes of this element individually.'
+                        raise ValueError(msg)
 
             # If a cross_section library is not present, expand the element into
             # its natural nuclides

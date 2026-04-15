@@ -968,7 +968,7 @@ class Chain:
 
         return csc_array((vals, (rows, cols)), shape=(n, n))
 
-    def form_matrix(self, rates, fission_yields=None):
+    def form_matrix(self, rates, fission_yields=None, isomeric_branching=None):
         """Form the full transmutation matrix (decay + reactions).
 
         Parameters
@@ -980,6 +980,9 @@ class Chain:
             to be of the form ``{parent : {product : f_yield}}``
             with string nuclide names for ``parent`` and ``product``,
             and ``f_yield`` as the respective fission yield
+        isomeric_branching : dict, optional
+            Isomeric branching ratios to use. Expected to be of the form
+            ``{parent: {reaction: {target: branching_ratio}}}``
 
         Returns
         -------
@@ -991,7 +994,7 @@ class Chain:
         :attr:`decay_matrix`, :meth:`form_rxn_matrix`,
         :meth:`get_default_fission_yields`
         """
-        return self.decay_matrix + self.form_rxn_matrix(rates, fission_yields)
+        return self.decay_matrix + self.form_rxn_matrix(rates, fission_yields, isomeric_branching)
 
     def add_redox_term(self, matrix, buffer, oxidation_states):
         r"""Adds a redox term to the depletion matrix from data contained in
@@ -1479,286 +1482,57 @@ class Chain:
             for nuc_name in family_list:
                 self._isomeric_families[nuc_name] = family_list
 
-    def _add_siblings_to_set(self, nuclide_name, isotope_set, pending_list):
-        """Add all isomeric siblings of a nuclide to a set and pending list.
+    def _expand_with_isomeric_siblings(self, isotope_set):
+        """Expand isotope set to include isomeric siblings and branching targets.
 
-        Helper method for chain reduction that adds siblings of a given nuclide
-        (ground state + metastable states) to the isotope set if they exist in
-        the chain and haven't been added yet.
+        This method adds:
+        1. All isomeric siblings for every nuclide in the set
+        2. If isomeric_branching_targets exists: all branching targets and their siblings
 
-        Parameters
-        ----------
-        nuclide_name : str
-            Nuclide whose siblings should be added
-        isotope_set : set
-            Set of nuclide names to add siblings to (modified in-place)
-        pending_list : list
-            List of nuclides pending processing (modified in-place)
-
-        Returns
-        -------
-        int
-            Number of siblings added
-        """
-        if nuclide_name not in self.nuclide_dict:
-            return 0
-
-        added = 0
-        siblings = self._get_isomeric_siblings(nuclide_name)
-        for sibling in siblings:
-            if sibling in self.nuclide_dict and sibling not in isotope_set:
-                isotope_set.add(sibling)
-                pending_list.append(sibling)
-                added += 1
-        return added
-
-    def _expand_with_siblings(self, isotope_set):
-        """Expand isotope set to include all isomeric branching targets and siblings.
-
-        This method iteratively adds all isomeric branching targets and their
-        isomeric siblings (ground state + metastable states) to the isotope set.
         This ensures that when ``keep_isomeric_siblings=True`` is used during
         chain reduction, no isomeric branching targets are excluded, which would
         otherwise cause renormalization warnings.
 
-        The expansion is performed in two directions:
-        1. Forward: For each nuclide that is a PARENT of isomeric branching,
-           add all its targets and their siblings.
-        2. Backward: For each nuclide that is a TARGET of isomeric branching,
-           add all siblings in its isomeric family.
-
         Parameters
         ----------
         isotope_set : set of str
-            Set of nuclide names to expand (modified in-place). Should contain
-            the initially reachable nuclides from the chain reduction algorithm.
+            Set of nuclide names to expand (modified in-place).
 
         Returns
         -------
         set of str
             The expanded isotope set (same object as input, modified in-place).
-
-        Notes
-        -----
-        This method requires ``self.isomeric_branching`` to be non-None.
-        If there is no isomeric branching data, the set is returned unchanged.
-
-        The algorithm uses a work-list approach to ensure all transitive
-        dependencies are captured. For example, if nuclide A produces B and B_m1
-        via isomeric branching, and B produces C and C_m1, all four products
-        (B, B_m1, C, C_m1) will be included.
-
         """
-        if not self.isomeric_branching:
-            return isotope_set
-
         to_check = list(isotope_set)
         checked = set()
 
-        # Iteratively add all isomeric branching targets and their siblings
         while to_check:
             nuc_name = to_check.pop()
             if nuc_name in checked:
                 continue
             checked.add(nuc_name)
 
-            # Strategy 1: Check if this nuclide HAS isomeric branching (is a PARENT)
-            if nuc_name in self.isomeric_branching:
-                for rx_type, iso_data in self.isomeric_branching[nuc_name].items():
-                    if 'targets' in iso_data:
-                        for target in iso_data['targets']:
-                            # Add target if not already present
-                            if target in self.nuclide_dict and target not in isotope_set:
-                                isotope_set.add(target)
-                                to_check.append(target)
+            # Add all siblings for this nuclide
+            siblings = self._get_isomeric_siblings(nuc_name)
+            for sibling in siblings:
+                if sibling in self.nuclide_dict and sibling not in isotope_set:
+                    isotope_set.add(sibling)
+                    to_check.append(sibling)
 
-                            # ALWAYS add siblings for ALL targets (even if target already in set)
-                            # This ensures that if ground state is already present,
-                            # we still add the metastable states
-                            self._add_siblings_to_set(target, isotope_set, to_check)
-
-            # Strategy 2: Check if this nuclide IS a TARGET of isomeric branching
-            # (even if the parent is not in the reduced chain)
-            # This handles cases like: Tm156 (n,3n) -> Tm154 + Tm154_m1
-            # where Tm154 is reached but Tm156 might not be in the chain
-            base_name = self._get_base_name(nuc_name)
-            found_sibling = False
-            for parent_name, reactions_dict in self.isomeric_branching.items():
-                for rx_type, iso_data in reactions_dict.items():
-                    if 'targets' in iso_data:
-                        for target in iso_data['targets']:
-                            target_base = self._get_base_name(target)
-                            if target_base == base_name:
-                                # Found isomeric branching TO this family
-                                # Add ALL siblings in this family
-                                self._add_siblings_to_set(nuc_name, isotope_set, to_check)
-                                # No need to check other reactions once we found one
-                                found_sibling = True
-                                break
-                    if found_sibling:
-                        break
-                if found_sibling:
-                    break
+            # If isomeric branching targets exist, also add targets and their siblings
+            if self.isomeric_branching_targets and nuc_name in self.isomeric_branching_targets:
+                for rx_type, targets in self.isomeric_branching_targets[nuc_name].items():
+                    for target in targets:
+                        if target in self.nuclide_dict and target not in isotope_set:
+                            isotope_set.add(target)
+                            to_check.append(target)
+                        # Add siblings for target
+                        for sibling in self._get_isomeric_siblings(target):
+                            if sibling in self.nuclide_dict and sibling not in isotope_set:
+                                isotope_set.add(sibling)
+                                to_check.append(sibling)
 
         return isotope_set
-
-    def _filter_isomeric_branching(self, retained_isotopes):
-        """Filter and renormalize isomeric branching data for a reduced chain.
-
-        This method creates a filtered copy of the chain's isomeric branching
-        data, keeping only entries where the parent nuclide is in the retained
-        set. For reactions where some (but not all) targets are excluded, the
-        branching ratios are renormalized to sum to 1.0 to preserve mass
-        conservation.
-
-        Parameters
-        ----------
-        retained_isotopes : set of str
-            Set of nuclide names that will be included in the reduced chain.
-
-        Returns
-        -------
-        dict or None
-            Filtered isomeric branching data structure, or None if no data
-            remains after filtering. The structure is::
-
-                {parent_name: {rx_type: {'energies': array,
-                                         'targets': list,
-                                         'branching_ratios': dict}}}
-
-        Notes
-        -----
-        Three cases are handled for each reaction's isomeric branching:
-
-        1. **All targets retained**: Original branching ratios preserved unchanged.
-        2. **All targets excluded**: The reaction's isomeric branching entry is
-           dropped entirely.
-        3. **Partial exclusion**: Branching ratios are renormalized so they sum
-           to 1.0 at each energy point. A warning is issued to inform the user.
-
-        The renormalization formula at each energy point is::
-
-            new_ratio[target] = old_ratio[target] / sum(old_ratios for retained targets)
-
-        This is analogous to how fission yields are implicitly renormalized when
-        fission products are excluded from a reduced chain.
-
-        Warnings are issued for:
-        - Malformed isomeric data (missing required keys)
-        - Renormalized ratios that don't sum to 1.0 (indicates data issues)
-        - Each reaction that undergoes renormalization (informational)
-
-        """
-        if self.isomeric_branching is None:
-            return None
-
-        new_isomeric_branching = {}
-
-        for parent_name, reactions_dict in self.isomeric_branching.items():
-            # Skip if parent nuclide not in reduced chain
-            if parent_name not in retained_isotopes:
-                continue
-
-            new_reactions_dict = {}
-
-            for rx_type, iso_data in reactions_dict.items():
-                # Validate data structure
-                if not all(key in iso_data for key in ['energies', 'targets', 'branching_ratios']):
-                    warn(f"Malformed isomeric data for {parent_name} {rx_type}, skipping")
-                    continue
-
-                original_targets = iso_data['targets']
-                energies = iso_data['energies']
-                original_ratios = iso_data['branching_ratios']
-
-                # Filter targets that remain in reduced chain
-                remaining_targets = [t for t in original_targets if t in retained_isotopes]
-
-                if not remaining_targets:
-                    # All targets excluded - drop this isomeric branching entry
-                    continue
-
-                if len(remaining_targets) == len(original_targets):
-                    # All targets retained - keep original data unchanged
-                    new_reactions_dict[rx_type] = {
-                        'energies': energies,
-                        'targets': remaining_targets,
-                        'branching_ratios': original_ratios.copy()
-                    }
-                else:
-                    # Partial removal - renormalize branching ratios
-                    new_ratios = {}
-
-                    # Extract ratios for remaining targets
-                    remaining_ratio_arrays = [
-                        original_ratios[target] for target in remaining_targets
-                    ]
-
-                    # Sum across targets at each energy point
-                    # Shape: (n_targets, n_energies) -> sum over axis 0 -> (n_energies,)
-                    total_per_energy = np.sum(remaining_ratio_arrays, axis=0)
-
-                    # Renormalize each target's ratios
-                    for target, ratio_array in zip(remaining_targets, remaining_ratio_arrays):
-                        # Avoid division by zero (shouldn't happen if original sums to 1.0)
-                        with np.errstate(divide='ignore', invalid='ignore'):
-                            renormalized = ratio_array / total_per_energy
-                            # Replace any NaN/Inf with 0 (shouldn't occur in valid data)
-                            renormalized = np.nan_to_num(renormalized, nan=0.0, posinf=0.0, neginf=0.0)
-                        new_ratios[target] = renormalized
-
-                    new_reactions_dict[rx_type] = {
-                        'energies': energies,
-                        'targets': remaining_targets,
-                        'branching_ratios': new_ratios
-                    }
-
-                    # Validation: check that renormalized ratios sum to ~1.0
-                    # Skip validation for energy points where original total was 0 (no valid data)
-                    renorm_total = np.sum([new_ratios[t] for t in remaining_targets], axis=0)
-                    valid_energies = total_per_energy > 0
-                    if valid_energies.any() and not np.allclose(renorm_total[valid_energies], 1.0, rtol=1e-6):
-                        warn(f"Chain.reduce(): Renormalized isomeric branching for "
-                             f"{parent_name} {rx_type} does not sum to 1.0 "
-                             f"(range: {renorm_total[valid_energies].min():.6f} - {renorm_total[valid_energies].max():.6f}). "
-                             f"This may indicate malformed input data.")
-
-                    # Informational: notify about renormalization
-                    excluded = set(original_targets) - set(remaining_targets)
-                    warn(f"Chain.reduce(): Renormalized isomeric branching for "
-                         f"{parent_name} {rx_type} after excluding targets {excluded}. "
-                         f"Branching ratios adjusted to preserve mass conservation.")
-
-            if new_reactions_dict:
-                new_isomeric_branching[parent_name] = new_reactions_dict
-
-        return new_isomeric_branching if new_isomeric_branching else None
-
-    def _expand_isomeric_families(self, nuclide_names, keep_siblings):
-        """Expand nuclide list to include isomeric siblings.
-
-        Parameters
-        ----------
-        nuclide_names : list of str
-            Initially reachable nuclide names
-        keep_siblings : bool
-            If True, add all isomeric siblings. If False, no expansion.
-
-        Returns
-        -------
-        list of str
-            Expanded nuclide list including siblings (if keep_siblings=True)
-        """
-        if not keep_siblings:
-            return nuclide_names
-
-        expanded = set(nuclide_names)
-
-        for nuc_name in nuclide_names:
-            siblings = self._get_isomeric_siblings(nuc_name)
-            expanded.update(siblings)
-
-        return list(expanded)
 
     def reduce(self, initial_isotopes, level=None, keep_isomeric_siblings=True):
         """Reduce the size of the chain by following transmutation paths
@@ -1868,20 +1642,7 @@ class Chain:
 
         # Expand to include isomeric siblings if requested
         if keep_isomeric_siblings:
-            expanded_isotopes = self._expand_isomeric_families(
-                list(all_isotopes), keep_isomeric_siblings
-            )
-
-            # Also include ALL isomeric branching targets AND their siblings,
-            # even if they're beyond the depth limit (prevents renormalization warnings)
-            if self.isomeric_branching:
-                expanded_isotopes_set = set(expanded_isotopes)
-                self._expand_with_siblings(expanded_isotopes_set)
-                expanded_isotopes = list(expanded_isotopes_set)
-
-            # Union to preserve explicitly added siblings beyond depth limit
-            if set(expanded_isotopes) != all_isotopes:
-                all_isotopes = all_isotopes | set(expanded_isotopes)
+            self._expand_with_isomeric_siblings(all_isotopes)
 
         # Avoid re-sorting for fission yields
         name_sort = sorted(all_isotopes)

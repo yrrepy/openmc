@@ -530,6 +530,8 @@ class StepResult:
             if "reaction rate index" in nuc_handle.attrs:
                 rxn_nuc_to_ind[nuc] = nuc_handle.attrs["reaction rate index"]
 
+        results.index_nuc = dict(sorted(temp_nuc_dict.items(), key=lambda x: x[1]))
+
         if "reactions" in handle:
             for rxn, rxn_handle in handle["/reactions"].items():
                 rxn_to_ind[rxn] = rxn_handle.attrs["index"]
