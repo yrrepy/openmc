@@ -59,6 +59,7 @@ def get_microxs_and_flux(
     path_statepoint: PathLike | None = None,
     path_input: PathLike | None = None,
     run_kwargs=None,
+    gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary' | None = None,
     reaction_rate_opts: dict | None = None,
 ) -> tuple[list[np.ndarray], list[MicroXS]]:
     """Generate microscopic cross sections and fluxes for multiple domains.
@@ -85,9 +86,10 @@ def get_microxs_and_flux(
     reactions : list of str
         Reactions to get cross sections for. If not specified, all neutron
         reactions listed in the depletion chain file are used.
-    energies : iterable of float or str
+    energies : iterable of float or str, optional
         Energy group boundaries in [eV] or the name of the group structure.
-        If left as None energies will default to [0.0, 100e6]
+        If left as None energies will default to [0.0, 100e6], unless
+        ``gendf_library`` is provided (see below).
     reaction_rate_mode : {"direct", "flux"}, optional
         The "direct" method tallies reaction rates directly (per energy
         group). The "flux" method tallies a multigroup flux spectrum and then
@@ -114,6 +116,12 @@ def get_microxs_and_flux(
         When `reaction_rate_mode="flux"`, allows selecting a subset of
         nuclide/reaction pairs to be computed via direct reaction-rate tallies
         (per energy group). Supported keys: "nuclides", "reactions".
+    gendf_library : path-like or GENDFLibrary, optional
+        GENDF library instance or path to GENDF library directory. When
+        provided and ``energies`` is None, the energy group structure is
+        automatically set from the library's energy bounds.
+
+        .. versionadded:: 0.15.4
 
     Returns
     -------
@@ -141,6 +149,17 @@ def get_microxs_and_flux(
         nuclides_with_data = _get_nuclides_with_data(cross_sections)
         nuclides = [nuc.name for nuc in chain.nuclides
                     if nuc.name in nuclides_with_data]
+
+    # Auto-detect energy structure from GENDF library
+    if gendf_library is not None:
+        if isinstance(gendf_library, (str, Path)):
+            gendf_library = GENDFLibrary(gendf_library)
+        elif not isinstance(gendf_library, _GENDF_TYPES):
+            raise TypeError(
+                f"gendf_library must be a path or GENDFLibrary instance, "
+                f"not {type(gendf_library)}")
+        if energies is None:
+            energies = gendf_library.energy_bounds
 
     # Set up the reaction rate and flux tallies
     if energies is None:
