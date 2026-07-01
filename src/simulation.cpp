@@ -921,6 +921,18 @@ void broadcast_results()
   // accumulator is all zeros at this point (end of run), so only the moments
   // need broadcasting.
   for (auto& t : model::tallies) {
+    // Non-master ranks drop their moments during a reduced run, so allocate a
+    // receiving buffer before the broadcast. This restores the end-of-run
+    // contract that every rank can serve results (openmc.lib .mean on any rank,
+    // coupled depletion). The shape comes from the tally's own dimensions so it
+    // matches the master's array exactly.
+    if (!t->has_moments()) {
+      t->moments() = tensor::Tensor<double>({static_cast<size_t>(
+                                               t->n_filter_bins()),
+        static_cast<size_t>(t->n_score_bins()),
+        static_cast<size_t>(t->n_moments())});
+    }
+
     auto& moments = t->moments();
     mpi::broadcast(moments.data(), moments.size(), 0, mpi::intracomm);
   }

@@ -859,6 +859,22 @@ void WeightWindowsGenerator::create_tally()
   tally_idx_ = model::tally_map[ww_tally->id()];
   ww_tally->set_scores({"flux"});
 
+  // update() reads this tally's moments on every rank with no reduction, so its
+  // moments must stay allocated on all ranks rather than the master alone.
+  ww_tally->moments_all_ranks_ = true;
+
+  // Because its moments are read on all ranks, the weight-window-generation
+  // tally always keeps replicated storage: the global tally_storage setting
+  // does not apply to it. Warn once (on the master) if a distributed default
+  // was requested, so the retained per-rank memory is not a surprise.
+  if (settings::tally_storage != TallyStorage::REPLICATED && mpi::master) {
+    warning(fmt::format(
+      "Weight-window generation tally {} keeps replicated storage (its moments "
+      "are read on all ranks); the global tally_storage setting does not apply "
+      "to it.",
+      ww_tally->id()));
+  }
+
   int32_t mesh_id = wws->mesh()->id();
   int32_t mesh_idx = model::mesh_map.at(mesh_id);
   // see if there's already a mesh filter using this mesh

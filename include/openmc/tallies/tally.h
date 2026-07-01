@@ -221,6 +221,13 @@ public:
   //! Where accum_ (and, for rma, moments_) is homed.
   TallyStorage storage_ {TallyStorage::REPLICATED};
 
+  //! Keep moments_ allocated on every rank, not just the master. In reduced
+  //! mode moments are otherwise homed on the master alone and distributed to
+  //! the other ranks only at the end-of-run broadcast. Tallies whose moments
+  //! are read off the master during the run set this so those reads see a live
+  //! array -- weight-window generation reads them on all ranks with no reduce.
+  bool moments_all_ranks_ {false};
+
   //! True if this tally should be written to statepoint files
   bool writable_ {true};
 
