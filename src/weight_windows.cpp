@@ -454,7 +454,7 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
   // build a shape for the tally results, this will always be
   // dimension 5 (3 filter dimensions, 1 score dimension, 1 results dimension)
   // Look for the size of the last dimension of the results tensor
-  const auto& results = tally->results();
+  const auto& results = tally->moments();
   const int results_dim = static_cast<int>(results.shape(2));
   std::array<int, 5> shape = {1, 1, 1, tally->n_scores(), results_dim};
 
@@ -530,8 +530,8 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
   tensor::Tensor<double> sum_sq(
     {static_cast<size_t>(e_bins), static_cast<size_t>(mesh_bins)});
 
-  const int i_sum = static_cast<int>(TallyResult::SUM);
-  const int i_sum_sq = static_cast<int>(TallyResult::SUM_SQ);
+  const int i_sum = static_cast<int>(TallyMoment::SUM);
+  const int i_sum_sq = static_cast<int>(TallyMoment::SUM_SQ);
 
   for (int e = 0; e < e_bins; e++) {
     for (int64_t m = 0; m < mesh_bins; m++) {

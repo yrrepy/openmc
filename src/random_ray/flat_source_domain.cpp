@@ -61,12 +61,12 @@ FlatSourceDomain::FlatSourceDomain() : negroups_(data::mg.num_energy_groups_)
   if (volume_normalized_flux_tallies_) {
     tally_volumes_.resize(model::tallies.size());
     for (int i = 0; i < model::tallies.size(); i++) {
-      //  Get the shape of the 3D result tensor
-      auto shape = model::tallies[i]->results().shape();
-
-      // Create a new 2D tensor with the same size as the first
-      // two dimensions of the 3D tensor
-      tally_volumes_[i] = tensor::Tensor<double>({shape[0], shape[1]});
+      // Create a 2D volume tensor matching the accumulator's
+      // [n_filter_bins, n_score_bins] shape.
+      const auto& tally = model::tallies[i];
+      tally_volumes_[i] = tensor::Tensor<double>(
+        {static_cast<size_t>(tally->n_filter_bins()),
+          static_cast<size_t>(tally->n_score_bins())});
     }
   }
 
@@ -695,9 +695,7 @@ void FlatSourceDomain::random_ray_tally()
         }
         // Apply score to the appropriate tally bin
         Tally& tally {*model::tallies[task.tally_idx]};
-#pragma omp atomic
-        tally.results_(task.filter_idx, task.score_idx, TallyResult::VALUE) +=
-          score;
+        tally.score_add(task.filter_idx, task.score_idx, score);
       }
     }
 
@@ -730,7 +728,7 @@ void FlatSourceDomain::random_ray_tally()
           if (score_type == SCORE_FLUX) {
             double vol = tally_volumes_[i](bin, score_idx);
             if (vol > 0.0) {
-              tally.results_(bin, score_idx, TallyResult::VALUE) /= vol;
+              tally.accum(bin, score_idx) /= vol;
             }
           }
         }

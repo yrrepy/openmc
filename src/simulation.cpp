@@ -823,19 +823,21 @@ void initialize_data()
 #ifdef OPENMC_MPI
 void broadcast_results()
 {
-  // Broadcast tally results so that each process has access to results
+  // Broadcast tally moments so that each process has access to results. The
+  // accumulator is all zeros at this point (end of run), so only the moments
+  // need broadcasting.
   for (auto& t : model::tallies) {
     // Create a new datatype that consists of all values for a given filter
     // bin and then use that to broadcast. This is done to minimize the
     // chance of the 'count' argument of MPI_BCAST exceeding 2**31
-    auto& results = t->results_;
+    auto& moments = t->moments();
 
-    auto shape = results.shape();
+    auto shape = moments.shape();
     int count_per_filter = shape[1] * shape[2];
     MPI_Datatype result_block;
     MPI_Type_contiguous(count_per_filter, MPI_DOUBLE, &result_block);
     MPI_Type_commit(&result_block);
-    MPI_Bcast(results.data(), shape[0], result_block, 0, mpi::intracomm);
+    MPI_Bcast(moments.data(), shape[0], result_block, 0, mpi::intracomm);
     MPI_Type_free(&result_block);
   }
 

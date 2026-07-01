@@ -172,6 +172,13 @@ class Settings:
     no_reduce : bool
         Indicate that all user-defined and global tallies should not be reduced
         across processes in a parallel calculation.
+    tally_storage : {'replicated', 'shared', 'rma'}
+        Default storage mode for tally accumulators, controlling how the
+        per-batch accumulator is distributed across MPI ranks. 'replicated'
+        (the default) keeps a full private copy on every rank. Individual
+        tallies can override this via :attr:`openmc.Tally.storage`.
+
+        .. versionadded:: 0.15.4
     output : dict
         Dictionary indicating what files to output. Acceptable keys are:
 
@@ -457,6 +464,7 @@ class Settings:
         self._surf_source_write = {}
 
         self._no_reduce = None
+        self._tally_storage = None
 
         self._verbosity = None
 
@@ -1016,6 +1024,16 @@ class Settings:
     def no_reduce(self, no_reduce: bool):
         cv.check_type('no reduction option', no_reduce, bool)
         self._no_reduce = no_reduce
+
+    @property
+    def tally_storage(self) -> str:
+        return self._tally_storage
+
+    @tally_storage.setter
+    def tally_storage(self, tally_storage: str):
+        cv.check_value(
+            'tally storage', tally_storage, ('replicated', 'shared', 'rma'))
+        self._tally_storage = tally_storage
 
     @property
     def verbosity(self) -> int:
@@ -1793,6 +1811,11 @@ class Settings:
             element = ET.SubElement(root, "no_reduce")
             element.text = str(self._no_reduce).lower()
 
+    def _create_tally_storage_subelement(self, root):
+        if self._tally_storage is not None:
+            element = ET.SubElement(root, "tally_storage")
+            element.text = self._tally_storage
+
     def _create_ifp_n_generation_subelement(self, root):
         if self._ifp_n_generation is not None:
             element = ET.SubElement(root, "ifp_n_generation")
@@ -2318,6 +2341,11 @@ class Settings:
         if text is not None:
             self.no_reduce = text in ('true', '1')
 
+    def _tally_storage_from_xml_element(self, root):
+        text = get_text(root, 'tally_storage')
+        if text is not None:
+            self.tally_storage = text
+
     def _verbosity_from_xml_element(self, root):
         text = get_text(root, 'verbosity')
         if text is not None:
@@ -2605,6 +2633,7 @@ class Settings:
         self._create_entropy_mesh_subelement(element, mesh_memo)
         self._create_trigger_subelement(element)
         self._create_no_reduce_subelement(element)
+        self._create_tally_storage_subelement(element)
         self._create_verbosity_subelement(element)
         self._create_ifp_n_generation_subelement(element)
         self._create_tabular_legendre_subelements(element)
@@ -2724,6 +2753,7 @@ class Settings:
         settings._entropy_mesh_from_xml_element(elem, meshes)
         settings._trigger_from_xml_element(elem)
         settings._no_reduce_from_xml_element(elem)
+        settings._tally_storage_from_xml_element(elem)
         settings._verbosity_from_xml_element(elem)
         settings._ifp_n_generation_from_xml_element(elem)
         settings._tabular_legendre_from_xml_element(elem)

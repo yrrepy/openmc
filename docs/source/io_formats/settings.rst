@@ -503,6 +503,32 @@ tally data, this option can significantly improve the parallel efficiency.
 
   *Default*: false
 
+---------------------------
+``<tally_storage>`` Element
+---------------------------
+
+The ``<tally_storage>`` element sets the default storage mode for tally
+accumulators, controlling how the per-batch accumulator is distributed across
+MPI ranks. Accepted values are:
+
+  :replicated:
+    Every rank owns a full private copy of each tally's accumulator (the legacy
+    behavior).
+
+  :shared:
+    One accumulator plane is shared per shared-memory node.
+
+  :rma:
+    The accumulator (and its moments) are block-distributed across all ranks.
+
+Individual tallies can override this default with the per-tally ``<storage>``
+element (see :ref:`io_tallies`).
+
+.. note:: The ``shared`` and ``rma`` modes are not yet implemented; only
+          ``replicated`` is currently accepted at run time.
+
+  *Default*: replicated
+
 --------------------
 ``<output>`` Element
 --------------------

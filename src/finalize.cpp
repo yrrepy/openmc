@@ -128,6 +128,7 @@ int openmc_finalize()
   settings::surface_grazing_cutoff = 0.001;
   settings::surface_grazing_ratio = 0.5;
   settings::solver_type = SolverType::MONTE_CARLO;
+  settings::tally_storage = TallyStorage::REPLICATED;
   settings::source_latest = false;
   settings::source_rejection_fraction = 0.05;
   settings::source_separate = false;

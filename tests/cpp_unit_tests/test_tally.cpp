@@ -1,8 +1,11 @@
 #include "openmc/tallies/tally.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
+#include "openmc/constants.h"
+#include "openmc/settings.h"
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/filter_energy.h"
 #include <catch2/catch_test_macros.hpp>
@@ -110,4 +113,83 @@ TEST_CASE("Test int64 filter-bin indexing for large tally shapes")
     bin0 * tally->strides(0) + bin1 * tally->strides(1);
   REQUIRE(flat_index > static_cast<int64_t>(INT32_MAX));
   REQUIRE(flat_index == expected_bins - 1);
+
+  // Free the globally-registered filters/tally so later cases start clean.
+  free_memory_tally();
+}
+
+TEST_CASE("Test tally score_add, accumulate fold, and reset")
+{
+  // Save globals this case mutates; restore them at the end so the shared test
+  // binary has no order dependence.
+  const auto saved_run_mode = settings::run_mode;
+  const auto saved_solver_type = settings::solver_type;
+  const auto saved_reduce_tallies = settings::reduce_tallies;
+  const auto saved_n_particles = settings::n_particles;
+  const auto saved_gen_per_batch = settings::gen_per_batch;
+
+  // Two energy bins x two scores => n_filter_bins = 2, n_score_bins = 2.
+  Filter* f = Filter::create("energy");
+  auto* ef = dynamic_cast<EnergyFilter*>(f);
+  REQUIRE(ef != nullptr);
+  std::vector<double> boundaries = {0.0, 1.0, 2.0};
+  ef->set_bins({boundaries.data(), boundaries.size()});
+
+  Tally* tally = Tally::create();
+  tally->set_filters({&f, 1});
+  tally->set_scores(std::vector<std::string> {"flux", "total"});
+  tally->set_strides();
+  tally->init_results();
+
+  REQUIRE(tally->n_filter_bins() == 2);
+  REQUIRE(tally->n_score_bins() == 2);
+  REQUIRE(tally->n_moments() == 2);
+  REQUIRE(tally->has_moments());
+
+  // Configure normalization so accumulate()'s norm factor is exactly 1
+  // (EIGENVALUE => total_source = 1, contributing = n_particles = 1).
+  settings::run_mode = RunMode::EIGENVALUE;
+  settings::solver_type = SolverType::MONTE_CARLO;
+  settings::reduce_tallies = true;
+  settings::n_particles = 1;
+  settings::gen_per_batch = 1;
+
+  // score_add writes into the accumulator; accum() reads it back.
+  tally->score_add(0, 0, 2.0); // filter bin 0, score 0
+  tally->score_add(1, 1, 3.0); // filter bin 1, score 1
+  REQUIRE(tally->accum(0, 0) == 2.0);
+  REQUIRE(tally->accum(1, 1) == 3.0);
+  REQUIRE(tally->accum(0, 1) == 0.0);
+
+  // First realization: fold the accumulator into the moments and zero it.
+  tally->accumulate();
+  const auto& m = tally->moments();
+  REQUIRE(m(0, 0, TallyMoment::SUM) == 2.0);
+  REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 4.0);
+  REQUIRE(m(1, 1, TallyMoment::SUM) == 3.0);
+  REQUIRE(m(1, 1, TallyMoment::SUM_SQ) == 9.0);
+  REQUIRE(tally->accum(0, 0) == 0.0);
+  REQUIRE(tally->accum(1, 1) == 0.0);
+
+  // Second realization accumulates on top of the first.
+  tally->score_add(0, 0, 5.0);
+  tally->accumulate();
+  REQUIRE(m(0, 0, TallyMoment::SUM) == 7.0);       // 2 + 5
+  REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 29.0);   // 4 + 25
+  REQUIRE(tally->n_realizations_ == 2);
+
+  // reset() clears both the accumulator and the moments.
+  tally->score_add(0, 0, 1.0);
+  tally->reset();
+  REQUIRE(tally->accum(0, 0) == 0.0);
+  REQUIRE(tally->moments()(0, 0, TallyMoment::SUM) == 0.0);
+  REQUIRE(tally->n_realizations_ == 0);
+
+  // Restore mutated globals and free the registered filter/tally.
+  settings::run_mode = saved_run_mode;
+  settings::solver_type = saved_solver_type;
+  settings::reduce_tallies = saved_reduce_tallies;
+  settings::n_particles = saved_n_particles;
+  settings::gen_per_batch = saved_gen_per_batch;
+  free_memory_tally();
 }

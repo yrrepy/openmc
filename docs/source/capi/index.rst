@@ -979,13 +979,21 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_tally_results(int32_t index, double** ptr, int shape_[3])
+.. c:function:: int openmc_tally_results(int32_t index, double** ptr, size_t shape_[3])
 
-   Get a pointer to tally results array.
+   Get a pointer to a tally's moments array.
+
+   .. versionchanged:: 0.15.4
+      The returned array is now the cross-batch moments with shape
+      ``(n_filter_bins, n_score_bins, n_moments)``. The innermost axis holds
+      ``[SUM, SUM_SQ, ...]`` -- there is no longer a leading ``VALUE`` column,
+      so ``SUM`` moved from index 1 to index 0 and ``SUM_SQ`` from 2 to 1. This
+      matches the on-disk statepoint layout. Callers using the ``openmc.lib``
+      Python bindings are unaffected (they were updated in lockstep).
 
    :param int32_t index: Index in the tallies array
-   :param double** ptr: Pointer to the results array
-   :param int[3] shape_: Shape of the results array
+   :param double** ptr: Pointer to the moments array
+   :param size_t[3] shape_: Shape of the moments array
    :return: Return status (negative if an error occurred)
    :rtype: int
 

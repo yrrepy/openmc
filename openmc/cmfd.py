@@ -1822,9 +1822,10 @@ class CMFDRun:
         # Set conditional numpy array as boolean vector based on coremap
         is_accel = self._coremap != _CMFD_NOACCEL
 
-        # Get flux from CMFD tally 0
+        # Get flux from CMFD tally 0. The innermost results index selects the
+        # moment column; column 0 is the running SUM (see openmc.lib.Tally.mean).
         tally_id = self._tally_ids[0]
-        flux = tallies[tally_id].results[:,0,1]
+        flux = tallies[tally_id].results[:,0,0]
 
         # Define target tally reshape dimensions. This defines how openmc
         # tallies are ordered by dimension
@@ -1861,7 +1862,7 @@ class CMFDRun:
             raise OpenMCError(err_message)
 
         # Get total reaction rate (rr) from CMFD tally 0
-        totalrr = tallies[tally_id].results[:,1,1]
+        totalrr = tallies[tally_id].results[:,1,0]
 
         # Reshape total reaction rate array to target shape. Swap x and z axes
         # so that shape is now [nx, ny, nz, ng, 1]
@@ -1885,7 +1886,7 @@ class CMFDRun:
         # Get scattering rr from CMFD tally 1
         # flux is repeated to account for extra dimensionality of scattering xs
         tally_id = self._tally_ids[1]
-        scattrr = tallies[tally_id].results[:,0,1]
+        scattrr = tallies[tally_id].results[:,0,0]
 
         # Define target tally reshape dimensions for xs with incoming
         # and outgoing energies
@@ -1914,7 +1915,7 @@ class CMFDRun:
                                   out=np.zeros_like(self._scattxs))
 
         # Get nu-fission rr from CMFD tally 1
-        nfissrr = tallies[tally_id].results[:,1,1]
+        nfissrr = tallies[tally_id].results[:,1,0]
         num_realizations = tallies[tally_id].num_realizations
 
         # Reshape nfissrr array to target shape. Swap x and z axes so that
@@ -1959,7 +1960,7 @@ class CMFDRun:
 
         # Get surface currents from CMFD tally 2
         tally_id = self._tally_ids[2]
-        current = tallies[tally_id].results[:,0,1]
+        current = tallies[tally_id].results[:,0,0]
 
         # Define target tally reshape dimensions for current
         target_tally_shape = [nz, ny, nx, 12, ng, 1]
@@ -1983,7 +1984,7 @@ class CMFDRun:
 
         # Get p1 scatter rr from CMFD tally 3
         tally_id = self._tally_ids[3]
-        p1scattrr = tallies[tally_id].results[:,0,1]
+        p1scattrr = tallies[tally_id].results[:,0,0]
 
         # Define target tally reshape dimensions for p1 scatter tally
         target_tally_shape = [nz, ny, nx, 2, ng, 1]

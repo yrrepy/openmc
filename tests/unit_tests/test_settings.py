@@ -51,6 +51,7 @@ def test_export_to_xml(run_in_tmpdir):
     s.trigger_max_batches = 10000
     s.trigger_batch_interval = 50
     s.no_reduce = False
+    s.tally_storage = 'replicated'
     s.tabular_legendre = {'enable': True, 'num_points': 50}
     s.temperature = {'default': 293.6, 'method': 'interpolation',
                      'multipole': True, 'range': (200., 1000.)}
@@ -142,6 +143,7 @@ def test_export_to_xml(run_in_tmpdir):
     assert s.trigger_max_batches == 10000
     assert s.trigger_batch_interval == 50
     assert not s.no_reduce
+    assert s.tally_storage == 'replicated'
     assert s.tabular_legendre == {'enable': True, 'num_points': 50}
     assert s.temperature == {'default': 293.6, 'method': 'interpolation',
                              'multipole': True, 'range': [200., 1000.]}
@@ -246,3 +248,18 @@ def test_properties_file_load(tmp_path, mpi_intracomm):
             assert mat.get_density('atom/b-cm') == pytest.approx(
                 orig_density * density_factor, rel=1e-5
             )
+
+
+def test_tally_storage_roundtrip(run_in_tmpdir):
+    for mode in ('replicated', 'shared', 'rma'):
+        s = openmc.Settings()
+        s.tally_storage = mode
+        s.export_to_xml()
+        s2 = openmc.Settings.from_xml()
+        assert s2.tally_storage == mode
+
+
+def test_tally_storage_invalid():
+    s = openmc.Settings()
+    with pytest.raises(ValueError):
+        s.tally_storage = 'bogus'

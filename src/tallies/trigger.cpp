@@ -32,8 +32,9 @@ std::pair<double, double> get_tally_uncertainty(
 {
   const auto& tally {model::tallies[i_tally]};
 
-  auto sum = tally->results_(filter_index, score_index, TallyResult::SUM);
-  auto sum_sq = tally->results_(filter_index, score_index, TallyResult::SUM_SQ);
+  auto sum = tally->moments()(filter_index, score_index, TallyMoment::SUM);
+  auto sum_sq =
+    tally->moments()(filter_index, score_index, TallyMoment::SUM_SQ);
 
   int n = tally->n_realizations_;
   auto mean = sum / n;
@@ -70,8 +71,7 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
       if (trigger.metric == TriggerMetric::not_active)
         continue;
 
-      const auto& results = t.results_;
-      for (int64_t filter_index = 0; filter_index < results.shape(0);
+      for (int64_t filter_index = 0; filter_index < t.n_filter_bins();
            ++filter_index) {
         // Compute the tally uncertainty metrics.
         auto uncert_pair =

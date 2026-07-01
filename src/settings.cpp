@@ -129,6 +129,7 @@ double res_scat_energy_max {1000.0};
 vector<std::string> res_scat_nuclides;
 RunMode run_mode {RunMode::UNSET};
 SolverType solver_type {SolverType::MONTE_CARLO};
+TallyStorage tally_storage {TallyStorage::REPLICATED};
 std::unordered_set<int> sourcepoint_batch;
 std::unordered_set<int> statepoint_batch;
 double source_rejection_fraction {0.05};
@@ -1061,6 +1062,20 @@ void read_settings_xml(pugi::xml_node root)
   // batch
   if (check_for_node(root, "no_reduce")) {
     reduce_tallies = !get_node_value_bool(root, "no_reduce");
+  }
+
+  // Default storage mode for tally accumulators (per-tally <storage> overrides).
+  if (check_for_node(root, "tally_storage")) {
+    std::string storage = get_node_value(root, "tally_storage", true, true);
+    if (storage == "replicated") {
+      tally_storage = TallyStorage::REPLICATED;
+    } else if (storage == "shared") {
+      tally_storage = TallyStorage::SHARED;
+    } else if (storage == "rma") {
+      tally_storage = TallyStorage::RMA;
+    } else {
+      fatal_error(fmt::format("Unrecognized tally storage mode: {}", storage));
+    }
   }
 
   // Check if the user has specified to use confidence intervals for

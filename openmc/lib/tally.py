@@ -309,7 +309,7 @@ class Tally(_FortranObjectWithID):
     @property
     def mean(self):
         n = self.num_realizations
-        sum_ = self.results[:, :, 1]
+        sum_ = self.results[:, :, 0]
         if n > 0:
             return sum_ / n
         else:
@@ -337,6 +337,14 @@ class Tally(_FortranObjectWithID):
 
     @property
     def results(self):
+        """Return the in-memory tally moments as a NumPy array.
+
+        The array has shape ``(n_filter_bins, n_score_bins, n_moments)`` where
+        the innermost axis holds the cross-batch moments in order
+        ``[SUM, SUM_SQ, ...]``. This matches the on-disk statepoint layout; there
+        is no leading ``VALUE`` column. Results are available on rank 0 during a
+        run and on all ranks after the run has finished.
+        """
         data = POINTER(c_double)()
         shape = (c_size_t*3)()
         _dll.openmc_tally_results(self._index, data, shape)
@@ -376,8 +384,8 @@ class Tally(_FortranObjectWithID):
         n = self.num_realizations
         if n > 1:
             # Get sum and sum-of-squares from results
-            sum_ = results[:, :, 1]
-            sum_sq = results[:, :, 2]
+            sum_ = results[:, :, 0]
+            sum_sq = results[:, :, 1]
 
             # Determine non-zero entries
             mean = sum_ / n

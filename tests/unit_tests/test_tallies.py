@@ -22,6 +22,7 @@ def test_xml_roundtrip(run_in_tmpdir):
     )
     tally.triggers = [openmc.Trigger('rel_err', 0.025)]
     tally.triggers[0].scores = ['total', 'fission']
+    tally.storage = 'shared'
     tallies = openmc.Tallies([tally])
 
     # Roundtrip through XML and make sure we get what we started with
@@ -45,6 +46,18 @@ def test_xml_roundtrip(run_in_tmpdir):
     assert new_tally.triggers[0].threshold == tally.triggers[0].threshold
     assert new_tally.triggers[0].scores == tally.triggers[0].scores
     assert new_tally.multiply_density == tally.multiply_density
+    assert new_tally.storage == tally.storage
+
+
+def test_tally_storage():
+    tally = openmc.Tally()
+    # Defaults to None (defer to the global Settings.tally_storage default)
+    assert tally.storage is None
+    for mode in ('replicated', 'shared', 'rma'):
+        tally.storage = mode
+        assert tally.storage == mode
+    with pytest.raises(ValueError):
+        tally.storage = 'bogus'
 
 
 def test_tally_equivalence():

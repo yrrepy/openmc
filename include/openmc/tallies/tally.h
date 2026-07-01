@@ -14,6 +14,10 @@
 #include <string>
 #include <unordered_map>
 
+#ifdef OPENMC_MPI
+#include <mpi.h>
+#endif
+
 namespace openmc {
 
 //==============================================================================
@@ -27,6 +31,14 @@ public:
   explicit Tally(int32_t id);
   explicit Tally(pugi::xml_node node);
   ~Tally();
+
+  // accum_ points into accum_buffer_, so a copy/move would leave the pointer
+  // dangling into the source's buffer. Tallies live only in
+  // vector<unique_ptr<Tally>> and are never copied or moved, so forbid it
+  // rather than write a pointer-reseating copy.
+  Tally(const Tally&) = delete;
+  Tally& operator=(const Tally&) = delete;
+
   static Tally* create(int32_t id = -1);
 
   //----------------------------------------------------------------------------
@@ -54,7 +66,44 @@ public:
 
   void set_nuclides(const vector<std::string>& nuclides);
 
-  const tensor::Tensor<double>& results() const { return results_; }
+  //! Cross-batch moments array, shape [n_filter_bins, n_score_bins, n_moments].
+  tensor::Tensor<double>& moments() { return moments_; }
+  const tensor::Tensor<double>& moments() const { return moments_; }
+
+  //! Number of moment columns stored per (filter, score) bin (2 or 4).
+  int n_moments() const { return higher_moments_ ? 4 : 2; }
+
+  //! Whether this tally currently holds an allocated moments array.
+  bool has_moments() const { return moments_.size() != 0; }
+
+  //! Length of the innermost (score x nuclide) dimension of the results.
+  int n_score_bins() const { return n_score_bins_; }
+
+  //! \brief Add a contribution to the per-batch accumulator. This is the ONLY
+  //! way transport writes a tally, and it is on the hot path.
+  //!
+  //! For the local storage modes (replicated/shared) accum_ points at an
+  //! owned or shared plane and the add is a single atomic RMW. The rma branch
+  //! (predicted-not-taken) routes remote bins through an out-of-line handler.
+  void score_add(int64_t filter_index, int score_index, double val)
+  {
+#ifdef OPENMC_MPI
+    if (storage_ == TallyStorage::RMA) {
+      rma_score_add(filter_index, score_index, val);
+      return;
+    }
+#endif
+    double& c = accum_[filter_index * n_score_bins_ + score_index];
+#pragma omp atomic
+    c += val;
+  }
+
+  //! \brief Direct (non-atomic) accumulator element access. Used by random ray
+  //! for the serial per-bin volume normalization outside the scoring loop.
+  double& accum(int64_t filter_index, int score_index)
+  {
+    return accum_[filter_index * n_score_bins_ + score_index];
+  }
 
   //! returns vector of indices corresponding to the tally this is called on
   const vector<int32_t>& filters() const { return filters_; }
@@ -155,11 +204,22 @@ public:
   //! Index of each nuclide to be tallied.  -1 indicates total material.
   vector<int> nuclides_ {-1};
 
-  //! Results for each bin -- the first dimension of the array is for the
-  //! combination of filters (e.g. specific cell, specific energy group, etc.)
-  //! and the second dimension of the array is for scores (e.g. flux, total
-  //! reaction rate, fission reaction rate, etc.)
-  tensor::Tensor<double> results_;
+  //! Per-batch accumulator plane (the s_k plane), logically shaped
+  //! [n_filter_bins, n_score_bins] and stored contiguously. This is the only
+  //! object transport writes to. accum_ is a raw pointer so that shared/rma
+  //! modes can re-home the storage (an MPI window) without changing the hot
+  //! path; in replicated mode it points at accum_buffer_ below.
+  double* accum_ {nullptr};
+  int64_t accum_size_ {0};       //!< n_filter_bins * n_score_bins
+  vector<double> accum_buffer_;  //!< backing storage for accum_ (replicated)
+
+  //! Cross-batch moments, shape [n_filter_bins, n_score_bins, n_moments] with
+  //! n_moments = higher_moments_ ? 4 : 2. Written only by the once-per-batch
+  //! fold in accumulate(). This layout matches the on-disk statepoint dataset.
+  tensor::Tensor<double> moments_;
+
+  //! Where accum_ (and, for rma, moments_) is homed.
+  TallyStorage storage_ {TallyStorage::REPLICATED};
 
   //! True if this tally should be written to statepoint files
   bool writable_ {true};
@@ -189,6 +249,15 @@ private:
   vector<int64_t> strides_;
 
   int64_t n_filter_bins_ {0};
+
+  //! Innermost dimension of the results: number of score x nuclide combinations
+  int n_score_bins_ {0};
+
+#ifdef OPENMC_MPI
+  //! Out-of-line handler for the rma storage mode; only reached when
+  //! storage_ == RMA.
+  void rma_score_add(int64_t filter_index, int score_index, double val);
+#endif
 
   //! Whether to multiply by atom density for reaction rates
   bool multiply_density_ {true};
@@ -260,6 +329,11 @@ void setup_active_tallies();
 #ifdef OPENMC_MPI
 //! Collect all tally results onto master process
 void reduce_tally_results();
+
+//! \brief In-place MPI_SUM reduction onto the master, split into chunks of at
+//! most 2^27 elements so tally-sized planes never exceed the int MPI count
+//! limit. Master reduces with MPI_IN_PLACE; other ranks send with a null recv.
+void reduce_in_place_chunked(double* data, int64_t n, MPI_Comm comm);
 #endif
 
 void free_memory_tally();

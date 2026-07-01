@@ -390,6 +390,49 @@ Tally::Tally(pugi::xml_node node)
     }
   }
 
+  // Resolve the storage mode: a per-tally <storage> element overrides the
+  // global settings::tally_storage default (the same idiom as <estimator>).
+  storage_ = settings::tally_storage;
+  if (check_for_node(node, "storage")) {
+    std::string storage = get_node_value(node, "storage", true, true);
+    if (storage == "replicated") {
+      storage_ = TallyStorage::REPLICATED;
+    } else if (storage == "shared") {
+      storage_ = TallyStorage::SHARED;
+    } else if (storage == "rma") {
+      storage_ = TallyStorage::RMA;
+    } else {
+      throw std::runtime_error {
+        fmt::format("Invalid storage mode '{}' on tally {}", storage, id_)};
+    }
+  }
+
+  // Validate the storage mode. The distributed modes carry hard prerequisites;
+  // shared/rma are parsed but not yet implemented.
+  if (storage_ != TallyStorage::REPLICATED) {
+#ifndef OPENMC_MPI
+    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
+                            "which requires an MPI-enabled build.",
+      id_));
+#endif
+    if (!settings::reduce_tallies) {
+      fatal_error(
+        fmt::format("Tally {} cannot combine a non-replicated storage mode "
+                    "with the no-reduction (no_reduce) option.",
+          id_));
+    }
+    if (settings::solver_type != SolverType::MONTE_CARLO) {
+      fatal_error(
+        fmt::format("Tally {} requests a non-replicated storage mode, which is "
+                    "only supported by the Monte Carlo solver.",
+          id_));
+    }
+    fatal_error(
+      fmt::format("Tally {} requests storage mode 'shared' or 'rma', which is "
+                  "not yet implemented.",
+        id_));
+  }
+
 #ifdef OPENMC_LIBMESH_ENABLED
   // ensure a tracklength tally isn't used with a libMesh filter
   for (auto i : this->filters_) {
@@ -838,23 +881,40 @@ void Tally::init_triggers(pugi::xml_node node)
   }
 }
 
+#ifdef OPENMC_MPI
+void Tally::rma_score_add(int64_t, int, double)
+{
+  // Storage validation rejects rma before any scoring occurs, so this handler
+  // is never reached while rma is unimplemented.
+  fatal_error("Internal error: rma tally storage is not yet implemented.");
+}
+#endif
+
 void Tally::init_results()
 {
-  int n_scores = scores_.size() * nuclides_.size();
-  if (higher_moments_) {
-    results_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
-      static_cast<size_t>(n_scores), size_t {5}});
-  } else {
-    results_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
-      static_cast<size_t>(n_scores), size_t {3}});
-  }
+  n_score_bins_ = scores_.size() * nuclides_.size();
+  accum_size_ = n_filter_bins_ * n_score_bins_;
+
+  // Per-batch accumulator plane. In replicated mode every rank owns a private
+  // contiguous buffer.
+  accum_buffer_.assign(accum_size_, 0.0);
+  accum_ = accum_buffer_.data();
+
+  // Cross-batch moments, shaped [n_filter_bins, n_score_bins, n_moments]. The
+  // moment count is 2 (SUM, SUM_SQ) or 4 (adding SUM_THIRD, SUM_FOURTH). This
+  // is exactly the on-disk statepoint layout, so no VALUE column is stored.
+  moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
+    static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
 }
 
 void Tally::reset()
 {
   n_realizations_ = 0;
-  if (results_.size() != 0) {
-    results_.fill(0.0);
+  if (accum_ != nullptr && accum_size_ != 0) {
+    std::fill(accum_, accum_ + accum_size_, 0.0);
+  }
+  if (moments_.size() != 0) {
+    moments_.fill(0.0);
   }
 }
 
@@ -885,32 +945,35 @@ void Tally::accumulate()
       norm = 1.0;
     }
 
-    // Accumulate each result
+    // Fold the per-batch accumulator into the moments, then zero it. accum_ is
+    // stored contiguously as [n_filter_bins, n_score_bins].
     if (higher_moments_) {
 #pragma omp parallel for
       // filter bins (specific cell, energy bins)
-      for (int64_t i = 0; i < results_.shape(0); ++i) {
+      for (int64_t i = 0; i < n_filter_bins_; ++i) {
         // score bins (flux, total reaction rate, fission reaction rate, etc.)
-        for (int j = 0; j < results_.shape(1); ++j) {
-          double val = results_(i, j, TallyResult::VALUE) * norm;
+        for (int j = 0; j < n_score_bins_; ++j) {
+          double& acc = accum_[i * n_score_bins_ + j];
+          double val = acc * norm;
           double val2 = val * val;
-          results_(i, j, TallyResult::VALUE) = 0.0;
-          results_(i, j, TallyResult::SUM) += val;
-          results_(i, j, TallyResult::SUM_SQ) += val2;
-          results_(i, j, TallyResult::SUM_THIRD) += val2 * val;
-          results_(i, j, TallyResult::SUM_FOURTH) += val2 * val2;
+          acc = 0.0;
+          moments_(i, j, TallyMoment::SUM) += val;
+          moments_(i, j, TallyMoment::SUM_SQ) += val2;
+          moments_(i, j, TallyMoment::SUM_THIRD) += val2 * val;
+          moments_(i, j, TallyMoment::SUM_FOURTH) += val2 * val2;
         }
       }
     } else {
 #pragma omp parallel for
       // filter bins (specific cell, energy bins)
-      for (int64_t i = 0; i < results_.shape(0); ++i) {
+      for (int64_t i = 0; i < n_filter_bins_; ++i) {
         // score bins (flux, total reaction rate, fission reaction rate, etc.)
-        for (int j = 0; j < results_.shape(1); ++j) {
-          double val = results_(i, j, TallyResult::VALUE) * norm;
-          results_(i, j, TallyResult::VALUE) = 0.0;
-          results_(i, j, TallyResult::SUM) += val;
-          results_(i, j, TallyResult::SUM_SQ) += val * val;
+        for (int j = 0; j < n_score_bins_; ++j) {
+          double& acc = accum_[i * n_score_bins_ + j];
+          double val = acc * norm;
+          acc = 0.0;
+          moments_(i, j, TallyMoment::SUM) += val;
+          moments_(i, j, TallyMoment::SUM_SQ) += val * val;
         }
       }
     }
@@ -934,10 +997,10 @@ tensor::Tensor<double> Tally::get_reshaped_data() const
   }
 
   // add number of scores and nuclides to tally
-  shape.push_back(results_.shape(1));
-  shape.push_back(results_.shape(2));
+  shape.push_back(moments_.shape(1));
+  shape.push_back(moments_.shape(2));
 
-  tensor::Tensor<double> reshaped_results = results_;
+  tensor::Tensor<double> reshaped_results = moments_;
   reshaped_results.reshape(shape);
   return reshaped_results;
 }
@@ -1034,32 +1097,40 @@ void read_tallies_xml(pugi::xml_node root)
 }
 
 #ifdef OPENMC_MPI
+void reduce_in_place_chunked(double* data, int64_t n, MPI_Comm comm)
+{
+  // 2^27 doubles = 1 GiB per call; keeps the int MPI count below 2^31 for the
+  // very large planes (up to ~4.3e9 elements) these tallies can reach.
+  constexpr int64_t MAX_CHUNK = int64_t {1} << 27;
+  for (int64_t offset = 0; offset < n; offset += MAX_CHUNK) {
+    int count = static_cast<int>(std::min<int64_t>(MAX_CHUNK, n - offset));
+    if (mpi::master) {
+      MPI_Reduce(
+        MPI_IN_PLACE, data + offset, count, MPI_DOUBLE, MPI_SUM, 0, comm);
+    } else {
+      MPI_Reduce(data + offset, nullptr, count, MPI_DOUBLE, MPI_SUM, 0, comm);
+    }
+  }
+}
+
 void reduce_tally_results()
 {
-  // Don't reduce tally is no_reduce option is on
+  // Don't reduce tallies if the no_reduce option is on
   if (settings::reduce_tallies) {
     for (int i_tally : model::active_tallies) {
       // Skip any tallies that are not active
       auto& tally {model::tallies[i_tally]};
 
-      // Extract 2D view of the VALUE column from the 3D results tensor,
-      // then copy into a contiguous array for MPI reduction
-      const int val_idx = static_cast<int>(TallyResult::VALUE);
-      tensor::View<double> val_view =
-        tally->results_.slice(tensor::all, tensor::all, val_idx);
-      tensor::Tensor<double> values(val_view);
+      // The accumulator is contiguous, so it reduces in place onto the master
+      // with no scratch buffer. Chunked to respect the int MPI count limit.
+      reduce_in_place_chunked(
+        tally->accum_, tally->accum_size_, mpi::intracomm);
 
-      tensor::Tensor<double> values_reduced(values.shape());
-
-      // Reduce contiguous set of tally results
-      MPI_Reduce(values.data(), values_reduced.data(), values.size(),
-        MPI_DOUBLE, MPI_SUM, 0, mpi::intracomm);
-
-      // Transfer values on master and reset on other ranks
-      if (mpi::master) {
-        val_view = values_reduced;
-      } else {
-        val_view = 0.0;
+      // The fold that zeroes accum_ only runs on the master, so non-master
+      // ranks must clear their (now already-summed) accumulator here to avoid
+      // double-counting into the next batch.
+      if (!mpi::master) {
+        std::fill(tally->accum_, tally->accum_ + tally->accum_size_, 0.0);
       }
     }
   }
@@ -1601,14 +1672,16 @@ extern "C" int openmc_tally_results(
   }
 
   const auto& t {model::tallies[index]};
-  if (t->results_.size() == 0) {
+  if (!t->has_moments()) {
     set_errmsg("Tally results have not been allocated yet.");
     return OPENMC_E_ALLOCATE;
   }
 
-  // Set pointer to results and copy shape
-  *results = t->results_.data();
-  auto s = t->results_.shape();
+  // Set pointer to the moments array and copy its shape. The innermost
+  // dimension is now n_moments (SUM=0, SUM_SQ=1, ...), matching the on-disk
+  // statepoint layout -- there is no leading VALUE column.
+  *results = t->moments().data();
+  auto s = t->moments().shape();
   shape[0] = s[0];
   shape[1] = s[1];
   shape[2] = s[2];

@@ -294,7 +294,21 @@ enum class MgxsType {
 // ============================================================================
 // TALLY-RELATED CONSTANTS
 
+// Interleaved per-result layout used only by simulation::global_tallies (k-eff
+// etc.). Per-tally results use a separate accumulator plane plus a moments
+// array indexed by TallyMoment (see tally.h).
 enum class TallyResult { VALUE, SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
+
+// Column indices into a Tally's moments_ array. n_moments is 2 by default and 4
+// when higher_moments_ is enabled. This layout matches the on-disk statepoint
+// "results" dataset exactly.
+enum class TallyMoment { SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
+
+// Where a Tally's per-batch accumulator (and, for rma, its moments) is homed:
+//   REPLICATED - every rank owns a full private copy (default)
+//   SHARED     - one accumulator plane per shared-memory node (MPI-3 window)
+//   RMA        - accumulator and moments block-distributed across all ranks
+enum class TallyStorage { REPLICATED, SHARED, RMA };
 
 enum class TallyType { VOLUME, MESH_SURFACE, SURFACE, PULSE_HEIGHT };
 
