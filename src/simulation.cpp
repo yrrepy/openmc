@@ -917,10 +917,12 @@ void initialize_data()
 #ifdef OPENMC_MPI
 void broadcast_results()
 {
-  // Broadcast tally results so that each process has access to results
+  // Broadcast tally moments so that each process has access to results. The
+  // accumulator is all zeros at this point (end of run), so only the moments
+  // need broadcasting.
   for (auto& t : model::tallies) {
-    auto& results = t->results_;
-    mpi::broadcast(results.data(), results.size(), 0, mpi::intracomm);
+    auto& moments = t->moments();
+    mpi::broadcast(moments.data(), moments.size(), 0, mpi::intracomm);
   }
 
   // Also broadcast global tally results

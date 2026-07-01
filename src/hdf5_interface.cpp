@@ -533,22 +533,33 @@ void read_complex(
 }
 
 void read_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
-  hsize_t n_results, double* results)
+  hsize_t n_moments, double* moments)
 {
-  // Create dataspace for hyperslab in memory
-  constexpr int ndim = 3;
-  hsize_t dims[ndim] {n_filter, n_score, n_results};
-  hsize_t start[ndim] {0, 0, 1};
-  hsize_t count[ndim] {n_filter, n_score, n_results - 1};
-  hid_t memspace = H5Screate_simple(ndim, dims, nullptr);
-  H5Sselect_hyperslab(memspace, H5S_SELECT_SET, start, nullptr, count, nullptr);
+  // read_dataset_lowlevel passes H5S_ALL for the memory space, so HDF5 reads
+  // the full on-disk extent of "results" into the caller's buffer with no
+  // bounds check. Validate that the stored shape matches the current model's
+  // tally shape first; otherwise a restart against a differently-shaped
+  // statepoint would overflow the (current-model-sized) buffer.
+  hid_t dset = open_dataset(group_id, "results");
+  auto shape = object_shape(dset);
+  close_dataset(dset);
+  if (shape.size() != 3 || shape[0] != n_filter || shape[1] != n_score ||
+      shape[2] != n_moments) {
+    std::string found;
+    for (auto d : shape)
+      found += (found.empty() ? "" : ", ") + std::to_string(d);
+    fatal_error(fmt::format(
+      "Tally results shape mismatch reading statepoint group \"{}\": the "
+      "current model expects [{}, {}, {}] but the stored \"results\" dataset "
+      "is [{}]. The restart model's tally layout must match the statepoint.",
+      object_name(group_id), n_filter, n_score, n_moments, found));
+  }
 
-  // Read the dataset
+  // The moments array is exactly the on-disk "results" dataset layout, so the
+  // read is a plain contiguous read (no hyperslab). Passing H5S_ALL for the
+  // memory space fills the whole [n_filter, n_score, n_moments] buffer.
   read_dataset_lowlevel(
-    group_id, "results", H5T_NATIVE_DOUBLE, memspace, false, results);
-
-  // Free resources
-  H5Sclose(memspace);
+    group_id, "results", H5T_NATIVE_DOUBLE, H5S_ALL, false, moments);
 }
 
 void write_attr(hid_t obj_id, int ndim, const hsize_t* dims, const char* name,
@@ -683,24 +694,14 @@ void write_string(
 }
 
 void write_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
-  hsize_t n_results, const double* results)
+  hsize_t n_moments, const double* moments)
 {
-  // Set dimensions of sum/sum_sq hyperslab to store
+  // The moments array is already the on-disk layout (no VALUE column to drop),
+  // so this is a plain contiguous write of [n_filter, n_score, n_moments].
   constexpr int ndim = 3;
-  hsize_t count[ndim] {n_filter, n_score, n_results - 1};
-
-  // Set dimensions of results array
-  hsize_t dims[ndim] {n_filter, n_score, n_results};
-  hsize_t start[ndim] {0, 0, 1};
-  hid_t memspace = H5Screate_simple(ndim, dims, nullptr);
-  H5Sselect_hyperslab(memspace, H5S_SELECT_SET, start, nullptr, count, nullptr);
-
-  // Create and write dataset
-  write_dataset_lowlevel(group_id, ndim, count, "results", H5T_NATIVE_DOUBLE,
-    memspace, false, results);
-
-  // Free resources
-  H5Sclose(memspace);
+  hsize_t dims[ndim] {n_filter, n_score, n_moments};
+  write_dataset_lowlevel(group_id, ndim, dims, "results", H5T_NATIVE_DOUBLE,
+    H5S_ALL, false, moments);
 }
 
 bool using_mpio_device(hid_t obj_id)

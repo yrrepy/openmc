@@ -169,9 +169,7 @@ void score_fission_delayed_dg(int i_tally, int d_bin, double score,
   }
 
 // Update the tally result
-#pragma omp atomic
-  tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-    score * filter_weight;
+  tally.score_add(filter_index, score_index, score * filter_weight);
 
   // Reset the original delayed group bin
   dg_match.bins_[i_bin] = original_bin;
@@ -460,9 +458,7 @@ void score_fission_eout(Particle& p, int i_tally, int i_score, int score_bin)
       }
 
 // Update tally results
-#pragma omp atomic
-      tally.results_(filter_index, i_score, TallyResult::VALUE) +=
-        score * filter_weight;
+      tally.score_add(filter_index, i_score, score * filter_weight);
 
     } else if (score_bin == SCORE_DELAYED_NU_FISSION && g != 0) {
 
@@ -508,9 +504,7 @@ void score_fission_eout(Particle& p, int i_tally, int i_score, int score_bin)
         }
 
 // Update tally results
-#pragma omp atomic
-        tally.results_(filter_index, i_score, TallyResult::VALUE) +=
-          score * filter_weight;
+        tally.score_add(filter_index, i_score, score * filter_weight);
       }
     }
   }
@@ -1100,9 +1094,7 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
 // Update tally results
-#pragma omp atomic
-    tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-      score * filter_weight;
+  tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -1604,9 +1596,7 @@ void score_general_ce_analog(Particle& p, int i_tally, int start_index,
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
 // Update tally results
-#pragma omp atomic
-    tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-      score * filter_weight;
+  tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -2300,9 +2290,7 @@ void score_general_mg(Particle& p, int i_tally, int start_index,
     }
 
 // Update tally results
-#pragma omp atomic
-    tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-      score * filter_weight;
+  tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -2635,8 +2623,7 @@ void score_meshsurface_tally(Particle& p, const vector<int>& tallies)
       double score = current * filter_weight;
       for (auto score_index = 0; score_index < tally.scores_.size();
            ++score_index) {
-#pragma omp atomic
-        tally.results_(filter_index, score_index, TallyResult::VALUE) += score;
+        tally.score_add(filter_index, score_index, score);
       }
     }
 
@@ -2698,9 +2685,7 @@ void score_surface_tally(
           // SCORE_FLUX: surface-crossing estimator phi_S = sum(w / |mu|).
           score = wgt / abs_mu;
         }
-#pragma omp atomic
-        tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-          score * filter_weight;
+        tally.score_add(filter_index, score_index, score * filter_weight);
       }
     }
     // If the user has specified that we can assume all tallies are spatially
@@ -2769,9 +2754,7 @@ void score_pulse_height_tally(Particle& p, const vector<int>& tallies)
           // Loop over scores.
           for (auto score_index = 0; score_index < tally.scores_.size();
                ++score_index) {
-#pragma omp atomic
-            tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-              filter_weight;
+            tally.score_add(filter_index, score_index, filter_weight);
           }
         }
       }
