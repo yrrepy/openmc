@@ -515,12 +515,29 @@ extern "C" int openmc_statepoint_load(const char* filename)
         if (internal) {
           tally->writable_ = false;
         } else {
+          // Under Parallel HDF5 every rank collectively opens, reads, and closes
+          // the results dataset, so a rank that dropped its moments (owner-only
+          // reduced mode) allocates a receiving buffer for the read and releases
+          // it again afterward. Only the master's copy needs to survive the
+          // restart; the others stay empty for the resumed run and are refilled
+          // by the end-of-run broadcast.
+          bool owns_moments = tally->has_moments();
+          if (!owns_moments) {
+            tally->moments() = tensor::Tensor<double>(
+              {static_cast<size_t>(tally->n_filter_bins()),
+                static_cast<size_t>(tally->n_score_bins()),
+                static_cast<size_t>(tally->n_moments())});
+          }
           auto& moments = tally->moments();
           read_tally_results(tally_group, moments.shape(0), moments.shape(1),
             moments.shape(2), moments.data());
 
           read_dataset(tally_group, "n_realizations", tally->n_realizations_);
           close_group(tally_group);
+
+          if (!owns_moments) {
+            tally->moments() = tensor::Tensor<double>();
+          }
         }
       }
       close_group(tallies_group);
@@ -834,23 +851,28 @@ void write_unstructured_mesh_results()
           // construct result vectors
           vector<double> mean_vec(umesh->n_bins()),
             std_dev_vec(umesh->n_bins());
-          const auto& moments = tally->moments();
-          for (int j = 0; j < moments.shape(0); j++) {
-            // get the volume for this bin
-            double volume = umesh->volume(j);
-            // compute the mean
-            double mean =
-              moments(j, nuc_score_idx, TallyMoment::SUM) / n_realizations;
-            mean_vec.at(j) = mean / volume;
+          // Only ranks that own moments fill these from the tally; the values
+          // are then broadcast from the master below, so non-owner ranks leave
+          // them zero here and receive the master's copy.
+          if (tally->has_moments()) {
+            const auto& moments = tally->moments();
+            for (int j = 0; j < moments.shape(0); j++) {
+              // get the volume for this bin
+              double volume = umesh->volume(j);
+              // compute the mean
+              double mean =
+                moments(j, nuc_score_idx, TallyMoment::SUM) / n_realizations;
+              mean_vec.at(j) = mean / volume;
 
-            // compute the standard deviation
-            double sum_sq = moments(j, nuc_score_idx, TallyMoment::SUM_SQ);
-            double std_dev {0.0};
-            if (n_realizations > 1) {
-              std_dev = sum_sq / n_realizations - mean * mean;
-              std_dev = std::sqrt(std_dev / (n_realizations - 1));
+              // compute the standard deviation
+              double sum_sq = moments(j, nuc_score_idx, TallyMoment::SUM_SQ);
+              double std_dev {0.0};
+              if (n_realizations > 1) {
+                std_dev = sum_sq / n_realizations - mean * mean;
+                std_dev = std::sqrt(std_dev / (n_realizations - 1));
+              }
+              std_dev_vec[j] = std_dev / volume;
             }
-            std_dev_vec[j] = std_dev / volume;
           }
 #ifdef OPENMC_MPI
           MPI_Bcast(

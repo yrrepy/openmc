@@ -903,8 +903,19 @@ void Tally::init_results()
   // Cross-batch moments, shaped [n_filter_bins, n_score_bins, n_moments]. The
   // moment count is 2 (SUM, SUM_SQ) or 4 (adding SUM_THIRD, SUM_FOURTH). This
   // is exactly the on-disk statepoint layout, so no VALUE column is stored.
-  moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
-    static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
+  //
+  // In reduced mode only the master folds and holds the moments during the run;
+  // the other ranks receive a copy at the final broadcast. They therefore skip
+  // the allocation here, cutting their per-tally footprint to just the
+  // accumulator plane. The moments live on every rank when tallies are not
+  // reduced (each rank is its own owner) or when a consumer reads them off the
+  // master mid-run (moments_all_ranks_).
+  if (mpi::master || !settings::reduce_tallies || moments_all_ranks_) {
+    moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
+      static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
+  } else {
+    moments_ = tensor::Tensor<double>();
+  }
 }
 
 void Tally::reset()
