@@ -51,10 +51,12 @@ inline void hash_combine(size_t& seed, const size_t v)
 // every iteration.
 struct TallyTask {
   int tally_idx;
-  int filter_idx;
+  // int64 to match the tally's int64 flat filter-bin index; a fine mesh
+  // crossed with a fine energy filter can exceed 2^31 combinations.
+  int64_t filter_idx;
   int score_idx;
   int score_type;
-  TallyTask(int tally_idx, int filter_idx, int score_idx, int score_type)
+  TallyTask(int tally_idx, int64_t filter_idx, int score_idx, int score_type)
     : tally_idx(tally_idx), filter_idx(filter_idx), score_idx(score_idx),
       score_type(score_type)
   {}
