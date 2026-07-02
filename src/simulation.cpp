@@ -385,6 +385,20 @@ void initialize_batch()
 {
   // Increment current batch
   ++simulation::current_batch;
+
+  // Shared/rma tally storage is incompatible with CMFD, which reads tally
+  // results on all ranks mid-run. cmfd_run is only set once the run has started
+  // (and openmc_reset clears it during simulation init), so this is checked
+  // here rather than at input validation. The scan runs only in CMFD runs.
+  if (settings::cmfd_run) {
+    for (const auto& t : model::tallies) {
+      if (t->storage_ != TallyStorage::REPLICATED) {
+        fatal_error(fmt::format("Tally {} uses a non-replicated storage mode, "
+                                "which is not compatible with CMFD.",
+          t->id_));
+      }
+    }
+  }
   if (settings::run_mode == RunMode::FIXED_SOURCE) {
     if (settings::solver_type == SolverType::RANDOM_RAY &&
         simulation::current_batch < settings::n_inactive + 1) {
@@ -827,16 +841,22 @@ void broadcast_results()
   // accumulator is all zeros at this point (end of run), so only the moments
   // need broadcasting.
   for (auto& t : model::tallies) {
+    // Distributed modes keep their results where they live (rank 0 for shared)
+    // and are read there by design, so they are not broadcast. Only replicated
+    // tallies serve full results on every rank.
+    if (t->storage_ != TallyStorage::REPLICATED)
+      continue;
+
     // Non-master ranks drop their moments during a reduced run, so allocate a
     // receiving buffer before the broadcast. This restores the end-of-run
     // contract that every rank can serve results (openmc.lib .mean on any rank,
     // coupled depletion). The shape comes from the tally's own dimensions so it
     // matches the master's array exactly.
     if (!t->has_moments()) {
-      t->moments() = tensor::Tensor<double>({static_cast<size_t>(
-                                               t->n_filter_bins()),
-        static_cast<size_t>(t->n_score_bins()),
-        static_cast<size_t>(t->n_moments())});
+      t->moments() =
+        tensor::Tensor<double>({static_cast<size_t>(t->n_filter_bins()),
+          static_cast<size_t>(t->n_score_bins()),
+          static_cast<size_t>(t->n_moments())});
     }
 
     // Create a new datatype that consists of all values for a given filter

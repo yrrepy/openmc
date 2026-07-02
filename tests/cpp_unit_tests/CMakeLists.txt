@@ -16,3 +16,26 @@ foreach(test ${TEST_NAMES})
   target_link_libraries(${test} Catch2::Catch2WithMain libopenmc)
   add_test(NAME ${test} COMMAND ${test} WORKING_DIRECTORY ${UNIT_TEST_BIN_OUTPUT_DIR})
 endforeach()
+
+# Shared-window tests: provide their own main (MPI_Init/Finalize around the
+# Catch2 session) and run under multiple MPI ranks, so they are wired up
+# separately from the single-process tests above. They exercise cross-process
+# atomics, so they require both MPI and OpenMP (without OpenMP the atomic
+# scoring is a no-op and the hammer test would legitimately detect lost
+# updates).
+if(OPENMC_USE_MPI AND OPENMC_USE_OPENMP)
+  add_executable(test_shared_window test_shared_window.cpp)
+  target_link_libraries(test_shared_window Catch2::Catch2 libopenmc
+                        OpenMP::OpenMP_CXX)
+  # 2 ranks (single node): the atomic hammer.
+  add_test(NAME test_shared_window
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+            $<TARGET_FILE:test_shared_window> "[hammer]"
+    WORKING_DIRECTORY ${UNIT_TEST_BIN_OUTPUT_DIR})
+  # 4 ranks split into 2 artificial nodes: the multi-node end-of-batch protocol
+  # (internode reduce + non-master-leader zero) that a single node cannot reach.
+  add_test(NAME test_shared_window_multinode
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4
+            $<TARGET_FILE:test_shared_window> "[multinode]"
+    WORKING_DIRECTORY ${UNIT_TEST_BIN_OUTPUT_DIR})
+endif()

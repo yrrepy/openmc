@@ -1064,7 +1064,8 @@ void read_settings_xml(pugi::xml_node root)
     reduce_tallies = !get_node_value_bool(root, "no_reduce");
   }
 
-  // Default storage mode for tally accumulators (per-tally <storage> overrides).
+  // Default storage mode for tally accumulators (per-tally <storage>
+  // overrides).
   if (check_for_node(root, "tally_storage")) {
     std::string storage = get_node_value(root, "tally_storage", true, true);
     if (storage == "replicated") {

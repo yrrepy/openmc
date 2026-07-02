@@ -20,6 +20,16 @@ extern bool master;
 extern MPI_Datatype source_site;
 extern MPI_Datatype collision_track_site;
 extern MPI_Comm intracomm;
+
+// Communicators for shared-storage tallies. node_comm groups ranks that share
+// memory (one shared accumulator plane per node); internode_comm groups the
+// node leaders (MPI_COMM_NULL on non-leaders). n_nodes is the number of nodes,
+// known on every rank.
+extern MPI_Comm node_comm;
+extern MPI_Comm internode_comm;
+extern int node_rank;    //!< rank within node_comm
+extern bool node_leader; //!< node_rank == 0
+extern int n_nodes;      //!< number of shared-memory nodes
 #endif
 
 //==============================================================================

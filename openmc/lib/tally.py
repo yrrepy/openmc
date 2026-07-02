@@ -463,7 +463,12 @@ class _TallyMapping(Mapping):
         return repr(dict(self))
 
     def __delitem__(self, key):
-        """Delete a tally from tally vector and remove the ID,index pair from tally"""
+        """Delete a tally from tally vector and remove the ID,index pair from tally
+
+        .. note:: Deleting a tally that uses the ``shared`` storage mode frees an
+                  MPI shared-memory window and is collective: every MPI rank must
+                  delete the same tally.
+        """
         _dll.openmc_remove_tally(self[key]._index)
 
 tallies = _TallyMapping()

@@ -3,6 +3,7 @@
 
 #include "openmc/constants.h"
 #include "openmc/memory.h" // for unique_ptr
+#include "openmc/openmp_interface.h"
 #include "openmc/span.h"
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/trigger.h"
@@ -93,9 +94,7 @@ public:
       return;
     }
 #endif
-    double& c = accum_[filter_index * n_score_bins_ + score_index];
-#pragma omp atomic
-    c += val;
+    atomic_score_add(&accum_[filter_index * n_score_bins_ + score_index], val);
   }
 
   //! \brief Direct (non-atomic) accumulator element access. Used by random ray
@@ -169,6 +168,16 @@ public:
 
   void accumulate();
 
+#ifdef OPENMC_MPI
+  //! \brief End-of-batch publish + internode combine for a shared tally.
+  //! Publishes this node's atomic scores (win_sync + node barrier), then node
+  //! leaders reduce the node planes onto the world master (skipped for a
+  //! single-node run). After this the master's plane holds the global sum; the
+  //! plane belongs to the node leader until shared_resume() -- non-leaders must
+  //! not touch accum_ in between. Called from reduce_tally_results().
+  void shared_publish();
+#endif
+
   //! return the index of a score specified by name
   int score_index(const std::string& score) const;
 
@@ -210,8 +219,14 @@ public:
   //! modes can re-home the storage (an MPI window) without changing the hot
   //! path; in replicated mode it points at accum_buffer_ below.
   double* accum_ {nullptr};
-  int64_t accum_size_ {0};       //!< n_filter_bins * n_score_bins
-  vector<double> accum_buffer_;  //!< backing storage for accum_ (replicated)
+  int64_t accum_size_ {0};      //!< n_filter_bins * n_score_bins
+  vector<double> accum_buffer_; //!< backing storage for accum_ (replicated)
+
+#ifdef OPENMC_MPI
+  //! Shared-memory window backing accum_ in the shared storage mode (one plane
+  //! per node). MPI_WIN_NULL in every other mode.
+  MPI_Win accum_win_ {MPI_WIN_NULL};
+#endif
 
   //! Cross-batch moments, shape [n_filter_bins, n_score_bins, n_moments] with
   //! n_moments = higher_moments_ ? 4 : 2. Written only by the once-per-batch
@@ -264,6 +279,16 @@ private:
   //! Out-of-line handler for the rma storage mode; only reached when
   //! storage_ == RMA.
   void rma_score_add(int64_t filter_index, int score_index, double val);
+
+  //! \brief End-of-batch resume for a shared tally: publish the zeroed plane
+  //! (win_sync + node barrier) so the next batch scores into all-zeros.
+  void shared_resume();
+
+  //! Close the passive-target epoch and free accum_win_ (idempotent).
+  void free_accum_window();
+
+  //! Allocate the per-node shared accumulator plane and open its epoch.
+  void init_shared_accum();
 #endif
 
   //! Whether to multiply by atom density for reaction rates

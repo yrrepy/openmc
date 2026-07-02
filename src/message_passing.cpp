@@ -8,7 +8,17 @@ int n_procs {1};
 bool master {true};
 
 #ifdef OPENMC_MPI
+// Shared/rma tally storage relies on MPI-3 shared-memory windows and
+// MPI_Comm_split_type.
+static_assert(MPI_VERSION >= 3,
+  "OpenMC's shared/rma tally storage requires an MPI-3 implementation.");
+
 MPI_Comm intracomm {MPI_COMM_NULL};
+MPI_Comm node_comm {MPI_COMM_NULL};
+MPI_Comm internode_comm {MPI_COMM_NULL};
+int node_rank {0};
+bool node_leader {true};
+int n_nodes {1};
 MPI_Datatype source_site {MPI_DATATYPE_NULL};
 MPI_Datatype collision_track_site {MPI_DATATYPE_NULL};
 #endif

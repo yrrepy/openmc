@@ -64,8 +64,8 @@ FlatSourceDomain::FlatSourceDomain() : negroups_(data::mg.num_energy_groups_)
       // Create a 2D volume tensor matching the accumulator's
       // [n_filter_bins, n_score_bins] shape.
       const auto& tally = model::tallies[i];
-      tally_volumes_[i] = tensor::Tensor<double>(
-        {static_cast<size_t>(tally->n_filter_bins()),
+      tally_volumes_[i] =
+        tensor::Tensor<double>({static_cast<size_t>(tally->n_filter_bins()),
           static_cast<size_t>(tally->n_score_bins())});
     }
   }

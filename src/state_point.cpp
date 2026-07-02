@@ -515,12 +515,12 @@ extern "C" int openmc_statepoint_load(const char* filename)
         if (internal) {
           tally->writable_ = false;
         } else {
-          // Under Parallel HDF5 every rank collectively opens, reads, and closes
-          // the results dataset, so a rank that dropped its moments (owner-only
-          // reduced mode) allocates a receiving buffer for the read and releases
-          // it again afterward. Only the master's copy needs to survive the
-          // restart; the others stay empty for the resumed run and are refilled
-          // by the end-of-run broadcast.
+          // Under Parallel HDF5 every rank collectively opens, reads, and
+          // closes the results dataset, so a rank that dropped its moments
+          // (owner-only reduced mode) allocates a receiving buffer for the read
+          // and releases it again afterward. Only the master's copy needs to
+          // survive the restart; the others stay empty for the resumed run and
+          // are refilled by the end-of-run broadcast.
           bool owns_moments = tally->has_moments();
           if (!owns_moments) {
             tally->moments() = tensor::Tensor<double>(

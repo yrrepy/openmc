@@ -174,8 +174,8 @@ TEST_CASE("Test tally score_add, accumulate fold, and reset")
   // Second realization accumulates on top of the first.
   tally->score_add(0, 0, 5.0);
   tally->accumulate();
-  REQUIRE(m(0, 0, TallyMoment::SUM) == 7.0);       // 2 + 5
-  REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 29.0);   // 4 + 25
+  REQUIRE(m(0, 0, TallyMoment::SUM) == 7.0);     // 2 + 5
+  REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 29.0); // 4 + 25
   REQUIRE(tally->n_realizations_ == 2);
 
   // reset() clears both the accumulator and the moments.

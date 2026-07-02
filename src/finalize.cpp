@@ -185,13 +185,27 @@ int openmc_finalize()
   settings::libmesh_init.reset();
 #endif
 
-  // Free all MPI types
+  // Free all MPI types and the shared-tally communicators. This runs after
+  // free_memory() so the per-tally shared windows (freed in ~Tally) are torn
+  // down while node_comm is still valid. intracomm is user-owned and left
+  // alone. Guarded by MPI_Finalized for the pathological host that finalizes
+  // MPI before openmc_finalize.
 #ifdef OPENMC_MPI
-  if (mpi::source_site != MPI_DATATYPE_NULL) {
-    MPI_Type_free(&mpi::source_site);
-  }
-  if (mpi::collision_track_site != MPI_DATATYPE_NULL) {
-    MPI_Type_free(&mpi::collision_track_site);
+  int mpi_finalized;
+  MPI_Finalized(&mpi_finalized);
+  if (!mpi_finalized) {
+    if (mpi::source_site != MPI_DATATYPE_NULL) {
+      MPI_Type_free(&mpi::source_site);
+    }
+    if (mpi::collision_track_site != MPI_DATATYPE_NULL) {
+      MPI_Type_free(&mpi::collision_track_site);
+    }
+    if (mpi::internode_comm != MPI_COMM_NULL) {
+      MPI_Comm_free(&mpi::internode_comm);
+    }
+    if (mpi::node_comm != MPI_COMM_NULL) {
+      MPI_Comm_free(&mpi::node_comm);
+    }
   }
 #endif
 

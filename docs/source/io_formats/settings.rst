@@ -516,7 +516,13 @@ MPI ranks. Accepted values are:
     behavior).
 
   :shared:
-    One accumulator plane is shared per shared-memory node.
+    One accumulator plane is shared per shared-memory node, cutting per-node
+    tally memory from one plane per rank to one plane per node. Results are read
+    on rank 0. Requires an MPI- and OpenMP-enabled build and the Monte Carlo
+    solver, and is not compatible with ``no_reduce`` or CMFD. A tally whose
+    moments are required on all ranks (the weight-window-generation tally)
+    always keeps ``replicated`` storage; the global ``tally_storage`` setting
+    does not apply to it, and the run proceeds.
 
   :rma:
     The accumulator (and its moments) are block-distributed across all ranks.
@@ -524,8 +530,7 @@ MPI ranks. Accepted values are:
 Individual tallies can override this default with the per-tally ``<storage>``
 element (see :ref:`io_tallies`).
 
-.. note:: The ``shared`` and ``rma`` modes are not yet implemented; only
-          ``replicated`` is currently accepted at run time.
+.. note:: The ``rma`` mode is not yet implemented.
 
   *Default*: replicated
 

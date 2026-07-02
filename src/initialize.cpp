@@ -159,6 +159,26 @@ void initialize_mpi(MPI_Comm intracomm)
   MPI_Comm_rank(intracomm, &mpi::rank);
   mpi::master = (mpi::rank == 0);
 
+  // Build the shared-memory (node) and node-leader (internode) communicators
+  // used by shared-storage tallies. Guard against re-entry so a repeated
+  // openmc_init (e.g. openmc.lib re-runs) does not leak communicators; this
+  // assumes intracomm does not change across re-inits without an intervening
+  // openmc_finalize (which frees these comms). Keying
+  // the splits on the world rank makes the lowest world rank on each node its
+  // leader; world rank 0 is therefore always a node leader and is rank 0 of
+  // internode_comm, so it holds the node count for the broadcast below.
+  if (mpi::node_comm == MPI_COMM_NULL) {
+    MPI_Comm_split_type(intracomm, MPI_COMM_TYPE_SHARED, mpi::rank,
+      MPI_INFO_NULL, &mpi::node_comm);
+    MPI_Comm_rank(mpi::node_comm, &mpi::node_rank);
+    mpi::node_leader = (mpi::node_rank == 0);
+    MPI_Comm_split(intracomm, mpi::node_leader ? 0 : MPI_UNDEFINED, mpi::rank,
+      &mpi::internode_comm);
+    if (mpi::master)
+      MPI_Comm_size(mpi::internode_comm, &mpi::n_nodes);
+    MPI_Bcast(&mpi::n_nodes, 1, MPI_INT, 0, intracomm);
+  }
+
   // Create bank datatype
   SourceSite b;
   MPI_Aint disp[14];

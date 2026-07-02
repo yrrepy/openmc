@@ -1093,7 +1093,7 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
 // Update tally results
-  tally.score_add(filter_index, score_index, score * filter_weight);
+    tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -1595,7 +1595,7 @@ void score_general_ce_analog(Particle& p, int i_tally, int start_index,
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
 // Update tally results
-  tally.score_add(filter_index, score_index, score * filter_weight);
+    tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -2289,7 +2289,7 @@ void score_general_mg(Particle& p, int i_tally, int start_index,
     }
 
 // Update tally results
-  tally.score_add(filter_index, score_index, score * filter_weight);
+    tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 

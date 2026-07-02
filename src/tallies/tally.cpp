@@ -42,6 +42,7 @@
 #include <algorithm> // for max, set_union
 #include <cassert>
 #include <cstddef>  // for size_t
+#include <cstdint>  // for uintptr_t
 #include <iterator> // for back_inserter
 #include <string>
 
@@ -407,12 +408,18 @@ Tally::Tally(pugi::xml_node node)
     }
   }
 
-  // Validate the storage mode. The distributed modes carry hard prerequisites;
-  // shared/rma are parsed but not yet implemented.
+  // Validate the storage mode. The distributed modes carry hard prerequisites.
   if (storage_ != TallyStorage::REPLICATED) {
 #ifndef OPENMC_MPI
     fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
                             "which requires an MPI-enabled build.",
+      id_));
+#endif
+#ifndef _OPENMP
+    // Shared scoring updates one plane from several ranks through omp atomic;
+    // with OpenMP disabled that pragma is a no-op and the updates would race.
+    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
+                            "which requires an OpenMP-enabled build.",
       id_));
 #endif
     if (!settings::reduce_tallies) {
@@ -427,10 +434,11 @@ Tally::Tally(pugi::xml_node node)
                     "only supported by the Monte Carlo solver.",
           id_));
     }
-    fatal_error(
-      fmt::format("Tally {} requests storage mode 'shared' or 'rma', which is "
-                  "not yet implemented.",
+    if (storage_ == TallyStorage::RMA) {
+      fatal_error(fmt::format(
+        "Tally {} requests storage mode 'rma', which is not yet implemented.",
         id_));
+    }
   }
 
 #ifdef OPENMC_LIBMESH_ENABLED
@@ -451,6 +459,9 @@ Tally::Tally(pugi::xml_node node)
 Tally::~Tally()
 {
   model::tally_map.erase(id_);
+#ifdef OPENMC_MPI
+  free_accum_window();
+#endif
 }
 
 Tally* Tally::create(int32_t id)
@@ -888,6 +899,100 @@ void Tally::rma_score_add(int64_t, int, double)
   // is never reached while rma is unimplemented.
   fatal_error("Internal error: rma tally storage is not yet implemented.");
 }
+
+void Tally::free_accum_window()
+{
+  if (accum_win_ == MPI_WIN_NULL)
+    return;
+  int mpi_finalized;
+  MPI_Finalized(&mpi_finalized);
+  if (!mpi_finalized) {
+    // Close the persistent passive-target epoch, then free. Both are collective
+    // on node_comm; every rank destroys its tallies in the same order, so the
+    // calls line up.
+    MPI_Win_unlock_all(accum_win_);
+    MPI_Win_free(&accum_win_);
+  }
+  accum_win_ = MPI_WIN_NULL;
+}
+
+void Tally::init_shared_accum()
+{
+  // Re-init (e.g. openmc.lib re-runs): drop any previous window first. This is
+  // collective on node_comm and lines up because every rank re-inits its
+  // tallies in the same order.
+  free_accum_window();
+
+  // The shared plane replaces the private buffer entirely -- that is the RAM
+  // win, so make sure no per-rank copy lingers.
+  accum_buffer_.clear();
+  accum_buffer_.shrink_to_fit();
+
+  // The node leader allocates the whole plane; everyone else contributes 0
+  // bytes. The default (contiguous) layout means querying the leader's segment
+  // returns one contiguous plane mapped into every rank -- do not request
+  // alloc_shared_noncontig, which would break that assumption.
+  MPI_Aint bytes =
+    mpi::node_leader ? static_cast<MPI_Aint>(accum_size_) * sizeof(double) : 0;
+  void* base = nullptr;
+  MPI_Win_allocate_shared(
+    bytes, sizeof(double), MPI_INFO_NULL, mpi::node_comm, &base, &accum_win_);
+
+  MPI_Aint seg_bytes;
+  int seg_disp;
+  MPI_Win_shared_query(accum_win_, 0, &seg_bytes, &seg_disp, &base);
+  accum_ = static_cast<double*>(base);
+
+  // The atomic scoring path needs natural alignment and the unified memory
+  // model (public == private window copy) so load/store atomics stay coherent.
+  assert(reinterpret_cast<uintptr_t>(accum_) % alignof(double) == 0);
+  int* model;
+  int flag;
+  MPI_Win_get_attr(accum_win_, MPI_WIN_MODEL, &model, &flag);
+  if (!flag || *model != MPI_WIN_UNIFIED) {
+    fatal_error(
+      "Shared tally storage requires an MPI_WIN_UNIFIED shared-memory "
+      "window (non-cache-coherent hardware is not supported).");
+  }
+
+  // Open a persistent passive-target epoch for the window's whole life so the
+  // win_sync memory barriers used at every batch boundary are legal MPI.
+  MPI_Win_lock_all(MPI_MODE_NOCHECK, accum_win_);
+
+  // Zero the plane on the leader and publish it so every rank sees all-zeros
+  // before the first score.
+  if (mpi::node_leader)
+    std::fill(accum_, accum_ + accum_size_, 0.0);
+  MPI_Win_sync(accum_win_);
+  MPI_Barrier(mpi::node_comm);
+  MPI_Win_sync(accum_win_);
+}
+
+void Tally::shared_publish()
+{
+  // Step 1 -- publish every node-local atomic score. The symmetric
+  // win_sync/barrier/win_sync is the MPI-3 shared-memory idiom: the first sync
+  // flushes writers, the barrier orders, the second refreshes the reader.
+  MPI_Win_sync(accum_win_);
+  MPI_Barrier(mpi::node_comm);
+  MPI_Win_sync(accum_win_);
+
+  // Step 2 -- combine the per-node planes onto the world master. A single-node
+  // run skips this: the one plane already holds the global sum and the master
+  // folds it directly. World rank 0 is rank 0 of internode_comm, so
+  // reduce_in_place_chunked roots the reduction on the master.
+  if (mpi::n_nodes > 1 && mpi::node_leader) {
+    reduce_in_place_chunked(accum_, accum_size_, mpi::internode_comm);
+  }
+}
+
+void Tally::shared_resume()
+{
+  // Step 4 -- publish the zeroed plane so the next batch scores into all-zeros.
+  MPI_Win_sync(accum_win_);
+  MPI_Barrier(mpi::node_comm);
+  MPI_Win_sync(accum_win_);
+}
 #endif
 
 void Tally::init_results()
@@ -895,10 +1000,27 @@ void Tally::init_results()
   n_score_bins_ = scores_.size() * nuclides_.size();
   accum_size_ = n_filter_bins_ * n_score_bins_;
 
-  // Per-batch accumulator plane. In replicated mode every rank owns a private
-  // contiguous buffer.
-  accum_buffer_.assign(accum_size_, 0.0);
-  accum_ = accum_buffer_.data();
+#ifdef OPENMC_MPI
+  if (storage_ == TallyStorage::SHARED) {
+    // A tally read on all ranks (weight-window generation) cannot use shared
+    // storage, which homes moments on the master alone. This flag is set after
+    // construction, so the check lives here rather than in the XML ctor.
+    if (moments_all_ranks_) {
+      fatal_error(fmt::format("Tally {} cannot use shared storage because its "
+                              "moments are required on all ranks.",
+        id_));
+    }
+    // The per-batch accumulator is one shared plane per node rather than a
+    // per-rank buffer.
+    init_shared_accum();
+  } else
+#endif
+  {
+    // Per-batch accumulator plane. In replicated mode every rank owns a private
+    // contiguous buffer.
+    accum_buffer_.assign(accum_size_, 0.0);
+    accum_ = accum_buffer_.data();
+  }
 
   // Cross-batch moments, shaped [n_filter_bins, n_score_bins, n_moments]. The
   // moment count is 2 (SUM, SUM_SQ) or 4 (adding SUM_THIRD, SUM_FOURTH). This
@@ -922,7 +1044,19 @@ void Tally::reset()
 {
   n_realizations_ = 0;
   if (accum_ != nullptr && accum_size_ != 0) {
-    std::fill(accum_, accum_ + accum_size_, 0.0);
+#ifdef OPENMC_MPI
+    // The shared plane is invariantly all-zeros between batches (each batch
+    // ends with a fold/zero + publish, and the window is born zeroed), so this
+    // fill is a no-op in every reachable state. Only the node leader writes it,
+    // to avoid a cross-process data race on the shared window.
+    if (storage_ == TallyStorage::SHARED) {
+      if (mpi::node_leader)
+        std::fill(accum_, accum_ + accum_size_, 0.0);
+    } else
+#endif
+    {
+      std::fill(accum_, accum_ + accum_size_, 0.0);
+    }
   }
   if (moments_.size() != 0) {
     moments_.fill(0.0);
@@ -989,6 +1123,22 @@ void Tally::accumulate()
       }
     }
   }
+#ifdef OPENMC_MPI
+  else if (storage_ == TallyStorage::SHARED && mpi::node_leader) {
+    // A non-master node leader does not fold, but its node plane was the source
+    // of the internode reduce and still holds this node's batch sum. Zero it so
+    // it does not carry into the next batch. (The master zeroes its own plane
+    // in the fold above.)
+#pragma omp parallel for
+    for (int64_t i = 0; i < accum_size_; ++i)
+      accum_[i] = 0.0;
+  }
+
+  // Publish the zeroed plane before the next batch scores into it. Every node
+  // rank participates in the barrier inside shared_resume().
+  if (storage_ == TallyStorage::SHARED)
+    shared_resume();
+#endif
 }
 
 int Tally::score_index(const std::string& score) const
@@ -1131,6 +1281,14 @@ void reduce_tally_results()
     for (int i_tally : model::active_tallies) {
       // Skip any tallies that are not active
       auto& tally {model::tallies[i_tally]};
+
+      if (tally->storage_ == TallyStorage::SHARED) {
+        // Publish this node's scores and combine the node planes onto the
+        // master, replacing the intracomm reduce. The plane then belongs to the
+        // node leader until accumulate() folds/zeroes it and resumes.
+        tally->shared_publish();
+        continue;
+      }
 
       // The accumulator is contiguous, so it reduces in place onto the master
       // with no scratch buffer. Chunked to respect the int MPI count limit.
@@ -1710,7 +1868,9 @@ extern "C" size_t tallies_size()
   return model::tallies.size();
 }
 
-// given a tally ID, remove it from the tallies vector
+// given a tally ID, remove it from the tallies vector. For a shared-storage
+// tally this destroys an MPI window and is therefore collective on node_comm --
+// every rank must call it for the same index.
 extern "C" int openmc_remove_tally(int32_t index)
 {
   // check that id is in the map
