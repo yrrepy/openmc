@@ -456,11 +456,17 @@ void finalize_batch()
     simulation::n_realizations = 0;
   }
 
-  // Check_triggers
-  if (mpi::master)
-    check_triggers();
+  // Check triggers. This is normally a master-only computation, but when an
+  // rma-storage tally carries a trigger the tally-uncertainty walk is
+  // distributed (each rank owns only part of the moments), so every rank must
+  // participate. The satisfy/continue decision still flows solely from the
+  // master via the broadcast below.
 #ifdef OPENMC_MPI
+  if (mpi::master || has_rma_triggers())
+    check_triggers();
   MPI_Bcast(&simulation::satisfy_triggers, 1, MPI_C_BOOL, 0, mpi::intracomm);
+#else
+  check_triggers();
 #endif
   if (simulation::satisfy_triggers ||
       (settings::trigger_on &&

@@ -67,10 +67,11 @@ The ``<tally>`` element accepts the following sub-elements:
   :storage:
     The storage element sets the accumulator storage mode for this tally,
     overriding the global ``<tally_storage>`` default in ``settings.xml``.
-    Accepted values are ``replicated``, ``shared``, and ``rma``.
-
-    .. note:: The ``shared`` and ``rma`` modes are not yet implemented; only
-              ``replicated`` is currently accepted at run time.
+    Accepted values are ``replicated``, ``shared``, and ``rma``; see the
+    :ref:`\<tally_storage\> element <settings_tally_storage>` for the meaning of
+    each mode. A run may mix modes across tallies (for example a large flux mesh
+    tally with ``shared`` or ``rma`` storage alongside small ``replicated``
+    tallies).
 
     *Default*: the value of the ``<tally_storage>`` element in settings.xml
     (``replicated`` if unset).

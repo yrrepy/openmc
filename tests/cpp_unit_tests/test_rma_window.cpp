@@ -43,8 +43,8 @@ using namespace openmc;
 // Build an rma tally with n_bins energy bins and n_scores scores, score
 // contrib=(rank+1) into every (bin, score) from every rank/thread through the
 // real seam, publish + fold, and verify each owned moment row holds the exact
-// cross-rank sum 1 + 2 + ... + n_procs. Returns whether every owned row matched;
-// the tally (and its collective window) is torn down before returning.
+// cross-rank sum 1 + 2 + ... + n_procs. Returns whether every owned row
+// matched; the tally (and its collective window) is torn down before returning.
 static bool run_rma_cycle(int64_t n_bins, int n_scores)
 {
   // The Tally rma paths read these globals; initialize_mpi would set them in a
@@ -104,7 +104,8 @@ static bool run_rma_cycle(int64_t n_bins, int n_scores)
   const int64_t P = mpi::n_procs;
   const double expected = static_cast<double>(P * (P + 1) / 2);
   const int64_t bpr = std::max<int64_t>(1, (n_bins + P - 1) / P);
-  const int64_t first = std::min<int64_t>(static_cast<int64_t>(mpi::rank) * bpr, n_bins);
+  const int64_t first =
+    std::min<int64_t>(static_cast<int64_t>(mpi::rank) * bpr, n_bins);
   const int64_t last =
     std::min<int64_t>(static_cast<int64_t>(mpi::rank + 1) * bpr, n_bins);
   const int64_t n_rows = last - first;

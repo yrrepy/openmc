@@ -157,8 +157,10 @@ void initialize_mpi(MPI_Comm intracomm)
     // scoring region, serialized by a named critical section. Request thread
     // serialization so those calls are legal under threads; the other storage
     // modes never issue MPI while threaded, so this is strictly more correct
-    // than the plain MPI_Init it replaces. The external-init path (mpi4py) does
-    // not run this; the rma validation checks the provided level there.
+    // than the plain MPI_Init it replaces. SERIALIZED-first (rather than
+    // THREAD_MULTIPLE) per the MCNP 6.3 experience, Josey & Kulesza (2021),
+    // LA-UR-21-26363. The external-init path (mpi4py) does not run this; the
+    // rma validation checks the provided level there.
     int provided;
     MPI_Init_thread(nullptr, nullptr, MPI_THREAD_SERIALIZED, &provided);
     // The rma tally validation (tally.cpp) re-checks the granted level via

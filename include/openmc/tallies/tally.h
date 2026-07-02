@@ -80,6 +80,21 @@ public:
   //! Length of the innermost (score x nuclide) dimension of the results.
   int n_score_bins() const { return n_score_bins_; }
 
+#ifdef OPENMC_MPI
+  //! Number of filter-bin rows this rank owns under rma block distribution
+  //! (0 in every other storage mode). Under rma the moments array is homed on
+  //! the owning rank and locally indexed, so this is its outer dimension.
+  int64_t rma_n_rows() const { return rma_n_rows_; }
+
+  //! First global filter-bin row owned by `rank` under rma block distribution.
+  //! Uses the same block map as init_rma_accum(), so the master can compute any
+  //! rank's ownership (for statepoint gather/scatter) without communication.
+  int64_t rma_first_row(int rank) const;
+
+  //! Number of filter-bin rows owned by `rank` under rma block distribution.
+  int64_t rma_rows_owned(int rank) const;
+#endif
+
   //! Duplicate rma staging rows merged so far (remote-coalescing diagnostic).
   int64_t rma_merged_rows() const { return rma_merged_rows_; }
 
@@ -182,9 +197,9 @@ public:
 
   //! \brief End-of-batch publish for an rma tally. Drains any thread-local
   //! staging, completes this rank's outstanding accumulates at their targets,
-  //! barriers so no accumulate is in flight anywhere, then issues a local memory
-  //! barrier before accumulate() folds this rank's owned window rows. Called
-  //! from reduce_tally_results().
+  //! barriers so no accumulate is in flight anywhere, then issues a local
+  //! memory barrier before accumulate() folds this rank's owned window rows.
+  //! Called from reduce_tally_results().
   void rma_publish();
 #endif
 
@@ -313,6 +328,7 @@ private:
     int coalesce_owner {-1};   //!< owner rank of coalesce_bin
     vector<double> row;        //!< n_score_bins_ coalesced score values
 
+    // clang-format off
     //! Per-target double buffers. For target rank t and buffer b in {0, 1}, with
     //! slot = t * 2 + b:
     //!   data[(slot * rma_k_ + r) * n_score_bins_ + s] : staged score values
@@ -320,23 +336,26 @@ private:
     //!   fill[slot]      : rows staged in that buffer (0..rma_k_)
     //!   in_flight[slot] : accumulate issued, origin not yet locally retired
     //!   cur[t]          : active buffer index for target t
+    // clang-format on
     vector<double> data;
     vector<MPI_Aint> disp;
     vector<int> fill;
     vector<char> in_flight;
     vector<int> cur;
 
-    //! Reusable scratch used when a buffer is issued: an index permutation sorted
-    //! by displacement (perm, rma_k_ ints) and the compacted, duplicate-free rows
-    //! (comp_disp / comp_data) merged before the MPI_Accumulate so its target
-    //! datatype never has overlapping entries. Written back into the buffer.
+    //! Reusable scratch used when a buffer is issued: an index permutation
+    //! sorted by displacement (perm, rma_k_ ints) and the compacted,
+    //! duplicate-free rows (comp_disp / comp_data) merged before the
+    //! MPI_Accumulate so its target datatype never has overlapping entries.
+    //! Written back into the buffer.
     vector<int> perm;
     vector<MPI_Aint> comp_disp;
     vector<double> comp_data;
 
     //! Count of staging rows merged into an earlier same-displacement row (a
-    //! coalescing diagnostic; > 0 exactly when a bin was staged non-consecutively
-    //! and would otherwise have produced an overlapping accumulate).
+    //! coalescing diagnostic; > 0 exactly when a bin was staged
+    //! non-consecutively and would otherwise have produced an overlapping
+    //! accumulate).
     int64_t merged {0};
   };
   vector<RmaThreadStaging> rma_staging_;
