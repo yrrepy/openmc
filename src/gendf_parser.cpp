@@ -111,8 +111,16 @@ ExtractResult<int> extract_int_safe(
   }
 
   try {
-    result.value = std::stoi(substr);
-    result.success = true;
+    size_t pos = 0;
+    result.value = std::stoi(substr, &pos);
+    if (pos != substr.length()) {
+      // Field contains non-integer content (e.g. ENDF float "2.796470-5");
+      // treating its leading digits as an integer would misidentify records
+      result.error = "Non-integer content in '" + substr + "'";
+      result.value = 0;
+    } else {
+      result.success = true;
+    }
   } catch (const std::exception& e) {
     result.error = "Cannot parse integer from '" + substr + "': " + e.what();
   }
@@ -230,6 +238,7 @@ GENDFParseResult parse_gendf_validated(
   vector<double> mf10_current_energies;
   int mf10_n_groups = 0;
   bool mf10_in_data = false;
+  bool mf10_discard = false; // consume but drop subsection (e.g. IZAP=0)
   int mf10_nr_skip = 0;
 
   // Extract basename from filename for cleaner warnings
@@ -285,10 +294,12 @@ GENDFParseResult parse_gendf_validated(
         }
         // Save previous MF=10 subsection
         if (current_mf == 10 && !mf10_current_xs.empty()) {
-          int key = current_mt * 1000 + mf10_current_lfs;
-          result.prod_xs_data[key] = std::move(mf10_current_xs);
-          result.prod_energy_data[key] = std::move(mf10_current_energies);
-          result.prod_izap_data[key] = mf10_current_izap;
+          if (!mf10_discard) {
+            int key = current_mt * 1000 + mf10_current_lfs;
+            result.prod_xs_data[key] = std::move(mf10_current_xs);
+            result.prod_energy_data[key] = std::move(mf10_current_energies);
+            result.prod_izap_data[key] = mf10_current_izap;
+          }
           mf10_current_xs.clear();
           mf10_current_energies.clear();
           mf10_in_data = false;
@@ -298,6 +309,7 @@ GENDFParseResult parse_gendf_validated(
         in_data_section = false;
         nr_lines_to_skip = 0;
         mf10_in_data = false;
+        mf10_discard = false;
         mf10_nr_skip = 0;
       }
     }
@@ -308,9 +320,10 @@ GENDFParseResult parse_gendf_validated(
     if (mf == 1 && mt == 451 && !found_mf1_header) {
       found_mf1_header = true;
 
-      auto za_result = extract_int_safe(line, 0, 11);
+      // ZA is the C1 field of the HEAD record, written as an ENDF float
+      auto za_result = extract_double_safe(line, 0, 11);
       if (za_result.success && za_result.value > 0) {
-        result.za = za_result.value;
+        result.za = static_cast<int>(za_result.value);
 
         // Validate ZA (only on HEAD record, not TEXT records)
         if (options.validate_za) {
@@ -411,14 +424,15 @@ GENDFParseResult parse_gendf_validated(
         auto np_result = extract_int_safe(line, 55, 11);
         if (np_result.success && np_result.value > 0) {
           // Save previous subsection
-          if (!mf10_current_xs.empty()) {
+          if (!mf10_current_xs.empty() && !mf10_discard) {
             int key = current_mt * 1000 + mf10_current_lfs;
             result.prod_xs_data[key] = std::move(mf10_current_xs);
             result.prod_energy_data[key] = std::move(mf10_current_energies);
             result.prod_izap_data[key] = mf10_current_izap;
-            mf10_current_xs.clear();
-            mf10_current_energies.clear();
           }
+          mf10_current_xs.clear();
+          mf10_current_energies.clear();
+          mf10_discard = false;
 
           auto izap_result = extract_int_safe(line, 22, 11);
           auto lfs_result = extract_int_safe(line, 33, 11);
@@ -429,16 +443,18 @@ GENDFParseResult parse_gendf_validated(
           mf10_n_groups = np_result.value;
           mf10_nr_skip = nr_result.success ? nr_result.value : 0;
 
-          // Skip IZAP=0 (data quality issue)
+          // Skip IZAP=0 (data quality issue). Enter discard mode so the
+          // subsection's data lines are consumed rather than re-scanned as
+          // potential subsection heads.
           if (mf10_current_izap == 0) {
             result.warnings.push_back(
               "Skipping MF=10 level in " + basename + " MT=" +
               std::to_string(current_mt) + " LFS=" +
               std::to_string(mf10_current_lfs) + ": IZAP=0");
-            continue;
+            mf10_discard = true;
           }
 
-          if (options.validate_za) {
+          if (!mf10_discard && options.validate_za) {
             std::string izap_error;
             if (!validate_za(mf10_current_izap, izap_error)) {
               result.warnings.push_back(
@@ -494,7 +510,7 @@ GENDFParseResult parse_gendf_validated(
   }
 
   // Save last MF=10 subsection
-  if (current_mf == 10 && !mf10_current_xs.empty()) {
+  if (current_mf == 10 && !mf10_current_xs.empty() && !mf10_discard) {
     int key = current_mt * 1000 + mf10_current_lfs;
     result.prod_xs_data[key] = std::move(mf10_current_xs);
     result.prod_energy_data[key] = std::move(mf10_current_energies);
