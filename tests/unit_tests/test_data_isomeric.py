@@ -4,7 +4,47 @@ import pytest
 
 from openmc.data.isomeric import (
     DecayState, ELIS_ATOL, ELIS_RTOL, elis_match, lookup_liso, map_lfs_to_liso,
+    parse_decay_isomeric_levels,
 )
+
+
+def _endf_cont(fields, mat, mf, mt, ns=0):
+    """Format one 80-column ENDF CONT/HEAD record from six field strings."""
+    body = ''.join(f'{s:>11}' for s in fields)
+    return f'{body}{mat:>4}{mf:>2}{mt:>3}{ns:>5}\n'
+
+
+def _malformed_decay_tape():
+    """A one-material MF=1/451 decay tape that defeats ``get_evaluations``.
+
+    Reproduces the EASY-II/FISPACT failure mode: the tape ends with a MEND
+    record (MAT=0) but omits the ENDF TEND record (MAT=-1), so the general
+    reader parses a spurious material past end-of-file and raises
+    ``ValueError: invalid literal for int() with base 10: ''``.  Encodes
+    Z=47, A=100, ELIS=15500.5 eV, LISO=1.
+    """
+    mat = 4710
+    lines = [
+        # TPID line (skipped by the reader), non-standard columns like the real
+        # decay files.
+        f'{"EASY-II decay test tape":<66}{"":>4}{"":>2}{"":>3}{0:>5}\n',
+        # HEAD: ZA, AWR, LRP=-1, LFI=1, NLIB=2, NMOD=0
+        _endf_cont([' 4.710000+4', ' 9.900000+1', '-1', '1', '2', '0'], mat, 1, 451, 1),
+        # CONT 1: ELIS, STA, LIS, LISO, 0, NFOR
+        _endf_cont([' 1.550050+4', ' 1.000000+0', '1', '1', '0', '6'], mat, 1, 451, 2),
+        # CONT 2: AWI, EMAX, LREL, 0, NSUB=4 (decay), NVER
+        _endf_cont([' 0.000000+0', ' 0.000000+0', '0', '0', '4', '22'], mat, 1, 451, 3),
+        # CONT 3: TEMP, 0, LDRV, 0, NWD=1, NXC=1
+        _endf_cont([' 0.000000+0', ' 0.000000+0', '0', '0', '1', '1'], mat, 1, 451, 4),
+        # NWD=1 text record
+        f'{"AG-100M   DECAY":<66}{mat:>4}{1:>2}{451:>3}{5:>5}\n',
+        # NXC=1 directory record (blank C1/C2, MF, MT, NC, MOD)
+        _endf_cont(['', '', '1', '451', '5', '0'], mat, 1, 451, 6),
+        _endf_cont(['0', '0', '0', '0', '0', '0'], mat, 1, 0, 99999),  # SEND
+        _endf_cont(['0', '0', '0', '0', '0', '0'], mat, 0, 0),         # FEND
+        _endf_cont(['0', '0', '0', '0', '0', '0'], 0, 0, 0),           # MEND (no TEND)
+    ]
+    return ''.join(lines)
 
 
 @pytest.fixture
@@ -130,3 +170,27 @@ def test_map_invalid_mode(ir192_lookup):
     with pytest.raises(ValueError, match='mode'):
         map_lfs_to_liso([{'lfs': 1, 'izap': 77192, 'elfs': 1.0}],
                         ir192_lookup, mode='bogus')
+
+
+def test_malformed_tape_defeats_get_evaluations(tmp_path):
+    # Guard: the fixture really does reproduce the EOF int('') failure mode,
+    # so the fallback path is genuinely exercised.
+    from openmc.data.endf import get_evaluations
+    tape = tmp_path / 'Ag100m'
+    tape.write_text(_malformed_decay_tape())
+    with pytest.raises(ValueError, match="invalid literal for int"):
+        get_evaluations(tape)
+
+
+def test_manual_fallback_recovers_states(tmp_path):
+    # parse_decay_isomeric_levels must fall back to the fixed-column reader and
+    # recover ZA/ELIS/LISO, emitting a 'manual-parse' note (counts stay visible).
+    tape = tmp_path / 'Ag100m'
+    tape.write_text(_malformed_decay_tape())
+    with pytest.warns(UserWarning, match='manual-parse'):
+        lookup = parse_decay_isomeric_levels(tape)
+    assert (47, 100) in lookup
+    (state,) = lookup[(47, 100)]
+    assert state.z == 47 and state.a == 100
+    assert state.liso == 1
+    assert state.elis == pytest.approx(15500.5)

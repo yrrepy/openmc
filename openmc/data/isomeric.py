@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from warnings import warn
 
-from .endf import get_evaluations
+from .endf import get_evaluations, py_float_endf
 
 __all__ = [
     'DecayState', 'ELIS_RTOL', 'ELIS_ATOL', 'elis_match', 'lookup_liso',
@@ -203,8 +203,20 @@ def parse_decay_isomeric_levels(decay_path):
     for path in paths:
         try:
             materials = get_evaluations(path)
-        except Exception as exc:  # unreadable / non-ENDF file
-            warn(f"Skipping decay file {path.name}: {exc}")
+        except Exception as exc:  # malformed / non-standard ENDF tape
+            # Many FISPACT/EASY-II per-nuclide decay files terminate with a
+            # MEND record (MAT=0) but omit the ENDF TEND record (MAT=-1), so
+            # the general reader parses a spurious material past end-of-file
+            # and raises.  The material itself is well-formed; recover the
+            # ELIS lookup fields with a minimal fixed-column MF=1/451 read.
+            states = _manual_decay_states(path)
+            if not states:
+                warn(f"Skipping decay file {path.name}: {exc}")
+                continue
+            warn(f"manual-parse: {path.name}: get_evaluations failed ({exc}); "
+                 f"recovered {len(states)} MF=1/451 state(s) by fixed-column read.")
+            for state in states:
+                lookup[(state.z, state.a)].append(state)
             continue
         for material in materials:
             info = material.section_data.get((1, 451))
@@ -221,6 +233,45 @@ def parse_decay_isomeric_levels(decay_path):
                 half_life=_half_life(material),
             ))
     return dict(lookup)
+
+
+def _manual_decay_states(path):
+    """Extract MF=1/451 states from a decay tape that defeats the ENDF reader.
+
+    Reads only the two records needed for the ELIS lookup -- the HEAD (``ZA``)
+    and the second CONT record (``ELIS``/``LIS``/``LISO``) -- of every MF=1/451
+    section, using fixed ENDF column positions.  Half-lives (MF=8/457) are not
+    recovered; they are optional for the lookup.  Returns a list of
+    :class:`DecayState` (empty if nothing usable is found).
+    """
+    states = []
+    section = []           # collected MF=1/451 lines for the current material
+    with open(path) as fh:
+        for line in fh:
+            if len(line) < 75:
+                continue
+            mf, mt = line[70:72].strip(), line[72:75].strip()
+            if mf == '1' and mt == '451':
+                section.append(line)
+            elif section:            # first non-451 line closes the section
+                _append_manual_state(section, states)
+                section = []
+    if section:
+        _append_manual_state(section, states)
+    return states
+
+
+def _append_manual_state(section, states):
+    """Parse a collected MF=1/451 header (``section``) into ``states``."""
+    if len(section) < 2:
+        return
+    head, rec2 = section[0], section[1]
+    za = int(py_float_endf(head[0:11]))
+    if za < 1001:
+        return
+    elis = py_float_endf(rec2[0:11]) if rec2[0:11].strip() else 0.0
+    liso = int(py_float_endf(rec2[33:44])) if rec2[33:44].strip() else 0
+    states.append(DecayState(z=za // 1000, a=za % 1000, elis=elis, liso=liso))
 
 
 def map_lfs_to_liso(partials, decay_lookup, mode='elis', rtol=ELIS_RTOL,
