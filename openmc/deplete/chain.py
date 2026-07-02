@@ -1204,7 +1204,7 @@ class Chain:
             valid = valid and stat
         return valid
 
-    def reduce(self, initial_isotopes, level=None):
+    def reduce(self, initial_isotopes, level=None, keep_isomeric_siblings=True):
         """Reduce the size of the chain by following transmutation paths
 
         As an example, consider a simple chain with the following
@@ -1230,6 +1230,12 @@ class Chain:
         total destruction rate and decay rate of included isotopes
         will be preserved.
 
+        .. versionchanged:: 0.15.4
+            Added the ``keep_isomeric_siblings`` parameter. When enabled
+            (the default), whenever any state of a nuclide is reached, all
+            of its isomeric siblings present in the original chain (ground
+            plus metastable) are kept together in the reduced chain.
+
         Parameters
         ----------
         initial_isotopes : iterable of str
@@ -1241,6 +1247,12 @@ class Chain:
             that all isotopes that appear in the transmutation paths
             of the initial isotopes and their progeny should be
             explored
+        keep_isomeric_siblings : bool, optional
+            Whether to keep all isomeric siblings (ground plus metastable
+            states of the same nuclide) together whenever any one of them is
+            reachable. Defaults to True, which keeps isomeric pathways intact
+            for activation. If False, isomeric states are treated
+            independently, reproducing the pre-0.15.4 behavior.
 
         Returns
         -------
@@ -1250,6 +1262,10 @@ class Chain:
 
         """
         check_type("initial_isotopes", initial_isotopes, Iterable, str)
+        if not isinstance(keep_isomeric_siblings, bool):
+            raise TypeError(
+                "keep_isomeric_siblings must be bool, got "
+                f"{type(keep_isomeric_siblings).__name__}")
         if level is None:
             level = math.inf
         else:
@@ -1257,6 +1273,11 @@ class Chain:
             check_greater_than("level", level, 0, equality=True)
 
         all_isotopes = self._follow(set(initial_isotopes), level)
+
+        # Expand to include isomeric siblings so ground and metastable states
+        # of the same nuclide are kept together
+        if keep_isomeric_siblings:
+            self._expand_with_isomeric_siblings(all_isotopes)
 
         # Avoid re-sorting for fission yields
         name_sort = sorted(all_isotopes)
@@ -1297,6 +1318,64 @@ class Chain:
         new_chain.reactions = sorted(new_chain.reactions)
 
         return new_chain
+
+    @staticmethod
+    def _get_base_name(nuclide_name):
+        """Return the nuclide name without its isomeric state suffix.
+
+        Examples
+        --------
+        >>> Chain._get_base_name('Ir191')
+        'Ir191'
+        >>> Chain._get_base_name('Ir191_m1')
+        'Ir191'
+        """
+        if '_m' in nuclide_name:
+            return nuclide_name.rsplit('_m', 1)[0]
+        return nuclide_name
+
+    def _build_isomeric_families_cache(self):
+        """Cache the isomeric family (ground + metastables) of each nuclide."""
+        families = defaultdict(list)
+        for nuc in self.nuclides:
+            families[self._get_base_name(nuc.name)].append(nuc.name)
+
+        self._isomeric_families = {}
+        for family in families.values():
+            for name in family:
+                self._isomeric_families[name] = family
+
+    def _get_isomeric_siblings(self, nuclide_name):
+        """Return all isomeric siblings of a nuclide present in the chain."""
+        if not hasattr(self, '_isomeric_families'):
+            self._build_isomeric_families_cache()
+        return self._isomeric_families.get(nuclide_name, [nuclide_name])
+
+    def _expand_with_isomeric_siblings(self, isotope_set):
+        """Expand an isotope set in place to include all isomeric siblings.
+
+        For every nuclide in ``isotope_set``, add any ground or metastable
+        sibling that is present in the chain. This keeps isomeric pathways
+        intact when the chain is reduced.
+
+        Parameters
+        ----------
+        isotope_set : set of str
+            Set of nuclide names to expand (modified in place).
+
+        Returns
+        -------
+        set of str
+            The expanded set (same object as the input).
+        """
+        to_check = list(isotope_set)
+        while to_check:
+            name = to_check.pop()
+            for sibling in self._get_isomeric_siblings(name):
+                if sibling in self.nuclide_dict and sibling not in isotope_set:
+                    isotope_set.add(sibling)
+                    to_check.append(sibling)
+        return isotope_set
 
     def _follow(self, isotopes, level):
         """Return all isotopes present up to depth level"""
