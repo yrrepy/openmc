@@ -599,6 +599,92 @@ is actually independent of the number of nodes:
     E \left [ \Lambda_{j_{\text{max}}} \right ] = \sqrt{ \frac{N\sigma^2}{2\pi
     k^2}}.
 
+.. _methods_parallel_tally_storage:
+
+------------------------------
+Tally Memory and Storage Modes
+------------------------------
+
+By default every MPI rank keeps a private copy of each tally. For a fine mesh
+crossed with a fine energy grid a single tally can reach tens of gigabytes, so a
+per-rank copy on every core of a node makes the tally, not the transport, the
+memory bottleneck. OpenMC therefore separates a tally's storage into two
+objects: a per-batch *accumulator* plane, the only thing transport writes, and a
+smaller set of cross-batch *moments* (:math:`\sum x` and :math:`\sum x^2`, plus
+higher moments when requested) that a once-per-batch fold updates from the
+accumulator. This is the batch-means decomposition used by the shared-memory
+mesh tally in MCNP [Mosher2018]_; keeping the accumulator separate from the
+moments is what lets the accumulator be re-homed without touching the scoring
+hot path. The :ref:`\<tally_storage\> element <settings_tally_storage>` selects
+where the accumulator (and, for ``rma``, the moments) live:
+
+* **replicated** -- one private accumulator per rank (the default). The
+  end-of-batch reduction sums the accumulators onto the master, which folds the
+  moments; a final broadcast restores full results on every rank.
+
+* **shared** -- one accumulator plane per shared-memory node, held in an MPI-3
+  shared-memory window. Cross-process scores use hardware atomics on the shared
+  window, so per-node tally memory no longer scales with the number of ranks on
+  the node.
+
+* **rma** -- the accumulator *and* its moments are block-distributed by
+  filter-bin row across all ranks, so total tally memory is divided by the
+  number of ranks (per-node memory falls as roughly one plane per node divided
+  by the number of nodes). Transport is replicated rather than
+  domain-decomposed, so most scores target bins owned by other ranks. A rank
+  writes bins it owns into a private plane and accumulates contributions to
+  remote bins into other ranks' blocks with one-sided ``MPI_Accumulate``. To
+  keep one-sided operations off the per-score critical path, scores are
+  coalesced per filter-bin row and staged into per-target buffers that are
+  flushed as batched, indexed accumulates -- the origin-side buffering that
+  makes remote accumulation viable [Romano2011]_ [Dun2015]_. One-sided tally
+  accumulation on a distributed, globally addressable tally block follows
+  [Romano2011]_ and [Dun2015]_; both are implemented here independently on
+  MPI-3. The tally-server alternative -- dedicating ranks to hold tally memory
+  and forwarding scores to them -- is analyzed in [Romano2013]_. Results are
+  read from the statepoint file, to which each rank writes (and from which each
+  rank reads back) only its owned rows.
+
+  The private plane is a deliberate memory cost. The window block is touched
+  only by ``MPI_Accumulate`` while scoring is in flight -- mixing CPU
+  read-modify-writes with NIC-side atomics on the same locations is undefined in
+  MPI and corrupts on fabrics with device atomics -- so a rank keeps the scores
+  it makes to its own bins in a separate private plane rather than writing them
+  into the window, which holds those scores at memory speed. Each rank therefore
+  holds, for its owned block of filter-bin rows, the window block, its owned
+  moment rows, *and* this extra private accumulator plane. Per-rank tally memory
+  is thus :math:`(2 + n_\text{moments}) / N` planes on :math:`N` ranks -- with
+  the default two moments about one third more than the theoretical
+  :math:`(1 + n_\text{moments}) / N` minimum -- though it still falls as
+  :math:`1/N`. Users sizing runs against this memory model should budget for the
+  extra plane.
+
+.. _methods_parallel_thread_level:
+
+MPI thread level
+++++++++++++++++++
+
+The ``rma`` mode is the first place OpenMC issues MPI calls from inside an
+OpenMP parallel region (the transport scoring loop). Those calls are serialized
+with a single named ``omp critical`` section, so OpenMC initializes MPI with
+``MPI_THREAD_SERIALIZED`` rather than the more permissive
+``MPI_THREAD_MULTIPLE``. This is deliberate: the MCNP 6.3 storage-backend
+experience documents a throughput collapse when many threads issue concurrent
+one-sided operations under ``MPI_THREAD_MULTIPLE`` on some fabrics
+[Josey2021]_. Dropping the critical section for genuinely concurrent
+``MPI_Accumulate`` is a possible optimization, but it is gated on a fabric
+micro-benchmark on the target machine and is not enabled by default.
+
+Parallel HDF5 caveats
+++++++++++++++++++++++
+
+The ``rma`` statepoint gather and restart use the same master-serial HDF5 path
+as the other modes by default, so they do not require a Parallel HDF5 build. If
+Parallel HDF5 is used, collective tally I/O can be very sensitive to the
+underlying filesystem -- it performs well on parallel filesystems such as Lustre
+but can stall on NFS -- which is why collective/chunked statepoint writing is an
+opt-in rather than the default [Rising2025]_.
+
 .. only:: html
 
    .. rubric:: References
@@ -606,6 +692,30 @@ is actually independent of the number of nodes:
 .. [Troubetzkoy] E. Troubetzkoy, H. Steinberg, and M. Kalos, "Monte Carlo
    Radiation Penetration Calculations on a Parallel Computer,"
    *Trans. Am. Nucl. Soc.*, **17**, 260 (1973).
+
+.. [Romano2011] P. K. Romano, B. Forget, and F. B. Brown, "Towards Scalable
+   Parallelism in Monte Carlo Particle Transport Codes Using Remote Memory
+   Access," *Prog. Nucl. Sci. Technol.*, **2**, 670--675 (2011).
+
+.. [Romano2013] P. K. Romano, A. R. Siegel, B. Forget, and K. Smith, "Data
+   decomposition of Monte Carlo particle transport simulations via tally
+   servers," *J. Comput. Phys.*, **252**, 20--36 (2013).
+   `doi:10.1016/j.jcp.2013.06.011 <https://doi.org/10.1016/j.jcp.2013.06.011>`_.
+
+.. [Dun2015] N. Dun, H. Fujita, J. R. Tramm, A. A. Chien, and A. R. Siegel,
+   "Data Decomposition in Monte Carlo Neutron Transport Simulations using Global
+   View Arrays," *Int. J. High Perform. Comput. Appl.*, **29** (2015).
+
+.. [Mosher2018] S. W. Mosher and S. C. Wilson, "Algorithmic Improvements to
+   MCNP5 for High-Resolution Fusion Neutronics Analyses," *Fusion Sci.
+   Technol.* (2018). `doi:10.1080/15361055.2018.1496691
+   <https://doi.org/10.1080/15361055.2018.1496691>`_.
+
+.. [Josey2021] C. J. Josey and J. A. Kulesza, "Improved FMESH Capabilities in
+   the MCNP 6.3 Code," LA-UR-21-26363, 2021 MCNP User Symposium (2021).
+
+.. [Rising2025] M. E. Rising, A. Sood, et al., MCNP6 workshop materials,
+   LA-UR-25-23947 Rev. 1, Los Alamos National Laboratory (2025).
 
 .. _first paper: https://doi.org/10.2307/2280232
 

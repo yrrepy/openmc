@@ -4,6 +4,8 @@ import pytest
 import openmc
 import scipy.stats as sps
 
+from tests.regression_tests import config
+
 
 def test_xml_roundtrip(run_in_tmpdir):
     # Create a tally with all possible gizmos
@@ -58,6 +60,54 @@ def test_tally_storage():
         assert tally.storage == mode
     with pytest.raises(ValueError):
         tally.storage = 'bogus'
+
+
+@pytest.mark.parametrize('storage', ['shared', 'rma'])
+def test_distributed_storage_equivalence(storage, run_in_tmpdir):
+    """A distributed-storage (shared/rma) mesh+energy tally reproduces the
+    replicated result. Single-rank, single-thread runs are bit-identical (the
+    same arithmetic order); with OpenMP threads > 1 or under --mpi the results
+    match to floating-point reordering. For rma an MPI run also exercises the
+    statepoint owner-to-master gather."""
+    m = openmc.Material()
+    m.add_nuclide('U235', 1.0)
+    m.set_density('g/cm3', 1.0)
+    sph = openmc.Sphere(r=10.0, boundary_type='vacuum')
+    cell = openmc.Cell(fill=m, region=-sph)
+    geometry = openmc.Geometry([cell])
+
+    mesh = openmc.RegularMesh()
+    mesh.dimension = (3, 3, 3)
+    mesh.lower_left = (-10.0, -10.0, -10.0)
+    mesh.upper_right = (10.0, 10.0, 10.0)
+
+    def run_with(mode):
+        tally = openmc.Tally(name='flux')
+        tally.filters = [openmc.MeshFilter(mesh),
+                         openmc.EnergyFilter([0.0, 1.0, 1.0e3, 20.0e6])]
+        tally.scores = ['flux', 'total']
+        settings = openmc.Settings()
+        settings.particles = 500
+        settings.batches = 12
+        settings.run_mode = 'fixed source'
+        settings.seed = 987
+        settings.source = openmc.IndependentSource(space=openmc.stats.Point())
+        settings.tally_storage = mode
+        model = openmc.model.Model(
+            geometry, openmc.Materials([m]), settings, openmc.Tallies([tally]))
+        kwargs = {}
+        if config['mpi']:
+            kwargs['mpi_args'] = [config['mpiexec'], '-n', config['mpi_np']]
+        with openmc.StatePoint(model.run(**kwargs)) as sp:
+            t = sp.get_tally(name='flux')
+            return t.mean.copy(), t.std_dev.copy()
+
+    mean_ref, std_ref = run_with('replicated')
+    mean, std = run_with(storage)
+    # Tolerances comfortably above cross-rank FP-reorder noise (~1e-15 on the
+    # mean) yet tight enough to catch a real accumulation or gather bug.
+    assert np.allclose(mean, mean_ref, rtol=1e-9, atol=0.0)
+    assert np.allclose(std, std_ref, rtol=1e-6, atol=0.0)
 
 
 def test_tally_equivalence():
