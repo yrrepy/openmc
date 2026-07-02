@@ -651,6 +651,16 @@ void write_tallies()
       continue;
     }
 
+    // rma tallies keep only owned moment rows on each rank; the full results
+    // are gathered only into the statepoint, so tallies.out points the user
+    // there.
+    if (tally.storage_ == TallyStorage::RMA) {
+      fmt::print(tallies_out,
+        " Results for this tally use 'rma' storage and are written to the "
+        "statepoint file only.\n\n");
+      continue;
+    }
+
     // Calculate t-value for confidence intervals
     double t_value = 1;
     if (settings::confidence_intervals) {

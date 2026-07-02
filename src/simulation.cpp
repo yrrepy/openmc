@@ -841,9 +841,9 @@ void broadcast_results()
   // accumulator is all zeros at this point (end of run), so only the moments
   // need broadcasting.
   for (auto& t : model::tallies) {
-    // Distributed modes keep their results where they live (rank 0 for shared)
-    // and are read there by design, so they are not broadcast. Only replicated
-    // tallies serve full results on every rank.
+    // Distributed modes keep their results where they live (rank 0 for shared,
+    // the owning rank for rma) and are read there by design, so they are not
+    // broadcast. Only replicated tallies serve full results on every rank.
     if (t->storage_ != TallyStorage::REPLICATED)
       continue;
 

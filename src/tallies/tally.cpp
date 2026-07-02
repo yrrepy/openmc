@@ -435,9 +435,38 @@ Tally::Tally(pugi::xml_node node)
           id_));
     }
     if (storage_ == TallyStorage::RMA) {
-      fatal_error(fmt::format(
-        "Tally {} requests storage mode 'rma', which is not yet implemented.",
-        id_));
+#if defined(OPENMC_MPI) && defined(_OPENMP)
+      // The remote-scoring arm issues MPI from inside the OpenMP scoring
+      // region. Until MPI is initialized with MPI_THREAD_SERIALIZED, reject a
+      // threaded rma run whose MPI cannot serialize those calls; a single-thread
+      // run is safe regardless of the provided level.
+      int provided;
+      MPI_Query_thread(&provided);
+      if (provided < MPI_THREAD_SERIALIZED && num_threads() > 1) {
+        fatal_error(fmt::format(
+          "Tally {} requests storage mode 'rma' with more than one OpenMP "
+          "thread, but MPI does not provide MPI_THREAD_SERIALIZED. Run with a "
+          "single thread or an MPI build providing thread serialization.",
+          id_));
+      }
+#endif
+      // Event-based transport reorders scoring; the rma coalescer assumes the
+      // history-based order.
+      if (settings::event_based) {
+        fatal_error(
+          fmt::format("Tally {} requests storage mode 'rma', which is "
+                      "not supported in event-based mode.",
+            id_));
+      }
+      // Tally triggers read cross-batch moments over all filter bins; under rma
+      // each rank holds only its owned rows, so the trigger walk is not yet
+      // supported.
+      if (!triggers_.empty()) {
+        fatal_error(
+          fmt::format("Tally {} requests storage mode 'rma' together with a "
+                      "tally trigger, which is not yet supported.",
+            id_));
+      }
     }
   }
 
@@ -893,11 +922,29 @@ void Tally::init_triggers(pugi::xml_node node)
 }
 
 #ifdef OPENMC_MPI
-void Tally::rma_score_add(int64_t, int, double)
+void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
 {
-  // Storage validation rejects rma before any scoring occurs, so this handler
-  // is never reached while rma is unimplemented.
-  fatal_error("Internal error: rma tally storage is not yet implemented.");
+  // Local arm: a bin this rank owns is scored into the private owned-rows plane
+  // (accum_), locally indexed. The window block itself receives only
+  // MPI_Accumulate, so a NIC-side remote atomic never races a CPU store on the
+  // same cell (the two classes target disjoint address ranges by construction).
+  if (rma_owner(filter_index) == mpi::rank) {
+    int64_t local =
+      (filter_index - rma_first_row_) * n_score_bins_ + score_index;
+    atomic_score_add(&accum_[local], val);
+    return;
+  }
+  // Remote scoring (batched, staged MPI_Accumulate) is not yet implemented.
+  fatal_error("rma tally storage: remote scoring is not yet implemented "
+              "(the bin being scored is owned by another rank).");
+}
+
+int Tally::rma_owner(int64_t filter_index) const
+{
+  // Whole filter-bin rows are block-distributed: rows [r*bpr, (r+1)*bpr) belong
+  // to rank r. bpr is the ceiling of bins/procs, so filter_index / bpr is
+  // always a valid rank in [0, n_procs).
+  return static_cast<int>(filter_index / rma_bins_per_rank_);
 }
 
 void Tally::free_accum_window()
@@ -908,12 +955,13 @@ void Tally::free_accum_window()
   MPI_Finalized(&mpi_finalized);
   if (!mpi_finalized) {
     // Close the persistent passive-target epoch, then free. Both are collective
-    // on node_comm; every rank destroys its tallies in the same order, so the
-    // calls line up.
+    // over the window's group (node_comm for shared, intracomm for rma); every
+    // rank destroys its tallies in the same order, so the calls line up.
     MPI_Win_unlock_all(accum_win_);
     MPI_Win_free(&accum_win_);
   }
   accum_win_ = MPI_WIN_NULL;
+  rma_win_base_ = nullptr;
 }
 
 void Tally::init_shared_accum()
@@ -993,6 +1041,99 @@ void Tally::shared_resume()
   MPI_Barrier(mpi::node_comm);
   MPI_Win_sync(accum_win_);
 }
+
+void Tally::init_rma_accum()
+{
+  // Re-init (e.g. openmc.lib re-runs): drop any previous window first.
+  // Idempotent and collective over the window's group; every rank re-inits in
+  // the same order so the calls line up.
+  free_accum_window();
+
+  // Block-distribute whole filter-bin rows across all ranks. bins_per_rank is
+  // the ceiling of bins/procs so the rows partition exactly; trailing ranks may
+  // own zero rows (a zero-size window block is legal). max(1, ...) guards the
+  // ownership division against a degenerate zero-bin tally.
+  const int64_t n_procs = mpi::n_procs;
+  rma_bins_per_rank_ =
+    std::max<int64_t>(1, (n_filter_bins_ + n_procs - 1) / n_procs);
+  rma_first_row_ = std::min<int64_t>(
+    static_cast<int64_t>(mpi::rank) * rma_bins_per_rank_, n_filter_bins_);
+  const int64_t last_row = std::min<int64_t>(
+    static_cast<int64_t>(mpi::rank + 1) * rma_bins_per_rank_, n_filter_bins_);
+  rma_n_rows_ = last_row - rma_first_row_;
+  rma_plane_size_ = rma_n_rows_ * n_score_bins_;
+
+  // Private owned-rows plane for this rank's own scores to bins it owns. Reuses
+  // accum_buffer_ so the hot path writes it exactly like replicated mode, just
+  // sized to the owned block and locally indexed.
+  accum_buffer_.assign(rma_plane_size_, 0.0);
+  accum_ = accum_buffer_.data();
+
+  // Distributed window: each rank contributes its owned block. same_op_no_op +
+  // no ordering lets the implementation use hardware atomics for the SUM-only
+  // accumulates and drops ordering overhead (we never mix ops or rely on
+  // order).
+  MPI_Info info;
+  MPI_Info_create(&info);
+  MPI_Info_set(info, "accumulate_ops", "same_op_no_op");
+  MPI_Info_set(info, "accumulate_ordering", "none");
+  MPI_Aint bytes = static_cast<MPI_Aint>(rma_plane_size_) * sizeof(double);
+  void* base = nullptr;
+  MPI_Win_allocate(
+    bytes, sizeof(double), info, mpi::intracomm, &base, &accum_win_);
+  MPI_Info_free(&info);
+  rma_win_base_ = static_cast<double*>(base);
+
+  // Require the unified memory model, exactly as the shared window does, so
+  // MPI_Win_sync is a plain memory barrier and the SEPARATE-model self-lock
+  // problem stays out of scope.
+  int* model;
+  int flag;
+  MPI_Win_get_attr(accum_win_, MPI_WIN_MODEL, &model, &flag);
+  if (!flag || *model != MPI_WIN_UNIFIED) {
+    fatal_error("rma tally storage requires an MPI_WIN_UNIFIED window "
+                "(non-cache-coherent hardware is not supported).");
+  }
+
+  // Persistent passive-target epoch for the window's whole life so the
+  // per-batch flush/sync operations are legal MPI.
+  MPI_Win_lock_all(MPI_MODE_NOCHECK, accum_win_);
+
+  // Zero this rank's window block (MPI_Win_allocate memory is uninitialized)
+  // and publish it so remote accumulates land on all-zeros.
+  if (rma_plane_size_ > 0)
+    std::fill(rma_win_base_, rma_win_base_ + rma_plane_size_, 0.0);
+  MPI_Win_sync(accum_win_);
+  MPI_Barrier(mpi::intracomm);
+  MPI_Win_sync(accum_win_);
+
+  // First-batch diagnostics (high verbosity only): the master reports the
+  // layout.
+  write_message(8,
+    "rma tally {}: {} filter bins block-distributed across {} ranks "
+    "(~{} rows/rank, {:.1f} MiB/rank window)",
+    id_, n_filter_bins_, mpi::n_procs, rma_bins_per_rank_,
+    static_cast<double>(rma_plane_size_) * sizeof(double) / (1024.0 * 1024.0));
+}
+
+void Tally::rma_publish()
+{
+  // Step 1 -- drain thread-local staging buffers (none while scoring is local).
+  // Step 2 -- complete this rank's outstanding accumulates at every target.
+  MPI_Win_flush_all(accum_win_);
+  // Step 3 -- after this barrier no accumulate is in flight anywhere.
+  MPI_Barrier(mpi::intracomm);
+  // Step 4 -- local memory barrier before the fold reads this rank's own block.
+  MPI_Win_sync(accum_win_);
+}
+
+void Tally::rma_resume()
+{
+  // Publish the zeroed window block so the next batch accumulates into zeros.
+  MPI_Win_sync(accum_win_);
+  MPI_Barrier(mpi::intracomm);
+  MPI_Win_sync(accum_win_);
+}
 #endif
 
 void Tally::init_results()
@@ -1001,18 +1142,24 @@ void Tally::init_results()
   accum_size_ = n_filter_bins_ * n_score_bins_;
 
 #ifdef OPENMC_MPI
+  // A tally read on all ranks (weight-window generation) cannot use a
+  // distributed mode, which homes moments on the master alone (shared) or on
+  // the owning rank (rma). This flag is set after construction, so the check
+  // lives here rather than in the XML ctor.
+  if (storage_ != TallyStorage::REPLICATED && moments_all_ranks_) {
+    fatal_error(fmt::format("Tally {} cannot use a distributed storage mode "
+                            "because its moments are required on all ranks.",
+      id_));
+  }
+
   if (storage_ == TallyStorage::SHARED) {
-    // A tally read on all ranks (weight-window generation) cannot use shared
-    // storage, which homes moments on the master alone. This flag is set after
-    // construction, so the check lives here rather than in the XML ctor.
-    if (moments_all_ranks_) {
-      fatal_error(fmt::format("Tally {} cannot use shared storage because its "
-                              "moments are required on all ranks.",
-        id_));
-    }
     // The per-batch accumulator is one shared plane per node rather than a
     // per-rank buffer.
     init_shared_accum();
+  } else if (storage_ == TallyStorage::RMA) {
+    // The accumulator and moments are block-distributed across ranks; each rank
+    // allocates only its owned window block plus a private owned-rows plane.
+    init_rma_accum();
   } else
 #endif
   {
@@ -1032,7 +1179,15 @@ void Tally::init_results()
   // accumulator plane. The moments live on every rank when tallies are not
   // reduced (each rank is its own owner) or when a consumer reads them off the
   // master mid-run (moments_all_ranks_).
-  if (mpi::master || !settings::reduce_tallies || moments_all_ranks_) {
+#ifdef OPENMC_MPI
+  if (storage_ == TallyStorage::RMA) {
+    // Under rma every rank folds and holds the moment rows for the filter bins
+    // it owns; a rank owning zero rows gets an empty (size-0) array.
+    moments_ = tensor::Tensor<double>({static_cast<size_t>(rma_n_rows_),
+      static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
+  } else
+#endif
+    if (mpi::master || !settings::reduce_tallies || moments_all_ranks_) {
     moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
       static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
   } else {
@@ -1043,6 +1198,23 @@ void Tally::init_results()
 void Tally::reset()
 {
   n_realizations_ = 0;
+#ifdef OPENMC_MPI
+  if (storage_ == TallyStorage::RMA) {
+    // Both owned-rows planes are invariantly zero between batches (the fold
+    // zeroes them and the window is born zeroed), so this is defensive. Zero
+    // the private plane and this rank's window block; MPI_Win_sync is a local
+    // memory barrier (not collective), so a single-tally reset stays valid.
+    if (rma_plane_size_ > 0) {
+      std::fill(accum_, accum_ + rma_plane_size_, 0.0);
+      std::fill(rma_win_base_, rma_win_base_ + rma_plane_size_, 0.0);
+      MPI_Win_sync(accum_win_);
+    }
+    if (moments_.size() != 0) {
+      moments_.fill(0.0);
+    }
+    return;
+  }
+#endif
   if (accum_ != nullptr && accum_size_ != 0) {
 #ifdef OPENMC_MPI
     // The shared plane is invariantly all-zeros between batches (each batch
@@ -1063,32 +1235,74 @@ void Tally::reset()
   }
 }
 
+double Tally::tally_normalization() const
+{
+  // Total source strength (fixed source) or unity (eigenvalue) per generation,
+  // divided by the number of contributing particles.
+  double total_source = 1.0;
+  if (settings::run_mode == RunMode::FIXED_SOURCE) {
+    total_source = model::external_sources_probability.integral();
+  }
+  double contributing_particles = settings::reduce_tallies
+                                    ? settings::n_particles
+                                    : simulation::work_per_rank;
+  double norm =
+    total_source / (contributing_particles * settings::gen_per_batch);
+  if (settings::solver_type == SolverType::RANDOM_RAY) {
+    norm = 1.0;
+  }
+  return norm;
+}
+
 void Tally::accumulate()
 {
   // Increment number of realizations
   n_realizations_ += settings::reduce_tallies ? 1 : mpi::n_procs;
 
-  if (mpi::master || !settings::reduce_tallies) {
-    // Calculate total source strength for normalization
-    double total_source = 0.0;
-    if (settings::run_mode == RunMode::FIXED_SOURCE) {
-      total_source = model::external_sources_probability.integral();
+#ifdef OPENMC_MPI
+  if (storage_ == TallyStorage::RMA) {
+    // Every rank folds its owned rows. The batch sum for a bin is its window
+    // block (remote contributions, zero while scoring is local) plus the private
+    // plane (this rank's own scores); both planes are then zeroed.
+    // norm is rank-identical: it depends only on global model data and rma
+    // requires reduce_tallies. n_realizations_ incremented on all ranks above.
+    const double norm = tally_normalization();
+    if (higher_moments_) {
+#pragma omp parallel for
+      for (int64_t i = 0; i < rma_n_rows_; ++i) {
+        for (int j = 0; j < n_score_bins_; ++j) {
+          const int64_t k = i * n_score_bins_ + j;
+          double val = (rma_win_base_[k] + accum_[k]) * norm;
+          rma_win_base_[k] = 0.0;
+          accum_[k] = 0.0;
+          double val2 = val * val;
+          moments_(i, j, TallyMoment::SUM) += val;
+          moments_(i, j, TallyMoment::SUM_SQ) += val2;
+          moments_(i, j, TallyMoment::SUM_THIRD) += val2 * val;
+          moments_(i, j, TallyMoment::SUM_FOURTH) += val2 * val2;
+        }
+      }
     } else {
-      total_source = 1.0;
+#pragma omp parallel for
+      for (int64_t i = 0; i < rma_n_rows_; ++i) {
+        for (int j = 0; j < n_score_bins_; ++j) {
+          const int64_t k = i * n_score_bins_ + j;
+          double val = (rma_win_base_[k] + accum_[k]) * norm;
+          rma_win_base_[k] = 0.0;
+          accum_[k] = 0.0;
+          moments_(i, j, TallyMoment::SUM) += val;
+          moments_(i, j, TallyMoment::SUM_SQ) += val * val;
+        }
+      }
     }
+    // Publish the zeroed window block before the next batch accumulates.
+    rma_resume();
+    return;
+  }
+#endif
 
-    // Determine number of particles contributing to tally
-    double contributing_particles = settings::reduce_tallies
-                                      ? settings::n_particles
-                                      : simulation::work_per_rank;
-
-    // Account for number of source particles in normalization
-    double norm =
-      total_source / (contributing_particles * settings::gen_per_batch);
-
-    if (settings::solver_type == SolverType::RANDOM_RAY) {
-      norm = 1.0;
-    }
+  if (mpi::master || !settings::reduce_tallies) {
+    double norm = tally_normalization();
 
     // Fold the per-batch accumulator into the moments, then zero it. accum_ is
     // stored contiguously as [n_filter_bins, n_score_bins].
@@ -1287,6 +1501,14 @@ void reduce_tally_results()
         // master, replacing the intracomm reduce. The plane then belongs to the
         // node leader until accumulate() folds/zeroes it and resumes.
         tally->shared_publish();
+        continue;
+      }
+
+      if (tally->storage_ == TallyStorage::RMA) {
+        // Complete every rank's accumulates into the distributed window and
+        // barrier so nothing is in flight; accumulate() then folds each rank's
+        // owned rows. No intracomm reduce -- the data is already at its owner.
+        tally->rma_publish();
         continue;
       }
 
@@ -1841,6 +2063,15 @@ extern "C" int openmc_tally_results(
   }
 
   const auto& t {model::tallies[index]};
+#ifdef OPENMC_MPI
+  if (t->storage_ == TallyStorage::RMA) {
+    // Under rma each rank holds only its owned moment rows, so there is no
+    // global in-memory array to return. Consume rma results from the statepoint.
+    set_errmsg("In-memory results are not available for a tally using 'rma' "
+               "storage; read them from the statepoint file instead.");
+    return OPENMC_E_ALLOCATE;
+  }
+#endif
   if (!t->has_moments()) {
     set_errmsg("Tally results have not been allocated yet.");
     return OPENMC_E_ALLOCATE;

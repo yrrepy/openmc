@@ -176,6 +176,13 @@ public:
   //! plane belongs to the node leader until shared_resume() -- non-leaders must
   //! not touch accum_ in between. Called from reduce_tally_results().
   void shared_publish();
+
+  //! \brief End-of-batch publish for an rma tally. Drains any thread-local
+  //! staging, completes this rank's outstanding accumulates at their targets,
+  //! barriers so no accumulate is in flight anywhere, then issues a local memory
+  //! barrier before accumulate() folds this rank's owned window rows. Called
+  //! from reduce_tally_results().
+  void rma_publish();
 #endif
 
   //! return the index of a score specified by name
@@ -276,9 +283,32 @@ private:
   int n_score_bins_ {0};
 
 #ifdef OPENMC_MPI
+  //! Distributed-window state for the rma storage mode. accum_win_ (reused from
+  //! the shared mode) holds this rank's contiguous block of owned filter-bin
+  //! rows and receives only MPI_Accumulate; accum_/accum_buffer_ is a private
+  //! same-size plane for this rank's own scores to bins it owns. Both planes
+  //! are locally indexed (row 0 == rma_first_row_). The fold sums them.
+  double* rma_win_base_ {nullptr}; //!< base of this rank's owned window block
+  int64_t rma_bins_per_rank_ {0};  //!< block size of the ownership map
+  int64_t rma_first_row_ {0};      //!< first global filter-bin row owned
+  int64_t rma_n_rows_ {0};         //!< number of owned filter-bin rows
+  int64_t rma_plane_size_ {0};     //!< rma_n_rows_ * n_score_bins_
+
   //! Out-of-line handler for the rma storage mode; only reached when
   //! storage_ == RMA.
   void rma_score_add(int64_t filter_index, int score_index, double val);
+
+  //! Owner rank of a global filter-bin row under rma block distribution.
+  int rma_owner(int64_t filter_index) const;
+
+  //! Allocate this rank's block of the distributed rma window plus the private
+  //! owned-rows plane, and open the window's passive-target epoch.
+  void init_rma_accum();
+
+  //! \brief End-of-batch resume for an rma tally: publish the zeroed window
+  //! block (win_sync + intracomm barrier) so the next batch accumulates into
+  //! all-zeros.
+  void rma_resume();
 
   //! \brief End-of-batch resume for a shared tally: publish the zeroed plane
   //! (win_sync + node barrier) so the next batch scores into all-zeros.
@@ -290,6 +320,10 @@ private:
   //! Allocate the per-node shared accumulator plane and open its epoch.
   void init_shared_accum();
 #endif
+
+  //! Per-batch normalization applied in the fold (source strength divided by
+  //! contributing particles per generation; 1 for the random ray solver).
+  double tally_normalization() const;
 
   //! Whether to multiply by atom density for reaction rates
   bool multiply_density_ {true};

@@ -1,6 +1,7 @@
 #include "openmc/state_point.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint> // for int64_t
 #include <string>
 
@@ -272,6 +273,14 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
           if (!tally->writable_)
             continue;
 
+          // Under rma the master holds only its own owned rows, so a multi-rank
+          // write needs an owner-to-master gather, which is not yet supported. A
+          // single rank owns every row, so it writes the full array as usual.
+          if (tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1) {
+            fatal_error("Writing a statepoint for a multi-rank 'rma' tally is "
+                        "not yet supported.");
+          }
+
           // Write results for each bin
           std::string name = "tally " + std::to_string(tally->id_);
           hid_t tally_group = open_group(tallies_group, name.c_str());
@@ -504,6 +513,15 @@ extern "C" int openmc_statepoint_load(const char* filename)
       hid_t tallies_group = open_group(file_id, "tallies");
 
       for (auto& tally : model::tallies) {
+        // rma restart needs a master-to-owner scatter of the row chunks, which
+        // is not yet supported; the full-moments temp-alloc idiom below must not
+        // be used for rma. A single rank owns every row, so it restarts as
+        // usual.
+        if (tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1) {
+          fatal_error("Restarting a multi-rank run with 'rma' tally storage is "
+                      "not yet supported.");
+        }
+
         // Read sum, sum_sq, and N for each bin
         std::string name = "tally " + std::to_string(tally->id_);
         hid_t tally_group = open_group(tallies_group, name.c_str());
@@ -805,6 +823,18 @@ void write_unstructured_mesh_results()
       if (!umesh->output_)
         continue;
 
+      // rma tallies hold only owned moment rows on each rank; the gather this
+      // per-rank mesh output would need is not yet implemented. Point the user
+      // at the statepoint instead.
+      if (tally->storage_ == TallyStorage::RMA) {
+        if (mpi::master)
+          warning(fmt::format(
+            "Unstructured mesh output for tally {} is skipped because it uses "
+            "'rma' storage. Read the results from the statepoint file.",
+            tally->id_));
+        continue;
+      }
+
       if (umesh->library() == "moab") {
         if (mpi::master)
           warning(fmt::format(
@@ -942,6 +972,10 @@ void write_tally_results_nr(hid_t file_id)
       continue;
     if (!t->writable_)
       continue;
+
+    // rma requires reduce_tallies at input validation, so an rma tally can
+    // never reach the no-reduction writer.
+    assert(t->storage_ != TallyStorage::RMA);
 
     if (mpi::master && !attribute_exists(file_id, "tallies_present")) {
       write_attribute(file_id, "tallies_present", 1);
