@@ -352,14 +352,30 @@ class _SparseXSTable:
     rxn_indices: np.ndarray
 
     def collapse(self, phi_norm: np.ndarray) -> np.ndarray:
-        """Collapse the table against a group flux with one matrix-vector product.
+        """Collapse the table against a single group flux.
 
         A normalized flux (summing to 1) yields one-group cross sections, a raw
         flux yields reaction rates. Returns a dense
-        ``(n_nuclides, n_reactions)`` array.
+        ``(n_nuclides, n_reactions)`` array. Thin wrapper over
+        :meth:`collapse_batch` with a one-flux batch.
         """
-        result = np.zeros((len(self.nuclides), len(self.reactions)))
-        result[self.nuc_indices, self.rxn_indices] = self.xs_matrix @ phi_norm
+        return self.collapse_batch(np.asarray(phi_norm)[np.newaxis])[0]
+
+    def collapse_batch(self, phi_norm: np.ndarray) -> np.ndarray:
+        """Collapse the table against a batch of group fluxes with one GEMM.
+
+        ``phi_norm`` is an ``(n_flux, n_groups)`` array; normalized rows (each
+        summing to 1) give one-group cross sections, raw rows give reaction
+        rates. A single matrix-matrix product ``phi_norm @ xs_matrix.T`` yields
+        the ``(n_flux, nnz)`` collapsed values, which are then scattered into a
+        dense ``(n_flux, n_nuclides, n_reactions)`` result exactly as
+        :meth:`collapse` does per flux. Only the ``(n_flux, nnz)`` product is
+        materialized beyond the returned result.
+        """
+        phi_norm = np.asarray(phi_norm)
+        result = np.zeros(
+            (phi_norm.shape[0], len(self.nuclides), len(self.reactions)))
+        result[:, self.nuc_indices, self.rxn_indices] = phi_norm @ self.xs_matrix.T
         return result
 
 
@@ -425,25 +441,63 @@ def _build_xs_table_ce(
         np.array(nuc_idx_list, np.int32), np.array(rxn_idx_list, np.int32))
 
 
-def _collapse_fluxes(table: _SparseXSTable, fluxes: Sequence[np.ndarray]) -> list[MicroXS]:
+# Number of fluxes collapsed per GEMM; bounds working memory to
+# ``chunk * max(n_groups, nnz)`` floats regardless of the total flux count.
+_COLLAPSE_CHUNK_SIZE = 1024
+
+
+def _collapse_fluxes(
+    table: _SparseXSTable,
+    fluxes: Sequence[np.ndarray],
+    chunk_size: int = _COLLAPSE_CHUNK_SIZE,
+) -> list[MicroXS]:
     """Collapse each domain's multigroup flux against a built XS table.
 
-    Each flux is validated (finite, non-negative) and normalized to sum 1 before
-    collapse; a zero-sum flux yields an all-zero MicroXS. Returns one
+    Fluxes are processed in chunks of ``chunk_size`` (default
+    :data:`_COLLAPSE_CHUNK_SIZE`): each chunk is stacked into an
+    ``(n_chunk, n_groups)`` array, validated (finite, non-negative) and
+    row-normalized to sum 1, then collapsed with a single GEMM via
+    :meth:`_SparseXSTable.collapse_batch`. A zero-sum flux stays all-zero (no
+    division, hence no NaN) and yields an all-zero MicroXS. Returns one
     ``(n_nuclides, n_reactions, 1)`` :class:`MicroXS` per domain.
+
+    Peak memory beyond the returned MicroXS is set by the working chunk (the
+    stacked fluxes plus the GEMM product), on the order of
+    ``chunk_size * max(n_groups, nnz)`` floats, independent of the number of
+    fluxes.
     """
+    n_groups = table.xs_matrix.shape[1]
     micros = []
-    for flux in fluxes:
-        flux = np.asarray(flux, dtype=float)
-        if not np.isfinite(flux).all():
-            raise ValueError('Multigroup flux contains non-finite values')
-        if (flux < 0).any():
-            raise ValueError('Multigroup flux contains negative values')
-        flux_sum = flux.sum()
-        # Zero-sum flux (all zeros, given the checks above) collapses to zeros
-        collapsed = table.collapse(flux / flux_sum if flux_sum else flux)
-        micros.append(MicroXS(collapsed[:, :, np.newaxis],
-                              table.nuclides, table.reactions))
+    for start in range(0, len(fluxes), chunk_size):
+        phi = np.asarray(fluxes[start:start + chunk_size], dtype=float)
+        if phi.ndim != 2 or phi.shape[1] != n_groups:
+            raise ValueError(f'Each multigroup flux must have length {n_groups}')
+
+        # Vectorized equivalents of the per-flux finite / non-negative checks,
+        # reporting the first offending flux in iteration order. As in the
+        # per-flux path, the finite check takes precedence for a flux that
+        # fails both.
+        not_finite = ~np.isfinite(phi).all(axis=1)
+        negative = (phi < 0).any(axis=1)
+        bad = not_finite | negative
+        if bad.any():
+            local = int(np.argmax(bad))
+            index = start + local
+            if not_finite[local]:
+                raise ValueError(
+                    f'Multigroup flux {index} contains non-finite values')
+            raise ValueError(
+                f'Multigroup flux {index} contains negative values')
+
+        # Row-normalize to sum 1; zero-sum rows (all zeros) divide by 1 and
+        # stay all-zero instead of producing NaN.
+        flux_sum = phi.sum(axis=1)
+        phi = phi / np.where(flux_sum > 0, flux_sum, 1.0)[:, np.newaxis]
+
+        collapsed = table.collapse_batch(phi)
+        for result in collapsed:
+            micros.append(MicroXS(result[:, :, np.newaxis],
+                                  table.nuclides, table.reactions))
     return micros
 
 
