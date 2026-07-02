@@ -8,9 +8,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+import re
 import shutil
 from tempfile import TemporaryDirectory
 from typing import Union, TypeAlias, Self
+from warnings import warn
 
 import h5py
 import pandas as pd
@@ -494,11 +496,22 @@ def _group_average(
     return group_area / np.diff(edges)
 
 
+def _liso_from_gnds(name: str) -> int:
+    """Return the isomeric state (LISO) parsed from a GNDS name.
+
+    ``'Am242_m1'`` -> ``1``, ``'Am242'`` -> ``0`` (ground). The suffix is the
+    product's isomer ordinal, not the MF=10 LFS level index.
+    """
+    match = re.search(r'_m(\d+)$', name)
+    return int(match.group(1)) if match else 0
+
+
 def _build_xs_table_pendf(
     nuclides: Sequence[str],
     reactions: Sequence[str],
     energies: Sequence[float],
     pendf_library,
+    pathways: bool = True,
 ) -> _SparseXSTable:
     """Build a sparse group cross section table from a pointwise PENDF library.
 
@@ -507,47 +520,144 @@ def _build_xs_table_pendf(
     openmc.lib session. Each requested ``(nuclide, reaction)`` present in the
     library has its MF=3 cross section flat-weighted onto the group structure
     via :func:`_group_average`; all-zero rows (nuclide or reaction absent, or a
-    threshold above the group structure) are skipped. Isomeric pathway (MF=10)
-    rows are out of scope here.
+    threshold above the group structure) are skipped.
+
+    When ``pathways`` is true and the library exposes isomeric pathway data
+    (MF=10 partial cross sections, per the ORIGEN-style "Option A" scheme), a
+    reaction with mapped MF=10 partials is expanded into one row per product
+    isomer instead of the single MF=3 total. The ground product (LISO 0) keeps
+    the canonical reaction name (e.g. ``(n,gamma)``) and each metastable product
+    is product-qualified (``(n,gamma)_m1``); the suffix is the product's LISO.
+    Rows come exclusively from the MF=10 partials -- never from static branching
+    ratios. The result's ``reactions`` axis is the expanded list: for each base
+    reaction in input order, the base name first then its ``_m{n}`` variants in
+    ascending isomer order.
 
     Parameters
     ----------
     nuclides : sequence of str
         Nuclide names defining the result's nuclide axis.
     reactions : sequence of str
-        Reaction names defining the result's reaction axis.
+        Base reaction names. The result's reaction axis contains these plus any
+        product-qualified names emitted from MF=10 partials.
     energies : sequence of float
         Ascending energy group boundaries in [eV], length ``n_groups + 1``.
     pendf_library : openmc.data.PendfLibrary
         Pointwise PENDF library, duck-typed with ``nuclides`` (list of GNDS
         names), ``reactions(nuclide)`` (list of MTs with MF=3 data) and
-        ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple).
+        ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple). Isomeric
+        pathway expansion additionally uses ``pathways(nuclide, mt)`` (LFS
+        values with MF=10, ``[]`` if none), ``pathway_xs(nuclide, mt, lfs)``
+        (``(energy, xs)`` of a partial) and ``product(nuclide, mt, lfs)`` (baked
+        GNDS product name, ``None`` if the library was written unmapped).
+    pathways : bool, optional
+        If true (default), expand reactions with mapped MF=10 partials into
+        per-product rows. If false, always emit the single MF=3-total row per
+        reaction (reaction axis equals ``reactions``).
     """
     mts = [REACTION_MT[name] for name in reactions]
     energies = np.asarray(energies, dtype=float)
     n_groups = len(energies) - 1
 
-    rows, nuc_idx_list, rxn_idx_list = [], [], []
+    # Pathway expansion needs all three MF=10 accessors; a library lacking them
+    # (e.g. an MF=3-only stand-in) transparently falls back to the total row.
+    pathways_fn = getattr(pendf_library, 'pathways', None) if pathways else None
+    pathway_xs_fn = getattr(pendf_library, 'pathway_xs', None)
+    product_fn = getattr(pendf_library, 'product', None)
+    have_pathways = None not in (pathways_fn, pathway_xs_fn, product_fn)
+
+    # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
+    # ordinals seen per base reaction are collected to build the expanded axis.
+    staged: list[tuple[int, int, str, np.ndarray]] = []
+    meta_by_base: dict[int, set[int]] = {i: set() for i in range(len(reactions))}
     available = set(pendf_library.nuclides)
+
+    def stage(nuc_idx, base_idx, row_name, xs_g):
+        if xs_g.any():
+            staged.append((nuc_idx, base_idx, row_name, xs_g))
+            liso = _liso_from_gnds(row_name)
+            if liso > 0:
+                meta_by_base[base_idx].add(liso)
+
     for nuc_idx, nuc in enumerate(nuclides):
         if nuc not in available:
             continue
         mts_present = set(pendf_library.reactions(nuc))
         # Index by reaction, not MT, so fission/(n,fission) stay separate
-        for rxn_idx, mt in enumerate(mts):
+        for base_idx, (name, mt) in enumerate(zip(reactions, mts)):
             if mt not in mts_present:
                 continue
             energy, xs = pendf_library.xs(nuc, mt)
-            xs_g = _group_average(energy, xs, energies)
-            if xs_g.any():
-                rows.append(xs_g)
-                nuc_idx_list.append(nuc_idx)
-                rxn_idx_list.append(rxn_idx)
+            total_g = _group_average(energy, xs, energies)
+
+            lfs_list = list(pathways_fn(nuc, mt)) if have_pathways else []
+            if not lfs_list:
+                # No MF=10 partials -> single canonical (ground) row
+                stage(nuc_idx, base_idx, name, total_g)
+                continue
+
+            products = [product_fn(nuc, mt, lfs) for lfs in lfs_list]
+            if any(p is None for p in products):
+                # Library written with mapping='none': product names are unknown
+                # so pathway rows cannot be named. Fall back to the MF=3 total.
+                # Chain-carried mapping is the B3 integration TODO (plan §1.7:
+                # HDF5-baked mapping supersedes chain mapping; if absent the
+                # chain must carry it). warn() fires once per (nuclide, mt) since
+                # each pair is visited exactly once here.
+                warn(f'PENDF library has MF=10 partials for {nuc} MT={mt} but no '
+                     f'baked product names (mapping=none); emitting the MF=3 '
+                     f'total instead of pathway rows. Use a product-mapped '
+                     f'library to resolve isomeric pathways.')
+                stage(nuc_idx, base_idx, name, total_g)
+                continue
+
+            # All partials mapped: one row per product, valued from its MF=10
+            # partial (never a branching ratio). Consistency-check the partials
+            # against the MF=3 total before staging.
+            partial_g = []
+            for lfs in lfs_list:
+                pe, pxs = pathway_xs_fn(nuc, mt, lfs)
+                partial_g.append(_group_average(pe, pxs, energies))
+            part_sum = np.sum(partial_g, axis=0)
+            nz = total_g != 0.0
+            if nz.any():
+                dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
+                worst = float(dev.max())
+                if worst > 1e-6:
+                    g = int(np.nonzero(nz)[0][dev.argmax()])
+                    warn(f'PENDF MF=10 partials for {nuc} MT={mt} sum to '
+                         f'{part_sum[g]:.6e} b but the MF=3 total is '
+                         f'{total_g[g]:.6e} b in group {g} (max relative '
+                         f'deviation {worst:.3e} > 1e-6).')
+            # Emit ground first, then ascending isomer order
+            for liso, xs_g in sorted(
+                    ((_liso_from_gnds(p), pg)
+                     for p, pg in zip(products, partial_g)),
+                    key=lambda t: t[0]):
+                row_name = name if liso == 0 else f'{name}_m{liso}'
+                stage(nuc_idx, base_idx, row_name, xs_g)
+
+    # Build the expanded reaction axis: every base name (always present, so the
+    # dense result keeps a column for each requested reaction) followed by its
+    # emitted metastable variants in ascending isomer order.
+    expanded: list[str] = []
+    name_to_idx: dict[str, int] = {}
+    for base_idx, name in enumerate(reactions):
+        name_to_idx[name] = len(expanded)
+        expanded.append(name)
+        for liso in sorted(meta_by_base[base_idx]):
+            qname = f'{name}_m{liso}'
+            name_to_idx[qname] = len(expanded)
+            expanded.append(qname)
+
+    rows = [xs_g for _, _, _, xs_g in staged]
+    nuc_idx_list = [nuc_idx for nuc_idx, _, _, _ in staged]
+    rxn_idx_list = [name_to_idx[row_name] for _, _, row_name, _ in staged]
 
     xs_matrix = np.vstack(rows) if rows else np.empty((0, n_groups))
 
     return _SparseXSTable(
-        list(nuclides), list(reactions), xs_matrix,
+        list(nuclides), expanded, xs_matrix,
         np.array(nuc_idx_list, np.int32), np.array(rxn_idx_list, np.int32))
 
 
@@ -591,8 +701,9 @@ class MicroXS:
         List of nuclide symbols for that have data for at least one
         reaction.
     reactions : list of str
-        List of reactions. All reactions must match those in
-        :data:`openmc.deplete.chain.REACTIONS`
+        List of reactions. Each reaction must match those in
+        :data:`openmc.deplete.chain.REACTIONS`, optionally with an isomeric
+        product suffix (e.g. ``(n,gamma)_m1``) for pathway-expanded data.
 
     """
     def __init__(self, data: np.ndarray, nuclides: list[str], reactions: list[str]):
@@ -607,8 +718,11 @@ class MicroXS:
         check_iterable_type('nuclides', nuclides, str)
         check_iterable_type('reactions', reactions, str)
         check_type('data', data, np.ndarray, expected_iter_type=float)
+        # Isomeric pathway reactions carry a product-qualified suffix (e.g.
+        # '(n,gamma)_m1'); validate the canonical base reaction, ignoring it.
         for reaction in reactions:
-            check_value('reactions', reaction, _valid_rxns)
+            check_value('reactions', re.sub(r'_m\d+$', '', reaction),
+                        _valid_rxns)
 
         self.data = data
         self.nuclides = nuclides
@@ -628,6 +742,7 @@ class MicroXS:
         *,
         cross_sections: PathLike | None = None,
         pendf_library=None,
+        pathways: bool = True,
         **init_kwargs: dict,
     ) -> MicroXS | list[MicroXS]:
         """Generated microscopic cross sections from a known flux.
@@ -681,6 +796,13 @@ class MicroXS:
             continuous-energy data; the continuous-energy session arguments
             (``cross_sections`` and any :func:`openmc.lib.init` keyword
             arguments) are then invalid and raise ``ValueError``.
+        pathways : bool, optional
+            Only used with ``pendf_library``. If true (default), reactions with
+            mapped isomeric MF=10 partials are expanded into per-product rows
+            (ground keeps the canonical name; metastable products are qualified,
+            e.g. ``(n,gamma)_m1``), so the returned ``reactions`` axis may
+            contain product-qualified names. If false, only MF=3-total rows are
+            emitted.
         **init_kwargs : dict
             Keyword arguments passed to :func:`openmc.lib.init`
 
@@ -733,7 +855,7 @@ class MicroXS:
                     'continuous-energy path and cannot be combined with '
                     'pendf_library')
             table = _build_xs_table_pendf(
-                nuclides, reactions, energies, pendf_library)
+                nuclides, reactions, energies, pendf_library, pathways=pathways)
         else:
             # Resolve the library once; data availability is derived from it
             if cross_sections is None:
