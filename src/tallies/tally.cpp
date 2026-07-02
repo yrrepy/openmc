@@ -39,10 +39,11 @@
 #include "openmc/tensor.h"
 #include <fmt/core.h>
 
-#include <algorithm> // for max, set_union
+#include <algorithm> // for max, set_union, clamp
 #include <cassert>
 #include <cstddef>  // for size_t
 #include <cstdint>  // for uintptr_t
+#include <cstdlib>  // for getenv, atoll
 #include <iterator> // for back_inserter
 #include <string>
 
@@ -928,15 +929,28 @@ void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
   // (accum_), locally indexed. The window block itself receives only
   // MPI_Accumulate, so a NIC-side remote atomic never races a CPU store on the
   // same cell (the two classes target disjoint address ranges by construction).
-  if (rma_owner(filter_index) == mpi::rank) {
+  const int owner = rma_owner(filter_index);
+  if (owner == mpi::rank) {
     int64_t local =
       (filter_index - rma_first_row_) * n_score_bins_ + score_index;
     atomic_score_add(&accum_[local], val);
     return;
   }
-  // Remote scoring (batched, staged MPI_Accumulate) is not yet implemented.
-  fatal_error("rma tally storage: remote scoring is not yet implemented "
-              "(the bin being scored is owned by another rank).");
+
+  // Remote arm (C2): coalesce consecutive contributions to a single filter bin
+  // into a thread-local row, then stage rows for a batched MPI_Accumulate to the
+  // owning rank. A remote bin implies n_procs > 1, so init_rma_staging() has
+  // allocated a slot for every thread. The state is per-thread, so nothing here
+  // races another thread; only the accumulate itself is serialized (a critical).
+  RmaThreadStaging& ts = rma_staging_[thread_num()];
+  if (filter_index != ts.coalesce_bin) {
+    if (ts.coalesce_bin >= 0)
+      rma_coalescer_flush(ts);
+    ts.coalesce_bin = filter_index;
+    ts.coalesce_owner = owner;
+    std::fill(ts.row.begin(), ts.row.end(), 0.0);
+  }
+  ts.row[score_index] += val;
 }
 
 int Tally::rma_owner(int64_t filter_index) const
@@ -945,6 +959,127 @@ int Tally::rma_owner(int64_t filter_index) const
   // to rank r. bpr is the ceiling of bins/procs, so filter_index / bpr is
   // always a valid rank in [0, n_procs).
   return static_cast<int>(filter_index / rma_bins_per_rank_);
+}
+
+void Tally::rma_coalescer_flush(RmaThreadStaging& ts)
+{
+  // Append the open coalescer row to the active buffer for its target rank.
+  const int t = ts.coalesce_owner;
+  const int64_t bin = ts.coalesce_bin;
+  const int b = ts.cur[t];
+  const int slot = t * 2 + b;
+  const int64_t f = ts.fill[slot];
+
+  double* dst =
+    &ts.data[(static_cast<int64_t>(slot) * rma_k_ + f) * n_score_bins_];
+  std::copy(ts.row.begin(), ts.row.end(), dst);
+  // Byte displacement of this row within the owner's window block. The owner's
+  // first global row is t * bins_per_rank (exact for a bin it owns), so the
+  // local row is bin - that, and each row spans n_score_bins_ doubles.
+  const int64_t first_owned_row = static_cast<int64_t>(t) * rma_bins_per_rank_;
+  ts.disp[static_cast<int64_t>(slot) * rma_k_ + f] =
+    static_cast<MPI_Aint>((bin - first_owned_row) * n_score_bins_) *
+    static_cast<MPI_Aint>(sizeof(double));
+  ts.fill[slot] = static_cast<int>(f) + 1;
+  ts.coalesce_bin = -1;
+
+  if (ts.fill[slot] < rma_k_)
+    return;
+
+  // Buffer full: issue its accumulate, then move to the other buffer.
+  rma_stage_issue(ts, t, b);
+  const int nb = 1 - b;
+  if (ts.in_flight[t * 2 + nb]) {
+    // Both buffers for this target are outstanding, so the one we are about to
+    // reuse still owns an in-flight payload. flush_local_all retires every
+    // origin buffer this rank has issued at once; clear this thread's flags to
+    // match (other threads stay conservatively marked -- a redundant flush at
+    // worst, never a reused-in-flight payload).
+#pragma omp critical(openmc_rma)
+    {
+      MPI_Win_flush_local_all(accum_win_);
+    }
+    std::fill(ts.in_flight.begin(), ts.in_flight.end(), 0);
+  }
+  ts.cur[t] = nb;
+  ts.fill[t * 2 + nb] = 0;
+}
+
+void Tally::rma_stage_issue(RmaThreadStaging& ts, int target, int buf)
+{
+  const int slot = target * 2 + buf;
+  const int f = ts.fill[slot];
+  if (f == 0)
+    return;
+  double* data = &ts.data[static_cast<int64_t>(slot) * rma_k_ * n_score_bins_];
+  MPI_Aint* disp = &ts.disp[static_cast<int64_t>(slot) * rma_k_];
+
+  // The coalescer only merges *consecutive* scores to a bin, so a bin scored
+  // non-consecutively (interleaved with other bins across particles) appears as
+  // several rows at the same target displacement. MPI_Accumulate forbids a
+  // target datatype with overlapping entries, so merge equal-displacement rows
+  // first: sort an index by displacement, sum duplicates into the thread's
+  // compaction scratch, then write the unique rows back to the front of this
+  // buffer -- keeping the accumulate origin inside the double-buffered storage
+  // whose in-flight liveness we track.
+  for (int i = 0; i < f; ++i)
+    ts.perm[i] = i;
+  std::sort(ts.perm.begin(), ts.perm.begin() + f,
+    [disp](int a, int b) { return disp[a] < disp[b]; });
+
+  int u = 0;
+  for (int i = 0; i < f; ++i) {
+    const int src = ts.perm[i];
+    const double* srow = &data[static_cast<int64_t>(src) * n_score_bins_];
+    if (u > 0 && disp[src] == ts.comp_disp[u - 1]) {
+      double* drow = &ts.comp_data[static_cast<int64_t>(u - 1) * n_score_bins_];
+      for (int s = 0; s < n_score_bins_; ++s)
+        drow[s] += srow[s];
+      ++ts.merged;
+    } else {
+      ts.comp_disp[u] = disp[src];
+      std::copy(srow, srow + n_score_bins_,
+        &ts.comp_data[static_cast<int64_t>(u) * n_score_bins_]);
+      ++u;
+    }
+  }
+  std::copy(ts.comp_data.begin(),
+    ts.comp_data.begin() + static_cast<int64_t>(u) * n_score_bins_, data);
+  std::copy(ts.comp_disp.begin(), ts.comp_disp.begin() + u, disp);
+
+  // One MPI_Accumulate moves u rows of n_score_bins_ contiguous doubles from the
+  // origin buffer into u scattered rows of the target's block. Accumulate
+  // atomicity is per basic element (MPI_DOUBLE), so the indexed type is fine.
+  // The type is created, committed, used, and freed inside the critical --
+  // freeing after posting is legal (the posted operation completes normally)
+  // and keeps every MPI call serialized under MPI_THREAD_SERIALIZED.
+#pragma omp critical(openmc_rma)
+  {
+    MPI_Datatype dt;
+    MPI_Type_create_hindexed_block(u, n_score_bins_, disp, MPI_DOUBLE, &dt);
+    MPI_Type_commit(&dt);
+    MPI_Accumulate(data, u * n_score_bins_, MPI_DOUBLE, target, 0, 1, dt,
+      MPI_SUM, accum_win_);
+    MPI_Type_free(&dt);
+  }
+  ts.in_flight[slot] = 1;
+}
+
+void Tally::rma_drain()
+{
+  // Runs single-threaded at end of batch (the transport region has ended), so
+  // there is no contention; the main thread walks every thread's slot. Flush
+  // each open coalescer row, then issue whatever remains in each target's active
+  // buffer (the inactive buffer, if full, was already issued at swap time).
+  for (auto& ts : rma_staging_) {
+    if (ts.coalesce_bin >= 0)
+      rma_coalescer_flush(ts);
+    for (int t = 0; t < mpi::n_procs; ++t) {
+      if (t == mpi::rank)
+        continue;
+      rma_stage_issue(ts, t, ts.cur[t]);
+    }
+  }
 }
 
 void Tally::free_accum_window()
@@ -1114,13 +1249,84 @@ void Tally::init_rma_accum()
     "(~{} rows/rank, {:.1f} MiB/rank window)",
     id_, n_filter_bins_, mpi::n_procs, rma_bins_per_rank_,
     static_cast<double>(rma_plane_size_) * sizeof(double) / (1024.0 * 1024.0));
+
+  // Allocate the per-thread remote-scoring staging (skipped on single-rank
+  // runs, which never score remotely).
+  init_rma_staging();
+}
+
+void Tally::init_rma_staging()
+{
+  rma_staging_.clear();
+  rma_k_ = 0;
+
+  // A single-rank run owns every bin, so score_add never reaches the remote arm
+  // -- no staging is needed and the 3.A local path is preserved untouched.
+  if (mpi::n_procs <= 1)
+    return;
+
+  // Choose the staging depth K (rows per buffer). The test seam
+  // OPENMC_RMA_STAGING_ROWS forces a tiny K to exercise buffer wrap + flush;
+  // otherwise K comes from a fixed per-rank budget split across threads,
+  // targets, and the two buffers, so total staging stays near the budget.
+  const int nt = num_threads();
+  if (const char* env = std::getenv("OPENMC_RMA_STAGING_ROWS")) {
+    rma_k_ = std::max<int64_t>(1, std::atoll(env));
+  } else {
+    constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank
+    const int64_t row_bytes =
+      static_cast<int64_t>(n_score_bins_) * sizeof(double);
+    const int64_t denom =
+      static_cast<int64_t>(nt) * mpi::n_procs * 2 * std::max<int64_t>(1, row_bytes);
+    rma_k_ = std::clamp<int64_t>(BUDGET / std::max<int64_t>(1, denom), 8, 4096);
+  }
+
+  // One slot per thread; self-target slots are allocated but never used (the
+  // local arm handles owned bins). Every per-thread buffer starts empty.
+  const int64_t np = mpi::n_procs;
+  rma_merged_rows_ = 0;
+  rma_staging_.resize(nt);
+  for (auto& ts : rma_staging_) {
+    ts.row.assign(n_score_bins_, 0.0);
+    ts.data.assign(np * 2 * rma_k_ * n_score_bins_, 0.0);
+    ts.disp.assign(np * 2 * rma_k_, 0);
+    ts.fill.assign(np * 2, 0);
+    ts.in_flight.assign(np * 2, 0);
+    ts.cur.assign(np, 0);
+    // Per-thread compaction scratch (one buffer's worth), reused at each issue.
+    ts.perm.assign(rma_k_, 0);
+    ts.comp_disp.assign(rma_k_, 0);
+    ts.comp_data.assign(rma_k_ * n_score_bins_, 0.0);
+    ts.merged = 0;
+  }
+
+  write_message(8,
+    "rma tally {}: staging K={} rows/buffer, {:.1f} MiB/rank "
+    "({} threads x {} targets x 2 buffers)",
+    id_, rma_k_,
+    static_cast<double>(nt) * np * 2 * rma_k_ * n_score_bins_ * sizeof(double) /
+      (1024.0 * 1024.0),
+    nt, np);
 }
 
 void Tally::rma_publish()
 {
-  // Step 1 -- drain thread-local staging buffers (none while scoring is local).
-  // Step 2 -- complete this rank's outstanding accumulates at every target.
+  // Step 1 -- drain thread-local staging: issue every open coalescer row and
+  // partial buffer so all of this rank's contributions become accumulates.
+  rma_drain();
+  // Step 2 -- complete this rank's outstanding accumulates at every target
+  // (both locally and remotely). All origin buffers are now retired.
   MPI_Win_flush_all(accum_win_);
+  // The next batch starts from empty staging; reset the per-thread bookkeeping
+  // and fold the per-thread merge counts into the run-level diagnostic.
+  for (auto& ts : rma_staging_) {
+    std::fill(ts.in_flight.begin(), ts.in_flight.end(), 0);
+    std::fill(ts.fill.begin(), ts.fill.end(), 0);
+    std::fill(ts.cur.begin(), ts.cur.end(), 0);
+    ts.coalesce_bin = -1;
+    rma_merged_rows_ += ts.merged;
+    ts.merged = 0;
+  }
   // Step 3 -- after this barrier no accumulate is in flight anywhere.
   MPI_Barrier(mpi::intracomm);
   // Step 4 -- local memory barrier before the fold reads this rank's own block.

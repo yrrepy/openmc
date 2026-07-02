@@ -151,8 +151,23 @@ void initialize_mpi(MPI_Comm intracomm)
   // Initialize MPI
   int flag;
   MPI_Initialized(&flag);
-  if (!flag)
+  if (!flag) {
+#ifdef _OPENMP
+    // The rma tally storage mode issues MPI calls from inside the OpenMP
+    // scoring region, serialized by a named critical section. Request thread
+    // serialization so those calls are legal under threads; the other storage
+    // modes never issue MPI while threaded, so this is strictly more correct
+    // than the plain MPI_Init it replaces. The external-init path (mpi4py) does
+    // not run this; the rma validation checks the provided level there.
+    int provided;
+    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_SERIALIZED, &provided);
+    // The rma tally validation (tally.cpp) re-checks the granted level via
+    // MPI_Query_thread and fatals if it is insufficient for a threaded run.
+    (void)provided;
+#else
     MPI_Init(nullptr, nullptr);
+#endif
+  }
 
   // Determine number of processes and rank for each
   MPI_Comm_size(intracomm, &mpi::n_procs);

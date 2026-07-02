@@ -80,6 +80,9 @@ public:
   //! Length of the innermost (score x nuclide) dimension of the results.
   int n_score_bins() const { return n_score_bins_; }
 
+  //! Duplicate rma staging rows merged so far (remote-coalescing diagnostic).
+  int64_t rma_merged_rows() const { return rma_merged_rows_; }
+
   //! \brief Add a contribution to the per-batch accumulator. This is the ONLY
   //! way transport writes a tally, and it is on the hot path.
   //!
@@ -294,12 +297,78 @@ private:
   int64_t rma_n_rows_ {0};         //!< number of owned filter-bin rows
   int64_t rma_plane_size_ {0};     //!< rma_n_rows_ * n_score_bins_
 
+  //! Rows per staging buffer (the coalescer depth K) for the remote-scoring
+  //! arm, sized from a fixed per-rank memory budget (or the test override).
+  //! Zero when this tally never scores remotely (single-rank runs).
+  int64_t rma_k_ {0};
+
+  //! Per-thread state for the rma remote-scoring arm (C2): a row coalescer plus
+  //! per-target double-buffered staging feeding batched MPI_Accumulate calls.
+  //! Sized num_threads(); each element is written by one thread alone, so the
+  //! only cross-thread contention is the named critical around the MPI calls.
+  struct RmaThreadStaging {
+    //! Row coalescer: consecutive score_add calls to the same remote filter bin
+    //! accumulate into row before it is flushed to a target's staging buffer.
+    int64_t coalesce_bin {-1}; //!< global filter bin held open, -1 == none
+    int coalesce_owner {-1};   //!< owner rank of coalesce_bin
+    vector<double> row;        //!< n_score_bins_ coalesced score values
+
+    //! Per-target double buffers. For target rank t and buffer b in {0, 1}, with
+    //! slot = t * 2 + b:
+    //!   data[(slot * rma_k_ + r) * n_score_bins_ + s] : staged score values
+    //!   disp[slot * rma_k_ + r] : byte displacement of row r in target t's block
+    //!   fill[slot]      : rows staged in that buffer (0..rma_k_)
+    //!   in_flight[slot] : accumulate issued, origin not yet locally retired
+    //!   cur[t]          : active buffer index for target t
+    vector<double> data;
+    vector<MPI_Aint> disp;
+    vector<int> fill;
+    vector<char> in_flight;
+    vector<int> cur;
+
+    //! Reusable scratch used when a buffer is issued: an index permutation sorted
+    //! by displacement (perm, rma_k_ ints) and the compacted, duplicate-free rows
+    //! (comp_disp / comp_data) merged before the MPI_Accumulate so its target
+    //! datatype never has overlapping entries. Written back into the buffer.
+    vector<int> perm;
+    vector<MPI_Aint> comp_disp;
+    vector<double> comp_data;
+
+    //! Count of staging rows merged into an earlier same-displacement row (a
+    //! coalescing diagnostic; > 0 exactly when a bin was staged non-consecutively
+    //! and would otherwise have produced an overlapping accumulate).
+    int64_t merged {0};
+  };
+  vector<RmaThreadStaging> rma_staging_;
+
+  //! Cumulative count of duplicate staging rows merged across the run (folded
+  //! from the per-thread counters at each publish). A remote-coalescing quality
+  //! metric, also asserted by the unit tests.
+  int64_t rma_merged_rows_ {0};
+
   //! Out-of-line handler for the rma storage mode; only reached when
-  //! storage_ == RMA.
+  //! storage_ == RMA. Local bins score into the private plane; remote bins are
+  //! coalesced and staged for a batched MPI_Accumulate.
   void rma_score_add(int64_t filter_index, int score_index, double val);
 
   //! Owner rank of a global filter-bin row under rma block distribution.
   int rma_owner(int64_t filter_index) const;
+
+  //! Allocate the per-thread remote-scoring staging from the memory budget (or
+  //! the OPENMC_RMA_STAGING_ROWS test override). No-op on single-rank runs.
+  void init_rma_staging();
+
+  //! Append a thread's open coalescer row to its target's active staging
+  //! buffer, issuing an MPI_Accumulate (and swapping buffers) when it fills.
+  void rma_coalescer_flush(RmaThreadStaging& ts);
+
+  //! Issue one hindexed-block MPI_Accumulate for a (target, buffer) staging
+  //! buffer under critical(openmc_rma). No-op if the buffer is empty.
+  void rma_stage_issue(RmaThreadStaging& ts, int target, int buf);
+
+  //! End-of-batch: flush every thread's open coalescer row and partial staging
+  //! buffer so all of this rank's contributions become outstanding accumulates.
+  void rma_drain();
 
   //! Allocate this rank's block of the distributed rma window plus the private
   //! owned-rows plane, and open the window's passive-target epoch.
