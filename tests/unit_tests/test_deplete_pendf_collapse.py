@@ -1,0 +1,221 @@
+"""Unit tests for the pointwise PENDF flux-collapse path in openmc.deplete.
+
+Covers the module-level ``_group_average`` flat-in-bin kernel, the
+``_build_xs_table_pendf`` sparse-table builder, the ``pendf_library`` dispatch
+in :meth:`MicroXS.from_multigroup_flux`, and the re-added group-length guard in
+``_SparseXSTable.collapse``.
+"""
+import io
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from openmc.deplete.microxs import (
+    MicroXS,
+    _SparseXSTable,
+    _group_average,
+    _build_xs_table_pendf,
+)
+
+CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
+PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
+
+
+class _FakePendf:
+    """Minimal duck-typed stand-in for openmc.data.PendfLibrary."""
+
+    def __init__(self, data):
+        # data: {nuclide: {mt: (energy, xs)}}
+        self._data = data
+
+    @property
+    def nuclides(self):
+        return list(self._data)
+
+    def reactions(self, nuclide):
+        return list(self._data[nuclide])
+
+    def xs(self, nuclide, mt):
+        return self._data[nuclide][mt]
+
+
+# ---------------------------------------------------------------------------
+# _group_average
+# ---------------------------------------------------------------------------
+
+def test_group_average_analytic_ramp():
+    """Ramp xs = a + b*E is integrated exactly (piecewise-linear)."""
+    a, b = 2.0, 3.0
+    # Irregular, ascending tabulated grid on [1, 10]
+    energy = np.array([1.0, 1.7, 3.2, 5.0, 6.66, 8.1, 10.0])
+    xs = a + b * energy
+
+    # Groups: [0.5,1] fully below range, [1,2.5] and [2.5,5] fully inside,
+    # [5,12] straddles the top tabulated end (10), [12,20] fully outside.
+    edges = np.array([0.5, 1.0, 2.5, 5.0, 12.0, 20.0])
+    result = _group_average(energy, xs, edges)
+
+    def exact(lo, hi):
+        return a * (hi - lo) + 0.5 * b * (hi**2 - lo**2)
+
+    assert result[0] == 0.0  # fully below the tabulated range
+    assert result[1] == pytest.approx(exact(1.0, 2.5) / 1.5, rel=1e-13)
+    assert result[2] == pytest.approx(exact(2.5, 5.0) / 2.5, rel=1e-13)
+    # Straddling group: only the [5, 10] portion contributes, divided by full dE
+    assert result[3] == pytest.approx(exact(5.0, 10.0) / 7.0, rel=1e-13)
+    assert result[4] == 0.0  # fully above the tabulated range
+
+
+def test_group_average_flat():
+    """Flat xs collapses to exactly the constant in every covered group."""
+    energy = np.array([1.0, 4.0, 7.0, 10.0])
+    xs = np.full_like(energy, 5.0)
+    edges = np.array([1.0, 3.0, 6.0, 10.0])
+    result = _group_average(energy, xs, edges)
+    assert result == pytest.approx([5.0, 5.0, 5.0], rel=1e-14)
+
+
+def test_group_average_threshold():
+    """A threshold reaction gives zero in every group below the threshold."""
+    # xs = 0 on [1, 5], then linear 0 -> 10 on [5, 10]
+    energy = np.array([1.0, 5.0, 10.0])
+    xs = np.array([0.0, 0.0, 10.0])
+    edges = np.array([1.0, 3.0, 5.0, 10.0])
+    result = _group_average(energy, xs, edges)
+    assert result[0] == 0.0  # [1, 3] below threshold
+    assert result[1] == 0.0  # [3, 5] below threshold
+    # [5, 10]: integral of a 0->10 ramp is 25, averaged over dE = 5
+    assert result[2] == pytest.approx(5.0, rel=1e-13)
+
+
+# ---------------------------------------------------------------------------
+# from_multigroup_flux(pendf_library=...) and _build_xs_table_pendf
+# ---------------------------------------------------------------------------
+
+def _fake_two_by_two():
+    # Constant cross sections tabulated over the full energy span so that every
+    # group average equals the constant. (n,gamma)=MT102, fission=MT18.
+    e = np.array([0.0, 2.0e7])
+    return _FakePendf({
+        "Gd157": {102: (e, np.array([3.0, 3.0])),
+                  18:  (e, np.array([0.0, 0.0]))},   # all-zero -> skipped
+        "U235":  {102: (e, np.array([5.0, 5.0])),
+                  18:  (e, np.array([11.0, 11.0]))},
+    })
+
+
+def test_from_multigroup_flux_pendf():
+    fake = _fake_two_by_two()
+    edges = [0.0, 1.0e3, 1.0e5, 1.0e7, 2.0e7]
+    flux = [1.0, 2.0, 3.0, 4.0]  # arbitrary; constant xs is flux-independent
+
+    micro = MicroXS.from_multigroup_flux(
+        energies=edges, multigroup_flux=flux, chain_file=CHAIN_FILE,
+        nuclides=["Gd157", "U235"], reactions=["(n,gamma)", "fission"],
+        pendf_library=fake)
+
+    assert isinstance(micro, MicroXS)
+    assert micro.nuclides == ["Gd157", "U235"]
+    assert micro.reactions == ["(n,gamma)", "fission"]
+    assert micro["Gd157", "(n,gamma)"] == pytest.approx([3.0])
+    assert micro["Gd157", "fission"] == pytest.approx([0.0])  # skipped zero row
+    assert micro["U235", "(n,gamma)"] == pytest.approx([5.0])
+    assert micro["U235", "fission"] == pytest.approx([11.0])
+
+
+def test_build_xs_table_pendf_skips_absent():
+    """Missing nuclides/MTs and all-zero rows are omitted from the table."""
+    e = np.array([0.0, 2.0e7])
+    fake = _FakePendf({
+        "U235": {18: (e, np.array([4.0, 4.0]))},   # no (n,gamma)
+    })
+    edges = np.array([0.0, 1.0e7, 2.0e7])
+    # Request a nuclide that is absent (Gd157) and an MT that is absent for U235
+    table = _build_xs_table_pendf(
+        ["Gd157", "U235"], ["(n,gamma)", "fission"], edges, fake)
+
+    # Only (U235, fission) survives -> one row mapping to (nuc=1, rxn=1)
+    assert table.xs_matrix.shape == (1, 2)
+    assert table.nuc_indices.tolist() == [1]
+    assert table.rxn_indices.tolist() == [1]
+    assert table.nuc_indices.dtype == np.int32
+    assert table.rxn_indices.dtype == np.int32
+    assert table.xs_matrix.dtype == np.float64
+    assert table.xs_matrix[0] == pytest.approx([4.0, 4.0])
+
+
+def test_from_multigroup_flux_pendf_mutual_exclusion():
+    """pendf_library rejects the continuous-energy session arguments."""
+    fake = _fake_two_by_two()
+    kwargs = dict(
+        energies=[0.0, 2.0e7], multigroup_flux=[1.0],
+        nuclides=["Gd157"], reactions=["(n,gamma)"], pendf_library=fake)
+
+    with pytest.raises(ValueError, match="cross_sections"):
+        MicroXS.from_multigroup_flux(cross_sections="fake.xml", **kwargs)
+
+    # Any openmc.lib.init keyword (captured by **init_kwargs) is also rejected
+    with pytest.raises(ValueError, match="cross_sections|init"):
+        MicroXS.from_multigroup_flux(threads=2, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# _SparseXSTable.collapse group-length guard
+# ---------------------------------------------------------------------------
+
+def test_collapse_group_length_guard():
+    table = _SparseXSTable(
+        ["Gd157"], ["(n,gamma)"],
+        np.array([[1.0, 2.0, 3.0]]),
+        np.array([0], np.int32), np.array([0], np.int32))
+
+    # Correct length works
+    table.collapse(np.array([0.2, 0.3, 0.5]))
+
+    with pytest.raises(ValueError, match="groups"):
+        table.collapse(np.array([0.5, 0.5]))
+
+
+# ---------------------------------------------------------------------------
+# Real-data spot check vs Tabulated1D.integral() (skipped if data absent)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not PENDF_DIR.exists(),
+                    reason="TENDL-2017 PENDF data not available")
+def test_group_average_vs_tabulated_integral():
+    from openmc.data import Tabulated1D
+    from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
+
+    path = PENDF_DIR / "n-Fe056.pendf"
+    assert path.exists()
+    ev = Evaluation(str(path))
+    f = io.StringIO(ev.section[3, 102])
+    get_head_record(f)                 # MF=3 HEAD record
+    _, tab = get_tab1_record(f)        # (E, xs) TAB1
+    energy = np.asarray(tab.x, dtype=float)
+    xs = np.asarray(tab.y, dtype=float)
+
+    # ~10 group edges snapped to existing grid points, 1e-5 eV -> 20 MeV, so the
+    # cumulative-integral reference is exact at each edge.
+    targets = np.array([1e-5, 1e-3, 1e-1, 1e1, 1e3, 1e5, 1e6, 5e6, 1e7,
+                        1.5e7, 2e7])
+    idx = np.unique(np.clip(np.searchsorted(energy, targets),
+                            0, len(energy) - 1))
+    edges = energy[idx]
+
+    # Reference: exact cumulative integral on the tabulated (lin-lin) grid.
+    # Truncate at the top edge so the reference stays on the same grid points
+    # the group average uses. cum[i] = integral from energy[0] to energy[i].
+    top = idx[-1]
+    cum = Tabulated1D(energy[:top + 1], xs[:top + 1]).integral()
+
+    result = _group_average(energy, xs, edges)
+    ref = np.diff(cum[idx]) / np.diff(edges)
+    np.testing.assert_allclose(result, ref, rtol=1e-10)
+
+    # Same values must come out of the sparse-table builder via the duck type
+    fake = _FakePendf({"Fe56": {102: (energy, xs)}})
+    table = _build_xs_table_pendf(["Fe56"], ["(n,gamma)"], edges, fake)
+    assert table.xs_matrix.shape == (1, len(edges) - 1)
+    np.testing.assert_allclose(table.xs_matrix[0], result, rtol=1e-12)

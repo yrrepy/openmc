@@ -358,6 +358,11 @@ class _SparseXSTable:
         flux yields reaction rates. Returns a dense
         ``(n_nuclides, n_reactions)`` array.
         """
+        n_groups = self.xs_matrix.shape[1]
+        if len(phi_norm) != n_groups:
+            raise ValueError(
+                f'Flux has {len(phi_norm)} groups but the cross section table '
+                f'expects {n_groups}')
         result = np.zeros((len(self.nuclides), len(self.reactions)))
         result[self.nuc_indices, self.rxn_indices] = self.xs_matrix @ phi_norm
         return result
@@ -417,6 +422,127 @@ def _build_xs_table_ce(
                     rows.append(xs_g)
                     nuc_idx_list.append(nuc_idx)
                     rxn_idx_list.append(rxn_idx)
+
+    xs_matrix = np.vstack(rows) if rows else np.empty((0, n_groups))
+
+    return _SparseXSTable(
+        list(nuclides), list(reactions), xs_matrix,
+        np.array(nuc_idx_list, np.int32), np.array(rxn_idx_list, np.int32))
+
+
+def _group_average(
+    energy: np.ndarray,
+    xs: np.ndarray,
+    group_edges: np.ndarray,
+) -> np.ndarray:
+    r"""Flat-in-bin group average of a pointwise cross section.
+
+    Computes :math:`\sigma_g = \int \sigma(E)\,dE / \Delta E_g` for each group,
+    treating the tabulated cross section as linear-linear between points. The
+    integral is evaluated by the trapezoid rule on the union of the group edges
+    and the reaction's own energy grid, so the result equals the exact analytic
+    integral of the piecewise-linear cross section. Energy regions outside the
+    tabulated ``(energy[0], energy[-1])`` range contribute zero (no
+    extrapolation); a group lying entirely outside that range averages to 0.
+
+    This replicates the C++ ``for_each_panel`` flat-weighting kernel
+    numerically.
+
+    Parameters
+    ----------
+    energy : numpy.ndarray
+        Ascending tabulated energies in [eV].
+    xs : numpy.ndarray
+        Cross section values in [b] at each ``energy`` point (linear-linear
+        between points).
+    group_edges : numpy.ndarray
+        Ascending energy group boundaries in [eV], length ``n_groups + 1``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Group-averaged cross sections in [b], length ``n_groups``.
+    """
+    energy = np.asarray(energy, dtype=float)
+    xs = np.asarray(xs, dtype=float)
+    edges = np.asarray(group_edges, dtype=float)
+    e_lo, e_hi = energy[0], energy[-1]
+
+    # Union grid: group edges plus the tabulated points inside the group span
+    inside_span = (energy >= edges[0]) & (energy <= edges[-1])
+    union = np.unique(np.concatenate((edges, energy[inside_span])))
+
+    # Linear-linear interpolate onto the union grid. Values outside the
+    # tabulated range are clamped by np.interp but land in intervals masked out
+    # below, so their value is irrelevant.
+    xs_u = np.interp(union, energy, xs)
+
+    # Trapezoid area of each union interval, zeroed for intervals outside the
+    # tabulated range. When e_lo/e_hi fall inside the group span they are union
+    # nodes, so no interval straddles the tabulated boundary and masking whole
+    # intervals is exact.
+    area = 0.5 * (xs_u[:-1] + xs_u[1:]) * np.diff(union)
+    covered = (union[:-1] >= e_lo) & (union[1:] <= e_hi)
+    area = np.where(covered, area, 0.0)
+
+    # Sum the intervals within each group and divide by the group width. Every
+    # group edge is a union node (located exactly by searchsorted) and, because
+    # edges are strictly ascending, each group spans at least one interval,
+    # which sidesteps the np.add.reduceat empty-slice quirk.
+    edge_idx = np.searchsorted(union, edges)
+    group_area = np.add.reduceat(area, edge_idx[:-1])
+    return group_area / np.diff(edges)
+
+
+def _build_xs_table_pendf(
+    nuclides: Sequence[str],
+    reactions: Sequence[str],
+    energies: Sequence[float],
+    pendf_library,
+) -> _SparseXSTable:
+    """Build a sparse group cross section table from a pointwise PENDF library.
+
+    Mirrors :func:`_build_xs_table_ce` but sources group cross sections from a
+    preprocessed pointwise PENDF library instead of a continuous-energy
+    openmc.lib session. Each requested ``(nuclide, reaction)`` present in the
+    library has its MF=3 cross section flat-weighted onto the group structure
+    via :func:`_group_average`; all-zero rows (nuclide or reaction absent, or a
+    threshold above the group structure) are skipped. Isomeric pathway (MF=10)
+    rows are out of scope here.
+
+    Parameters
+    ----------
+    nuclides : sequence of str
+        Nuclide names defining the result's nuclide axis.
+    reactions : sequence of str
+        Reaction names defining the result's reaction axis.
+    energies : sequence of float
+        Ascending energy group boundaries in [eV], length ``n_groups + 1``.
+    pendf_library : openmc.data.PendfLibrary
+        Pointwise PENDF library, duck-typed with ``nuclides`` (list of GNDS
+        names), ``reactions(nuclide)`` (list of MTs with MF=3 data) and
+        ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple).
+    """
+    mts = [REACTION_MT[name] for name in reactions]
+    energies = np.asarray(energies, dtype=float)
+    n_groups = len(energies) - 1
+
+    rows, nuc_idx_list, rxn_idx_list = [], [], []
+    available = set(pendf_library.nuclides)
+    for nuc_idx, nuc in enumerate(nuclides):
+        if nuc not in available:
+            continue
+        mts_present = set(pendf_library.reactions(nuc))
+        # Index by reaction, not MT, so fission/(n,fission) stay separate
+        for rxn_idx, mt in enumerate(mts):
+            if mt not in mts_present:
+                continue
+            energy, xs = pendf_library.xs(nuc, mt)
+            xs_g = _group_average(energy, xs, energies)
+            if xs_g.any():
+                rows.append(xs_g)
+                nuc_idx_list.append(nuc_idx)
+                rxn_idx_list.append(rxn_idx)
 
     xs_matrix = np.vstack(rows) if rows else np.empty((0, n_groups))
 
@@ -501,6 +627,7 @@ class MicroXS:
         reactions: Sequence[str] | None = None,
         *,
         cross_sections: PathLike | None = None,
+        pendf_library=None,
         **init_kwargs: dict,
     ) -> MicroXS | list[MicroXS]:
         """Generated microscopic cross sections from a known flux.
@@ -522,7 +649,8 @@ class MicroXS:
         .. versionchanged:: 0.15.4
             ``multigroup_flux`` may be 2-D (or a list of 1-D arrays) to collapse
             several fluxes against a single shared cross section table, returning
-            a list of :class:`MicroXS`. Added the ``cross_sections`` argument.
+            a list of :class:`MicroXS`. Added the ``cross_sections`` and
+            ``pendf_library`` arguments.
 
         Parameters
         ----------
@@ -546,6 +674,13 @@ class MicroXS:
         cross_sections : PathLike, optional
             Cross section library used to resolve nuclide data availability and
             evaluate cross sections. Defaults to ``openmc.config['cross_sections']``.
+        pendf_library : openmc.data.PendfLibrary, optional
+            Pointwise PENDF cross section library, duck-typed with ``nuclides``,
+            ``reactions(nuclide)`` and ``xs(nuclide, mt)``. When given, group
+            cross sections are flat-weighted from this library rather than from
+            continuous-energy data; the continuous-energy session arguments
+            (``cross_sections`` and any :func:`openmc.lib.init` keyword
+            arguments) are then invalid and raise ``ValueError``.
         **init_kwargs : dict
             Keyword arguments passed to :func:`openmc.lib.init`
 
@@ -580,11 +715,6 @@ class MicroXS:
             if len(flux) != n_groups:
                 raise ValueError('Length of flux array should be len(energies)-1')
 
-        # Resolve the library once; data availability is derived from it
-        if cross_sections is None:
-            cross_sections = _find_cross_sections(model=None)
-        nuclides_with_data = _get_nuclides_with_data(cross_sections)
-
         # Default nuclides/reactions from the chain only when needed
         if not nuclides or reactions is None:
             chain = _get_chain(chain_file)
@@ -593,10 +723,26 @@ class MicroXS:
             if reactions is None:
                 reactions = chain.reactions
 
-        # Build the XS table once and collapse every flux against it
-        table = _build_xs_table_ce(
-            nuclides, reactions, energies, temperature, nuclides_with_data,
-            cross_sections=cross_sections, **init_kwargs)
+        # Build the group cross section table once and collapse every flux
+        if pendf_library is not None:
+            # The pointwise PENDF path is mutually exclusive with the
+            # continuous-energy openmc.lib session path
+            if cross_sections is not None or init_kwargs:
+                raise ValueError(
+                    'cross_sections and openmc.lib init arguments configure the '
+                    'continuous-energy path and cannot be combined with '
+                    'pendf_library')
+            table = _build_xs_table_pendf(
+                nuclides, reactions, energies, pendf_library)
+        else:
+            # Resolve the library once; data availability is derived from it
+            if cross_sections is None:
+                cross_sections = _find_cross_sections(model=None)
+            nuclides_with_data = _get_nuclides_with_data(cross_sections)
+            table = _build_xs_table_ce(
+                nuclides, reactions, energies, temperature, nuclides_with_data,
+                cross_sections=cross_sections, **init_kwargs)
+
         micros = _collapse_fluxes(table, fluxes)
         return micros[0] if single else micros
 
