@@ -1,0 +1,173 @@
+"""Tests for openmc.data.pendf against real TENDL-2017 PENDF fixtures."""
+
+import io
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import openmc.data
+from openmc.data.pendf import PendfLibrary
+from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
+
+_PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
+
+_FIXTURES = {
+    "Fe56": "n-Fe056.pendf",
+    "W186": "n-W186.pendf",
+    "Am241": "n-Am241.pendf",
+    "In115": "n-In115.pendf",
+}
+
+pytestmark = pytest.mark.skipif(
+    not _PENDF_DIR.is_dir(),
+    reason=f"TENDL PENDF data not available at {_PENDF_DIR}",
+)
+
+
+def _mf3(ev, mt):
+    """Parse an MF=3 section into (QM, QI, Tabulated1D)."""
+    fo = io.StringIO(ev.section[3, mt])
+    get_head_record(fo)
+    (qm, qi, _l1, _lr), tab = get_tab1_record(fo)
+    return qm, qi, tab
+
+
+def _mf10(ev, mt):
+    """Parse an MF=10 section into (NS, [(QM, QI, IZAP, LFS, Tabulated1D), ...])."""
+    fo = io.StringIO(ev.section[10, mt])
+    _, _, _lis, _liso, ns, _ = get_head_record(fo)
+    subs = []
+    for _ in range(ns):
+        (qm, qi, izap, lfs), tab = get_tab1_record(fo)
+        subs.append((qm, qi, izap, lfs, tab))
+    return ns, subs
+
+
+@pytest.fixture(scope="module")
+def evaluations():
+    return {name: Evaluation(_PENDF_DIR / fn) for name, fn in _FIXTURES.items()}
+
+
+def test_identity(evaluations):
+    # Header-derived GNDS names and isomeric states
+    assert evaluations["Fe56"].gnds_name == "Fe56"
+    assert evaluations["W186"].gnds_name == "W186"
+    assert evaluations["Am241"].gnds_name == "Am241"
+    assert evaluations["In115"].gnds_name == "In115"
+    for ev in evaluations.values():
+        assert ev.target["isomeric_state"] == 0
+        assert abs(ev.target["temperature"] - 293.16) < 0.1
+
+
+def test_am241_mf10(evaluations):
+    ev = evaluations["Am241"]
+    mf10 = sorted(mt for (mf, mt) in ev.section if mf == 10)
+    assert mf10 == [24, 102, 108, 111]
+
+    # MT=102: MF=3 has 16157 points; MF=10 has 2 partials on the same grid
+    qm, qi, tab = _mf3(ev, 102)
+    assert len(tab.x) == 16157
+    ns, subs = _mf10(ev, 102)
+    assert ns == 2
+    assert [s[3] for s in subs] == [0, 2]          # LFS values (0 skips to 2)
+    for pqm, pqi, izap, lfs, ptab in subs:
+        assert len(ptab.x) == 16157
+        assert izap == 95242
+    # ELFS == QM - QI for each partial (LFS=0 is ground, LFS=2 excited)
+    assert (subs[0][0] - subs[0][1]) == pytest.approx(0.0)
+    assert (subs[1][0] - subs[1][1]) == pytest.approx(48600.0)
+
+
+def test_in115_mf10(evaluations):
+    ev = evaluations["In115"]
+    qm, qi, tab = _mf3(ev, 102)
+    assert len(tab.x) == 29572
+    ns, subs = _mf10(ev, 102)
+    assert ns == 3
+    assert [s[3] for s in subs] == [0, 1, 4]
+    for pqm, pqi, izap, lfs, ptab in subs:
+        assert len(ptab.x) == 29572
+        assert izap == 49116
+
+
+def test_mf3_all_lin_lin(evaluations):
+    # Every MF=3 TAB1 must be single-region lin-lin (NR=1, INT=2)
+    for ev in evaluations.values():
+        for (mf, mt) in ev.section:
+            if mf != 3:
+                continue
+            _qm, _qi, tab = _mf3(ev, mt)
+            assert len(tab.breakpoints) == 1
+            assert int(tab.interpolation[0]) == 2
+
+
+def test_basic_xs_sanity(evaluations):
+    # W186/Fe56 MT lists non-empty; energies non-decreasing; xs finite >= 0.
+    # Grids are non-decreasing (not strictly increasing): TENDL repeats the
+    # 30 MeV point as an ENDF-6 discontinuity at the TALYS evaluation boundary.
+    for name in ("Fe56", "W186"):
+        ev = evaluations[name]
+        mts = [mt for (mf, mt) in ev.section if mf == 3]
+        assert mts
+        for mt in mts:
+            _qm, _qi, tab = _mf3(ev, mt)
+            assert np.all(np.diff(tab.x) >= 0)
+            assert np.all(np.isfinite(tab.y))
+            assert np.all(tab.y >= 0)
+
+
+def test_roundtrip(tmp_path, evaluations):
+    # Symlink the 4 fixtures into an isolated directory and preprocess
+    src = tmp_path / "pendf"
+    src.mkdir()
+    for fn in _FIXTURES.values():
+        (src / fn).symlink_to(_PENDF_DIR / fn)
+
+    out = tmp_path / "tendl.h5"
+    lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+
+    # Library-level metadata
+    assert sorted(lib.nuclides) == ["Am241", "Fe56", "In115", "W186"]
+    assert lib.library == "TENDL-2017"
+    assert lib.temperature == pytest.approx(293.16)
+    assert lib.mapping == "none"
+
+    # Reopen from disk to exercise the reader path
+    reader = PendfLibrary(out)
+    try:
+        assert sorted(reader.nuclides) == ["Am241", "Fe56", "In115", "W186"]
+
+        # MF=3 arrays exactly equal the direct parse
+        _qm, _qi, tab = _mf3(evaluations["Am241"], 102)
+        energy, xs = reader.xs("Am241", 102)
+        np.testing.assert_array_equal(energy, tab.x)
+        np.testing.assert_array_equal(xs, tab.y)
+        assert reader._reaction("Am241", 102).attrs["QM"] == pytest.approx(_qm)
+
+        # MF=10 partials present with correct LFS values and ELFS = QM - QI
+        assert reader.pathways("Am241", 102) == [0, 2]
+        _ns, subs = _mf10(evaluations["Am241"], 102)
+        for pqm, pqi, izap, lfs, ptab in subs:
+            penergy, pxs = reader.pathway_xs("Am241", 102, lfs)
+            np.testing.assert_array_equal(penergy, ptab.x)
+            np.testing.assert_array_equal(pxs, ptab.y)
+            grp = reader._reaction("Am241", 102)[f"LFS{lfs}"]
+            assert grp.attrs["ELFS"] == pytest.approx(pqm - pqi)
+            assert grp.attrs["IZAP"] == izap
+            # mapping='none' -> no baked product name
+            assert reader.product("Am241", 102, lfs) is None
+
+        assert reader.pathways("In115", 102) == [0, 1, 4]
+
+        # Nuclide-level attrs correct
+        nuc = reader._nuclide("Am241")
+        assert nuc.attrs["ZA"] == 95241
+        assert nuc.attrs["LISO"] == 0
+
+        # Extra (non-activation) MTs excluded by default
+        assert not (set(reader.reactions("Am241")) &
+                    {251, 252, 253, 301, 444})
+    finally:
+        reader.close()

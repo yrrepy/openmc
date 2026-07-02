@@ -27,6 +27,7 @@ from .nbody import *
 from .thermal import *
 from .urr import *
 from .library import *
+from .pendf import *
 from .fission_energy import *
 from .resonance import *
 from .resonance_covariance import *
