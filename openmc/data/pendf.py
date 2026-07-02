@@ -26,6 +26,8 @@ import numpy as np
 import openmc
 from .data import gnds_name
 from .endf import Evaluation, get_head_record, get_tab1_record
+from .isomeric import (ELIS_ATOL, ELIS_RTOL, map_lfs_to_liso,
+                       parse_decay_isomeric_levels)
 
 __all__ = ['PendfLibrary']
 
@@ -318,7 +320,8 @@ class PendfLibrary:
     @staticmethod
     def from_endf_directory(pendf_dir, out, library=None, temperature=None,
                             keep_extra_mts=False, mapping='none',
-                            decay_file=None):
+                            decay_file=None, elis_rtol=ELIS_RTOL,
+                            elis_atol=ELIS_ATOL):
         """Preprocess a directory of PENDF files into an HDF5 library.
 
         Nuclide identity (Z, A, isomeric state) is always taken from the
@@ -346,11 +349,20 @@ class PendfLibrary:
             heating/damage, average secondary quantities, resonance
             parameters). Default is ``False``.
         mapping : {'none', 'elis', 'lfs_order'}
-            Product-mapping mode for MF=10 partials. Only ``'none'`` is
-            implemented; the others raise :class:`NotImplementedError`.
+            Product-mapping mode for MF=10 partials. ``'none'`` stores only the
+            raw IZAP/LFS/ELFS attributes. ``'elis'`` bakes a product GNDS name
+            onto each partial by matching ELFS (= QM - QI) to decay-library
+            excitation energies (:mod:`openmc.data.isomeric`); ``'lfs_order'``
+            uses the positional FISPACT-like fallback. Both require
+            ``decay_file``.
         decay_file : str or path-like, optional
-            Decay data used for product mapping (only when ``mapping`` is not
-            ``'none'``).
+            Decay data used for product mapping (required when ``mapping`` is not
+            ``'none'``). A directory of per-nuclide ENDF decay files or a single
+            concatenated decay file.
+        elis_rtol, elis_atol : float
+            Relative and absolute tolerances for ELFS/ELIS matching
+            (``mapping='elis'``). Default to the values in
+            :mod:`openmc.data.isomeric`.
 
         Returns
         -------
@@ -358,18 +370,23 @@ class PendfLibrary:
             Reader for the file just written.
 
         """
-        if mapping != 'none':
-            # TODO: re-home _map_via_elis / _map_via_lfs_order from the GENDF
-            # fork (openmc/deplete/gendf.py:1290/1619) to bake product names.
-            raise NotImplementedError(
-                f"mapping={mapping!r} is not implemented; only 'none' is "
-                "supported in this release.")
+        if mapping not in ('none', 'elis', 'lfs_order'):
+            raise ValueError(
+                f"mapping must be 'none', 'elis', or 'lfs_order', got "
+                f"{mapping!r}.")
 
         pendf_dir = Path(pendf_dir)
         out = Path(out)
         entries = _discover_pendf_files(pendf_dir)
         if not entries:
             raise ValueError(f"No PENDF files found in {pendf_dir}.")
+
+        decay_lookup = None
+        if mapping != 'none':
+            if decay_file is None:
+                raise ValueError(
+                    f"mapping={mapping!r} requires decay_file.")
+            decay_lookup = parse_decay_isomeric_levels(decay_file)
 
         lib_temperature = temperature
         with h5py.File(out, 'w') as h5:
@@ -424,15 +441,31 @@ class PendfLibrary:
                     if (10, mt) in ev.section:
                         fo = io.StringIO(ev.section[10, mt])
                         _, _, _lis, _liso, ns, _ = get_head_record(fo)
+                        partials = []
                         for _ in range(ns):
                             (pqm, pqi, izap, lfs), ptab = get_tab1_record(fo)
                             _check_lin_lin(name, 10, mt, ptab)
+                            partials.append((pqm, pqi, izap, lfs, ptab))
+
+                        lfs_to_liso = {}
+                        if mapping != 'none':
+                            lfs_to_liso = map_lfs_to_liso(
+                                [{'lfs': lfs, 'izap': izap, 'elfs': pqm - pqi}
+                                 for pqm, pqi, izap, lfs, _pt in partials],
+                                decay_lookup, mode=mapping,
+                                rtol=elis_rtol, atol=elis_atol,
+                                context=f"{name} MT={mt}")
+
+                        for pqm, pqi, izap, lfs, ptab in partials:
                             lg = mtg.create_group(f'LFS{lfs}')
                             lg.attrs['QM'] = pqm
                             lg.attrs['QI'] = pqi
                             lg.attrs['IZAP'] = izap
                             lg.attrs['LFS'] = lfs
                             lg.attrs['ELFS'] = pqm - pqi
+                            if lfs in lfs_to_liso:
+                                lg.attrs['product'] = np.bytes_(gnds_name(
+                                    izap // 1000, izap % 1000, lfs_to_liso[lfs]))
                             _write_xy(lg, ptab.x, ptab.y)
 
             h5.attrs['format_version'] = _FORMAT_VERSION
@@ -442,6 +475,11 @@ class PendfLibrary:
             h5.attrs['source_path'] = np.bytes_(str(pendf_dir))
             h5.attrs['created'] = np.bytes_(date.today().isoformat())
             h5.attrs['mapping'] = np.bytes_(mapping)
+            if mapping != 'none':
+                h5.attrs['decay_file'] = np.bytes_(str(decay_file))
+                if mapping == 'elis':
+                    h5.attrs['elis_rtol'] = float(elis_rtol)
+                    h5.attrs['elis_atol'] = float(elis_atol)
             h5.attrs['openmc_version'] = np.bytes_(openmc.__version__)
 
         return PendfLibrary(out)

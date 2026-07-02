@@ -3,6 +3,7 @@
 import io
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 
@@ -18,6 +19,13 @@ _FIXTURES = {
     "Am241": "n-Am241.pendf",
     "In115": "n-In115.pendf",
 }
+
+# Decay library used for ELIS-based product mapping. FISPACT-style directory of
+# per-nuclide ENDF decay files (ground/m1/m2 as separate materials).
+_DECAY_DIR = Path("/home/perry/NukeData/Activation/DecayData/decay_2020")
+
+# Decay files providing product-nuclide level energies for the Am241/In115 bake.
+_DECAY_FILES = ["Am242", "Am242m", "Am242n", "In116", "In116m", "In116n"]
 
 pytestmark = pytest.mark.skipif(
     not _PENDF_DIR.is_dir(),
@@ -169,5 +177,63 @@ def test_roundtrip(tmp_path, evaluations):
         # Extra (non-activation) MTs excluded by default
         assert not (set(reader.reactions("Am241")) &
                     {251, 252, 253, 301, 444})
+    finally:
+        reader.close()
+
+
+@pytest.mark.skipif(
+    not _DECAY_DIR.is_dir(),
+    reason=f"Decay data not available at {_DECAY_DIR}",
+)
+def test_elis_mapping_bake(tmp_path):
+    # Isolate the two parents that have MF=10 isomeric production, and a minimal
+    # decay directory holding just their product states.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    for name in ("Am241", "In115"):
+        fn = _FIXTURES[name]
+        (src / fn).symlink_to(_PENDF_DIR / fn)
+
+    dk = tmp_path / "decay"
+    dk.mkdir()
+    for fn in _DECAY_FILES:
+        (dk / fn).symlink_to(_DECAY_DIR / fn)
+
+    out = tmp_path / "tendl_elis.h5"
+    lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16,
+        mapping="elis", decay_file=dk)
+
+    # Root-level provenance attrs (frozen schema §4.1)
+    assert lib.mapping == "elis"
+    with h5py.File(out, "r") as f:
+        assert f.attrs["mapping"].decode() == "elis"
+        assert f.attrs["decay_file"].decode() == str(dk)
+        assert f.attrs["elis_rtol"] == pytest.approx(0.50)
+        assert f.attrs["elis_atol"] == pytest.approx(0.0)
+
+    reader = PendfLibrary(out)
+    try:
+        assert reader.mapping == "elis"
+
+        # Am241(n,gamma): LFS 0 -> ground Am242, LFS 2 -> Am242_m1 (ELFS ~48.6 keV,
+        # NOT LISO 2 -- LFS is a level index, LISO comes from ELIS matching).
+        assert reader.pathways("Am241", 102) == [0, 2]
+        assert reader.product("Am241", 102, 0) == "Am242"
+        assert reader.product("Am241", 102, 2) == "Am242_m1"
+
+        # In115(n,gamma): LFS 0/1/4 -> In116 / In116_m1 (~127.3 keV) / In116_m2
+        # (~289.7 keV). In116_m2 is present in the decay source, so LFS 4 maps.
+        assert reader.pathways("In115", 102) == [0, 1, 4]
+        assert reader.product("In115", 102, 0) == "In116"
+        assert reader.product("In115", 102, 1) == "In116_m1"
+        assert reader.product("In115", 102, 4) == "In116_m2"
+
+        # Baked product name lives on the LFS group; raw MF=10 attrs still present
+        grp = reader._reaction("In115", 102)["LFS4"]
+        assert grp.attrs["product"].decode() == "In116_m2"
+        assert grp.attrs["IZAP"] == 49116
+        assert grp.attrs["LFS"] == 4
+        assert grp.attrs["ELFS"] == pytest.approx(289660.0)
     finally:
         reader.close()
