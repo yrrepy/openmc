@@ -884,13 +884,17 @@ class MicroXS:
         cross_sections : PathLike, optional
             Cross section library used to resolve nuclide data availability and
             evaluate cross sections. Defaults to ``openmc.config['cross_sections']``.
-        pendf_library : openmc.data.PendfLibrary, optional
-            Pointwise PENDF cross section library, duck-typed with ``nuclides``,
+        pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary, optional
+            PENDF cross section library, duck-typed with ``nuclides``,
             ``reactions(nuclide)`` and ``xs(nuclide, mt)``. When given, group
-            cross sections are flat-weighted from this library rather than from
+            cross sections are taken from this library rather than from
             continuous-energy data; the continuous-energy session arguments
             (``cross_sections`` and any :func:`openmc.lib.init` keyword
-            arguments) are then invalid and raise ``ValueError``.
+            arguments) are then invalid and raise ``ValueError``. A pointwise
+            :class:`~openmc.data.PendfLibrary` is flat-weighted onto ``energies``
+            at runtime, whereas a pre-binned
+            :class:`~openmc.data.GroupedPendfLibrary` (matched to ``energies``)
+            is read directly without rebinning.
         pathways : bool, optional
             Only used with ``pendf_library``. If true (default), reactions with
             mapped isomeric MF=10 partials are expanded into per-product rows

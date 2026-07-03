@@ -11,6 +11,8 @@ the same duck-typed accessor names as the pointwise reader
 accessors :meth:`xs_g` and :meth:`pathway_xs_g`, so
 :func:`openmc.deplete.microxs._build_xs_table_pendf` can source rows from either
 library without rebinning.
+
+.. versionadded:: 0.15.4
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ def _decode(value):
 
 class GroupedPendfLibrary:
     """Pre-binned grouped PENDF library backed by an HDF5 file.
+
+    .. versionadded:: 0.15.4
 
     Parameters
     ----------
