@@ -6,6 +6,7 @@ in :meth:`MicroXS.from_multigroup_flux`, and the re-added group-length guard in
 ``_SparseXSTable.collapse``.
 """
 import io
+import os
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,8 @@ from openmc.deplete.microxs import (
 )
 
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
-PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
+PENDF_DIR = Path(os.environ.get(
+    "OPENMC_PENDF_TEST_DATA", "/home/perry/NukeData/Activation/PENDF/Point_TENDL2017"))
 
 
 class _FakePendf:
@@ -107,6 +109,24 @@ def test_group_average_threshold():
     assert result[2] == pytest.approx(5.0, rel=1e-13)
 
 
+def test_group_average_rejects_descending_energy():
+    """A descending tabulated grid is rejected, not silently averaged to zero."""
+    energy = np.array([10.0, 5.0, 1.0])
+    xs = np.array([1.0, 2.0, 3.0])
+    edges = np.array([1.0, 5.0, 10.0])
+    with pytest.raises(ValueError, match="non-decreasing"):
+        _group_average(energy, xs, edges)
+
+
+def test_group_average_rejects_nan_xs():
+    """A NaN cross section is rejected before it can poison the whole table."""
+    energy = np.array([1.0, 5.0, 10.0])
+    xs = np.array([1.0, np.nan, 3.0])
+    edges = np.array([1.0, 10.0])
+    with pytest.raises(ValueError, match="NaN"):
+        _group_average(energy, xs, edges)
+
+
 # ---------------------------------------------------------------------------
 # from_multigroup_flux(pendf_library=...) and _build_xs_table_pendf
 # ---------------------------------------------------------------------------
@@ -176,6 +196,16 @@ def test_from_multigroup_flux_pendf_mutual_exclusion():
     # Any openmc.lib.init keyword (captured by **init_kwargs) is also rejected
     with pytest.raises(ValueError, match="cross_sections|init"):
         MicroXS.from_multigroup_flux(threads=2, **kwargs)
+
+
+def test_from_multigroup_flux_pendf_rejects_temperature():
+    """A non-default temperature selects the CE path and is rejected."""
+    fake = _fake_two_by_two()
+    with pytest.raises(ValueError, match="temperature"):
+        MicroXS.from_multigroup_flux(
+            energies=[0.0, 2.0e7], multigroup_flux=[1.0],
+            nuclides=["Gd157"], reactions=["(n,gamma)"],
+            pendf_library=fake, temperature=500)
 
 
 # ---------------------------------------------------------------------------
