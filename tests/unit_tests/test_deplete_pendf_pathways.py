@@ -109,6 +109,61 @@ def test_pathway_rows_mapped():
         table.xs_matrix[0] + table.xs_matrix[1], total.xs_matrix[0])
 
 
+def test_duplicate_product_rows_sum():
+    # Two MF=10 levels (LFS 1 and 2) both map to the SAME product isomer
+    # Am242_m1 -- a level index is not the observable final state, so two levels
+    # feeding one final state is physically legitimate. Their 1-barn partials
+    # must SUM into a single qualified row (2 barns), not last-wins overwrite at
+    # the collapse fancy-index assignment.
+    fake = _FakePendf(
+        mf3={"Am241": {102: _const(2.0)}},
+        mf10={"Am241": {102: {
+            1: ("Am242_m1", _const(1.0)),
+            2: ("Am242_m1", _const(1.0)),
+        }}})
+    edges = np.array([0.0, 1.0e7, 2.0e7])
+
+    table = _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake)
+
+    # The qualified name appears in the axis exactly once
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
+    assert table.reactions.count("(n,gamma)_m1") == 1
+    m1_idx = table.reactions.index("(n,gamma)_m1")
+    # Exactly one staged row targets the m1 reaction -> no duplicate to clobber
+    assert list(table.rxn_indices).count(m1_idx) == 1
+    row = next(table.xs_matrix[i]
+               for i, r in enumerate(table.rxn_indices) if r == m1_idx)
+    np.testing.assert_allclose(row, [2.0, 2.0])   # SUM of the two partials
+
+    # End to end: the collapsed qualified row equals the summed 2 barns
+    micro = MicroXS.from_multigroup_flux(
+        energies=edges, multigroup_flux=[1.0, 1.0], chain_file=CHAIN_FILE,
+        nuclides=["Am241"], reactions=["(n,gamma)"], pendf_library=fake)
+    assert list(micro.reactions).count("(n,gamma)_m1") == 1
+    assert micro["Am241", "(n,gamma)_m1"] == pytest.approx([2.0])
+
+
+def test_duplicate_zero_then_nonzero_row_sums_once():
+    # A zero metastable partial staged first (keep_zero) followed by a nonzero
+    # duplicate for the same product must end up summed and present exactly once.
+    fake = _FakePendf(
+        mf3={"Am241": {102: _const(3.0)}},
+        mf10={"Am241": {102: {
+            1: ("Am242_m1", _const(0.0)),   # zero, staged via keep_zero
+            2: ("Am242_m1", _const(3.0)),   # nonzero duplicate -> sums in
+        }}})
+    edges = np.array([0.0, 1.0e7, 2.0e7])
+
+    table = _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake)
+
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
+    m1_idx = table.reactions.index("(n,gamma)_m1")
+    assert list(table.rxn_indices).count(m1_idx) == 1
+    row = next(table.xs_matrix[i]
+               for i, r in enumerate(table.rxn_indices) if r == m1_idx)
+    np.testing.assert_allclose(row, [3.0, 3.0])
+
+
 def test_reaction_without_mf10_single_row():
     """A reaction with no MF=10 data yields one canonical (ground) row."""
     fake = _FakePendf(mf3={"Fe56": {102: _const(2.0)}})  # no MF=10 at all
