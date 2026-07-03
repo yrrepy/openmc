@@ -279,3 +279,45 @@ def test_pathway_chain_qualified_but_micro_has_no_data_passes():
                               ("(n,gamma)_m1", "In116_m1")]})
     micro = _micro({"In115": []}, ["(n,gamma)"])  # In115 present but all-zero
     _check_pathway_consistency(chain, micro)  # no raise
+
+
+def test_zero_metastable_partial_stages_and_passes():
+    """Regression: a metastable MF=10 partial that group-averages to exactly
+    zero (its threshold is above the tally groups) must still stage a zero row,
+    so the reaction axis carries the qualified name (Part 1) and the chain <->
+    MicroXS consistency check does not raise a false positive (Part 2, mode b).
+
+    Physics: at benchmark energies all yield goes to the ground product, so the
+    metastable partial averages to 0. The ground partial IS the ground route
+    (staged under the base name), not a misrouted MF=3 total.
+    """
+    fake = _FakePendf(
+        mf3={"In115": {102: _const(4.0)}},
+        mf10={"In115": {102: {
+            0: ("In116", _const(4.0)),      # ground: all yield here
+            1: ("In116_m1", _const(0.0)),   # metastable: zero over the groups
+        }}})
+    edges = [0.0, 1.0e7, 2.0e7]
+
+    # Part 1: the all-zero metastable partial is staged, so the axis carries the
+    # qualified name with an all-zero row (ground first -> rxn 0, m1 -> rxn 1).
+    table = _build_xs_table_pendf(["In115"], ["(n,gamma)"], edges, fake)
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
+    assert table.nuc_indices.tolist() == [0, 0]
+    assert table.rxn_indices.tolist() == [0, 1]
+    np.testing.assert_array_equal(table.xs_matrix[0], [4.0, 4.0])   # ground
+    np.testing.assert_array_equal(table.xs_matrix[1], [0.0, 0.0])   # m1 all-zero
+
+    # Collapse: the qualified column is present in the MicroXS but all-zero.
+    micro = MicroXS.from_multigroup_flux(
+        energies=edges, multigroup_flux=[1.0, 1.0], chain_file=CHAIN_FILE,
+        nuclides=["In115"], reactions=["(n,gamma)"], pendf_library=fake)
+    assert "(n,gamma)_m1" in micro.reactions
+    assert micro["In115", "(n,gamma)"] == pytest.approx([4.0])
+    assert micro["In115", "(n,gamma)_m1"] == pytest.approx([0.0])
+
+    # Part 2: chain carries the qualified pathway; axis membership marks it
+    # resolved, so the check must NOT raise (this was the false positive).
+    chain = _chain({"In115": [("(n,gamma)", "In116"),
+                              ("(n,gamma)_m1", "In116_m1")]})
+    _check_pathway_consistency(chain, micro)  # no raise

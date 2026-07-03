@@ -539,8 +539,8 @@ def _build_xs_table_pendf(
     preprocessed pointwise PENDF library instead of a continuous-energy
     openmc.lib session. Each requested ``(nuclide, reaction)`` present in the
     library has its MF=3 cross section flat-weighted onto the group structure
-    via :func:`_group_average`; all-zero rows (nuclide or reaction absent, or a
-    threshold above the group structure) are skipped.
+    via :func:`_group_average`; all-zero MF=3-total rows (nuclide or reaction
+    absent, or a threshold above the group structure) are skipped.
 
     When ``pathways`` is true and the library exposes isomeric pathway data
     (MF=10 partial cross sections, per the ORIGEN-style "Option A" scheme), a
@@ -551,7 +551,10 @@ def _build_xs_table_pendf(
     Rows come exclusively from the MF=10 partials -- never from static branching
     ratios. The result's ``reactions`` axis is the expanded list: for each base
     reaction in input order, the base name first then its ``_m{n}`` variants in
-    ascending isomer order.
+    ascending isomer order. Unlike MF=3-total rows, a pathway-expanded partial
+    row is staged even when it group-averages to zero (a metastable threshold
+    above the group structure), so a product-qualified name in the reaction axis
+    reliably marks that the collapse resolved pathways for that reaction.
 
     Parameters
     ----------
@@ -592,8 +595,15 @@ def _build_xs_table_pendf(
     meta_by_base: dict[int, set[int]] = {i: set() for i in range(len(reactions))}
     available = set(pendf_library.nuclides)
 
-    def stage(nuc_idx, base_idx, row_name, xs_g):
-        if xs_g.any():
+    def stage(nuc_idx, base_idx, row_name, xs_g, keep_zero=False):
+        # Pathway-expanded partials (keep_zero) stage even when the whole row
+        # group-averages to zero (e.g. a metastable partial whose threshold lies
+        # above the group structure), so a product-qualified name in the
+        # reaction axis reliably marks that the collapse resolved pathways for
+        # this reaction. MF=3-total rows keep the drop-if-zero behaviour, where
+        # an absent reaction means "no data". A zero metastable row still
+        # registers its isomer in meta_by_base so the axis gains the column.
+        if keep_zero or xs_g.any():
             staged.append((nuc_idx, base_idx, row_name, xs_g))
             liso = _liso_from_gnds(row_name)
             if liso > 0:
@@ -658,7 +668,7 @@ def _build_xs_table_pendf(
                      for p, pg in zip(products, partial_g)),
                     key=lambda t: t[0]):
                 row_name = name if liso == 0 else f'{name}_m{liso}'
-                stage(nuc_idx, base_idx, row_name, xs_g)
+                stage(nuc_idx, base_idx, row_name, xs_g, keep_zero=True)
 
     # Build the expanded reaction axis: every base name (always present, so the
     # dense result keeps a column for each requested reaction) followed by its
@@ -712,12 +722,28 @@ def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
     :meth:`Chain.form_rxn_matrix` matches reaction rates to chain reactions by
     reaction type, so a product-qualified pathway (e.g. ``(n,gamma)_m1``) that
     exists on only one side is silently dropped or zeroed. For every nuclide
-    present in both ``chain`` and ``micro_xs``, this requires the qualified
-    (``_m{n}``) reactions the ``micro_xs`` carries (with non-zero data) to agree
-    with the chain nuclide's qualified reactions, raising ``ValueError`` listing
-    every offending ``(nuclide, reaction)`` pair otherwise. The check is confined
-    to the isomeric domain: plain (unqualified) reaction differences and nuclides
-    present on only one side are left alone (ordinary OpenMC behaviour).
+    present in both ``chain`` and ``micro_xs``, this raises ``ValueError``
+    listing every offending ``(nuclide, reaction)`` pair when either:
+
+    (a) ``micro_xs`` carries a qualified pathway *with non-zero data* for the
+        nuclide whose reaction type the chain nuclide cannot route (its rate
+        would be dropped), or
+    (b) the chain nuclide carries a qualified pathway whose reaction type is
+        entirely *absent from the* ``micro_xs`` *reaction axis* while the
+        nuclide's unqualified base row is non-zero (pathway expansion never ran
+        for this reaction, so the isomer route silently gets zero rate).
+
+    Rule (b) is axis-level: because pathway expansion stages every partial row
+    (even those that group-average to zero), the presence of a qualified name in
+    ``micro_xs.reactions`` marks that the collapse resolved pathways for that
+    reaction. A per-nuclide zero row under a *present* qualified column is
+    therefore legitimate physics (a threshold above the group structure), not a
+    mismatch. The residual limitation is that a cross-library chain/MicroXS mix,
+    where a nuclide's partials exist in one library but not the other, is not
+    detectable per-nuclide once the axis carries the qualified name; the
+    axis-level test plus rule (a) is the guarantee. Plain (unqualified) reaction
+    differences and nuclides present on only one side are left alone (ordinary
+    OpenMC behaviour).
     """
     qualified = re.compile(r'_m\d+$')
     offenders = []
@@ -734,10 +760,13 @@ def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
         for rx in micro_rxns:
             if qualified.search(rx) and rx not in chain_rxns:
                 offenders.append((nuc, rx, 'in MicroXS but not in chain'))
-        # (b) Chain carries a qualified pathway the MicroXS lacks while carrying
-        # the unqualified base -> the isomer route silently gets zero rate.
+        # (b) Chain carries a qualified pathway whose reaction type is absent
+        # from the MicroXS reaction axis while the unqualified base carries data
+        # -> pathway expansion never ran here and the isomer route silently gets
+        # zero rate. A qualified column that IS in the axis (even if this
+        # nuclide's row is zero) means expansion ran, so it is not a mismatch.
         for rx in chain_rxns:
-            if (qualified.search(rx) and rx not in micro_rxns
+            if (qualified.search(rx) and rx not in micro_xs.reactions
                     and qualified.sub('', rx) in micro_rxns):
                 offenders.append((nuc, rx, 'in chain but missing from MicroXS'))
 
