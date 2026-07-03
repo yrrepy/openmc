@@ -203,6 +203,39 @@ Functions
     endf.get_tab2_record
     endf.get_text_record
 
+PENDF Format
+------------
+
+The following classes and functions provide access to preprocessed pointwise
+PENDF cross-section libraries and to the ENDF decay data used to resolve the
+isomeric products of transmutation reactions. The default ELIS matching
+tolerances are held in the module constants ``openmc.data.isomeric.ELIS_RTOL``
+and ``openmc.data.isomeric.ELIS_ATOL``.
+
+Classes
++++++++
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+    :template: myclass.rst
+
+    PendfLibrary
+    isomeric.DecayState
+
+Functions
++++++++++
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+    :template: myfunction.rst
+
+    isomeric.elis_match
+    isomeric.lookup_liso
+    isomeric.parse_decay_isomeric_levels
+    isomeric.map_lfs_to_liso
+
 NJOY Interface
 --------------
 

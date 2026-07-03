@@ -135,6 +135,8 @@ def _discover_pendf_files(pendf_dir):
 class PendfLibrary:
     """Pointwise PENDF cross-section library backed by preprocessed HDF5.
 
+    .. versionadded:: 0.15.4
+
     Parameters
     ----------
     path : str or path-like
