@@ -472,6 +472,14 @@ def _group_average(
     xs = np.asarray(xs, dtype=float)
     edges = np.asarray(group_edges, dtype=float)
 
+    # Reject silently-wrong inputs: a descending grid makes the interpolation
+    # and reduceat masking return zeros, and a NaN would propagate through the
+    # all-zero keep-guard into the whole table.
+    if np.any(np.diff(energy) < 0):
+        raise ValueError('Tabulated energy grid must be non-decreasing')
+    if np.isnan(xs).any():
+        raise ValueError('Cross section data contains NaN values')
+
     # Coincident energies mark step discontinuities. np.interp would take only
     # the right-hand value there, dropping the sliver left of the jump, so
     # integrate each strictly increasing segment separately instead.
@@ -893,7 +901,9 @@ class MicroXS:
             cross sections are flat-weighted from this library rather than from
             continuous-energy data; the continuous-energy session arguments
             (``cross_sections`` and any :func:`openmc.lib.init` keyword
-            arguments) are then invalid and raise ``ValueError``.
+            arguments) are then invalid and raise ``ValueError``. The
+            ``temperature`` argument is likewise rejected; the library's own
+            preprocessed temperature is used.
         pathways : bool, optional
             Only used with ``pendf_library``. If true (default), reactions with
             mapped isomeric MF=10 partials are expanded into per-product rows
@@ -952,6 +962,12 @@ class MicroXS:
                     'cross_sections and openmc.lib init arguments configure the '
                     'continuous-energy path and cannot be combined with '
                     'pendf_library')
+            # temperature selects a continuous-energy evaluation; the PENDF
+            # library carries its own preprocessed temperature
+            if temperature != 293.6:
+                raise ValueError(
+                    'temperature configures the continuous-energy path and '
+                    'cannot be combined with pendf_library')
             table = _build_xs_table_pendf(
                 nuclides, reactions, energies, pendf_library, pathways=pathways)
         else:
