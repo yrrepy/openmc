@@ -441,8 +441,9 @@ def _build_xs_table_ce(
         np.array(nuc_idx_list, np.int32), np.array(rxn_idx_list, np.int32))
 
 
-# Number of fluxes collapsed per GEMM; bounds working memory to
-# ``chunk * max(n_groups, nnz)`` floats regardless of the total flux count.
+# Number of fluxes collapsed per GEMM; bounds working memory to the dense
+# scatter buffer of ``chunk * n_nuclides * n_reactions`` floats regardless of
+# the total flux count.
 _COLLAPSE_CHUNK_SIZE = 1024
 
 
@@ -461,10 +462,11 @@ def _collapse_fluxes(
     division, hence no NaN) and yields an all-zero MicroXS. Returns one
     ``(n_nuclides, n_reactions, 1)`` :class:`MicroXS` per domain.
 
-    Peak memory beyond the returned MicroXS is set by the working chunk (the
-    stacked fluxes plus the GEMM product), on the order of
-    ``chunk_size * max(n_groups, nnz)`` floats, independent of the number of
-    fluxes.
+    Peak memory beyond the returned MicroXS is set by the working chunk,
+    dominated by the dense scatter buffer that
+    :meth:`_SparseXSTable.collapse_batch` allocates: ``chunk_size *
+    n_nuclides * n_reactions`` floats (at least ``chunk_size * nnz``),
+    independent of the number of fluxes.
     """
     n_groups = table.xs_matrix.shape[1]
     micros = []
