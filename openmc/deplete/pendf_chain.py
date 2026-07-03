@@ -31,13 +31,52 @@ def _decay_filename(name):
     return f'{openmc.data.ATOMIC_SYMBOL[z]}{a:03d}{suffix}'
 
 
-def _decay_closure(decay_dir, nuclides):
-    """Return ``nuclides`` plus every decay daughter reachable from them.
+def _reaction_products(h5, name, mt_to_name):
+    """Yield the transmutation product names of ``name`` from the PENDF library.
 
-    ``Chain.from_endf`` resolves each decay mode's daughter against the decay
-    data it was given; restricting to a bare seed set leaves daughters (and
-    thus whole elements) unrepresented and trips ``replace_missing``. Walking
-    the decay closure keeps the base chain self-consistent.
+    Mirrors the reaction extraction in :func:`chain_from_pendf`: every baked
+    MF=10 ``product`` for a mapped MT, plus the DADZ ground product for a mapped
+    MT that carries no MF=10 pathway. ``name`` absent from the library yields
+    nothing.
+    """
+    if name not in h5:
+        return
+    z, a, _ = openmc.data.zam(name)
+    nuc_group = h5[name]
+    for mt_key in nuc_group:
+        if not mt_key.startswith('MT'):
+            continue
+        r_name = mt_to_name.get(int(mt_key[2:]))
+        if r_name is None:
+            continue
+        mt_group = nuc_group[mt_key]
+        lfs_keys = [k for k in mt_group if k.startswith('LFS')]
+        if lfs_keys:
+            for lfs_key in lfs_keys:
+                product = mt_group[lfs_key].attrs.get('product')
+                if product is None:
+                    continue
+                if isinstance(product, bytes):
+                    product = product.decode()
+                yield product
+        else:
+            delta_a, delta_z = openmc.data.DADZ[r_name]
+            yield f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
+
+
+def _chain_closure(decay_dir, nuclides, h5, mt_to_name):
+    """Return the transmutation+decay closure of ``nuclides``.
+
+    Maps each reachable nuclide name to its decay-sublibrary path. Restricting
+    to a bare seed set silently loses the seed's own activation products:
+    capture/transmutation products are *not* decay daughters of the seed, so a
+    decay-only walk leaves them out of the chain and the reaction pathways fall
+    into the coverage report. This walks BOTH the decay daughters and the PENDF
+    transmutation products (:func:`_reaction_products`) to a fixed point, so a
+    seeded target keeps its whole activation network. Only nuclides with a
+    decay file join the closure (unchanged rule); products lacking one never
+    enter ``chain_names`` and are surfaced as coverage by the caller. The
+    nuclide set is finite, so the walk terminates.
     """
     closure = {}
     frontier = list(nuclides)
@@ -50,8 +89,9 @@ def _decay_closure(decay_dir, nuclides):
             continue
         closure[name] = str(path)
         for mode in openmc.data.Decay(str(path)).modes:
-            if mode.daughter and mode.daughter not in closure:
+            if mode.daughter:
                 frontier.append(mode.daughter)
+        frontier.extend(_reaction_products(h5, name, mt_to_name))
     return closure
 
 
@@ -65,9 +105,12 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
     decay_dir : path-like
         Directory of ENDF decay sub-library files (one per nuclide).
     nuclides : iterable of str, optional
-        Restrict the chain to these GNDS nuclide names (and whatever decay
-        modes reference). If ``None``, every decay file in ``decay_dir`` is
-        used.
+        Restrict the chain to these GNDS nuclide names and their full
+        transmutation+decay closure: the walk follows both decay daughters and
+        PENDF reaction products (MF=10 baked products and DADZ ground products)
+        to a fixed point, so seeding only a target keeps that target's whole
+        activation network instead of dropping its capture pathways to the
+        coverage report. If ``None``, every decay file in ``decay_dir`` is used.
 
     Returns
     -------
@@ -79,16 +122,8 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
 
     """
     decay_dir = Path(decay_dir)
-    if nuclides is not None:
-        decay_files = sorted(_decay_closure(decay_dir, nuclides).values())
-    else:
-        decay_files = [str(p) for p in sorted(decay_dir.iterdir()) if p.is_file()]
 
-    # Base chain: decay structure only (no neutron files -> no reactions).
-    chain = Chain.from_endf(decay_files, [], [], reactions=(), progress=False)
-    chain_names = {nuc.name for nuc in chain.nuclides}
-
-    # Reverse MT -> canonical chain reaction name.
+    # Reverse MT -> canonical chain reaction name (built once, reused below).
     mt_to_name = {}
     for name, info in REACTIONS.items():
         for mt in info.mts:
@@ -96,6 +131,17 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
 
     coverage = []
     with h5py.File(pendf_h5, 'r') as h5:
+        if nuclides is not None:
+            decay_files = sorted(
+                _chain_closure(decay_dir, nuclides, h5, mt_to_name).values())
+        else:
+            decay_files = [str(p) for p in sorted(decay_dir.iterdir())
+                           if p.is_file()]
+
+        # Base chain: decay structure only (no neutron files -> no reactions).
+        chain = Chain.from_endf(decay_files, [], [], reactions=(), progress=False)
+        chain_names = {nuc.name for nuc in chain.nuclides}
+
         for nuclide in chain.nuclides:
             if nuclide.name not in h5:
                 continue
@@ -160,4 +206,16 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                             reason='metastable product in decay data but no MF=10 pathway'))
 
     chain.coverage = coverage
+
+    # Reactions were attached to the Nuclide objects directly, bypassing
+    # Chain.add_nuclide, so the top-level chain.reactions (built by from_endf
+    # when no reactions existed yet) is still empty and IndependentOperator
+    # would read nothing from it. Rebuild it exactly as Chain.from_xml would:
+    # first-appearance order across nuclides in chain order, then within each
+    # nuclide's reaction list (mirrors Chain.add_nuclide, chain.py).
+    chain.reactions = []
+    for nuclide in chain.nuclides:
+        for rx in nuclide.reactions:
+            if rx.type not in chain.reactions:
+                chain.reactions.append(rx.type)
     return chain

@@ -29,6 +29,15 @@ def small_chain():
     return chain_from_pendf(_PENDF_H5, _DECAY_DIR, nuclides=_NUCLIDES)
 
 
+@pytest.fixture(scope="module")
+def in115_seed_chain():
+    # Seeding ONLY the target: the closure must follow transmutation products
+    # (not just decay daughters) so the capture pathways survive. This walks
+    # the full activation network upward from In115 (~3k nuclides, tens of s),
+    # so it is its own module-scoped fixture kept off the fast path.
+    return chain_from_pendf(_PENDF_H5, _DECAY_DIR, nuclides=["In115"])
+
+
 def _reactions(chain, parent):
     """Map reaction type -> (target, branching_ratio) for a parent nuclide."""
     return {rx.type: (rx.target, rx.branching_ratio)
@@ -142,3 +151,36 @@ def test_xml_roundtrip(tmp_path, small_chain):
     back = _reactions(reread, "Am241")
     assert back["(n,gamma)"] == orig["(n,gamma)"]
     assert back["(n,gamma)_m1"] == orig["(n,gamma)_m1"]
+
+
+def test_seed_only_target_follows_transmutation(in115_seed_chain):
+    # Seeding ONLY In115: the closure must follow reaction products, so the
+    # (n,gamma) capture products join the chain and In115 carries all three
+    # capture pathways -- not just the (n,n') self-scatter to decay daughters.
+    names = {n.name for n in in115_seed_chain.nuclides}
+    assert {"In116", "In116_m1", "In116_m2", "In115_m1"} <= names
+    rxns = _reactions(in115_seed_chain, "In115")
+    assert rxns["(n,gamma)"] == ("In116", 1.0)
+    assert rxns["(n,gamma)_m1"] == ("In116_m1", 1.0)
+    assert rxns["(n,gamma)_m2"] == ("In116_m2", 1.0)
+    assert rxns["(n,n')_m1"] == ("In115_m1", 1.0)
+    # No capture pathway should have silently fallen into the coverage report.
+    dropped = [c for c in in115_seed_chain.coverage
+               if c["parent"] == "In115"
+               and c["reason"] == "pathway target not in chain nuclide set"]
+    assert dropped == []
+
+
+def test_reactions_populated_in_memory(small_chain, tmp_path):
+    # IndependentOperator reads chain.reactions on the in-memory object; it must
+    # be non-empty and match what a from_xml round-trip would produce (ordered).
+    from openmc.deplete import Chain
+
+    assert small_chain.reactions
+    assert "(n,gamma)" in small_chain.reactions
+    assert "(n,gamma)_m1" in small_chain.reactions
+
+    path = tmp_path / "reactions_roundtrip.xml"
+    small_chain.export_to_xml(path)
+    reread = Chain.from_xml(path)
+    assert small_chain.reactions == reread.reactions
