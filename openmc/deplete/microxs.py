@@ -472,6 +472,14 @@ def _group_average(
     xs = np.asarray(xs, dtype=float)
     edges = np.asarray(group_edges, dtype=float)
 
+    # Reject silently-wrong inputs: a descending grid makes the interpolation
+    # and reduceat masking return zeros, and a NaN would propagate through the
+    # all-zero keep-guard into the whole table.
+    if np.any(np.diff(energy) < 0):
+        raise ValueError('Tabulated energy grid must be non-decreasing')
+    if np.isnan(xs).any():
+        raise ValueError('Cross section data contains NaN values')
+
     # Coincident energies mark step discontinuities. np.interp would take only
     # the right-hand value there, dropping the sliver left of the jump, so
     # integrate each strictly increasing segment separately instead.
@@ -592,6 +600,11 @@ def _build_xs_table_pendf(
     # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
     # ordinals seen per base reaction are collected to build the expanded axis.
     staged: list[tuple[int, int, str, np.ndarray]] = []
+    # Position of each (nuc_idx, row_name) in ``staged`` so a duplicate row sums
+    # into the existing one instead of appending a second row that would be
+    # silently clobbered by the last-wins fancy-index assignment in
+    # ``_SparseXSTable.collapse`` (result[nuc, rxn] = ...).
+    staged_pos: dict[tuple[int, str], int] = {}
     meta_by_base: dict[int, set[int]] = {i: set() for i in range(len(reactions))}
     available = set(pendf_library.nuclides)
 
@@ -603,11 +616,23 @@ def _build_xs_table_pendf(
         # this reaction. MF=3-total rows keep the drop-if-zero behaviour, where
         # an absent reaction means "no data". A zero metastable row still
         # registers its isomer in meta_by_base so the axis gains the column.
-        if keep_zero or xs_g.any():
+        if not (keep_zero or xs_g.any()):
+            return
+        key = (nuc_idx, row_name)
+        pos = staged_pos.get(key)
+        if pos is None:
+            staged_pos[key] = len(staged)
             staged.append((nuc_idx, base_idx, row_name, xs_g))
-            liso = _liso_from_gnds(row_name)
-            if liso > 0:
-                meta_by_base[base_idx].add(liso)
+        else:
+            # Two MF=10 levels (LFS is a level index, not the observable final
+            # state) can map to the same product isomer; production of that
+            # isomer sums over the levels rather than the later partial silently
+            # overwriting the earlier one at collapse time.
+            n_i, b_i, r_i, prev = staged[pos]
+            staged[pos] = (n_i, b_i, r_i, prev + xs_g)
+        liso = _liso_from_gnds(row_name)
+        if liso > 0:
+            meta_by_base[base_idx].add(liso)
 
     for nuc_idx, nuc in enumerate(nuclides):
         if nuc not in available:
@@ -834,7 +859,7 @@ class MicroXS:
         energies: Sequence[float] | str,
         multigroup_flux: Sequence[float] | Sequence[Sequence[float]],
         chain_file: PathLike | None = None,
-        temperature: float = 293.6,
+        temperature: float | None = None,
         nuclides: Sequence[str] | None = None,
         reactions: Sequence[str] | None = None,
         *,
@@ -876,8 +901,8 @@ class MicroXS:
         chain_file : PathLike or Chain, optional
             Path to the depletion chain XML file or an instance of
             openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
-        temperature : int, optional
-            Temperature for cross section evaluation in [K].
+        temperature : float, optional
+            Temperature for cross section evaluation in [K]. Default 293.6 K.
         nuclides : list of str, optional
             Nuclides to get cross sections for. If not specified, all burnable
             nuclides from the depletion chain file are used.
@@ -893,7 +918,9 @@ class MicroXS:
             cross sections are flat-weighted from this library rather than from
             continuous-energy data; the continuous-energy session arguments
             (``cross_sections`` and any :func:`openmc.lib.init` keyword
-            arguments) are then invalid and raise ``ValueError``.
+            arguments) are then invalid and raise ``ValueError``. The
+            ``temperature`` argument is likewise rejected; the library's own
+            preprocessed temperature is used.
         pathways : bool, optional
             Only used with ``pendf_library``. If true (default), reactions with
             mapped isomeric MF=10 partials are expanded into per-product rows
@@ -912,7 +939,7 @@ class MicroXS:
             1-element list, not an unwrapped :class:`MicroXS`).
         """
 
-        check_type("temperature", temperature, (int, float))
+        check_type("temperature", temperature, (int, float, type(None)))
         # if energy is string then use group structure of that name
         if isinstance(energies, str):
             energies = GROUP_STRUCTURES[energies]
@@ -952,9 +979,18 @@ class MicroXS:
                     'cross_sections and openmc.lib init arguments configure the '
                     'continuous-energy path and cannot be combined with '
                     'pendf_library')
+            # temperature selects a continuous-energy evaluation; the PENDF
+            # library carries its own preprocessed temperature
+            if temperature is not None:
+                raise ValueError(
+                    'temperature configures the continuous-energy path and '
+                    'cannot be combined with pendf_library')
             table = _build_xs_table_pendf(
                 nuclides, reactions, energies, pendf_library, pathways=pathways)
         else:
+            # None selects the continuous-energy default (293.6 K); resolve it
+            # here, the sole place temperature is consumed (passed to group_xs).
+            temperature = 293.6 if temperature is None else temperature
             # Resolve the library once; data availability is derived from it
             if cross_sections is None:
                 cross_sections = _find_cross_sections(model=None)
