@@ -2,9 +2,10 @@
 
 from pathlib import Path
 
+import h5py
 import pytest
 
-from openmc.deplete.pendf_chain import chain_from_pendf
+from openmc.deplete.pendf_chain import chain_from_pendf, _reaction_products
 
 _PENDF_H5 = Path(
     "/home/perry/Projects/OMC_Development/PENDF/data/tendl2017_pendf_293K_elis.h5")
@@ -184,3 +185,14 @@ def test_reactions_populated_in_memory(small_chain, tmp_path):
     small_chain.export_to_xml(path)
     reread = Chain.from_xml(path)
     assert small_chain.reactions == reread.reactions
+
+
+def test_reaction_products_skips_out_of_range_z():
+    # An exotic multi-particle MT on a low-Z target drives the product below
+    # Z=1; _reaction_products must skip it instead of raising a KeyError on the
+    # ATOMIC_SYMBOL lookup. (n,3a) on H1 gives Z = 1 + (-6) = -5.
+    with h5py.File("mem.h5", "w", driver="core", backing_store=False) as h5:
+        grp = h5.create_group("H1")
+        grp.create_group("MT999")  # no LFS -> DADZ/ATOMIC_SYMBOL ground path
+        products = list(_reaction_products(h5, "H1", {999: "(n,3a)"}))
+    assert products == []

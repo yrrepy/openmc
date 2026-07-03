@@ -142,3 +142,29 @@ def test_default_keeps_all_siblings():
 
     nuclide_names = {n.name for n in reduced.nuclides}
     assert nuclide_names == {'Ag108', 'Ag109', 'Ag109_m1'}
+
+
+def test_reduce_after_add_nuclide_respects_new_sibling():
+    """A sibling added between reductions is honored (no stale family cache)."""
+    chain = create_chain_with_siblings()
+
+    # First reduce builds the per-call isomeric family mapping.
+    chain.reduce(['Ag108'], level=1, keep_isomeric_siblings=True)
+
+    # Add a new metastable sibling of Ag109 after the first reduce.
+    ag109_m2 = openmc.deplete.Nuclide('Ag109_m2')
+    ag109_m2.half_life = 1.0
+    ag109_m2.add_decay_mode('IT', 'Ag109', 1.0)
+    chain.add_nuclide(ag109_m2)
+
+    reduced = chain.reduce(['Ag108'], level=1, keep_isomeric_siblings=True)
+
+    nuclide_names = {n.name for n in reduced.nuclides}
+    assert nuclide_names == {'Ag108', 'Ag109', 'Ag109_m1', 'Ag109_m2'}
+    # The family mapping must not persist on the chain between reductions.
+    assert not hasattr(chain, '_isomeric_families')
+
+
+def test_chain_from_pendf_exported():
+    """chain_from_pendf is re-exported at the openmc.deplete package level."""
+    assert hasattr(openmc.deplete, 'chain_from_pendf')
