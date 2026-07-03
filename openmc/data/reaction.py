@@ -78,6 +78,7 @@ REACTION_MT['elastic'] = 2
 REACTION_MT['fission'] = 18
 REACTION_MT['absorption'] = 27
 REACTION_MT['capture'] = 102
+REACTION_MT["(n,n')"] = 4  # Alias for (n,level) - total inelastic scattering
 
 FISSION_MTS = (18, 19, 20, 21, 38)
 
