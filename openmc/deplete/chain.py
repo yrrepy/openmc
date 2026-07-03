@@ -1337,22 +1337,22 @@ class Chain:
             return nuclide_name.rsplit('_m', 1)[0]
         return nuclide_name
 
-    def _build_isomeric_families_cache(self):
-        """Cache the isomeric family (ground + metastables) of each nuclide."""
+    def _build_isomeric_families(self):
+        """Map each nuclide name to its isomeric family (ground + metastables).
+
+        Built fresh on each call rather than cached on the chain: the mapping
+        is only needed for the duration of a single :meth:`reduce`, and caching
+        it on ``self`` would go stale if nuclides were added between reductions.
+        """
         families = defaultdict(list)
         for nuc in self.nuclides:
             families[self._get_base_name(nuc.name)].append(nuc.name)
 
-        self._isomeric_families = {}
+        isomeric_families = {}
         for family in families.values():
             for name in family:
-                self._isomeric_families[name] = family
-
-    def _get_isomeric_siblings(self, nuclide_name):
-        """Return all isomeric siblings of a nuclide present in the chain."""
-        if not hasattr(self, '_isomeric_families'):
-            self._build_isomeric_families_cache()
-        return self._isomeric_families.get(nuclide_name, [nuclide_name])
+                isomeric_families[name] = family
+        return isomeric_families
 
     def _expand_with_isomeric_siblings(self, isotope_set):
         """Expand an isotope set in place to include all isomeric siblings.
@@ -1371,10 +1371,11 @@ class Chain:
         set of str
             The expanded set (same object as the input).
         """
+        families = self._build_isomeric_families()
         to_check = list(isotope_set)
         while to_check:
             name = to_check.pop()
-            for sibling in self._get_isomeric_siblings(name):
+            for sibling in families.get(name, [name]):
                 if sibling in self.nuclide_dict and sibling not in isotope_set:
                     isotope_set.add(sibling)
                     to_check.append(sibling)

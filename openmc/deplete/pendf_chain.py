@@ -63,7 +63,10 @@ def _reaction_products(h5, name, mt_to_name):
                 yield product
         else:
             delta_a, delta_z = openmc.data.DADZ[r_name]
-            yield f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
+            # Exotic multi-particle MTs on low-Z targets can push the product
+            # below Z=1; no such nuclide exists, so skip it.
+            if (z + delta_z) in openmc.data.ATOMIC_SYMBOL:
+                yield f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
 
 
 def _chain_closure(decay_dir, nuclides, h5, mt_to_name):
@@ -159,12 +162,15 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                 if name is None:
                     continue
                 mt_group = nuc_group[mt_key]
-                # MT-group QI drives the no-MF=10 (ground-only) branch; each
-                # LFS pathway carries its own QI (differs by product excitation).
-                q_value = float(mt_group.attrs['QI'])
 
                 # Ground product from DADZ (Sym{A}), drives coverage checks.
                 delta_a, delta_z = openmc.data.DADZ[name]
+                if (z + delta_z) not in openmc.data.ATOMIC_SYMBOL:
+                    # Exotic multi-particle MT drove the product below Z=1.
+                    coverage.append(dict(
+                        parent=nuclide.name, reaction=name, product=None,
+                        reason='product Z out of range'))
+                    continue
                 ground = f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
 
                 lfs_keys = sorted(k for k in mt_group if k.startswith('LFS'))
@@ -184,7 +190,11 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                         liso = openmc.data.zam(product)[2]
                         r_type = name if liso == 0 else f'{name}_m{liso}'
                         if product in chain_names:
-                            lfs_q = float(sub.attrs['QI'])
+                            if 'QI' not in sub.attrs:
+                                coverage.append(dict(
+                                    parent=nuclide.name, reaction=r_type, product=product,
+                                    reason='LFS QI absent; Q defaulted to 0.0'))
+                            lfs_q = float(sub.attrs.get('QI', 0.0))
                             nuclide.add_reaction(r_type, product, lfs_q, 1.0)
                             products_added.add(product)
                         else:
@@ -192,7 +202,15 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                                 parent=nuclide.name, reaction=r_type, product=product,
                                 reason='pathway target not in chain nuclide set'))
                 else:
-                    # No MF=10 -> single canonical reaction to the ground product.
+                    # No MF=10 -> single canonical reaction to the ground
+                    # product. The MT-group QI drives this ground-only branch;
+                    # read it here (only branch that uses it) and default to 0.0
+                    # with a coverage note if the file omits it.
+                    if 'QI' not in mt_group.attrs:
+                        coverage.append(dict(
+                            parent=nuclide.name, reaction=name, product=ground,
+                            reason='MT-group QI absent; Q defaulted to 0.0'))
+                    q_value = float(mt_group.attrs.get('QI', 0.0))
                     if ground in chain_names:
                         nuclide.add_reaction(name, ground, q_value, 1.0)
                         products_added.add(ground)
