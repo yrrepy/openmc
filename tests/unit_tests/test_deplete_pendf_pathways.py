@@ -13,9 +13,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from openmc.deplete.chain import Chain
+from openmc.deplete.nuclide import Nuclide
 from openmc.deplete.microxs import (
     MicroXS,
     _build_xs_table_pendf,
+    _check_pathway_consistency,
     _liso_from_gnds,
 )
 
@@ -201,3 +204,78 @@ def test_from_multigroup_flux_pathways_end_to_end():
         pathways=False)
     assert micro_no.reactions == ["(n,gamma)"]
     assert micro_no["Am241", "(n,gamma)"] == pytest.approx([5.0])
+
+
+# ---------------------------------------------------------------------------
+# Deplete-time chain <-> MicroXS pathway-mismatch hard error
+# (plan section 1.1: mismatch is a hard error, never a silent fallback)
+# ---------------------------------------------------------------------------
+
+def _chain(reactions_by_nuc):
+    """Minimal Chain with the given ``{nuc: [(type, target), ...]}`` reactions."""
+    chain = Chain()
+    for name, rxns in reactions_by_nuc.items():
+        nuc = Nuclide(name)
+        for rtype, target in rxns:
+            nuc.add_reaction(rtype, target, 0.0, 1.0)
+        chain.add_nuclide(nuc)
+    return chain
+
+
+def _micro(carried_by_nuc, reactions):
+    """MicroXS over ``reactions`` with a non-zero group for carried pairs."""
+    nuclides = list(carried_by_nuc)
+    data = np.zeros((len(nuclides), len(reactions), 1))
+    for i, nuc in enumerate(nuclides):
+        for rx in carried_by_nuc[nuc]:
+            data[i, reactions.index(rx), 0] = 1.0
+    return MicroXS(data, nuclides, reactions)
+
+
+def test_pathway_mismatch_micro_only_raises():
+    """(a) MicroXS carries a qualified row the chain cannot route -> raise."""
+    chain = _chain({"In115": [("(n,gamma)", "In116")]})  # no _m1 in chain
+    micro = _micro({"In115": ["(n,gamma)", "(n,gamma)_m1"]},
+                   ["(n,gamma)", "(n,gamma)_m1"])
+    with pytest.raises(ValueError, match="pathway mismatch") as exc:
+        _check_pathway_consistency(chain, micro)
+    assert "In115 (n,gamma)_m1" in str(exc.value)
+
+
+def test_pathway_mismatch_chain_only_raises():
+    """(b) Chain carries a qualified pathway the MicroXS lacks (base present)."""
+    chain = _chain({"In115": [("(n,gamma)", "In116"),
+                              ("(n,gamma)_m1", "In116_m1")]})
+    micro = _micro({"In115": ["(n,gamma)"]}, ["(n,gamma)"])  # base only
+    with pytest.raises(ValueError, match="pathway mismatch") as exc:
+        _check_pathway_consistency(chain, micro)
+    assert "In115 (n,gamma)_m1" in str(exc.value)
+
+
+def test_pathway_consistent_qualified_passes():
+    """Matching qualified reactions on both sides -> no error."""
+    chain = _chain({"In115": [("(n,gamma)", "In116"),
+                              ("(n,gamma)_m1", "In116_m1")]})
+    micro = _micro({"In115": ["(n,gamma)", "(n,gamma)_m1"]},
+                   ["(n,gamma)", "(n,gamma)_m1"])
+    _check_pathway_consistency(chain, micro)  # no raise
+
+
+def test_plain_non_pathway_passes():
+    """No qualified names anywhere -> untouched, even with unqualified diffs and
+    nuclides present on only one side."""
+    chain = _chain({"Fe56": [("(n,gamma)", "Fe57"), ("(n,p)", "Mn56")],
+                    "Cs137": [("(n,gamma)", "Cs138")]})  # Cs137 only in chain
+    micro = _micro({"Fe56": ["(n,gamma)"],            # (n,p) only in chain: ok
+                    "W186": ["(n,gamma)"]},           # W186 only in MicroXS: ok
+                   ["(n,gamma)", "(n,p)"])
+    _check_pathway_consistency(chain, micro)  # no raise
+
+
+def test_pathway_chain_qualified_but_micro_has_no_data_passes():
+    """Chain has a qualified pathway but MicroXS carries no data for the nuclide
+    (base absent) -> a no-data nuclide, not a mismatch."""
+    chain = _chain({"In115": [("(n,gamma)", "In116"),
+                              ("(n,gamma)_m1", "In116_m1")]})
+    micro = _micro({"In115": []}, ["(n,gamma)"])  # In115 present but all-zero
+    _check_pathway_consistency(chain, micro)  # no raise

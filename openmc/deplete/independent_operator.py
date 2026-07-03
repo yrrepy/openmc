@@ -18,7 +18,7 @@ from openmc.mpi import comm
 from .abc import ReactionRateHelper, OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
-from .microxs import MicroXS
+from .microxs import MicroXS, _check_pathway_consistency
 from .results import Results
 from .helpers import ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper
 
@@ -153,6 +153,13 @@ class IndependentOperator(OpenMCOperator):
             fission_q=fission_q,
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level)
+
+        # Isomeric pathway reactions are matched to the chain by reaction type,
+        # so a product-qualified pathway present on only one side would be
+        # silently dropped or zeroed; fail loudly instead (chain is the reduced
+        # one built above). Ordinary non-isomeric usage is untouched.
+        for micro in self.cross_sections:
+            _check_pathway_consistency(self.chain, micro)
 
     @classmethod
     def from_nuclides(cls, volume, nuclides,

@@ -623,12 +623,15 @@ def _build_xs_table_pendf(
             if nz.any():
                 dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
                 worst = float(dev.max())
-                if worst > 1e-6:
+                # Real TENDL-2017 partials deviate from the MF=3 total by up to
+                # ~4e-6 per group (genuine data property); 1e-6 would warn on
+                # nearly every isomeric nuclide at full-library scale.
+                if worst > 1e-5:
                     g = int(np.nonzero(nz)[0][dev.argmax()])
                     warn(f'PENDF MF=10 partials for {nuc} MT={mt} sum to '
                          f'{part_sum[g]:.6e} b but the MF=3 total is '
                          f'{total_g[g]:.6e} b in group {g} (max relative '
-                         f'deviation {worst:.3e} > 1e-6).')
+                         f'deviation {worst:.3e} > 1e-5).')
             # Emit ground first, then ascending isomer order
             for liso, xs_g in sorted(
                     ((_liso_from_gnds(p), pg)
@@ -681,6 +684,52 @@ def _collapse_fluxes(table: _SparseXSTable, fluxes: Sequence[np.ndarray]) -> lis
         micros.append(MicroXS(collapsed[:, :, np.newaxis],
                               table.nuclides, table.reactions))
     return micros
+
+
+def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
+    """Fail on chain/MicroXS isomeric-pathway mismatches before depletion.
+
+    :meth:`Chain.form_rxn_matrix` matches reaction rates to chain reactions by
+    reaction type, so a product-qualified pathway (e.g. ``(n,gamma)_m1``) that
+    exists on only one side is silently dropped or zeroed. For every nuclide
+    present in both ``chain`` and ``micro_xs``, this requires the qualified
+    (``_m{n}``) reactions the ``micro_xs`` carries (with non-zero data) to agree
+    with the chain nuclide's qualified reactions, raising ``ValueError`` listing
+    every offending ``(nuclide, reaction)`` pair otherwise. The check is confined
+    to the isomeric domain: plain (unqualified) reaction differences and nuclides
+    present on only one side are left alone (ordinary OpenMC behaviour).
+    """
+    qualified = re.compile(r'_m\d+$')
+    offenders = []
+    for nuc in micro_xs.nuclides:
+        if nuc not in chain:
+            continue
+        chain_rxns = {r.type for r in chain[nuc].reactions}
+        n_idx = micro_xs._index_nuc[nuc]
+        # Reactions this MicroXS actually carries for this nuclide (non-zero row)
+        micro_rxns = {rx for rx in micro_xs.reactions
+                      if micro_xs.data[n_idx, micro_xs._index_rx[rx]].any()}
+        # (a) MicroXS carries a qualified pathway the chain cannot route -> its
+        # rate is dropped when the reaction type is not in the chain.
+        for rx in micro_rxns:
+            if qualified.search(rx) and rx not in chain_rxns:
+                offenders.append((nuc, rx, 'in MicroXS but not in chain'))
+        # (b) Chain carries a qualified pathway the MicroXS lacks while carrying
+        # the unqualified base -> the isomer route silently gets zero rate.
+        for rx in chain_rxns:
+            if (qualified.search(rx) and rx not in micro_rxns
+                    and qualified.sub('', rx) in micro_rxns):
+                offenders.append((nuc, rx, 'in chain but missing from MicroXS'))
+
+    if offenders:
+        lines = '\n'.join(f'  {nuc} {rx} ({why})' for nuc, rx, why in offenders)
+        raise ValueError(
+            'Isomeric pathway mismatch between the depletion chain and MicroXS. '
+            'These product-qualified reaction rates would be silently dropped or '
+            'zeroed when forming the transmutation matrix (rates are matched by '
+            f'reaction type):\n{lines}\n'
+            'Regenerate the chain and MicroXS from the same PENDF MF=10 product '
+            'mapping so their qualified reactions agree.')
 
 
 class MicroXS:
