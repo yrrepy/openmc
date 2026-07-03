@@ -9,6 +9,8 @@ single product. The ground channel keeps the canonical reaction name
 (``(n,gamma)``); metastable channels are product-qualified (``(n,gamma)_m1``,
 ``(n,gamma)_m2``, ...) so the reaction ``type`` matches the per-target rows a
 PENDF MicroXS carries. No branching ratios are stored.
+
+.. versionadded:: 0.15.4
 """
 
 from pathlib import Path
@@ -97,6 +99,8 @@ def _chain_closure(decay_dir, nuclides, h5, mt_to_name):
 
 def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
     """Build a depletion chain with PENDF isomeric pathway reactions.
+
+    .. versionadded:: 0.15.4
 
     Parameters
     ----------
