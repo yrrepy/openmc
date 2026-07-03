@@ -579,10 +579,30 @@ def _build_xs_table_pendf(
     energies = np.asarray(energies, dtype=float)
     n_groups = len(energies) - 1
 
+    # Fast path: a grouped PENDF library exposes ``group_edges`` and pre-binned
+    # ``xs_g``/``pathway_xs_g`` accessors, so rows are read straight from the
+    # file instead of flat-weighting pointwise data at runtime. The library's
+    # own edges must equal the requested tally structure exactly -- a grouped
+    # library carries no pointwise data to rebin, so a mismatch is a hard error
+    # (never a silent fallback).
+    lib_edges = getattr(pendf_library, 'group_edges', None)
+    grouped = lib_edges is not None
+    if grouped:
+        lib_edges = np.asarray(lib_edges, dtype=float)
+        if not np.array_equal(lib_edges, energies):
+            raise ValueError(
+                f'Grouped PENDF library has {len(lib_edges)} group edges but '
+                f'the requested tally structure has {len(energies)}; a grouped '
+                f'library must be collapsed on its own edges (no rebinning). '
+                f'Edge arrays differ (counts and/or values).')
+
     # Pathway expansion needs all three MF=10 accessors; a library lacking them
     # (e.g. an MF=3-only stand-in) transparently falls back to the total row.
+    # Grouped libraries expose pre-binned ``pathway_xs_g``; pointwise ones expose
+    # ``pathway_xs``.
     pathways_fn = getattr(pendf_library, 'pathways', None) if pathways else None
-    pathway_xs_fn = getattr(pendf_library, 'pathway_xs', None)
+    pathway_xs_fn = getattr(
+        pendf_library, 'pathway_xs_g' if grouped else 'pathway_xs', None)
     product_fn = getattr(pendf_library, 'product', None)
     have_pathways = None not in (pathways_fn, pathway_xs_fn, product_fn)
 
@@ -607,8 +627,11 @@ def _build_xs_table_pendf(
         for base_idx, (name, mt) in enumerate(zip(reactions, mts)):
             if mt not in mts_present:
                 continue
-            energy, xs = pendf_library.xs(nuc, mt)
-            total_g = _group_average(energy, xs, energies)
+            if grouped:
+                total_g = pendf_library.xs_g(nuc, mt)
+            else:
+                energy, xs = pendf_library.xs(nuc, mt)
+                total_g = _group_average(energy, xs, energies)
 
             lfs_list = list(pathways_fn(nuc, mt)) if have_pathways else []
             if not lfs_list:
@@ -636,8 +659,11 @@ def _build_xs_table_pendf(
             # against the MF=3 total before staging.
             partial_g = []
             for lfs in lfs_list:
-                pe, pxs = pathway_xs_fn(nuc, mt, lfs)
-                partial_g.append(_group_average(pe, pxs, energies))
+                if grouped:
+                    partial_g.append(pathway_xs_fn(nuc, mt, lfs))
+                else:
+                    pe, pxs = pathway_xs_fn(nuc, mt, lfs)
+                    partial_g.append(_group_average(pe, pxs, energies))
             part_sum = np.sum(partial_g, axis=0)
             nz = total_g != 0.0
             if nz.any():
