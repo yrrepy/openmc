@@ -76,6 +76,24 @@ def test_group_average_flat():
     assert result == pytest.approx([5.0, 5.0, 5.0], rel=1e-14)
 
 
+def test_group_average_step_discontinuity():
+    """Coincident-energy jumps keep both sides (C++ for_each_panel semantics)."""
+    # 158 b plateau on [100, 150], step down to a 34 b plateau on [150, 200]
+    energy = np.array([100.0, 150.0, 150.0, 200.0])
+    xs = np.array([158.0, 158.0, 34.0, 34.0])
+    result = _group_average(energy, xs, np.array([100.0, 200.0]))
+    assert result[0] == pytest.approx(96.0, rel=1e-13)  # (50*158 + 50*34)/100
+
+
+def test_group_average_jump_on_group_edge():
+    """A jump coinciding with a group edge splits cleanly between the groups."""
+    energy = np.array([100.0, 150.0, 150.0, 200.0])
+    xs = np.array([158.0, 158.0, 34.0, 34.0])
+    result = _group_average(energy, xs, np.array([100.0, 150.0, 200.0]))
+    assert result[0] == pytest.approx(158.0, rel=1e-13)
+    assert result[1] == pytest.approx(34.0, rel=1e-13)
+
+
 def test_group_average_threshold():
     """A threshold reaction gives zero in every group below the threshold."""
     # xs = 0 on [1, 5], then linear 0 -> 10 on [5, 10]
