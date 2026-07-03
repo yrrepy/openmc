@@ -443,12 +443,15 @@ def _group_average(
     treating the tabulated cross section as linear-linear between points. The
     integral is evaluated by the trapezoid rule on the union of the group edges
     and the reaction's own energy grid, so the result equals the exact analytic
-    integral of the piecewise-linear cross section. Energy regions outside the
-    tabulated ``(energy[0], energy[-1])`` range contribute zero (no
-    extrapolation); a group lying entirely outside that range averages to 0.
+    integral of the piecewise-linear cross section. Coincident-energy points
+    (step discontinuities, e.g. TENDL's repeated 30 MeV node) split the data
+    into strictly increasing segments integrated separately, so both sides of
+    a jump contribute exactly. Energy regions outside the tabulated
+    ``(energy[0], energy[-1])`` range contribute zero (no extrapolation); a
+    group lying entirely outside that range averages to 0.
 
-    This replicates the C++ ``for_each_panel`` flat-weighting kernel
-    numerically.
+    This replicates the C++ ``for_each_panel`` flat-weighting kernel, which
+    skips the zero-width panel at a coincident point (src/reaction.cpp).
 
     Parameters
     ----------
@@ -468,6 +471,24 @@ def _group_average(
     energy = np.asarray(energy, dtype=float)
     xs = np.asarray(xs, dtype=float)
     edges = np.asarray(group_edges, dtype=float)
+
+    # Coincident energies mark step discontinuities. np.interp would take only
+    # the right-hand value there, dropping the sliver left of the jump, so
+    # integrate each strictly increasing segment separately instead.
+    splits = np.flatnonzero(np.diff(energy) == 0.0) + 1
+    group_area = np.zeros(len(edges) - 1)
+    for seg_e, seg_xs in zip(np.split(energy, splits), np.split(xs, splits)):
+        if len(seg_e) >= 2:
+            group_area += _segment_group_area(seg_e, seg_xs, edges)
+    return group_area / np.diff(edges)
+
+
+def _segment_group_area(
+    energy: np.ndarray,
+    xs: np.ndarray,
+    edges: np.ndarray,
+) -> np.ndarray:
+    """Per-group trapezoid integral of one strictly increasing segment."""
     e_lo, e_hi = energy[0], energy[-1]
 
     # Union grid: group edges plus the tabulated points inside the group span
@@ -487,13 +508,12 @@ def _group_average(
     covered = (union[:-1] >= e_lo) & (union[1:] <= e_hi)
     area = np.where(covered, area, 0.0)
 
-    # Sum the intervals within each group and divide by the group width. Every
+    # Sum the intervals within each group. Every
     # group edge is a union node (located exactly by searchsorted) and, because
     # edges are strictly ascending, each group spans at least one interval,
     # which sidesteps the np.add.reduceat empty-slice quirk.
     edge_idx = np.searchsorted(union, edges)
-    group_area = np.add.reduceat(area, edge_idx[:-1])
-    return group_area / np.diff(edges)
+    return np.add.reduceat(area, edge_idx[:-1])
 
 
 def _liso_from_gnds(name: str) -> int:
