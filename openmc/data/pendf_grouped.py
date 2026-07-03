@@ -59,17 +59,27 @@ class GroupedPendfLibrary:
     def __init__(self, path: PathLike):
         self._path = Path(path)
         self._file = h5py.File(self._path, 'r')
-        fmt = _decode(self._file.attrs.get('format'))
-        if fmt != GROUPED_FORMAT:
+        # Any failure while validating/reading the just-opened file must close
+        # the handle before propagating, otherwise a caller that catches the
+        # error leaks the open HDF5 file.
+        try:
+            fmt = _decode(self._file.attrs.get('format'))
+            if fmt != GROUPED_FORMAT:
+                raise ValueError(
+                    f"{self._path} is not a grouped PENDF library "
+                    f"(format={fmt!r}, expected {GROUPED_FORMAT!r}).")
+            if 'group_edges' not in self._file:
+                raise ValueError(
+                    f"{self._path} is not a grouped PENDF library "
+                    f"(missing 'group_edges' dataset).")
+            self._group_edges = np.asarray(
+                self._file['group_edges'][()], dtype=np.float64)
+            self._nuclides = [
+                name for name, obj in self._file.items()
+                if isinstance(obj, h5py.Group)]
+        except Exception:
             self._file.close()
-            raise ValueError(
-                f"{self._path} is not a grouped PENDF library "
-                f"(format={fmt!r}, expected {GROUPED_FORMAT!r}).")
-        self._group_edges = np.asarray(
-            self._file['group_edges'][()], dtype=np.float64)
-        self._nuclides = [
-            name for name, obj in self._file.items()
-            if isinstance(obj, h5py.Group)]
+            raise
 
     def close(self):
         """Close the backing HDF5 file."""

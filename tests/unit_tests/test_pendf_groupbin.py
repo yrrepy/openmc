@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from openmc.data import GroupedPendfLibrary
+from openmc.data.pendf_grouped import GROUPED_FORMAT
 from openmc.deplete.microxs import _build_xs_table_pendf
 
 # Load the writer CLI module (tools/ is not a package) by path.
@@ -179,6 +180,21 @@ def test_edge_mismatch_hard_error(libs):
     other = np.array([1e-5, 1e3, 2e7])  # different count -> mismatch
     with pytest.raises(ValueError, match="group edges"):
         _build_xs_table_pendf(["In115"], REACTIONS, other, grouped)
+
+
+def test_missing_group_edges_raises_and_closes(tmp_path):
+    """Right format attr but no group_edges: informative raise, no handle leak.
+
+    The reader opens the file before validating it; a failure during that
+    post-open init must close the handle (guarded try/except) and re-raise with
+    a message that names the missing dataset rather than leaking a KeyError.
+    """
+    path = tmp_path / "no_edges.h5"
+    with h5py.File(path, "w") as f:
+        f.attrs["format"] = np.bytes_(GROUPED_FORMAT)  # passes the format check
+        # ... but no 'group_edges' dataset is written.
+    with pytest.raises((ValueError, KeyError), match="group_edges"):
+        GroupedPendfLibrary(path)
 
 
 def test_writer_summary(tmp_path):

@@ -208,6 +208,17 @@ def test_from_multigroup_flux_pendf_rejects_temperature():
             pendf_library=fake, temperature=500)
 
 
+def test_from_multigroup_flux_pendf_accepts_temperature_none():
+    """The sentinel default (temperature=None) is accepted with pendf_library."""
+    fake = _fake_two_by_two()
+    micro = MicroXS.from_multigroup_flux(
+        energies=[0.0, 2.0e7], multigroup_flux=[1.0], chain_file=CHAIN_FILE,
+        nuclides=["Gd157", "U235"], reactions=["(n,gamma)", "fission"],
+        pendf_library=fake, temperature=None)
+    assert isinstance(micro, MicroXS)
+    assert micro["U235", "(n,gamma)"] == pytest.approx([5.0])
+
+
 # ---------------------------------------------------------------------------
 # _SparseXSTable.collapse group-length guard
 # ---------------------------------------------------------------------------
