@@ -650,7 +650,7 @@ class MicroXS:
         energies: Sequence[float] | str,
         multigroup_flux: Sequence[float] | Sequence[Sequence[float]],
         chain_file: PathLike | None = None,
-        temperature: float = 293.6,
+        temperature: float | None = None,
         nuclides: Sequence[str] | None = None,
         reactions: Sequence[str] | None = None,
         *,
@@ -691,8 +691,8 @@ class MicroXS:
         chain_file : PathLike or Chain, optional
             Path to the depletion chain XML file or an instance of
             openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
-        temperature : int, optional
-            Temperature for cross section evaluation in [K].
+        temperature : float, optional
+            Temperature for cross section evaluation in [K]. Default 293.6 K.
         nuclides : list of str, optional
             Nuclides to get cross sections for. If not specified, all burnable
             nuclides from the depletion chain file are used.
@@ -722,7 +722,7 @@ class MicroXS:
             1-element list, not an unwrapped :class:`MicroXS`).
         """
 
-        check_type("temperature", temperature, (int, float))
+        check_type("temperature", temperature, (int, float, type(None)))
         # if energy is string then use group structure of that name
         if isinstance(energies, str):
             energies = GROUP_STRUCTURES[energies]
@@ -764,13 +764,16 @@ class MicroXS:
                     'pendf_library')
             # temperature selects a continuous-energy evaluation; the PENDF
             # library carries its own preprocessed temperature
-            if temperature != 293.6:
+            if temperature is not None:
                 raise ValueError(
                     'temperature configures the continuous-energy path and '
                     'cannot be combined with pendf_library')
             table = _build_xs_table_pendf(
                 nuclides, reactions, energies, pendf_library)
         else:
+            # None selects the continuous-energy default (293.6 K); resolve it
+            # here, the sole place temperature is consumed (passed to group_xs).
+            temperature = 293.6 if temperature is None else temperature
             # Resolve the library once; data availability is derived from it
             if cross_sections is None:
                 cross_sections = _find_cross_sections(model=None)
