@@ -109,6 +109,8 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                 if name is None:
                     continue
                 mt_group = nuc_group[mt_key]
+                # MT-group QI drives the no-MF=10 (ground-only) branch; each
+                # LFS pathway carries its own QI (differs by product excitation).
                 q_value = float(mt_group.attrs['QI'])
 
                 # Ground product from DADZ (Sym{A}), drives coverage checks.
@@ -132,7 +134,8 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                         liso = openmc.data.zam(product)[2]
                         r_type = name if liso == 0 else f'{name}_m{liso}'
                         if product in chain_names:
-                            nuclide.add_reaction(r_type, product, q_value, 1.0)
+                            lfs_q = float(sub.attrs['QI'])
+                            nuclide.add_reaction(r_type, product, lfs_q, 1.0)
                             products_added.add(product)
                         else:
                             coverage.append(dict(

@@ -31,6 +31,7 @@ import openmc.data
 ReactionInfo = namedtuple('ReactionInfo', ('mts', 'secondaries'))
 
 REACTIONS = {
+    "(n,n')": ReactionInfo({4}, ()),
     '(n,2nd)': ReactionInfo({11}, ('H2',)),
     '(n,2n)': ReactionInfo(set(chain([16], range(875, 892))), ()),
     '(n,3n)': ReactionInfo({17}, ()),
@@ -732,9 +733,11 @@ class Chain:
                         setval(k, i, path_rate * br)
 
                     # Determine light nuclide production, e.g., (n,d) should
-                    # produce H2
+                    # produce H2. Product-qualified types ((n,gamma)_m1)
+                    # share their base type's secondaries.
                     if path_rate != 0.0:
-                        light_nucs = REACTIONS[r_type].secondaries
+                        base_type = re.sub(r'_m\d+$', '', r_type)
+                        light_nucs = REACTIONS[base_type].secondaries
                         for light_nuc in light_nucs:
                             k = self.nuclide_dict.get(light_nuc)
                             if k is not None:
