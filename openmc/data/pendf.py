@@ -15,7 +15,9 @@ partial cross sections nested under their reaction as ``LFS{lfs}`` subgroups.
 """
 
 import io
+import os
 import re
+import tempfile
 from datetime import date
 from pathlib import Path
 from warnings import warn
@@ -130,6 +132,14 @@ def _discover_pendf_files(pendf_dir):
         if m is not None:
             files.append((path, _SUFFIX_LISO[m.group(3)]))
     return files
+
+
+class _TemperatureMismatchError(ValueError):
+    """A tape's temperature disagrees with the library temperature.
+
+    Library-level inconsistency: unlike a single unparseable tape, this must
+    abort the whole conversion rather than be skipped with a warning.
+    """
 
 
 class PendfLibrary:
@@ -319,6 +329,12 @@ class PendfLibrary:
         self._files = []
         self._groups = {}
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     @staticmethod
     def from_endf_directory(pendf_dir, out, library=None, temperature=None,
                             keep_extra_mts=False, mapping='none',
@@ -391,97 +407,140 @@ class PendfLibrary:
             decay_lookup = parse_decay_isomeric_levels(decay_file)
 
         lib_temperature = temperature
-        with h5py.File(out, 'w') as h5:
-            for path, implied_liso in entries:
-                ev = Evaluation(path)
-                Z = ev.target['atomic_number']
-                A = ev.target['mass_number']
-                liso = ev.target['isomeric_state']
-                name = gnds_name(Z, A, liso)
-                if implied_liso != liso:
-                    warn(f"{path.name}: filename implies isomeric state "
-                         f"{implied_liso} but MF=1/451 header gives {liso}; "
-                         f"trusting header ({name}).")
+        n_converted = 0
+        n_skipped = 0
 
-                T = ev.target['temperature']
-                if lib_temperature is None:
-                    lib_temperature = T
-                elif abs(T - lib_temperature) > 0.1:
+        # Convert into a temporary file in the destination directory and
+        # atomically replace ``out`` only on success, so an unparseable file
+        # mid-run never leaves a partially written (and unreadable) library
+        # behind. Files that fail to parse are skipped with a warning.
+        fd, tmp_name = tempfile.mkstemp(dir=str(out.parent), suffix='.h5.tmp')
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            with h5py.File(tmp, 'w') as h5:
+                for path, implied_liso in entries:
+                    name = None
+                    created_here = False
+                    try:
+                        ev = Evaluation(path)
+                        Z = ev.target['atomic_number']
+                        A = ev.target['mass_number']
+                        liso = ev.target['isomeric_state']
+                        name = gnds_name(Z, A, liso)
+                        if implied_liso != liso:
+                            warn(f"{path.name}: filename implies isomeric state "
+                                 f"{implied_liso} but MF=1/451 header gives "
+                                 f"{liso}; trusting header ({name}).")
+
+                        T = ev.target['temperature']
+                        if lib_temperature is None:
+                            lib_temperature = T
+                        elif abs(T - lib_temperature) > 0.1:
+                            raise _TemperatureMismatchError(
+                                f"file temperature {T} K disagrees with library "
+                                f"temperature {lib_temperature} K by more than "
+                                "0.1 K.")
+
+                        if name in h5:
+                            warn(f"{path.name}: duplicate nuclide {name}; "
+                                 "skipping.")
+                            continue
+
+                        nuc = h5.create_group(name)
+                        created_here = True
+                        nuc.attrs['ZA'] = 1000 * Z + A
+                        nuc.attrs['AWR'] = ev.target['mass']
+                        nuc.attrs['LIS'] = ev.target['state']
+                        nuc.attrs['LISO'] = liso
+                        nuc.attrs['ELIS'] = ev.target['excitation_energy']
+                        nuc.attrs['MAT'] = ev.material
+                        nuc.attrs['source_file'] = np.bytes_(path.name)
+
+                        for (mf, mt), text in sorted(ev.section.items()):
+                            if mf != 3:
+                                continue
+                            if mt in _EXTRA_MTS and not keep_extra_mts:
+                                continue
+                            fo = io.StringIO(text)
+                            get_head_record(fo)             # MF=3 HEAD (discarded)
+                            (QM, QI, _l1, _lr), tab = get_tab1_record(fo)
+                            _check_lin_lin(name, 3, mt, tab)
+                            mtg = nuc.create_group(f'MT{mt}')
+                            mtg.attrs['QM'] = QM
+                            mtg.attrs['QI'] = QI
+                            _write_xy(mtg, tab.x, tab.y)
+
+                            # MF=10 isomeric production partials for this reaction
+                            if (10, mt) in ev.section:
+                                fo = io.StringIO(ev.section[10, mt])
+                                _, _, _lis, _liso, ns, _ = get_head_record(fo)
+                                partials = []
+                                for _ in range(ns):
+                                    (pqm, pqi, izap, lfs), ptab = \
+                                        get_tab1_record(fo)
+                                    _check_lin_lin(name, 10, mt, ptab)
+                                    partials.append((pqm, pqi, izap, lfs, ptab))
+
+                                lfs_to_liso = {}
+                                if mapping != 'none':
+                                    lfs_to_liso = map_lfs_to_liso(
+                                        [{'lfs': lfs, 'izap': izap,
+                                          'elfs': pqm - pqi}
+                                         for pqm, pqi, izap, lfs, _pt in partials],
+                                        decay_lookup, mode=mapping,
+                                        rtol=elis_rtol, atol=elis_atol,
+                                        context=f"{name} MT={mt}")
+
+                                for pqm, pqi, izap, lfs, ptab in partials:
+                                    lg = mtg.create_group(f'LFS{lfs}')
+                                    lg.attrs['QM'] = pqm
+                                    lg.attrs['QI'] = pqi
+                                    lg.attrs['IZAP'] = izap
+                                    lg.attrs['LFS'] = lfs
+                                    lg.attrs['ELFS'] = pqm - pqi
+                                    if lfs in lfs_to_liso:
+                                        lg.attrs['product'] = np.bytes_(gnds_name(
+                                            izap // 1000, izap % 1000,
+                                            lfs_to_liso[lfs]))
+                                    _write_xy(lg, ptab.x, ptab.y)
+
+                        n_converted += 1
+                    except _TemperatureMismatchError:
+                        # Library-level inconsistency, not a bad file: abort
+                        # (the temp-file cleanup leaves no partial output).
+                        raise
+                    except Exception as exc:
+                        # Drop any partially written group for this file so a
+                        # later file for the same nuclide can still convert.
+                        if created_here and name in h5:
+                            del h5[name]
+                        warn(f"skipping {path}: {exc}")
+                        n_skipped += 1
+                        continue
+
+                if n_converted == 0:
                     raise ValueError(
-                        f"{path.name}: file temperature {T} K disagrees with "
-                        f"library temperature {lib_temperature} K by more than "
-                        "0.1 K.")
+                        f"No PENDF files in {pendf_dir} could be converted "
+                        f"({n_skipped} skipped).")
 
-                if name in h5:
-                    warn(f"{path.name}: duplicate nuclide {name}; skipping.")
-                    continue
+                h5.attrs['format_version'] = _FORMAT_VERSION
+                h5.attrs['library'] = np.bytes_(
+                    'unknown' if library is None else str(library))
+                h5.attrs['temperature'] = float(lib_temperature)
+                h5.attrs['source_path'] = np.bytes_(str(pendf_dir))
+                h5.attrs['created'] = np.bytes_(date.today().isoformat())
+                h5.attrs['mapping'] = np.bytes_(mapping)
+                if mapping != 'none':
+                    h5.attrs['decay_file'] = np.bytes_(str(decay_file))
+                    if mapping == 'elis':
+                        h5.attrs['elis_rtol'] = float(elis_rtol)
+                        h5.attrs['elis_atol'] = float(elis_atol)
+                h5.attrs['openmc_version'] = np.bytes_(openmc.__version__)
 
-                nuc = h5.create_group(name)
-                nuc.attrs['ZA'] = 1000 * Z + A
-                nuc.attrs['AWR'] = ev.target['mass']
-                nuc.attrs['LIS'] = ev.target['state']
-                nuc.attrs['LISO'] = liso
-                nuc.attrs['ELIS'] = ev.target['excitation_energy']
-                nuc.attrs['MAT'] = ev.material
-                nuc.attrs['source_file'] = np.bytes_(path.name)
-
-                for (mf, mt), text in sorted(ev.section.items()):
-                    if mf != 3:
-                        continue
-                    if mt in _EXTRA_MTS and not keep_extra_mts:
-                        continue
-                    fo = io.StringIO(text)
-                    get_head_record(fo)                 # MF=3 HEAD (discarded)
-                    (QM, QI, _l1, _lr), tab = get_tab1_record(fo)
-                    _check_lin_lin(name, 3, mt, tab)
-                    mtg = nuc.create_group(f'MT{mt}')
-                    mtg.attrs['QM'] = QM
-                    mtg.attrs['QI'] = QI
-                    _write_xy(mtg, tab.x, tab.y)
-
-                    # MF=10 isomeric production partials for this reaction
-                    if (10, mt) in ev.section:
-                        fo = io.StringIO(ev.section[10, mt])
-                        _, _, _lis, _liso, ns, _ = get_head_record(fo)
-                        partials = []
-                        for _ in range(ns):
-                            (pqm, pqi, izap, lfs), ptab = get_tab1_record(fo)
-                            _check_lin_lin(name, 10, mt, ptab)
-                            partials.append((pqm, pqi, izap, lfs, ptab))
-
-                        lfs_to_liso = {}
-                        if mapping != 'none':
-                            lfs_to_liso = map_lfs_to_liso(
-                                [{'lfs': lfs, 'izap': izap, 'elfs': pqm - pqi}
-                                 for pqm, pqi, izap, lfs, _pt in partials],
-                                decay_lookup, mode=mapping,
-                                rtol=elis_rtol, atol=elis_atol,
-                                context=f"{name} MT={mt}")
-
-                        for pqm, pqi, izap, lfs, ptab in partials:
-                            lg = mtg.create_group(f'LFS{lfs}')
-                            lg.attrs['QM'] = pqm
-                            lg.attrs['QI'] = pqi
-                            lg.attrs['IZAP'] = izap
-                            lg.attrs['LFS'] = lfs
-                            lg.attrs['ELFS'] = pqm - pqi
-                            if lfs in lfs_to_liso:
-                                lg.attrs['product'] = np.bytes_(gnds_name(
-                                    izap // 1000, izap % 1000, lfs_to_liso[lfs]))
-                            _write_xy(lg, ptab.x, ptab.y)
-
-            h5.attrs['format_version'] = _FORMAT_VERSION
-            h5.attrs['library'] = np.bytes_(
-                'unknown' if library is None else str(library))
-            h5.attrs['temperature'] = float(lib_temperature)
-            h5.attrs['source_path'] = np.bytes_(str(pendf_dir))
-            h5.attrs['created'] = np.bytes_(date.today().isoformat())
-            h5.attrs['mapping'] = np.bytes_(mapping)
-            if mapping != 'none':
-                h5.attrs['decay_file'] = np.bytes_(str(decay_file))
-                if mapping == 'elis':
-                    h5.attrs['elis_rtol'] = float(elis_rtol)
-                    h5.attrs['elis_atol'] = float(elis_atol)
-            h5.attrs['openmc_version'] = np.bytes_(openmc.__version__)
+            os.replace(tmp, out)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
         return PendfLibrary(out)

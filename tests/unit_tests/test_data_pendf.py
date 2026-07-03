@@ -237,3 +237,71 @@ def test_elis_mapping_bake(tmp_path):
         assert grp.attrs["ELFS"] == pytest.approx(289660.0)
     finally:
         reader.close()
+
+
+def _write_garbage(path):
+    """Write a non-ENDF file (TENDL-named) that fails to parse as an evaluation."""
+    path.write_text("this is not an ENDF tape\n" * 4)
+
+
+def test_skips_unparseable_file(tmp_path):
+    # One good tape plus one garbage tape: the build succeeds, warns about the
+    # skipped file, and the library holds only the good nuclide.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+    _write_garbage(src / "n-Xx999.pendf")
+
+    out = tmp_path / "tendl.h5"
+    with pytest.warns(UserWarning, match="skipping"):
+        lib = PendfLibrary.from_endf_directory(
+            src, out, library="TENDL-2017", temperature=293.16)
+
+    assert lib.nuclides == ["Fe56"]
+    assert out.is_file()
+    assert not list(tmp_path.glob("*.tmp")) and not list(src.glob("*.tmp"))
+
+    # Output is a valid library: root attrs present and the reader reopens it.
+    with h5py.File(out, "r") as f:
+        assert f.attrs["format_version"] == 1
+        assert f.attrs["library"].decode() == "TENDL-2017"
+        assert f.attrs["temperature"] == pytest.approx(293.16)
+    reader = PendfLibrary(out)
+    try:
+        assert reader.nuclides == ["Fe56"]
+        assert reader.reactions("Fe56")
+    finally:
+        reader.close()
+
+
+def test_all_unparseable_raises(tmp_path):
+    # Only garbage: no library is produced. The output file is not created and
+    # no stray temporary file is left behind.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    _write_garbage(src / "n-Xx998.pendf")
+    _write_garbage(src / "n-Xx999.pendf")
+
+    out = tmp_path / "tendl.h5"
+    with pytest.warns(UserWarning, match="skipping"):
+        with pytest.raises(ValueError, match="could be converted"):
+            PendfLibrary.from_endf_directory(src, out, temperature=293.16)
+
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_context_manager(tmp_path):
+    # PendfLibrary supports the context-manager protocol and closes on exit.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+
+    with PendfLibrary(out) as lib:
+        assert lib.nuclides == ["Fe56"]
+        assert lib._files
+    assert lib._files == []
