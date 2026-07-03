@@ -833,8 +833,8 @@ class MicroXS:
         .. versionchanged:: 0.15.4
             ``multigroup_flux`` may be 2-D (or a list of 1-D arrays) to collapse
             several fluxes against a single shared cross section table, returning
-            a list of :class:`MicroXS`. Added the ``cross_sections`` and
-            ``pendf_library`` arguments.
+            a list of :class:`MicroXS`. Added the ``cross_sections``,
+            ``pendf_library`` and ``pathways`` arguments.
 
         Parameters
         ----------
