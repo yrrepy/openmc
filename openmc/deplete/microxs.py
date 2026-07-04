@@ -590,10 +590,30 @@ def _build_xs_table_pendf(
     energies = np.asarray(energies, dtype=float)
     n_groups = len(energies) - 1
 
+    # Fast path: a grouped PENDF library exposes ``group_edges`` and pre-binned
+    # ``xs_g``/``pathway_xs_g`` accessors, so rows are read straight from the
+    # file instead of flat-weighting pointwise data at runtime. The library's
+    # own edges must equal the requested tally structure exactly -- a grouped
+    # library carries no pointwise data to rebin, so a mismatch is a hard error
+    # (never a silent fallback).
+    lib_edges = getattr(pendf_library, 'group_edges', None)
+    grouped = lib_edges is not None
+    if grouped:
+        lib_edges = np.asarray(lib_edges, dtype=float)
+        if not np.array_equal(lib_edges, energies):
+            raise ValueError(
+                f'Grouped PENDF library has {len(lib_edges)} group edges but '
+                f'the requested tally structure has {len(energies)}; a grouped '
+                f'library must be collapsed on its own edges (no rebinning). '
+                f'Edge arrays differ (counts and/or values).')
+
     # Pathway expansion needs all three MF=10 accessors; a library lacking them
     # (e.g. an MF=3-only stand-in) transparently falls back to the total row.
+    # Grouped libraries expose pre-binned ``pathway_xs_g``; pointwise ones expose
+    # ``pathway_xs``.
     pathways_fn = getattr(pendf_library, 'pathways', None) if pathways else None
-    pathway_xs_fn = getattr(pendf_library, 'pathway_xs', None)
+    pathway_xs_fn = getattr(
+        pendf_library, 'pathway_xs_g' if grouped else 'pathway_xs', None)
     product_fn = getattr(pendf_library, 'product', None)
     have_pathways = None not in (pathways_fn, pathway_xs_fn, product_fn)
 
@@ -642,8 +662,11 @@ def _build_xs_table_pendf(
         for base_idx, (name, mt) in enumerate(zip(reactions, mts)):
             if mt not in mts_present:
                 continue
-            energy, xs = pendf_library.xs(nuc, mt)
-            total_g = _group_average(energy, xs, energies)
+            if grouped:
+                total_g = pendf_library.xs_g(nuc, mt)
+            else:
+                energy, xs = pendf_library.xs(nuc, mt)
+                total_g = _group_average(energy, xs, energies)
 
             lfs_list = list(pathways_fn(nuc, mt)) if have_pathways else []
             if not lfs_list:
@@ -671,8 +694,11 @@ def _build_xs_table_pendf(
             # against the MF=3 total before staging.
             partial_g = []
             for lfs in lfs_list:
-                pe, pxs = pathway_xs_fn(nuc, mt, lfs)
-                partial_g.append(_group_average(pe, pxs, energies))
+                if grouped:
+                    partial_g.append(pathway_xs_fn(nuc, mt, lfs))
+                else:
+                    pe, pxs = pathway_xs_fn(nuc, mt, lfs)
+                    partial_g.append(_group_average(pe, pxs, energies))
             part_sum = np.sum(partial_g, axis=0)
             nz = total_g != 0.0
             if nz.any():
@@ -856,8 +882,8 @@ class MicroXS:
     @classmethod
     def from_multigroup_flux(
         cls,
-        energies: Sequence[float] | str,
-        multigroup_flux: Sequence[float] | Sequence[Sequence[float]],
+        energies: Sequence[float] | str | None = None,
+        multigroup_flux: Sequence[float] | Sequence[Sequence[float]] | None = None,
         chain_file: PathLike | None = None,
         temperature: float | None = None,
         nuclides: Sequence[str] | None = None,
@@ -888,12 +914,18 @@ class MicroXS:
             ``multigroup_flux`` may be 2-D (or a list of 1-D arrays) to collapse
             several fluxes against a single shared cross section table, returning
             a list of :class:`MicroXS`. Added the ``cross_sections``,
-            ``pendf_library`` and ``pathways`` arguments.
+            ``pendf_library`` and ``pathways`` arguments. When
+            ``pendf_library`` is a grouped PENDF library, ``energies`` may be
+            omitted and defaults to the library's ``group_edges``.
 
         Parameters
         ----------
-        energies : iterable of float or str
-            Energy group boundaries in [eV] or the name of the group structure
+        energies : iterable of float or str or None, optional
+            Energy group boundaries in [eV] or the name of a group structure.
+            May be omitted (``None``) only when ``pendf_library`` is a grouped
+            PENDF library (:class:`~openmc.data.GroupedPendfLibrary`), in which
+            case the library's own ``group_edges`` supply the group structure;
+            omitting it otherwise raises ``ValueError``.
         multigroup_flux : iterable of float or iterable of iterable of float
             Energy-dependent multigroup flux values. Must be finite and
             non-negative. A 1-D input is a single flux; a 2-D input (or a list of
@@ -912,15 +944,19 @@ class MicroXS:
         cross_sections : PathLike, optional
             Cross section library used to resolve nuclide data availability and
             evaluate cross sections. Defaults to ``openmc.config['cross_sections']``.
-        pendf_library : openmc.data.PendfLibrary, optional
-            Pointwise PENDF cross section library, duck-typed with ``nuclides``,
+        pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary, optional
+            PENDF cross section library, duck-typed with ``nuclides``,
             ``reactions(nuclide)`` and ``xs(nuclide, mt)``. When given, group
-            cross sections are flat-weighted from this library rather than from
+            cross sections are taken from this library rather than from
             continuous-energy data; the continuous-energy session arguments
             (``cross_sections`` and any :func:`openmc.lib.init` keyword
             arguments) are then invalid and raise ``ValueError``. The
             ``temperature`` argument is likewise rejected; the library's own
-            preprocessed temperature is used.
+            preprocessed temperature is used. A pointwise
+            :class:`~openmc.data.PendfLibrary` is flat-weighted onto ``energies``
+            at runtime, whereas a pre-binned
+            :class:`~openmc.data.GroupedPendfLibrary` (matched to ``energies``)
+            is read directly without rebinning.
         pathways : bool, optional
             Only used with ``pendf_library``. If true (default), reactions with
             mapped isomeric MF=10 partials are expanded into per-product rows
@@ -940,6 +976,25 @@ class MicroXS:
         """
 
         check_type("temperature", temperature, (int, float, type(None)))
+
+        # ``multigroup_flux`` is required; it only carries a default so that
+        # ``energies`` (which precedes it positionally) can default to None.
+        if multigroup_flux is None:
+            raise ValueError('multigroup_flux is a required argument')
+
+        # Default the group structure to a grouped PENDF library's own edges
+        # when the caller omits ``energies``. A grouped library is duck-detected
+        # exactly as in ``_build_xs_table_pendf`` -- by exposing ``group_edges``.
+        # A grouped library carries no pointwise data to rebin, so its edges are
+        # the only structure it can be collapsed on.
+        if energies is None:
+            energies = getattr(pendf_library, 'group_edges', None)
+            if energies is None:
+                raise ValueError(
+                    'energies must be provided unless pendf_library is a grouped '
+                    'PENDF library (openmc.data.GroupedPendfLibrary), whose '
+                    'group_edges then define the group structure')
+
         # if energy is string then use group structure of that name
         if isinstance(energies, str):
             energies = GROUP_STRUCTURES[energies]

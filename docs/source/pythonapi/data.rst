@@ -236,6 +236,21 @@ Functions
     isomeric.parse_decay_isomeric_levels
     isomeric.map_lfs_to_liso
 
+Grouped PENDF Format
+--------------------
+
+The following class reads a pre-binned grouped PENDF library (group-averaged
+cross sections on a fixed energy group structure) so that the depletion collapse
+can skip runtime flat-weighting of a pointwise library. Such files are written
+by ``tools/pendf_group_bin.py``.
+
+.. autosummary::
+    :toctree: generated
+    :nosignatures:
+    :template: myclass.rst
+
+    GroupedPendfLibrary
+
 NJOY Interface
 --------------
 
