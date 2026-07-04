@@ -1776,7 +1776,7 @@ class EnergyFilter(RealFilter):
 
         cv.check_value('group_structure', group_structure,
                        openmc.mgxs.GROUP_STRUCTURES.keys())
-        return cls(openmc.mgxs.GROUP_STRUCTURES[group_structure.upper()])
+        return cls(openmc.mgxs.GROUP_STRUCTURES[group_structure])
 
 
 class EnergyoutFilter(EnergyFilter):
@@ -1890,7 +1890,7 @@ class ParticleProductionFilter(Filter):
             cv.check_value('energies', energies,
                            openmc.mgxs.GROUP_STRUCTURES.keys())
             self._energies = np.array(
-                openmc.mgxs.GROUP_STRUCTURES[energies.upper()])
+                openmc.mgxs.GROUP_STRUCTURES[energies])
         else:
             energies = np.asarray(energies, dtype=float)
             cv.check_length('energies', energies, 2)

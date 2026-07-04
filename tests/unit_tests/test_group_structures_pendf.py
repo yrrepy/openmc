@@ -4,6 +4,7 @@
 import numpy as np
 import pytest
 
+import openmc
 import openmc.mgxs
 
 # name -> expected number of energy edges (groups + 1)
@@ -61,3 +62,50 @@ def test_pendf_group_structure_regression(name):
     assert edges[0] == np.float64(float.fromhex(first_hex))
     assert edges[-1] == np.float64(float.fromhex(last_hex))
     assert np.float64(edges.sum()) == np.float64(float.fromhex(sum_hex))
+
+
+# Group-structure name -> expected filter bin count (n_edges - 1). Includes an
+# upstream all-uppercase name to prove the .upper() removal changed no behavior
+# for canonical names, alongside the two mixed-case PENDF names that used to
+# KeyError (e.g. 'FOMG-16k'.upper() == 'FOMG-16K', which is not a key).
+NAME_LOOKUP_CASES = {
+    'FOMG-16k': 16000,
+    'VESTA-43k': 43000,
+    'CCFE-709': 709,
+}
+
+
+@pytest.mark.parametrize("name,n_bins", NAME_LOOKUP_CASES.items())
+def test_energy_filter_from_group_structure(name, n_bins):
+    """EnergyFilter.from_group_structure resolves the raw (possibly mixed-case)
+    key directly against GROUP_STRUCTURES, with no ``.upper()`` mangling."""
+    expected = openmc.mgxs.GROUP_STRUCTURES[name]
+
+    efilter = openmc.EnergyFilter.from_group_structure(name)
+
+    assert np.array_equal(efilter.values, expected)
+    assert efilter.num_bins == n_bins
+
+
+@pytest.mark.parametrize("name,n_bins", NAME_LOOKUP_CASES.items())
+def test_energy_groups_from_name(name, n_bins):
+    """EnergyGroups accepts a group-structure name and looks it up with the raw
+    key (see openmc/mgxs/groups.py)."""
+    expected = openmc.mgxs.GROUP_STRUCTURES[name]
+
+    groups = openmc.mgxs.EnergyGroups(name)
+
+    assert np.array_equal(groups.group_edges, expected)
+    assert groups.num_groups == n_bins
+
+
+@pytest.mark.parametrize("name,n_bins", NAME_LOOKUP_CASES.items())
+def test_particle_production_filter_energies_name(name, n_bins):
+    """ParticleProductionFilter's string ``energies`` path also resolves the raw
+    key directly (openmc/filter.py)."""
+    expected = openmc.mgxs.GROUP_STRUCTURES[name]
+
+    pfilter = openmc.ParticleProductionFilter('photon', energies=name)
+
+    assert np.array_equal(pfilter.energies, expected)
+    assert pfilter.num_energy_bins == n_bins
