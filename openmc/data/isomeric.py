@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from warnings import warn
 
+import openmc.checkvalue as cv
+
 from .endf import get_evaluations, py_float_endf
 
 __all__ = [
@@ -143,7 +145,14 @@ def lookup_liso(z, a, target_elis, decay_lookup, rtol=ELIS_RTOL, atol=ELIS_ATOL,
     if not metastables_valid:
         return {'status': 'no_metastables'}
 
-    # Nearest metastable by absolute ELIS difference
+    # Deliberate mixed-metric selection (load-bearing and validated against the
+    # LFS 2 -> m1 and LFS 4 -> m2 level-index resolutions):
+    #   * SELECT the nearest metastable by ABSOLUTE ELIS difference, then
+    #   * ACCEPT it only if within the RELATIVE tolerance (elis_match, below).
+    # On an exact absolute tie, ``min`` keeps the first candidate in iteration
+    # order -- the lower LISO, since decay states are listed ground -> m1 -> m2.
+    # This two-metric behavior is intentional; downstream mappings depend on it,
+    # so do not collapse it to a single (all-absolute or all-relative) metric.
     liso, dk_elis = min(
         ((s.liso, s.elis) for s in metastables_valid),
         key=lambda item: abs(target_elis - item[1]),
@@ -313,9 +322,7 @@ def map_lfs_to_liso(partials, decay_lookup, mode='elis', rtol=ELIS_RTOL,
         ``{lfs: liso}`` for every partial that resolves to a product state.
 
     """
-    if mode not in ('elis', 'lfs_order'):
-        raise ValueError(
-            f"mode must be 'elis' or 'lfs_order', got {mode!r}.")
+    cv.check_value('mode', mode, ('elis', 'lfs_order'))
 
     mapping = {}
     metastables = []

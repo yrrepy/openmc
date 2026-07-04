@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 import openmc.data
-from openmc.data.pendf import PendfLibrary
+from openmc.data import Tabulated1D
+from openmc.data.pendf import PendfLibrary, _check_lin_lin
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
 _PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
@@ -108,6 +109,22 @@ def test_mf3_all_lin_lin(evaluations):
             _qm, _qi, tab = _mf3(ev, mt)
             assert len(tab.breakpoints) == 1
             assert int(tab.interpolation[0]) == 2
+
+
+def test_check_lin_lin_multiregion_all_lin_lin_accepted():
+    # A multi-region TAB1 in which every region is lin-lin (INT=2) is
+    # equivalent to a single lin-lin table and must be accepted (not raise).
+    tab = Tabulated1D([0, 5, 10], [1, 2, 3], breakpoints=[2, 3],
+                      interpolation=[2, 2])
+    _check_lin_lin("Test0", 3, 1, tab)
+
+
+def test_check_lin_lin_mixed_int_rejected():
+    # Any region with INT != 2 (here a lin-log region) is still rejected.
+    tab = Tabulated1D([0, 5, 10], [1, 2, 3], breakpoints=[2, 3],
+                      interpolation=[2, 1])
+    with pytest.raises(ValueError, match="INT=2"):
+        _check_lin_lin("Test0", 3, 1, tab)
 
 
 def test_basic_xs_sanity(evaluations):

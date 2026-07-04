@@ -26,6 +26,7 @@ import h5py
 import numpy as np
 
 import openmc
+import openmc.checkvalue as cv
 from .data import gnds_name
 from .endf import Evaluation, get_head_record, get_tab1_record
 from .isomeric import (ELIS_ATOL, ELIS_RTOL, map_lfs_to_liso,
@@ -67,11 +68,17 @@ def _write_xy(group, x, y):
 
 
 def _check_lin_lin(name, mf, mt, tab):
-    """Raise unless a TAB1 record is a single lin-lin (NR=1, INT=2) region."""
-    if len(tab.breakpoints) != 1 or int(tab.interpolation[0]) != 2:
+    """Raise unless every interpolation region of a TAB1 is lin-lin (INT=2).
+
+    NJOY PENDF is single-region, but a multi-region TAB1 in which every region
+    is lin-lin (INT=2) is equivalent to a single lin-lin table, so it is
+    accepted; only a region with INT != 2 (a genuinely non-lin-lin scheme) is
+    rejected.
+    """
+    if any(int(i) != 2 for i in tab.interpolation):
         raise ValueError(
-            f"{name} MF={mf} MT={mt}: expected a single lin-lin region "
-            f"(NR=1, INT=2), got NR={len(tab.breakpoints)}, "
+            f"{name} MF={mf} MT={mt}: expected lin-lin interpolation (INT=2) "
+            f"in every region, got NR={len(tab.breakpoints)}, "
             f"INT={list(tab.interpolation)}."
         )
 
@@ -187,10 +194,34 @@ class PendfLibrary:
         for p in paths:
             f = h5py.File(p, 'r')
             self._files.append(f)
+            library = _attr_str(f.attrs, 'library')
+            temperature = float(f.attrs['temperature'])
+            mapping = _attr_str(f.attrs, 'mapping')
             if self.temperature is None:
-                self.library = _attr_str(f.attrs, 'library')
-                self.temperature = float(f.attrs['temperature'])
-                self.mapping = _attr_str(f.attrs, 'mapping')
+                self.library = library
+                self.temperature = temperature
+                self.mapping = mapping
+            else:
+                # Directory mode: every file must share the first file's
+                # library identity, temperature, and product mapping, or data
+                # would be served silently under mismatched metadata. Compare
+                # root attributes only (no dataset reads).
+                mismatches = []
+                if library != self.library:
+                    mismatches.append(
+                        f"library {library!r} != {self.library!r}")
+                if abs(temperature - self.temperature) > 0.1:
+                    mismatches.append(
+                        f"temperature {temperature} K != {self.temperature} K")
+                if mapping != self.mapping:
+                    mismatches.append(
+                        f"mapping {mapping!r} != {self.mapping!r}")
+                if mismatches:
+                    for handle in self._files:
+                        handle.close()
+                    raise ValueError(
+                        f"{Path(p).name}: root metadata disagrees with "
+                        f"{Path(paths[0]).name}: {'; '.join(mismatches)}.")
             for name, group in f.items():
                 if name in self._groups:
                     warn(f"Nuclide {name} appears in more than one file; "
@@ -388,10 +419,7 @@ class PendfLibrary:
             Reader for the file just written.
 
         """
-        if mapping not in ('none', 'elis', 'lfs_order'):
-            raise ValueError(
-                f"mapping must be 'none', 'elis', or 'lfs_order', got "
-                f"{mapping!r}.")
+        cv.check_value('mapping', mapping, ('none', 'elis', 'lfs_order'))
 
         pendf_dir = Path(pendf_dir)
         out = Path(out)
@@ -493,6 +521,11 @@ class PendfLibrary:
                                         context=f"{name} MT={mt}")
 
                                 for pqm, pqi, izap, lfs, ptab in partials:
+                                    if f'LFS{lfs}' in mtg:
+                                        warn(f"{path.name}: duplicate MF=10 "
+                                             f"partial LFS={lfs} in {name} "
+                                             f"MT={mt}; skipping.")
+                                        continue
                                     lg = mtg.create_group(f'LFS{lfs}')
                                     lg.attrs['QM'] = pqm
                                     lg.attrs['QI'] = pqi
@@ -504,6 +537,17 @@ class PendfLibrary:
                                             izap // 1000, izap % 1000,
                                             lfs_to_liso[lfs]))
                                     _write_xy(lg, ptab.x, ptab.y)
+
+                        # MF=10 partials are written only alongside their MF=3
+                        # sibling (loop above). Warn about any MF=10 reaction
+                        # with no MF=3 section so the silent drop is visible; a
+                        # total is not synthesized from the partials (that would
+                        # invent data the format requires from MF=3).
+                        mf3_mts = {mt for (mf, mt) in ev.section if mf == 3}
+                        mf10_mts = {mt for (mf, mt) in ev.section if mf == 10}
+                        for mt in sorted(mf10_mts - mf3_mts):
+                            warn(f"{path.name}: {name} MF=10 MT={mt} has no "
+                                 f"MF=3 section; isomeric partials dropped.")
 
                         n_converted += 1
                     except _TemperatureMismatchError:
