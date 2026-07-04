@@ -235,3 +235,17 @@ def test_collapse_matches_collapse_batch_single_row():
     assert single.shape == (N_NUC, N_RXN)
     assert batched.shape == (1, N_NUC, N_RXN)
     np.testing.assert_allclose(single, batched[0], rtol=1e-12)
+
+
+def test_collapse_wrong_length_flux_raises():
+    """A single flux whose length differs from the table's group count raises a
+    clear ValueError instead of a cryptic numpy shape error, and a correct
+    length still collapses."""
+    rng = np.random.default_rng(9)
+    table = _random_table(rng)
+
+    with pytest.raises(ValueError, match='groups but the cross section table'):
+        table.collapse(np.ones(N_GROUPS - 1))
+
+    result = table.collapse(np.ones(N_GROUPS) / N_GROUPS)
+    assert result.shape == (N_NUC, N_RXN)

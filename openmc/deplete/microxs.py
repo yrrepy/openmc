@@ -359,6 +359,11 @@ class _SparseXSTable:
         ``(n_nuclides, n_reactions)`` array. Thin wrapper over
         :meth:`collapse_batch` with a one-flux batch.
         """
+        n_groups = self.xs_matrix.shape[1]
+        if len(phi_norm) != n_groups:
+            raise ValueError(
+                f'Flux has {len(phi_norm)} groups but the cross section table '
+                f'expects {n_groups}')
         return self.collapse_batch(np.asarray(phi_norm)[np.newaxis])[0]
 
     def collapse_batch(self, phi_norm: np.ndarray) -> np.ndarray:
