@@ -31,7 +31,7 @@ class EnergyGroups:
 
     def __init__(self, group_edges):
         if isinstance(group_edges, str):
-            self._name = group_edges.upper()
+            self._name = group_edges
             group_edges = openmc.mgxs.GROUP_STRUCTURES[self._name]
 
         self.group_edges = group_edges
