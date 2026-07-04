@@ -10,6 +10,7 @@ for element, the table built by flat-weighting the pointwise data at runtime
 All fixtures are synthetic -- no dependency on the multi-GB real library.
 """
 import importlib.util
+import sys
 from pathlib import Path
 
 import h5py
@@ -18,6 +19,7 @@ import pytest
 
 from openmc.data import GroupedPendfLibrary
 from openmc.data.pendf_grouped import GROUPED_FORMAT
+from openmc.deplete import MicroXS
 from openmc.deplete.microxs import _build_xs_table_pendf
 
 # Load the writer CLI module (tools/ is not a package) by path.
@@ -207,3 +209,113 @@ def test_writer_summary(tmp_path):
     assert stats["rows"] == 7
     assert stats["n_warnings"] == 0
     assert stats["worst_dev"] < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# from_multigroup_flux: energies defaults to a grouped library's group_edges
+# ---------------------------------------------------------------------------
+
+def test_energies_default_to_group_edges(libs):
+    """Omitting ``energies`` with a grouped library matches passing the edges."""
+    _, grouped, _ = libs
+    flux = np.ones(len(EDGES) - 1)
+    nucs = ["In115", "Fe56"]
+
+    explicit = MicroXS.from_multigroup_flux(
+        energies=EDGES, multigroup_flux=flux,
+        nuclides=nucs, reactions=REACTIONS, pendf_library=grouped)
+    default = MicroXS.from_multigroup_flux(
+        multigroup_flux=flux,
+        nuclides=nucs, reactions=REACTIONS, pendf_library=grouped)
+
+    assert isinstance(default, MicroXS)
+    assert default.nuclides == explicit.nuclides
+    assert default.reactions == explicit.reactions
+    # Bit-exact: defaulting the edges must change nothing about the result.
+    assert np.array_equal(default.data, explicit.data)
+    # Sanity: the pathway expansion actually ran (product-qualified name).
+    assert "(n,gamma)_m1" in default.reactions
+
+
+def test_energies_none_without_grouped_raises(libs):
+    """energies=None without a grouped library is a clear ValueError."""
+    pointwise, _, _ = libs
+    flux = np.ones(len(EDGES) - 1)
+    # A pointwise library exposes no ``group_edges`` attribute.
+    with pytest.raises(ValueError, match="grouped"):
+        MicroXS.from_multigroup_flux(
+            multigroup_flux=flux, nuclides=["In115"],
+            reactions=REACTIONS, pendf_library=pointwise)
+    # No pendf_library at all is likewise rejected.
+    with pytest.raises(ValueError, match="grouped"):
+        MicroXS.from_multigroup_flux(
+            multigroup_flux=flux, nuclides=["In115"], reactions=REACTIONS)
+
+
+def test_explicit_mismatched_edges_still_hard_error(libs):
+    """An explicit energies array that differs from the library edges hard-fails."""
+    _, grouped, _ = libs
+    other = np.array([1e-5, 1e3, 2e7])  # different count -> mismatch
+    flux = np.ones(len(other) - 1)
+    with pytest.raises(ValueError, match="group edges"):
+        MicroXS.from_multigroup_flux(
+            energies=other, multigroup_flux=flux,
+            nuclides=["In115"], reactions=REACTIONS, pendf_library=grouped)
+
+
+# ---------------------------------------------------------------------------
+# Writer CLI hardening (tools/pendf_group_bin.main)
+# ---------------------------------------------------------------------------
+
+def _run_main(monkeypatch, src, out, *extra):
+    """Invoke pgb.main() with a synthetic argv (edges passed as an .npy)."""
+    edges_npy = src.parent / "edges.npy"
+    np.save(edges_npy, EDGES)
+    argv = ["pendf_group_bin", "--pendf-in", str(src), "--out", str(out),
+            "--edges", str(edges_npy), *extra]
+    monkeypatch.setattr(sys, "argv", argv)
+    pgb.main()
+
+
+def test_cli_refuses_existing_out(tmp_path, monkeypatch):
+    """An existing --out is refused without --force and overwritten with it."""
+    src = tmp_path / "pointwise.h5"
+    out = tmp_path / "grouped.h5"
+    _make_pointwise_h5(src)
+    out.write_bytes(b"stale")  # pre-existing output
+
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, src, out)
+    assert out.read_bytes() == b"stale"  # untouched by the refusal
+
+    # --force lets it overwrite; the file is now a valid grouped library.
+    _run_main(monkeypatch, src, out, "--force")
+    with h5py.File(out, "r") as f:
+        assert f.attrs["format"] == pgb.GROUPED_FORMAT
+
+
+def test_cli_reports_all_unknown_nuclides(tmp_path, monkeypatch, capsys):
+    """A bad --nuclides names every unknown entry and writes no output file."""
+    src = tmp_path / "pointwise.h5"
+    out = tmp_path / "grouped.h5"
+    _make_pointwise_h5(src)
+
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, src, out,
+                  "--nuclides", "In115", "Xx999", "Zz111")
+    err = capsys.readouterr().err
+    assert "Xx999" in err and "Zz111" in err  # every unknown listed
+    assert "In115" not in err.split("valid examples")[0]  # known one not flagged
+    assert not out.exists()  # validated before any output was created
+
+
+def test_cli_unwritable_out_is_clean_error(tmp_path, monkeypatch, capsys):
+    """An unwritable output path gives a one-line error, not a traceback."""
+    src = tmp_path / "pointwise.h5"
+    _make_pointwise_h5(src)
+    out = tmp_path / "no_such_dir" / "grouped.h5"  # parent missing
+
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, src, out)
+    err = capsys.readouterr().err
+    assert "cannot open output file" in err

@@ -202,9 +202,38 @@ def main():
     parser.add_argument('--dtype',    type=str,   default='float64',  help="Storage dtype: 'float64' (default) or 'float32'")
     parser.add_argument('--mts',      type=int,   default=None, nargs='+', help='Explicit MT override list (default: chain-relevant MTs)')
     parser.add_argument('--nuclides', type=str,   default=None, nargs='+', help='Subset of nuclides to bin (default: all)')
+    parser.add_argument('--force',    action='store_true',            help='Overwrite --out if it already exists (default: refuse)')
     args = parser.parse_args()
 
     edges = _resolve_edges(args.edges, args.groups)
+
+    # Refuse to silently truncate an existing output unless --force is given.
+    if args.out.exists() and not args.force:
+        parser.error(
+            f'output file {args.out} already exists; pass --force to overwrite')
+
+    # Validate any requested nuclide subset against the source up front, so a
+    # typo fails with one clear message -- naming every unknown entry -- before
+    # any output file is created.
+    if args.nuclides is not None:
+        with h5py.File(args.pendf_in, 'r') as src:
+            available = [k for k in src if isinstance(src[k], h5py.Group)]
+        unknown = [n for n in args.nuclides if n not in available]
+        if unknown:
+            examples = ', '.join(sorted(available)[:5]) or '(none)'
+            parser.error(
+                f'--nuclides not found in {args.pendf_in}: '
+                f'{", ".join(unknown)} (valid examples: {examples})')
+
+    # A bad output path (missing/unwritable directory, permission denied) should
+    # fail with a one-line message here, not an h5py traceback from inside the
+    # binning loop.
+    try:
+        with h5py.File(args.out, 'w'):
+            pass
+    except OSError as exc:
+        parser.error(f'cannot open output file {args.out} for writing: {exc}')
+
     bin_pendf_library(
         args.pendf_in, args.out, edges, dtype=args.dtype,
         mts=args.mts, nuclides=args.nuclides)

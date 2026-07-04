@@ -882,8 +882,8 @@ class MicroXS:
     @classmethod
     def from_multigroup_flux(
         cls,
-        energies: Sequence[float] | str,
-        multigroup_flux: Sequence[float] | Sequence[Sequence[float]],
+        energies: Sequence[float] | str | None = None,
+        multigroup_flux: Sequence[float] | Sequence[Sequence[float]] | None = None,
         chain_file: PathLike | None = None,
         temperature: float | None = None,
         nuclides: Sequence[str] | None = None,
@@ -914,12 +914,18 @@ class MicroXS:
             ``multigroup_flux`` may be 2-D (or a list of 1-D arrays) to collapse
             several fluxes against a single shared cross section table, returning
             a list of :class:`MicroXS`. Added the ``cross_sections`` and
-            ``pendf_library`` arguments.
+            ``pendf_library`` arguments. When ``pendf_library`` is a grouped
+            PENDF library, ``energies`` may be omitted and defaults to the
+            library's ``group_edges``.
 
         Parameters
         ----------
-        energies : iterable of float or str
-            Energy group boundaries in [eV] or the name of the group structure
+        energies : iterable of float or str or None, optional
+            Energy group boundaries in [eV] or the name of a group structure.
+            May be omitted (``None``) only when ``pendf_library`` is a grouped
+            PENDF library (:class:`~openmc.data.GroupedPendfLibrary`), in which
+            case the library's own ``group_edges`` supply the group structure;
+            omitting it otherwise raises ``ValueError``.
         multigroup_flux : iterable of float or iterable of iterable of float
             Energy-dependent multigroup flux values. Must be finite and
             non-negative. A 1-D input is a single flux; a 2-D input (or a list of
@@ -970,6 +976,25 @@ class MicroXS:
         """
 
         check_type("temperature", temperature, (int, float, type(None)))
+
+        # ``multigroup_flux`` is required; it only carries a default so that
+        # ``energies`` (which precedes it positionally) can default to None.
+        if multigroup_flux is None:
+            raise ValueError('multigroup_flux is a required argument')
+
+        # Default the group structure to a grouped PENDF library's own edges
+        # when the caller omits ``energies``. A grouped library is duck-detected
+        # exactly as in ``_build_xs_table_pendf`` -- by exposing ``group_edges``.
+        # A grouped library carries no pointwise data to rebin, so its edges are
+        # the only structure it can be collapsed on.
+        if energies is None:
+            energies = getattr(pendf_library, 'group_edges', None)
+            if energies is None:
+                raise ValueError(
+                    'energies must be provided unless pendf_library is a grouped '
+                    'PENDF library (openmc.data.GroupedPendfLibrary), whose '
+                    'group_edges then define the group structure')
+
         # if energy is string then use group structure of that name
         if isinstance(energies, str):
             energies = GROUP_STRUCTURES[energies]
