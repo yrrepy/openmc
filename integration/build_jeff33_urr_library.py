@@ -32,7 +32,7 @@ import numpy as np
 import openmc.data
 from openmc.data.pendf import PendfLibrary
 from openmc.mgxs import GROUP_STRUCTURES
-from tools.pendf_group_bin import bin_pendf_library
+from tools.pendf_group_bin import bin_pendf_library, chain_relevant_mts
 
 # Flagged URR nuclides (all confirmed to carry MF=2 MT=152/153 in JEFF-3.3).
 DEFAULT_FLAGGED = [
@@ -97,8 +97,18 @@ def build(pendf_dir, out_pointwise, out_grouped, groups, nuclides, library):
             p.unlink()
         tmpdir.rmdir()
 
-    print(f"Group-binning onto {groups} ({len(edges) - 1} groups) ...")
-    bin_pendf_library(out_pointwise, out_grouped, edges, nuclides=nuclides)
+    # The URR material-dilution correction needs each diluter's group TOTAL
+    # sigma_t,g to build the sigma_0 background (mat_ssf: xs_g(j, 1) on a grouped
+    # library, and the resonant nuclide's smooth total at the URR nodes for
+    # factor-form tables). MT=1 is not a depletion-activation reaction, so the
+    # default group-bin MT set (chain_relevant_mts) drops it; add it explicitly
+    # so the grouped URR library can supply the total. (An extra ~1 dataset per
+    # nuclide; the flag-off collapse never requests MT=1 so it is unaffected.)
+    mts = chain_relevant_mts() | {1}
+    print(f"Group-binning onto {groups} ({len(edges) - 1} groups) "
+          f"with MT=1 (total) included for URR sigma_0 ...")
+    bin_pendf_library(out_pointwise, out_grouped, edges, mts=mts,
+                      nuclides=nuclides)
     print(f"  grouped: {out_grouped}")
 
 
