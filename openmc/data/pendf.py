@@ -45,10 +45,29 @@ _EXTRA_MTS = frozenset(
     {151, 152, 153} | set(range(203, 208)) | {251, 252, 253} | set(range(301, 451))
 )
 
-# Filename conventions understood by :func:`_discover_pendf_files`
+# Filename conventions understood by :func:`_discover_pendf_files`. Every pattern
+# is fully anchored (``^...$``) so a name is matched in whole or not at all; this
+# keeps recognition deterministic and prevents, e.g., the ``.tendl20NN`` infix
+# names below from being partially accepted by the plain TENDL patterns.
 _TENDL_RE = re.compile(r'^n-([A-Za-z]+)(\d+)([mn]?)\.pendf$')
 _ENDFB_RE = re.compile(r'^ZA(\d{3})(\d{3})(?:\.(\d+))?$')
 _JEFF_RE = re.compile(r'^(?:0[kK]|293[kK])-\d+-([A-Za-z]+)-(\d+)([gmn]?)_p\.asc$')
+# TENDL-2015 (nuclide-first, reversed vs TENDL-2017), plain or carrying a
+# ``.tendl20NN`` version infix: ``Ag107-n.pendf``, ``Ac222m-n.pendf``,
+# ``Ag107-n.tendl2015.pendf``.
+_TENDL2015_RE = re.compile(r'^([A-Za-z]+)(\d+)([mn]?)-n(?:\.tendl20\d\d)?\.pendf$')
+# TENDL-2017 projectile-first stem carrying a ``.tendl20NN`` version infix; the
+# loose-file companion to the frozen ``_TENDL_RE`` (which cannot absorb the
+# optional infix): ``n-Ag107.tendl2017.pendf``.
+_TENDL2017_INFIX_RE = re.compile(r'^n-([A-Za-z]+)(\d+)([mn]?)\.tendl20\d\d\.pendf$')
+# TENDL-2019 native pendf: ``Ag107p.asc``, ``Ac222mp.asc``.
+_TENDL2019_RE = re.compile(r'^([A-Za-z]+)(\d+)([mn]?)p\.asc$')
+# JEFF-3.3: ``47-Ag-107g.jeff33.pendf`` (any two-digit ``.jeffNN`` suffix).
+_JEFF33_RE = re.compile(r'^\d+-([A-Za-z]+)-(\d+)([gmn]?)\.jeff\d{2}\.pendf$')
+# JENDL-5: ``n_047-Ag-107_300K.dat`` with a free-form temperature token
+# (``300K``, ``293.6K``, ...) and an ``m<digit>`` isomer index that doubles as
+# the implied LISO (``n_052-Te-123m1_300K.dat`` -> LISO 1).
+_JENDL5_RE = re.compile(r'^n_\d{3}-([A-Za-z]+)-(\d+)(?:m(\d))?_[^_]*K\.dat$')
 
 # Isomer suffix -> LISO (isomeric state) implied by a filename
 _SUFFIX_LISO = {'': 0, 'g': 0, 'm': 1, 'n': 2}
@@ -88,8 +107,11 @@ def _discover_pendf_files(pendf_dir):
     """Find PENDF files in a directory and the isomeric state implied by name.
 
     A ``_manifest.tsv`` (TENDL convention, columns ``Z El A m url fname``) is
-    used when present; otherwise the directory is scanned for the TENDL, ENDF/B,
-    and JEFF filename conventions.
+    used when present; otherwise the directory is scanned for the TENDL-2017,
+    TENDL-2015, TENDL-2019, ENDF/B PREPRO, JEFF-4.0, JEFF-3.3, and JENDL-5
+    filename conventions (including loose ``.tendl20NN``-infixed TENDL names).
+    Every convention contributes only the isomeric state (LISO) implied by the
+    name; nuclide identity is always taken from the MF=1/451 header afterward.
 
     Parameters
     ----------
@@ -139,6 +161,27 @@ def _discover_pendf_files(pendf_dir):
         m = _JEFF_RE.match(name)
         if m is not None:
             files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _TENDL2015_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _TENDL2017_INFIX_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _TENDL2019_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _JEFF33_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _JENDL5_RE.match(name)
+        if m is not None:
+            files.append((path, int(m.group(3)) if m.group(3) else 0))
+            continue
     return files
 
 
@@ -459,7 +502,7 @@ class PendfLibrary:
         Parameters
         ----------
         pendf_dir : str or path-like
-            Directory of PENDF files (TENDL, ENDF/B, or JEFF filename
+            Directory of PENDF files (TENDL, ENDF/B, JEFF, or JENDL filename
             conventions; a ``_manifest.tsv`` is used when present).
         out : str or path-like
             Output ``.h5`` file (one file per library and temperature).

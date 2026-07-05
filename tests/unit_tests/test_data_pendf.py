@@ -12,7 +12,9 @@ import pytest
 import openmc.data
 from openmc.data import Tabulated1D
 from openmc.data.isomeric import ELIS_ATOL, ELIS_RTOL
-from openmc.data.pendf import PendfLibrary, _check_lin_lin, _write_mf10_partials
+from openmc.data.pendf import (PendfLibrary, _check_lin_lin,
+                               _discover_pendf_files, _write_mf10_partials,
+                               _TENDL_RE)
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
 _PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
@@ -441,3 +443,106 @@ def test_mf10_unique_lfs_schema_compatible(tmp_path):
             assert mtg["LFS2"].attrs["ELFS"] == pytest.approx(48600.0)
 
     assert not records
+
+
+# ---------------------------------------------------------------------------
+# Filename-recognition tests for _discover_pendf_files. These exercise only the
+# regex/dispatch boundary of discovery: dummy empty files are touched into a
+# tmp_path directory and the returned (path, implied-LISO) pairs are checked. No
+# data is parsed, so no PENDF fixtures are needed (though the module skipif still
+# gates them, matching the rest of the file).
+
+
+def _discover_liso(tmp_path, names):
+    """Touch ``names`` as empty files and map recognized name -> implied LISO."""
+    scan = tmp_path / "scan"
+    scan.mkdir()
+    for name in names:
+        (scan / name).touch()
+    return {p.name: liso for p, liso in _discover_pendf_files(scan)}
+
+
+def test_discover_tendl2015_reversed(tmp_path):
+    # TENDL-2015 nuclide-first stem ``SymA[m|n]-n.pendf`` (reversed vs 2017).
+    got = _discover_liso(tmp_path, ["Ag107-n.pendf", "Ac222m-n.pendf",
+                                    "Ac214-n.pendf"])
+    assert got == {"Ag107-n.pendf": 0, "Ac222m-n.pendf": 1, "Ac214-n.pendf": 0}
+
+
+def test_discover_tendl2019_native(tmp_path):
+    # TENDL-2019 native ``SymA[m|n]p.asc``; the trailing ``p`` is not an isomer.
+    got = _discover_liso(tmp_path, ["Ag107p.asc", "Ac222mp.asc", "Am241p.asc"])
+    assert got == {"Ag107p.asc": 0, "Ac222mp.asc": 1, "Am241p.asc": 0}
+
+
+def test_discover_jeff33(tmp_path):
+    # JEFF-3.3 ``Z-Sym-A(g|m|n).jeffNN.pendf`` with any two-digit version token.
+    got = _discover_liso(tmp_path, [
+        "47-Ag-107g.jeff33.pendf",     # ground (g -> LISO 0)
+        "27-Co-58m.jeff33.pendf",      # m -> LISO 1
+        "100-Fm-255g.jeff33.pendf",    # 3-digit Z
+        "47-Ag-107g.jeff40.pendf",     # any two digits accepted
+    ])
+    assert got == {
+        "47-Ag-107g.jeff33.pendf": 0,
+        "27-Co-58m.jeff33.pendf": 1,
+        "100-Fm-255g.jeff33.pendf": 0,
+        "47-Ag-107g.jeff40.pendf": 0,
+    }
+
+
+def test_discover_jendl5(tmp_path):
+    # JENDL-5 ``n_ZZZ-Sym-AAA[m<digit>]_<T>K.dat``; free-form temperature token
+    # and ``m<digit>`` isomer index doubling as the implied LISO.
+    got = _discover_liso(tmp_path, [
+        "n_047-Ag-107_300K.dat",       # no isomer -> LISO 0
+        "n_052-Te-123m1_300K.dat",     # m1 -> LISO 1
+        "n_065-Tb-156m2_300K.dat",     # m2 -> LISO 2
+        "n_047-Ag-107_293.6K.dat",     # non-integer temperature token
+    ])
+    assert got == {
+        "n_047-Ag-107_300K.dat": 0,
+        "n_052-Te-123m1_300K.dat": 1,
+        "n_065-Tb-156m2_300K.dat": 2,
+        "n_047-Ag-107_293.6K.dat": 0,
+    }
+
+
+def test_discover_tendl_infix(tmp_path):
+    # Loose ``.tendl20NN``-infixed files for both TENDL stems (projectile-first
+    # 2017 and nuclide-first 2015), including a metastable through the infix.
+    got = _discover_liso(tmp_path, [
+        "n-Ag107.tendl2017.pendf",     # 2017 stem + infix
+        "Ag107-n.tendl2015.pendf",     # 2015 stem + infix
+        "n-Ag110m.tendl2019.pendf",    # metastable m -> LISO 1
+    ])
+    assert got == {
+        "n-Ag107.tendl2017.pendf": 0,
+        "Ag107-n.tendl2015.pendf": 0,
+        "n-Ag110m.tendl2019.pendf": 1,
+    }
+
+
+def test_discover_infix_not_half_matched_by_tendl2017(tmp_path):
+    # The overlap guard: the frozen projectile-first TENDL-2017 pattern is fully
+    # anchored, so a ``.tendl20NN``-infixed name is NOT (half-)matched by it; the
+    # dedicated infix pattern must pick it up instead. A plain 2017 name in the
+    # same directory is still recognized, proving both coexist.
+    assert _TENDL_RE.match("n-Ag107.tendl2017.pendf") is None
+    got = _discover_liso(tmp_path, ["n-Ag107.tendl2017.pendf", "n-Fe056.pendf"])
+    assert got == {"n-Ag107.tendl2017.pendf": 0, "n-Fe056.pendf": 0}
+
+
+def test_discover_negatives_and_near_misses(tmp_path):
+    # Non-PENDF and near-miss names must be ignored entirely: a FLUKA-style
+    # ``.z``, a stray ``.txt``, a ``.pendf.bak`` backup, and a truncated JENDL-5
+    # name missing its temperature token.
+    got = _discover_liso(tmp_path, [
+        "Ag107.z",                     # FLUKA-ish
+        "notes.txt",                   # random text file
+        "Ag107-n.pendf.bak",           # backup near-miss (trailing .bak)
+        "n-Ag107.tendl2017.pendf.bak", # infix backup near-miss
+        "n_047-Ag-107.dat",            # JENDL-5 missing _<T>K token
+        "ZA000001",                    # ENDF/B free-neutron placeholder (skipped)
+    ])
+    assert got == {}
