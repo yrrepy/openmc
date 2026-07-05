@@ -294,6 +294,29 @@ def _write_urr_ptables(nuc, ev, name, path):
     grp.create_dataset('table', data=table)
 
 
+def _select_urr_tkey(tkeys, temperature, default_temperature):
+    """Pick the ``<nuclide>/urr`` temperature key to read.
+
+    A single-temperature PENDF library stores exactly one ``<Tkey>`` (e.g.
+    ``'294K'``), which is returned regardless of ``temperature``. With several,
+    the key whose temperature is nearest to ``temperature`` is chosen (falling
+    back to ``default_temperature`` when ``temperature`` is ``None``). Returns
+    ``None`` for an empty ``urr`` group.
+    """
+    if not tkeys:
+        return None
+    if len(tkeys) == 1:
+        return tkeys[0]
+    target = default_temperature if temperature is None else temperature
+    if target is None:
+        return sorted(tkeys)[0]
+
+    def _temp(k):
+        return float(k[:-1]) if k.endswith('K') else float(k)
+
+    return min(tkeys, key=lambda k: abs(_temp(k) - float(target)))
+
+
 class _TemperatureMismatchError(ValueError):
     """A tape's temperature disagrees with the library temperature.
 
@@ -506,6 +529,58 @@ class PendfLibrary:
         if 'product' in group.attrs:
             return _attr_str(group.attrs, 'product')
         return None
+
+    def has_ptables(self, nuclide):
+        """Return whether the nuclide carries URR probability tables.
+
+        Parameters
+        ----------
+        nuclide : str
+            GNDS name of the nuclide.
+
+        Returns
+        -------
+        bool
+            ``True`` if a ``<nuclide>/urr`` group is present (ingested from
+            MF=2 MT=153 at build time), otherwise ``False``. A nuclide absent
+            from the library answers ``False`` gracefully (the group is not
+            present) rather than raising.
+
+        """
+        group = self._groups.get(nuclide)
+        return group is not None and 'urr' in group
+
+    def ptables(self, nuclide, temperature=None):
+        """Return the URR probability tables for a nuclide, or ``None``.
+
+        Parameters
+        ----------
+        nuclide : str
+            GNDS name of the nuclide.
+        temperature : float, optional
+            Requested temperature in kelvin. When a nuclide carries a single
+            temperature (the usual case for a single-temperature PENDF library)
+            it is returned regardless of this value; when several are present
+            the nearest ``<Tkey>`` is chosen. Defaults to the library
+            temperature.
+
+        Returns
+        -------
+        openmc.data.ProbabilityTables or None
+            Probability tables read from ``<nuclide>/urr/<Tkey>``, or ``None``
+            if the nuclide has no ``/urr`` group (including a nuclide absent
+            from the library).
+
+        """
+        group = self._groups.get(nuclide)
+        if group is None or 'urr' not in group:
+            return None
+        urr = group['urr']
+        tkey = _select_urr_tkey(
+            list(urr.keys()), temperature, self.temperature)
+        if tkey is None:
+            return None
+        return openmc.data.urr.ProbabilityTables.from_hdf5(urr[tkey])
 
     def close(self):
         """Close the underlying HDF5 file handles."""
