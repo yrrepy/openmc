@@ -29,7 +29,7 @@ import numpy as np
 import openmc
 import openmc.checkvalue as cv
 from .data import gnds_name
-from .endf import Evaluation, get_head_record, get_tab1_record
+from .endf import Evaluation, get_head_record, get_list_record, get_tab1_record
 from .isomeric import (ELIS_ATOL, ELIS_RTOL, map_lfs_to_liso,
                        parse_decay_isomeric_levels)
 
@@ -258,6 +258,40 @@ def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
                 izap // 1000, izap % 1000,
                 lfs_to_liso[izap, lfs]))
         _write_xy(lg, ptab.x, ptab.y)
+
+
+# MF=2 MT=153 (NJOY PURR) probability-table layout: each URR energy carries a
+# leading energy value followed by six band columns -- probability, total,
+# elastic, fission, capture, heating -- so NPL = NUNR * (1 + 6*NBAND).
+_URR_PTABLE_COLS = 6
+
+
+def _write_urr_ptables(nuc, ev, name, path):
+    """Ingest MF=2 MT=153 probability tables into <nuclide>/urr/<Tkey>/."""
+    if (2, 153) not in ev.section:
+        return
+    fo = io.StringIO(ev.section[2, 153])
+    # HEAD: N1 = #xs columns (5), N2 = #bands (NBAND=20)
+    _za, _awr, _l1, _l2, _n1, nband = get_head_record(fo)
+    # LIST: C1 = temperature [K], N2 = #URR energies (NUNR)
+    (temp, _c2, _ll1, _ll2, npl, nunr), values = get_list_record(fo)
+    per_energy = 1 + _URR_PTABLE_COLS * nband
+    if nunr <= 0 or nband <= 0 or npl != nunr * per_energy:
+        warn(f"{path.name}: {name} MF=2 MT=153 NPL={npl} incompatible with "
+             f"NUNR={nunr}, NBAND={nband}; skipping probability tables.")
+        return
+    block = np.asarray(values, dtype=np.float64).reshape(nunr, per_energy)
+    energy = np.array(block[:, 0], dtype=np.float64)                    # eV
+    table = block[:, 1:].reshape(nunr, _URR_PTABLE_COLS, nband).copy()  # col-major
+    # OpenMC stores CUMULATIVE probability in column 0; ENDF gives raw per-band.
+    table[:, 0, :] = np.cumsum(table[:, 0, :], axis=1)
+    grp = nuc.create_group(f'urr/{round(float(temp))}K')
+    grp.attrs['interpolation'] = 2
+    grp.attrs['inelastic'] = -1
+    grp.attrs['absorption'] = -1
+    grp.attrs['multiply_smooth'] = 0
+    grp.create_dataset('energy', data=energy)
+    grp.create_dataset('table', data=table)
 
 
 class _TemperatureMismatchError(ValueError):
@@ -634,6 +668,12 @@ class PendfLibrary:
                         for mt in sorted(mf10_mts - mf3_mts):
                             warn(f"{path.name}: {name} MF=10 MT={mt} has no "
                                  f"MF=3 section; isomeric partials dropped.")
+
+                        # MF=2 MT=153 probability tables (URR). Ingested
+                        # unconditionally (independent of keep_extra_mts, which
+                        # only gates the MF=3 loop) so a rebuilt library always
+                        # carries /urr for downstream self-shielding.
+                        _write_urr_ptables(nuc, ev, name, path)
 
                         n_converted += 1
                     except _TemperatureMismatchError:
