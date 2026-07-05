@@ -55,7 +55,26 @@ Pure Python; consumes :class:`openmc.data.urr.ProbabilityTables` read back from
 the PENDF library. No C++ rebuild and no transport change.
 """
 
+import warnings
+
 import numpy as np
+
+# Nuclides that carry URR probability tables in the JEFF-3.3 PENDF library and
+# for which the material-dilution self-shielding correction is applied by
+# default. All 24 carry MF=2 MT=152/153; the collapse hook intersects this with
+# any caller-supplied ``mat_ssf_nuclides`` and with the library's actual ptable
+# coverage (a flagged nuclide lacking a ``/urr`` group warns once and is left at
+# infinite dilution).
+DEFAULT_FLAGGED = frozenset({
+    'W180', 'W182', 'W183', 'W184', 'W186', 'Ta181', 'Re185', 'Re187',
+    'Hf174', 'Hf176', 'Hf177', 'Hf178', 'Hf179', 'Hf180',
+    'Os186', 'Os187', 'Os188', 'Os189', 'Os190', 'Os192',
+    'U235', 'U238', 'Pu239', 'Pu240',
+})
+
+# Base reaction name -> MF=3 MT of its smooth cross section, used to evaluate the
+# resonant nuclide's smooth reaction XS at the URR nodes for factor-form tables.
+_BASE_REACTION_MT = {'(n,gamma)': 102, 'fission': 18}
 
 
 def material_dilution_sigma0(densities, resonant, group_totals):
@@ -331,3 +350,205 @@ def mat_ssf_factors(ptab, sigma0_g, group_edges, reaction, flux_g=None,
     f_g = np.ones(n_groups)
     np.divide(eff_g, inf_g, out=f_g, where=inf_g > 0)
     return f_g
+
+
+def _library_group_total(lib, nuc, group_edges, grouped):
+    r"""Group-averaged total cross section :math:`\sigma_{t,g}` of one nuclide.
+
+    Reads the diluter's MF=3 MT=1 total from the PENDF library and, for a
+    pointwise library, flat-weights it onto ``group_edges`` with
+    :func:`~openmc.deplete.microxs._group_average` (a grouped library returns its
+    pre-binned ``xs_g``). If MT=1 is absent the total is reconstructed as
+    MT=2 (elastic) + MT=102 (capture) [+ MT=18 (fission)] from whichever of those
+    are present. Returns ``None`` if the nuclide is absent from the library or
+    carries none of those MTs, so the caller can defer the missing-diluter error
+    to :func:`material_dilution_sigma0` (which names them, amendment A2).
+    """
+    from .microxs import _group_average
+
+    if nuc not in lib.nuclides:
+        return None
+    mts = set(lib.reactions(nuc))
+    order = [1] if 1 in mts else [mt for mt in (2, 102, 18) if mt in mts]
+    if not order:
+        return None
+    total = None
+    for mt in order:
+        part = (np.asarray(lib.xs_g(nuc, mt), dtype=float) if grouped
+                else _group_average(*lib.xs(nuc, mt), group_edges))
+        total = part if total is None else total + part
+    return total
+
+
+def _smooth_at_nodes(lib, nuc, nodes, mts, grouped, group_edges):
+    r"""Sum of a nuclide's smooth MF=3 cross sections at the URR nodes.
+
+    Evaluates :math:`\sum_{mt} \sigma_{mt}(E_i)` over the ``mts`` present for
+    ``nuc`` at each URR node energy ``nodes``. For a pointwise library the smooth
+    XS is linearly interpolated onto the nodes; for a grouped library it is a
+    per-node step-function lookup of the group the node falls in (the URR smooth
+    XS is nearly flat, so this is a second-order approximation). Returns ``None``
+    if none of ``mts`` are present.
+    """
+    present = [mt for mt in mts if mt in set(lib.reactions(nuc))]
+    if not present:
+        return None
+    nodes = np.asarray(nodes, dtype=float)
+    total = None
+    for mt in present:
+        if grouped:
+            xs_g = np.asarray(lib.xs_g(nuc, mt), dtype=float)
+            g = np.clip(np.searchsorted(group_edges, nodes, side='right') - 1,
+                        0, len(xs_g) - 1)
+            part = xs_g[g]
+        else:
+            energy, xs = lib.xs(nuc, mt)
+            part = np.interp(nodes, energy, xs)
+        total = part if total is None else total + part
+    return total
+
+
+def _apply_mat_ssf(table, pendf_library, energies, densities,
+                   mat_ssf_nuclides=None):
+    r"""Apply the URR material-dilution self-shielding factors to a collapse table.
+
+    Mutates ``table.xs_matrix`` in place: each capture/fission row of a flagged
+    resonant nuclide is multiplied by its per-group self-shielding factor
+    :math:`f_g` (:func:`mat_ssf_factors`), evaluated at the homogeneous
+    background :math:`\sigma_0` built from the composition snapshot
+    (:func:`material_dilution_sigma0`). The correction is confined to
+    URR-overlapping groups (:math:`f_g = 1` elsewhere). This is the C4 collapse
+    hook consumed by :meth:`MicroXS.from_multigroup_flux` when
+    ``urr_material_dilution=True``.
+
+    **Limitations.** :math:`\sigma_0` is homogeneous (no escape/Dancoff
+    geometry, infinite-medium limit) and is built from the single ``densities``
+    snapshot supplied by the caller; diluter build-in over a long irradiation
+    (per-step densities) is not modelled here (phase 2).
+
+    Row handling:
+
+    * Non-flagged nuclides and non-capture/fission reactions are left untouched.
+    * A flagged nuclide whose own density is zero/absent is infinitely dilute
+      (:math:`\sigma_0 \to \infty`, :math:`f \to 1`) and is skipped silently
+      (amendment A1) -- transmutation products carry ptables but need no
+      shielding at trace density.
+    * A flagged nuclide with no ``/urr`` probability tables warns **once** and is
+      left at infinite dilution.
+
+    :math:`f_g` is cached per ``(nuclide, base reaction)`` and shared across the
+    isomeric MF=10 partial rows (``'(n,gamma)'``, ``'(n,gamma)_m1'``, ...);
+    :math:`\sigma_{0,g}` is cached per nuclide; each diluter's group totals are
+    computed once per call (amendment A9).
+
+    Parameters
+    ----------
+    table : openmc.deplete.microxs._SparseXSTable
+        Sparse collapse table; ``xs_matrix`` rows are multiplied in place.
+    pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary
+        Library supplying probability tables (via ``ptables``) and diluter/
+        resonant smooth cross sections.
+    energies : numpy.ndarray
+        Ascending collapse group edges (eV), length ``n_groups + 1``. For a
+        grouped library these must equal the library's own ``group_edges``.
+    densities : dict
+        Maps nuclide name to number density (or fraction); the composition
+        snapshot the :math:`\sigma_0` background is built from.
+    mat_ssf_nuclides : iterable of str, optional
+        Restricts the shielded set; the effective set is
+        ``DEFAULT_FLAGGED`` intersected with this (and, per row, ptable
+        coverage). ``None`` uses the full flagged list.
+
+    Raises
+    ------
+    ValueError
+        If a grouped library's ``group_edges`` differ from ``energies``, or if a
+        diluter with nonzero density has no group totals in the library
+        (propagated from :func:`material_dilution_sigma0`).
+    """
+    from .microxs import _ISOMER_SUFFIX
+
+    edges = np.asarray(energies, dtype=float)
+    grouped = hasattr(pendf_library, 'group_edges')
+    if grouped:
+        lib_edges = np.asarray(pendf_library.group_edges, dtype=float)
+        if not np.array_equal(lib_edges, edges):
+            raise ValueError(
+                "grouped pendf_library group_edges differ from the collapse "
+                "energies; URR self-shielding of a grouped library requires the "
+                "collapse to run on the library's own group structure (omit "
+                "`energies` so it defaults to group_edges)")
+
+    flagged = set(DEFAULT_FLAGGED)
+    if mat_ssf_nuclides is not None:
+        flagged &= set(mat_ssf_nuclides)
+
+    # Diluter group totals, once per call (A9). A nuclide the library cannot
+    # supply is omitted here; material_dilution_sigma0 then raises a *named*
+    # ValueError (A2) for any diluter a shielded nuclide actually needs.
+    group_totals = {}
+    for j, n_j in densities.items():
+        if n_j <= 0:
+            continue
+        tot = _library_group_total(pendf_library, j, edges, grouped)
+        if tot is not None:
+            group_totals[j] = tot
+
+    sigma0_cache = {}       # nuc -> sigma0_g
+    smooth_total_cache = {}  # nuc -> smooth total at that nuc's URR nodes
+    f_cache = {}            # (nuc, base reaction) -> f_g
+    warned = set()
+
+    for r in range(table.xs_matrix.shape[0]):
+        nuc = table.nuclides[table.nuc_indices[r]]
+        if nuc not in flagged:
+            continue
+        rxn = table.reactions[table.rxn_indices[r]]
+        base = _ISOMER_SUFFIX.sub('', rxn)
+        if base not in ('(n,gamma)', 'fission'):
+            continue
+        # A1: a zero/absent-density resonant nuclide is infinitely dilute -> f=1.
+        if densities.get(nuc, 0.0) == 0:
+            continue
+
+        ptab = pendf_library.ptables(nuc)
+        if ptab is None:
+            if nuc not in warned:
+                warnings.warn(
+                    f"{nuc} is flagged for URR material-dilution "
+                    f"self-shielding but carries no probability tables (no "
+                    f"/urr group); leaving its reaction rates at infinite "
+                    f"dilution (f=1)")
+                warned.add(nuc)
+            continue
+
+        key = (nuc, base)
+        f_g = f_cache.get(key)
+        if f_g is None:
+            sigma0_g = sigma0_cache.get(nuc)
+            if sigma0_g is None:
+                sigma0_g = material_dilution_sigma0(
+                    densities, nuc, group_totals)
+                sigma0_cache[nuc] = sigma0_g
+            if ptab.multiply_smooth:
+                nodes = np.asarray(ptab.energy, dtype=float)
+                smooth_total = smooth_total_cache.get(nuc)
+                if smooth_total is None:
+                    smooth_total = _smooth_at_nodes(
+                        pendf_library, nuc, nodes, [1], grouped, edges)
+                    if smooth_total is None:
+                        smooth_total = _smooth_at_nodes(
+                            pendf_library, nuc, nodes, [2, 102, 18],
+                            grouped, edges)
+                    smooth_total_cache[nuc] = smooth_total
+                smooth_rxn = _smooth_at_nodes(
+                    pendf_library, nuc, nodes, [_BASE_REACTION_MT[base]],
+                    grouped, edges)
+                f_g = mat_ssf_factors(
+                    ptab, sigma0_g, edges, base,
+                    smooth_total=smooth_total, smooth_rxn=smooth_rxn)
+            else:
+                f_g = mat_ssf_factors(ptab, sigma0_g, edges, base)
+            f_cache[key] = f_g
+
+        table.xs_matrix[r] *= f_g

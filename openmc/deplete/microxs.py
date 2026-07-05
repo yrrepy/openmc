@@ -977,6 +977,9 @@ class MicroXS:
         cross_sections: PathLike | None = None,
         pendf_library=None,
         pathways: bool = True,
+        urr_material_dilution: bool = False,
+        densities=None,
+        mat_ssf_nuclides=None,
         **init_kwargs: dict,
     ) -> MicroXS | list[MicroXS]:
         """Generated microscopic cross sections from a known flux.
@@ -1049,6 +1052,30 @@ class MicroXS:
             e.g. ``(n,gamma)_m1``), so the returned ``reactions`` axis may
             contain product-qualified names. If false, only MF=3-total rows are
             emitted.
+        urr_material_dilution : bool, optional
+            Only valid with ``pendf_library``. If true, apply the unresolved
+            resonance region (URR) material-dilution self-shielding correction:
+            the collapsed capture (and fission) reaction rates of flagged
+            resonant nuclides are multiplied, in URR-overlapping groups only, by
+            a per-group self-shielding factor computed from the nuclides'
+            probability tables at a homogeneous background cross section
+            ``sigma_0`` built from ``densities``. The background is
+            infinite-medium (no escape/Dancoff geometry) and uses the single
+            ``densities`` snapshot (diluter build-in over an irradiation is not
+            modelled). Requires ``densities``; raises ``ValueError`` on the
+            continuous-energy path or if ``densities`` is ``None``. Default False,
+            in which case the collapse is unchanged.
+        densities : dict, optional
+            Maps nuclide name to number density (or fraction; only ratios
+            matter) for the ``sigma_0`` background. Required when
+            ``urr_material_dilution`` is true, ignored otherwise. A flagged
+            nuclide absent from this mapping (e.g. a trace transmutation product)
+            is treated as infinitely dilute (self-shielding factor 1).
+        mat_ssf_nuclides : iterable of str, optional
+            Restricts the URR self-shielding to these nuclides (intersected with
+            the default flagged list and the library's ptable coverage). ``None``
+            (default) uses the full flagged list. Only used when
+            ``urr_material_dilution`` is true.
         **init_kwargs : dict
             Keyword arguments passed to :func:`openmc.lib.init`
 
@@ -1066,6 +1093,21 @@ class MicroXS:
         # ``energies`` (which precedes it positionally) can default to None.
         if multigroup_flux is None:
             raise ValueError('multigroup_flux is a required argument')
+
+        # The URR material-dilution correction is defined only on the PENDF
+        # path (it needs the library's probability tables) and needs a
+        # composition to build the sigma_0 background from.
+        if urr_material_dilution:
+            if pendf_library is None:
+                raise ValueError(
+                    'urr_material_dilution requires a pendf_library; the URR '
+                    'self-shielding correction is built from its probability '
+                    'tables and is not available on the continuous-energy path')
+            if densities is None:
+                raise ValueError(
+                    'urr_material_dilution=True requires densities (a mapping '
+                    'of nuclide name to number density or fraction) to build '
+                    'the sigma_0 background')
 
         # Default the group structure to a grouped PENDF library's own edges
         # when the caller omits ``energies``. A grouped library is duck-detected
@@ -1123,6 +1165,13 @@ class MicroXS:
                     'cannot be combined with pendf_library')
             table = _build_xs_table_pendf(
                 nuclides, reactions, energies, pendf_library, pathways=pathways)
+            # URR material-dilution self-shielding: multiply the capture/fission
+            # rows of flagged resonant nuclides by their per-group factor in the
+            # URR-overlapping groups (in place). The =False path is untouched.
+            if urr_material_dilution:
+                from .mat_ssf import _apply_mat_ssf
+                _apply_mat_ssf(table, pendf_library, energies, densities,
+                               mat_ssf_nuclides)
         else:
             # None selects the continuous-energy default (293.6 K); resolve it
             # here, the sole place temperature is consumed (passed to group_xs).
