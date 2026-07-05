@@ -194,7 +194,9 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                         reason='product Z out of range'))
                     continue
 
-                lfs_keys = sorted(k for k in mt_group if k.startswith('LFS'))
+                lfs_keys = sorted((k for k in mt_group if k.startswith('LFS')),
+                                  key=lambda k: (int(mt_group[k].attrs['LFS']),
+                                                 int(mt_group[k].attrs['IZAP'])))
                 products_added = set()
                 if lfs_keys:
                     # One reaction per MF=10 pathway with a baked product name.
