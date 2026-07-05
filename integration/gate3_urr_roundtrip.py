@@ -42,6 +42,19 @@ TEST_NUCLIDES = ['W182', 'U238', 'Ta181']
 ABSENT_NUCLIDE = 'Xe135'  # not in the flagged-only URR library
 RTOL = 1e-12
 
+# The 24 flagged JEFF-3.3 URR nuclides and their band convention. Only these 5
+# carry ABSOLUTE bands (MT=153 LSSF=0 -> multiply_smooth=False); the other 19
+# are FACTOR-form (LSSF=1 -> multiply_smooth=True). Empirically established from
+# the MT=153 LIST L1 field, cross-checked against the data (prob-weighted
+# band-total ~1 iff factor). The parser must set this per nuclide.
+FLAGGED_NUCLIDES = [
+    'W180', 'W182', 'W183', 'W184', 'W186', 'Ta181', 'Re185', 'Re187',
+    'Hf174', 'Hf176', 'Hf177', 'Hf178', 'Hf179', 'Hf180',
+    'Os186', 'Os187', 'Os188', 'Os189', 'Os190', 'Os192',
+    'U235', 'U238', 'Pu239', 'Pu240',
+]
+ABSOLUTE_NUCLIDES = {'W182', 'W183', 'W184', 'W186', 'Ta181'}
+
 
 def _jeff33_filename(gnds):
     """GNDS name -> JEFF-3.3 point-library filename (ground state)."""
@@ -60,7 +73,8 @@ def reference_ptable(src_path):
     ev = Evaluation(src_path)
     fo = io.StringIO(ev.section[2, 153])
     _za, _awr, _l1, _l2, _n1, nband = get_head_record(fo)
-    (temp, _c2, _ll1, _ll2, npl, nunr), values = get_list_record(fo)
+    # LIST L1 is the LSSF flag (verified): 0 -> absolute bands, 1 -> factor bands.
+    (temp, _c2, lssf, _ll2, npl, nunr), values = get_list_record(fo)
     per_energy = 1 + 6 * nband
     assert npl == nunr * per_energy, (
         f"{src_path.name}: NPL={npl} != NUNR*({per_energy}) for NUNR={nunr}")
@@ -69,7 +83,7 @@ def reference_ptable(src_path):
     table = block[:, 1:].reshape(nunr, 6, nband).copy()
     table[:, 0, :] = np.cumsum(table[:, 0, :], axis=1)
     attrs = dict(interpolation=2, inelastic=-1, absorption=-1,
-                 multiply_smooth=False, temp=float(temp),
+                 multiply_smooth=bool(lssf), temp=float(temp),
                  nunr=int(nunr), nband=int(nband))
     return energy, table, attrs
 
@@ -171,6 +185,29 @@ def main():
             if lib.ptables(ABSENT_NUCLIDE) is not None:
                 absent_ok = False
                 absent_msgs.append(f'{kind}: ptables({ABSENT_NUCLIDE}) not None')
+
+        # Per-nuclide multiply_smooth (LSSF) split: exactly the 5 ABSOLUTE
+        # nuclides carry multiply_smooth=False; the other 19 carry True. Checked
+        # against BOTH libraries for all 24 flagged nuclides.
+        ms_ok = True
+        ms_msgs = []
+        n_abs = n_fac = 0
+        for kind, lib in (('pointwise', plib), ('grouped', glib)):
+            for nuc in FLAGGED_NUCLIDES:
+                pt = lib.ptables(nuc)
+                if pt is None:
+                    ms_ok = False
+                    ms_msgs.append(f'{kind}: {nuc} has no ptables')
+                    continue
+                expected = nuc not in ABSOLUTE_NUCLIDES  # True == factor-form
+                if kind == 'pointwise':
+                    n_fac += int(expected)
+                    n_abs += int(not expected)
+                if bool(pt.multiply_smooth) != expected:
+                    ms_ok = False
+                    ms_msgs.append(
+                        f'{kind}: {nuc} multiply_smooth='
+                        f'{bool(pt.multiply_smooth)} expected {expected}')
     finally:
         plib.close()
         glib.close()
@@ -201,6 +238,14 @@ def main():
     for m in absent_msgs:
         print(f'    ! {m}')
     all_ok &= absent_ok
+
+    print('-' * 78)
+    print(f'multiply_smooth LSSF split (both libs, 24 flagged): '
+          f'{n_abs} absolute / {n_fac} factor per lib '
+          f'(expect 5/19): {"PASS" if ms_ok else "FAIL"}')
+    for m in ms_msgs:
+        print(f'    ! {m}')
+    all_ok &= ms_ok
 
     worst_abs = max((r['max_abs'] for r in results
                      if not np.isnan(r['max_abs'])), default=0.0)

@@ -273,8 +273,16 @@ def _write_urr_ptables(nuc, ev, name, path):
     fo = io.StringIO(ev.section[2, 153])
     # HEAD: N1 = #xs columns (5), N2 = #bands (NBAND=20)
     _za, _awr, _l1, _l2, _n1, nband = get_head_record(fo)
-    # LIST: C1 = temperature [K], N2 = #URR energies (NUNR)
-    (temp, _c2, _ll1, _ll2, npl, nunr), values = get_list_record(fo)
+    # LIST: C1 = temperature [K], L1 = LSSF flag, N2 = #URR energies (NUNR).
+    # LSSF (self-shielding flag, carried through from MF=2 MT=151) governs the
+    # band convention: 0 -> bands are ABSOLUTE cross sections; 1 -> bands are
+    # FACTORS relative to the smooth (infinite-dilution) MF=3 cross section.
+    # Empirically verified across all 24 JEFF-3.3 flagged nuclides (LIST L1 is
+    # the only record field matching the 5/19 absolute/factor split): LSSF=0 for
+    # W182/183/184/186 & Ta181, LSSF=1 for the other 19. Cross-checked against
+    # the data (prob-weighted band-total ~1 iff factor-form). The fold needs this
+    # to know whether to multiply the bands by the smooth XS (mat_ssf.py).
+    (temp, _c2, lssf, _ll2, npl, nunr), values = get_list_record(fo)
     per_energy = 1 + _URR_PTABLE_COLS * nband
     if nunr <= 0 or nband <= 0 or npl != nunr * per_energy:
         warn(f"{path.name}: {name} MF=2 MT=153 NPL={npl} incompatible with "
@@ -289,7 +297,7 @@ def _write_urr_ptables(nuc, ev, name, path):
     grp.attrs['interpolation'] = 2
     grp.attrs['inelastic'] = -1
     grp.attrs['absorption'] = -1
-    grp.attrs['multiply_smooth'] = 0
+    grp.attrs['multiply_smooth'] = int(lssf)
     grp.create_dataset('energy', data=energy)
     grp.create_dataset('table', data=table)
 
