@@ -141,6 +141,16 @@ _MT_ELASTIC = 2
 _MT_CAPTURE = 101   # total disappearance (n,gamma dominated in the URR)
 _MT_FISSION = 18
 
+# Library / GENDF-collapse-side ENDF MT numbers. These differ from the .tpe KP
+# MTs above: the .tpe carries capture as MT=101 (total disappearance), while the
+# GENDF library and the flux collapse identify radiative capture as MT=102. The
+# fold uses the .tpe MT=101 band cross sections; the resulting capture f_g then
+# multiplies the collapse's MT=102 group row (the two channels agree to <~1.5%
+# for the flagged nuclides in this energy range, see the module docstring).
+_LIB_TOTAL_MT = 1        # diluter group totals for the sigma0 background
+_LIB_CAPTURE_MT = 102    # (n,gamma) rows shielded with the capture f_g
+_LIB_FISSION_MT = 18     # fission rows shielded with the fission f_g
+
 # Values <= this are the .tpe zero placeholder (~2e-20), treated as exactly 0.
 _ZERO_PLACEHOLDER = 1e-19
 
@@ -617,3 +627,149 @@ def compute_mat_ssf(tables, densities, resonant, group_totals, n_groups,
             continue
         out[rx] = mat_ssf_factors_gendf(tables, sigma0_g, n_groups, rx)
     return out
+
+
+def _apply_mat_ssf_gendf(table, gendf_library, calendf_path, densities, mts,
+                         mat_ssf_nuclides=None):
+    """Self-shield a sparse GENDF cross-section table in place (material dilution).
+
+    Apply seam for :meth:`openmc.deplete.MicroXS.from_multigroup_flux_with_gendf`.
+    It runs between the infinite-dilution table build and the flux collapse. For
+    every flagged, self-shielding nuclide that is present in ``table``, has a
+    positive density in ``densities`` and a ``.tpe`` file under ``calendf_path``,
+    it folds the nuclide's CALENDF probability tables against the material
+    background cross section ``sigma0_mat`` and multiplies that nuclide's capture
+    (MT=102) and, when fissile, fission (MT=18) group rows in ``table.xs_matrix``
+    by the per-group self-shielding factor ``f_g``. This is the exact analogue of
+    FISPACT-II ``PROBTABLE multxs=1``; the CALENDF tables span the resolved range
+    as well as the URR, so ``f_g`` deviates from 1 across both (in some
+    resolved-range groups capture anti-correlates with the total, giving
+    ``f_g`` > 1 -- legitimate ``multxs=1`` behaviour, not a bug).
+
+    The table is modified **in place**; nothing is returned.
+
+    Parameters
+    ----------
+    table : openmc.deplete.microxs._SparseXSTable
+        Sparse infinite-dilution table (``xs_matrix`` rows keyed by
+        ``nuc_indices`` -> ``table.nuclides`` and ``rxn_indices`` -> ``mts``).
+    gendf_library : GENDF library instance
+        Source of diluter group totals (``get_xs(diluter, 1)``) and of the
+        energy-structure name used to map the ``.tpe`` groups.
+    calendf_path : path-like
+        Directory of ``<Nuclide>-<T>.tpe`` CALENDF tables (per temperature).
+    densities : dict of str to float
+        Atom densities keyed by nuclide (only ratios matter). A resonant nuclide
+        with zero / non-positive / absent density is silently skipped (``f=1``).
+    mts : sequence of int
+        ENDF MT numbers parallel to ``table.reactions`` (identifies which sparse
+        rows are capture / fission). Capture rows are MT=102, fission MT=18.
+    mat_ssf_nuclides : sequence of str, optional
+        Restrict the correction to this subset. ``None`` (default) uses the full
+        :data:`DEFAULT_FLAGGED` set. When given it is **intersected** with
+        :data:`DEFAULT_FLAGGED` (restrict-only, matching the PENDF sibling's
+        ``mat_ssf_nuclides`` semantics), so it can only narrow -- never widen --
+        the flagged set.
+
+    Raises
+    ------
+    ValueError
+        If a nuclide named as a diluter in ``densities`` (positive density) is
+        absent from the GENDF library.
+
+    Warns
+    -----
+    UserWarning
+        Once per flagged nuclide that has a positive density but no ``.tpe``
+        table under ``calendf_path`` (that nuclide is left at ``f=1``).
+    """
+    # Flagged set: restrict-only when an explicit subset is given (sibling API
+    # symmetry -- the argument can narrow the default set but never widen it).
+    if mat_ssf_nuclides is None:
+        flagged = set(DEFAULT_FLAGGED)
+    else:
+        flagged = set(mat_ssf_nuclides) & set(DEFAULT_FLAGGED)
+    if not flagged:
+        return
+
+    n_groups = table.n_groups
+    calendf_path = Path(calendf_path)
+    mts = list(mts)
+
+    # Group structure the .tpe IG maps onto (match the library's own structure).
+    group_structure = getattr(gendf_library, 'energy_structure', None) \
+        or 'CCFE-709'
+
+    # Positive-density nuclides act as diluters (and only ratios matter).
+    pos_densities = {k: float(v) for k, v in densities.items()
+                     if v is not None and float(v) > 0.0}
+
+    nuc_to_index = {nuc: i for i, nuc in enumerate(table.nuclides)}
+    nuc_indices = table.nuc_indices
+    rxn_indices = table.rxn_indices
+
+    available = gendf_library.available_nuclides_set()
+    diluter_total_cache = {}
+
+    def _diluter_total(name):
+        """Cached MT=1 group total for a diluter (barns); ValueError if absent."""
+        if name not in diluter_total_cache:
+            if name not in available:
+                raise ValueError(
+                    f"diluter {name!r} has a density but is absent from the "
+                    f"GENDF library; cannot build sigma0_mat")
+            diluter_total_cache[name] = np.asarray(
+                gendf_library.get_xs(name, _LIB_TOTAL_MT), dtype=float)
+        return diluter_total_cache[name]
+
+    warned = set()
+    for nuc in table.nuclides:
+        if nuc not in flagged:
+            continue
+        idx = nuc_to_index[nuc]
+        row_ids = np.nonzero(nuc_indices == idx)[0]
+        if row_ids.size == 0:
+            continue
+
+        # Which of this nuclide's rows are shieldable (capture / fission)?
+        row_mt = {int(r): mts[rxn_indices[r]] for r in row_ids}
+        want_capture = _LIB_CAPTURE_MT in row_mt.values()
+        want_fission = _LIB_FISSION_MT in row_mt.values()
+        if not (want_capture or want_fission):
+            continue
+
+        # Silent skip for zero / absent resonant density (f = 1).
+        if pos_densities.get(nuc, 0.0) <= 0.0:
+            continue
+
+        tpe_path = find_tpe(calendf_path, nuc)
+        if tpe_path is None:
+            if nuc not in warned:
+                warnings.warn(
+                    f"urr_material_dilution: no CALENDF .tpe table for {nuc!r} "
+                    f"under {calendf_path}; leaving it infinite-dilution (f=1)",
+                    UserWarning)
+                warned.add(nuc)
+            continue
+        tpe = read_tpe(tpe_path, group_structure=group_structure)
+
+        # sigma0_mat from the OTHER positive-density nuclides' group totals.
+        group_totals = {j: _diluter_total(j)
+                        for j in pos_densities if j != nuc}
+        need = (['capture'] if want_capture else []) \
+            + (['fission'] if want_fission else [])
+        f_by_reaction = compute_mat_ssf(
+            tpe, pos_densities, nuc, group_totals, n_groups,
+            reactions=tuple(need))
+
+        # Cache f_g by library MT so repeated rows do not refold.
+        f_by_mt = {}
+        if 'capture' in f_by_reaction:
+            f_by_mt[_LIB_CAPTURE_MT] = f_by_reaction['capture']
+        if 'fission' in f_by_reaction:
+            f_by_mt[_LIB_FISSION_MT] = f_by_reaction['fission']
+
+        for r in row_ids:
+            f = f_by_mt.get(row_mt[int(r)])
+            if f is not None:
+                table.xs_matrix[r, :] *= f
