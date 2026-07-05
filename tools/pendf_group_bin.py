@@ -30,17 +30,12 @@ import h5py
 import numpy as np
 
 from openmc.deplete.chain import REACTIONS
-from openmc.deplete.microxs import _group_average
+from openmc.deplete.microxs import CONSISTENCY_RTOL, _group_average, _partials_total_max_deviation
 from openmc.mgxs import GROUP_STRUCTURES
 
 # Grouped-schema constants.
 GROUPED_FORMAT = 'pendf-grouped'
 GROUPED_VERSION = 1
-
-# Warn when binned partials disagree with the binned total by more than this
-# relative amount in any nonzero group -- the same threshold and spirit as the
-# runtime check in openmc.deplete.microxs._build_xs_table_pendf.
-CONSISTENCY_RTOL = 1e-5
 
 
 def chain_relevant_mts() -> set[int]:
@@ -157,17 +152,14 @@ def bin_pendf_library(
                     rows += 1
 
                 # Consistency check on the float64 binned values.
-                nz = total_g != 0.0
-                if nz.any() and (part_sum != 0.0).any():
-                    dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
-                    worst = float(dev.max())
+                worst, g = _partials_total_max_deviation(total_g, part_sum)
+                if (part_sum != 0.0).any():
                     if worst > worst_dev:
                         worst_dev = worst
                     if worst > CONSISTENCY_RTOL:
                         n_warnings += 1
-                        g = int(np.nonzero(nz)[0][dev.argmax()])
                         warn(f'{nuc} MT={mt}: binned MF=10 partials sum to '
-                             f'{part_sum[nz][dev.argmax()]:.6e} b but the MF=3 '
+                             f'{part_sum[g]:.6e} b but the MF=3 '
                              f'total is {total_g[g]:.6e} b in group {g} (max '
                              f'relative deviation {worst:.3e} > '
                              f'{CONSISTENCY_RTOL:.0e}).')
