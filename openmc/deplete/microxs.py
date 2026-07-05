@@ -534,6 +534,26 @@ def _liso_from_gnds(name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+# Real TENDL-2017 partials deviate from the MF=3 total by up to ~4e-6
+# per group (genuine data property); 1e-6 would warn on nearly every
+# isomeric nuclide at full-library scale.
+CONSISTENCY_RTOL = 1e-5
+
+
+def _partials_total_max_deviation(total_g, part_sum):
+    """Max relative deviation of summed MF=10 partials from the MF=3 total.
+
+    Returns (worst, group_idx) over groups with nonzero total, or
+    (0.0, -1) when every group's total is zero.
+    """
+    nz = total_g != 0.0
+    if not nz.any():
+        return 0.0, -1
+    dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
+    worst = float(dev.max())
+    return worst, int(np.nonzero(nz)[0][dev.argmax()])
+
+
 def _build_xs_table_pendf(
     nuclides: Sequence[str],
     reactions: Sequence[str],
@@ -674,19 +694,12 @@ def _build_xs_table_pendf(
                 pe, pxs = pathway_xs_fn(nuc, mt, lfs)
                 partial_g.append(_group_average(pe, pxs, energies))
             part_sum = np.sum(partial_g, axis=0)
-            nz = total_g != 0.0
-            if nz.any():
-                dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
-                worst = float(dev.max())
-                # Real TENDL-2017 partials deviate from the MF=3 total by up to
-                # ~4e-6 per group (genuine data property); 1e-6 would warn on
-                # nearly every isomeric nuclide at full-library scale.
-                if worst > 1e-5:
-                    g = int(np.nonzero(nz)[0][dev.argmax()])
-                    warn(f'PENDF MF=10 partials for {nuc} MT={mt} sum to '
-                         f'{part_sum[g]:.6e} b but the MF=3 total is '
-                         f'{total_g[g]:.6e} b in group {g} (max relative '
-                         f'deviation {worst:.3e} > 1e-5).')
+            worst, g = _partials_total_max_deviation(total_g, part_sum)
+            if worst > CONSISTENCY_RTOL:
+                warn(f'PENDF MF=10 partials for {nuc} MT={mt} sum to '
+                     f'{part_sum[g]:.6e} b but the MF=3 total is '
+                     f'{total_g[g]:.6e} b in group {g} (max relative '
+                     f'deviation {worst:.3e} > {CONSISTENCY_RTOL:.0e}).')
             # Emit ground first, then ascending isomer order
             for liso, xs_g in sorted(
                     ((_liso_from_gnds(p), pg)
