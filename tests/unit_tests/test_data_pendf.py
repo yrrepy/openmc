@@ -1,6 +1,8 @@
 """Tests for openmc.data.pendf against real TENDL-2017 PENDF fixtures."""
 
 import io
+import types
+import warnings
 from pathlib import Path
 
 import h5py
@@ -9,7 +11,10 @@ import pytest
 
 import openmc.data
 from openmc.data import Tabulated1D
-from openmc.data.pendf import PendfLibrary, _check_lin_lin
+from openmc.data.isomeric import ELIS_ATOL, ELIS_RTOL
+from openmc.data.pendf import (PendfLibrary, _check_lin_lin,
+                               _discover_pendf_files, _write_mf10_partials,
+                               _TENDL_RE)
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
 _PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
@@ -51,6 +56,41 @@ def _mf10(ev, mt):
         (qm, qi, izap, lfs), tab = get_tab1_record(fo)
         subs.append((qm, qi, izap, lfs, tab))
     return ns, subs
+
+
+def _endf_field(value):
+    """Format a value as an 11-character ENDF-6 record field."""
+    return f"{value:>11.4E}" if isinstance(value, float) else f"{value:>11d}"
+
+
+def _mf10_section_text(subs, za=451230, awr=122.0):
+    """Build a synthetic ENDF-6 MF=10 section from partial subsection data.
+
+    Each entry of ``subs`` is ``(QM, QI, IZAP, LFS, [(energy, xs), ...])`` and is
+    written as a single lin-lin (INT=2) TAB1 region, matching the NJOY PENDF
+    single-region convention.
+    """
+    lines = [_endf_field(float(za)) + _endf_field(awr) + _endf_field(0)
+             + _endf_field(0) + _endf_field(len(subs)) + _endf_field(0)]
+    for qm, qi, izap, lfs, pairs in subs:
+        lines.append(_endf_field(qm) + _endf_field(qi) + _endf_field(izap)
+                     + _endf_field(lfs) + _endf_field(1) + _endf_field(len(pairs)))
+        lines.append(_endf_field(len(pairs)) + _endf_field(2))   # NBT, INT=lin-lin
+        row = ""
+        for i, (x, y) in enumerate(pairs):
+            row += _endf_field(float(x)) + _endf_field(float(y))
+            if (i + 1) % 3 == 0:
+                lines.append(row)
+                row = ""
+        if row:
+            lines.append(row)
+    return "\n".join(lines) + "\n"
+
+
+def _fake_mf10_evaluation(mt, subs, **kwargs):
+    """A stand-in evaluation exposing only a synthetic MF=10 section."""
+    return types.SimpleNamespace(
+        section={(10, mt): _mf10_section_text(subs, **kwargs)})
 
 
 @pytest.fixture(scope="module")
@@ -322,3 +362,187 @@ def test_context_manager(tmp_path):
         assert lib.nuclides == ["Fe56"]
         assert lib._files
     assert lib._files == []
+
+
+def test_mf10_shared_lfs_distinct_izap(tmp_path):
+    # A lumped reaction (e.g. TENDL MT=5) can carry several MF=10 partials that
+    # share an LFS but describe different product nuclides (distinct IZAP). All
+    # must be kept, disambiguated by IZAP in the subgroup name, and no duplicate
+    # warning may fire.
+    mt = 5
+    subs = [
+        (0.0, 0.0, 451230, 0, [(1.0, 2.0), (3.0, 4.0)]),
+        (5.0, -3.0, 461230, 0, [(1.0, 0.5), (3.0, 0.25)]),
+    ]
+    ev = _fake_mf10_evaluation(mt, subs)
+
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        with h5py.File(tmp_path / "t.h5", "w") as f:
+            mtg = f.create_group(f"MT{mt}")
+            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"),
+                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+
+            # Both partials stored under IZAP-disambiguated names.
+            assert sorted(mtg.keys()) == ["LFS0_ZAP451230", "LFS0_ZAP461230"]
+            g1 = mtg["LFS0_ZAP451230"]
+            g2 = mtg["LFS0_ZAP461230"]
+            assert (int(g1.attrs["IZAP"]), int(g1.attrs["LFS"])) == (451230, 0)
+            assert (int(g2.attrs["IZAP"]), int(g2.attrs["LFS"])) == (461230, 0)
+            # Each subgroup keeps its own cross section (no data lost/overwritten).
+            np.testing.assert_array_equal(g1["xs"][()], [2.0, 4.0])
+            np.testing.assert_array_equal(g2["xs"][()], [0.5, 0.25])
+
+    assert not records          # legitimate distinct-IZAP data must not warn
+
+
+def test_mf10_true_izap_lfs_duplicate(tmp_path):
+    # A genuine (IZAP, LFS) duplicate: keep the first, warn about the (IZAP, LFS)
+    # duplicate, and skip the rest.
+    mt = 5
+    subs = [
+        (0.0, 0.0, 451230, 0, [(1.0, 2.0)]),
+        (0.0, 0.0, 451230, 0, [(1.0, 9.0)]),   # same (IZAP, LFS): true duplicate
+    ]
+    ev = _fake_mf10_evaluation(mt, subs)
+
+    with h5py.File(tmp_path / "t.h5", "w") as f:
+        mtg = f.create_group(f"MT{mt}")
+        with pytest.warns(UserWarning,
+                          match=r"duplicate MF=10 partial \(IZAP=451230, LFS=0\)"):
+            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"),
+                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+
+        # Only the first partial survives, under the plain LFS name (a duplicate
+        # must not make the survivor's LFS look shared).
+        assert sorted(mtg.keys()) == ["LFS0"]
+        np.testing.assert_array_equal(mtg["LFS0"]["xs"][()], [2.0])
+
+
+def test_mf10_unique_lfs_schema_compatible(tmp_path):
+    # Schema-compatibility guard: a normal reaction whose partials all have
+    # unique LFS (single product nuclide) still lands under the bare LFS{lfs}
+    # names with no IZAP suffix and no warning.
+    mt = 102
+    subs = [
+        (0.0, 0.0, 95242, 0, [(1.0, 2.0)]),
+        (48600.0, 0.0, 95242, 2, [(1.0, 3.0)]),
+    ]
+    ev = _fake_mf10_evaluation(mt, subs, za=95242)
+
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        with h5py.File(tmp_path / "t.h5", "w") as f:
+            mtg = f.create_group(f"MT{mt}")
+            _write_mf10_partials(mtg, ev, mt, "Am241", Path("n-Am241.pendf"),
+                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+
+            assert sorted(mtg.keys()) == ["LFS0", "LFS2"]
+            assert int(mtg["LFS2"].attrs["LFS"]) == 2
+            assert int(mtg["LFS2"].attrs["IZAP"]) == 95242
+            assert mtg["LFS2"].attrs["ELFS"] == pytest.approx(48600.0)
+
+    assert not records
+
+
+# ---------------------------------------------------------------------------
+# Filename-recognition tests for _discover_pendf_files. These exercise only the
+# regex/dispatch boundary of discovery: dummy empty files are touched into a
+# tmp_path directory and the returned (path, implied-LISO) pairs are checked. No
+# data is parsed, so no PENDF fixtures are needed (though the module skipif still
+# gates them, matching the rest of the file).
+
+
+def _discover_liso(tmp_path, names):
+    """Touch ``names`` as empty files and map recognized name -> implied LISO."""
+    scan = tmp_path / "scan"
+    scan.mkdir()
+    for name in names:
+        (scan / name).touch()
+    return {p.name: liso for p, liso in _discover_pendf_files(scan)}
+
+
+def test_discover_tendl2015_reversed(tmp_path):
+    # TENDL-2015 nuclide-first stem ``SymA[m|n]-n.pendf`` (reversed vs 2017).
+    got = _discover_liso(tmp_path, ["Ag107-n.pendf", "Ac222m-n.pendf",
+                                    "Ac214-n.pendf"])
+    assert got == {"Ag107-n.pendf": 0, "Ac222m-n.pendf": 1, "Ac214-n.pendf": 0}
+
+
+def test_discover_tendl2019_native(tmp_path):
+    # TENDL-2019 native ``SymA[m|n]p.asc``; the trailing ``p`` is not an isomer.
+    got = _discover_liso(tmp_path, ["Ag107p.asc", "Ac222mp.asc", "Am241p.asc"])
+    assert got == {"Ag107p.asc": 0, "Ac222mp.asc": 1, "Am241p.asc": 0}
+
+
+def test_discover_jeff33(tmp_path):
+    # JEFF-3.3 ``Z-Sym-A(g|m|n).jeffNN.pendf`` with any two-digit version token.
+    got = _discover_liso(tmp_path, [
+        "47-Ag-107g.jeff33.pendf",     # ground (g -> LISO 0)
+        "27-Co-58m.jeff33.pendf",      # m -> LISO 1
+        "100-Fm-255g.jeff33.pendf",    # 3-digit Z
+        "47-Ag-107g.jeff40.pendf",     # any two digits accepted
+    ])
+    assert got == {
+        "47-Ag-107g.jeff33.pendf": 0,
+        "27-Co-58m.jeff33.pendf": 1,
+        "100-Fm-255g.jeff33.pendf": 0,
+        "47-Ag-107g.jeff40.pendf": 0,
+    }
+
+
+def test_discover_jendl5(tmp_path):
+    # JENDL-5 ``n_ZZZ-Sym-AAA[m<digit>]_<T>K.dat``; free-form temperature token
+    # and ``m<digit>`` isomer index doubling as the implied LISO.
+    got = _discover_liso(tmp_path, [
+        "n_047-Ag-107_300K.dat",       # no isomer -> LISO 0
+        "n_052-Te-123m1_300K.dat",     # m1 -> LISO 1
+        "n_065-Tb-156m2_300K.dat",     # m2 -> LISO 2
+        "n_047-Ag-107_293.6K.dat",     # non-integer temperature token
+    ])
+    assert got == {
+        "n_047-Ag-107_300K.dat": 0,
+        "n_052-Te-123m1_300K.dat": 1,
+        "n_065-Tb-156m2_300K.dat": 2,
+        "n_047-Ag-107_293.6K.dat": 0,
+    }
+
+
+def test_discover_tendl_infix(tmp_path):
+    # Loose ``.tendl20NN``-infixed files for both TENDL stems (projectile-first
+    # 2017 and nuclide-first 2015), including a metastable through the infix.
+    got = _discover_liso(tmp_path, [
+        "n-Ag107.tendl2017.pendf",     # 2017 stem + infix
+        "Ag107-n.tendl2015.pendf",     # 2015 stem + infix
+        "n-Ag110m.tendl2019.pendf",    # metastable m -> LISO 1
+    ])
+    assert got == {
+        "n-Ag107.tendl2017.pendf": 0,
+        "Ag107-n.tendl2015.pendf": 0,
+        "n-Ag110m.tendl2019.pendf": 1,
+    }
+
+
+def test_discover_infix_not_half_matched_by_tendl2017(tmp_path):
+    # The overlap guard: the frozen projectile-first TENDL-2017 pattern is fully
+    # anchored, so a ``.tendl20NN``-infixed name is NOT (half-)matched by it; the
+    # dedicated infix pattern must pick it up instead. A plain 2017 name in the
+    # same directory is still recognized, proving both coexist.
+    assert _TENDL_RE.match("n-Ag107.tendl2017.pendf") is None
+    got = _discover_liso(tmp_path, ["n-Ag107.tendl2017.pendf", "n-Fe056.pendf"])
+    assert got == {"n-Ag107.tendl2017.pendf": 0, "n-Fe056.pendf": 0}
+
+
+def test_discover_negatives_and_near_misses(tmp_path):
+    # Non-PENDF and near-miss names must be ignored entirely: a FLUKA-style
+    # ``.z``, a stray ``.txt``, a ``.pendf.bak`` backup, and a truncated JENDL-5
+    # name missing its temperature token.
+    got = _discover_liso(tmp_path, [
+        "Ag107.z",                     # FLUKA-ish
+        "notes.txt",                   # random text file
+        "Ag107-n.pendf.bak",           # backup near-miss (trailing .bak)
+        "n-Ag107.tendl2017.pendf.bak", # infix backup near-miss
+        "n_047-Ag-107.dat",            # JENDL-5 missing _<T>K token
+        "ZA000001",                    # ENDF/B free-neutron placeholder (skipped)
+    ])
+    assert got == {}

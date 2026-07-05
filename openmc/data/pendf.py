@@ -18,6 +18,7 @@ import io
 import os
 import re
 import tempfile
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
 from warnings import warn
@@ -44,10 +45,29 @@ _EXTRA_MTS = frozenset(
     {151, 152, 153} | set(range(203, 208)) | {251, 252, 253} | set(range(301, 451))
 )
 
-# Filename conventions understood by :func:`_discover_pendf_files`
+# Filename conventions understood by :func:`_discover_pendf_files`. Every pattern
+# is fully anchored (``^...$``) so a name is matched in whole or not at all; this
+# keeps recognition deterministic and prevents, e.g., the ``.tendl20NN`` infix
+# names below from being partially accepted by the plain TENDL patterns.
 _TENDL_RE = re.compile(r'^n-([A-Za-z]+)(\d+)([mn]?)\.pendf$')
 _ENDFB_RE = re.compile(r'^ZA(\d{3})(\d{3})(?:\.(\d+))?$')
 _JEFF_RE = re.compile(r'^(?:0[kK]|293[kK])-\d+-([A-Za-z]+)-(\d+)([gmn]?)_p\.asc$')
+# TENDL-2015 (nuclide-first, reversed vs TENDL-2017), plain or carrying a
+# ``.tendl20NN`` version infix: ``Ag107-n.pendf``, ``Ac222m-n.pendf``,
+# ``Ag107-n.tendl2015.pendf``.
+_TENDL2015_RE = re.compile(r'^([A-Za-z]+)(\d+)([mn]?)-n(?:\.tendl20\d\d)?\.pendf$')
+# TENDL-2017 projectile-first stem carrying a ``.tendl20NN`` version infix; the
+# loose-file companion to the frozen ``_TENDL_RE`` (which cannot absorb the
+# optional infix): ``n-Ag107.tendl2017.pendf``.
+_TENDL2017_INFIX_RE = re.compile(r'^n-([A-Za-z]+)(\d+)([mn]?)\.tendl20\d\d\.pendf$')
+# TENDL-2019 native pendf: ``Ag107p.asc``, ``Ac222mp.asc``.
+_TENDL2019_RE = re.compile(r'^([A-Za-z]+)(\d+)([mn]?)p\.asc$')
+# JEFF-3.3: ``47-Ag-107g.jeff33.pendf`` (any two-digit ``.jeffNN`` suffix).
+_JEFF33_RE = re.compile(r'^\d+-([A-Za-z]+)-(\d+)([gmn]?)\.jeff\d{2}\.pendf$')
+# JENDL-5: ``n_047-Ag-107_300K.dat`` with a free-form temperature token
+# (``300K``, ``293.6K``, ...) and an ``m<digit>`` isomer index that doubles as
+# the implied LISO (``n_052-Te-123m1_300K.dat`` -> LISO 1).
+_JENDL5_RE = re.compile(r'^n_\d{3}-([A-Za-z]+)-(\d+)(?:m(\d))?_[^_]*K\.dat$')
 
 # Isomer suffix -> LISO (isomeric state) implied by a filename
 _SUFFIX_LISO = {'': 0, 'g': 0, 'm': 1, 'n': 2}
@@ -87,8 +107,11 @@ def _discover_pendf_files(pendf_dir):
     """Find PENDF files in a directory and the isomeric state implied by name.
 
     A ``_manifest.tsv`` (TENDL convention, columns ``Z El A m url fname``) is
-    used when present; otherwise the directory is scanned for the TENDL, ENDF/B,
-    and JEFF filename conventions.
+    used when present; otherwise the directory is scanned for the TENDL-2017,
+    TENDL-2015, TENDL-2019, ENDF/B PREPRO, JEFF-4.0, JEFF-3.3, and JENDL-5
+    filename conventions (including loose ``.tendl20NN``-infixed TENDL names).
+    Every convention contributes only the isomeric state (LISO) implied by the
+    name; nuclide identity is always taken from the MF=1/451 header afterward.
 
     Parameters
     ----------
@@ -138,7 +161,103 @@ def _discover_pendf_files(pendf_dir):
         m = _JEFF_RE.match(name)
         if m is not None:
             files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _TENDL2015_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _TENDL2017_INFIX_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _TENDL2019_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _JEFF33_RE.match(name)
+        if m is not None:
+            files.append((path, _SUFFIX_LISO[m.group(3)]))
+            continue
+        m = _JENDL5_RE.match(name)
+        if m is not None:
+            files.append((path, int(m.group(3)) if m.group(3) else 0))
+            continue
     return files
+
+
+def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
+                         elis_rtol, elis_atol):
+    """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
+
+    Each MF=10 partial for reaction ``mt`` is stored as a subgroup of ``mtg``
+    with its IZAP/LFS/QM/QI/ELFS attributes (and, when ``mapping`` is active, a
+    baked ``product`` name). A partial whose LFS is unique within the reaction
+    keeps the bare ``LFS{lfs}`` name (byte-identical to non-lumped libraries);
+    an LFS shared by several distinct IZAP -- different product nuclides, as in
+    lumped TENDL MT=5 -- is disambiguated as ``LFS{lfs}_ZAP{izap}``. A true
+    ``(IZAP, LFS)`` duplicate warns and is skipped.
+    """
+    if (10, mt) not in ev.section:
+        return
+
+    fo = io.StringIO(ev.section[10, mt])
+    _, _, _lis, _liso, ns, _ = get_head_record(fo)
+    partials = []
+    for _ in range(ns):
+        (pqm, pqi, izap, lfs), ptab = get_tab1_record(fo)
+        _check_lin_lin(name, 10, mt, ptab)
+        partials.append((pqm, pqi, izap, lfs, ptab))
+
+    # Drop true (IZAP, LFS) duplicates, keeping the first occurrence. Uniqueness
+    # of an LFS is decided from the distinct (IZAP, LFS) pairs below, so a
+    # duplicate never makes the surviving partial's LFS look shared.
+    seen = set()
+    unique = []
+    for pqm, pqi, izap, lfs, ptab in partials:
+        if (izap, lfs) in seen:
+            warn(f"{path.name}: duplicate MF=10 "
+                 f"partial (IZAP={izap}, LFS={lfs}) in {name} "
+                 f"MT={mt}; skipping.")
+            continue
+        seen.add((izap, lfs))
+        unique.append((pqm, pqi, izap, lfs, ptab))
+
+    # An LFS carried by more than one product nuclide must be disambiguated by
+    # IZAP in the subgroup name; a unique LFS keeps the plain ``LFS{lfs}`` name.
+    lfs_izaps = defaultdict(set)
+    for _pqm, _pqi, izap, lfs, _pt in unique:
+        lfs_izaps[lfs].add(izap)
+
+    # Resolve products per IZAP so a shared LFS bakes the right product for each
+    # nuclide; the result is keyed by (IZAP, LFS). With a single IZAP (the
+    # common, non-lumped case) this is one call with the same partials as before.
+    lfs_to_liso = {}
+    if mapping != 'none':
+        by_izap = defaultdict(list)
+        for pqm, pqi, izap, lfs, _pt in unique:
+            by_izap[izap].append(
+                {'lfs': lfs, 'izap': izap, 'elfs': pqm - pqi})
+        for izap, plist in by_izap.items():
+            for lfs, liso in map_lfs_to_liso(
+                    plist, decay_lookup, mode=mapping,
+                    rtol=elis_rtol, atol=elis_atol,
+                    context=f"{name} MT={mt}").items():
+                lfs_to_liso[izap, lfs] = liso
+
+    for pqm, pqi, izap, lfs, ptab in unique:
+        gname = (f'LFS{lfs}_ZAP{izap}' if len(lfs_izaps[lfs]) > 1
+                 else f'LFS{lfs}')
+        lg = mtg.create_group(gname)
+        lg.attrs['QM'] = pqm
+        lg.attrs['QI'] = pqi
+        lg.attrs['IZAP'] = izap
+        lg.attrs['LFS'] = lfs
+        lg.attrs['ELFS'] = pqm - pqi
+        if (izap, lfs) in lfs_to_liso:
+            lg.attrs['product'] = np.bytes_(gnds_name(
+                izap // 1000, izap % 1000,
+                lfs_to_liso[izap, lfs]))
+        _write_xy(lg, ptab.x, ptab.y)
 
 
 class _TemperatureMismatchError(ValueError):
@@ -280,8 +399,9 @@ class PendfLibrary:
             MF=10 partials.
 
         """
-        return sorted(int(k[3:]) for k in self._reaction(nuclide, mt)
-                      if k.startswith('LFS'))
+        rx = self._reaction(nuclide, mt)
+        return sorted(int(rx[k].attrs['LFS'])
+                      for k in rx if k.startswith('LFS'))
 
     def xs(self, nuclide, mt):
         """Return the MF=3 cross section for a reaction.
@@ -382,7 +502,7 @@ class PendfLibrary:
         Parameters
         ----------
         pendf_dir : str or path-like
-            Directory of PENDF files (TENDL, ENDF/B, or JEFF filename
+            Directory of PENDF files (TENDL, ENDF/B, JEFF, or JENDL filename
             conventions; a ``_manifest.tsv`` is used when present).
         out : str or path-like
             Output ``.h5`` file (one file per library and temperature).
@@ -500,43 +620,9 @@ class PendfLibrary:
                             _write_xy(mtg, tab.x, tab.y)
 
                             # MF=10 isomeric production partials for this reaction
-                            if (10, mt) in ev.section:
-                                fo = io.StringIO(ev.section[10, mt])
-                                _, _, _lis, _liso, ns, _ = get_head_record(fo)
-                                partials = []
-                                for _ in range(ns):
-                                    (pqm, pqi, izap, lfs), ptab = \
-                                        get_tab1_record(fo)
-                                    _check_lin_lin(name, 10, mt, ptab)
-                                    partials.append((pqm, pqi, izap, lfs, ptab))
-
-                                lfs_to_liso = {}
-                                if mapping != 'none':
-                                    lfs_to_liso = map_lfs_to_liso(
-                                        [{'lfs': lfs, 'izap': izap,
-                                          'elfs': pqm - pqi}
-                                         for pqm, pqi, izap, lfs, _pt in partials],
-                                        decay_lookup, mode=mapping,
-                                        rtol=elis_rtol, atol=elis_atol,
-                                        context=f"{name} MT={mt}")
-
-                                for pqm, pqi, izap, lfs, ptab in partials:
-                                    if f'LFS{lfs}' in mtg:
-                                        warn(f"{path.name}: duplicate MF=10 "
-                                             f"partial LFS={lfs} in {name} "
-                                             f"MT={mt}; skipping.")
-                                        continue
-                                    lg = mtg.create_group(f'LFS{lfs}')
-                                    lg.attrs['QM'] = pqm
-                                    lg.attrs['QI'] = pqi
-                                    lg.attrs['IZAP'] = izap
-                                    lg.attrs['LFS'] = lfs
-                                    lg.attrs['ELFS'] = pqm - pqi
-                                    if lfs in lfs_to_liso:
-                                        lg.attrs['product'] = np.bytes_(gnds_name(
-                                            izap // 1000, izap % 1000,
-                                            lfs_to_liso[lfs]))
-                                    _write_xy(lg, ptab.x, ptab.y)
+                            _write_mf10_partials(mtg, ev, mt, name, path,
+                                                 mapping, decay_lookup,
+                                                 elis_rtol, elis_atol)
 
                         # MF=10 partials are written only alongside their MF=3
                         # sibling (loop above). Warn about any MF=10 reaction
