@@ -106,10 +106,14 @@ class GroupedPendfLibrary:
             if name.startswith('MT'))
 
     def pathways(self, nuclide: str, mt: int) -> list[int]:
-        """Return the ascending MF=10 LFS levels stored for ``(nuclide, mt)``."""
+        """Return the ascending MF=10 LFS levels stored for ``(nuclide, mt)``.
+
+        A lumped reaction may repeat an LFS: disambiguated ``LFS<l>_ZAP<izap>``
+        subgroups yield that level once per product.
+        """
         group = self._file[f'{nuclide}/MT{mt}']
         return sorted(
-            int(name[3:]) for name in group if name.startswith('LFS'))
+            int(group[name].attrs['LFS']) for name in group if name.startswith('LFS'))
 
     def product(self, nuclide: str, mt: int, lfs: int):
         """Return the baked GNDS product name for a partial, or ``None``."""
