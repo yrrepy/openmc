@@ -1,6 +1,8 @@
 """Tests for openmc.data.pendf against real TENDL-2017 PENDF fixtures."""
 
 import io
+import types
+import warnings
 from pathlib import Path
 
 import h5py
@@ -9,7 +11,8 @@ import pytest
 
 import openmc.data
 from openmc.data import Tabulated1D
-from openmc.data.pendf import PendfLibrary, _check_lin_lin
+from openmc.data.isomeric import ELIS_ATOL, ELIS_RTOL
+from openmc.data.pendf import PendfLibrary, _check_lin_lin, _write_mf10_partials
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
 _PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
@@ -51,6 +54,41 @@ def _mf10(ev, mt):
         (qm, qi, izap, lfs), tab = get_tab1_record(fo)
         subs.append((qm, qi, izap, lfs, tab))
     return ns, subs
+
+
+def _endf_field(value):
+    """Format a value as an 11-character ENDF-6 record field."""
+    return f"{value:>11.4E}" if isinstance(value, float) else f"{value:>11d}"
+
+
+def _mf10_section_text(subs, za=451230, awr=122.0):
+    """Build a synthetic ENDF-6 MF=10 section from partial subsection data.
+
+    Each entry of ``subs`` is ``(QM, QI, IZAP, LFS, [(energy, xs), ...])`` and is
+    written as a single lin-lin (INT=2) TAB1 region, matching the NJOY PENDF
+    single-region convention.
+    """
+    lines = [_endf_field(float(za)) + _endf_field(awr) + _endf_field(0)
+             + _endf_field(0) + _endf_field(len(subs)) + _endf_field(0)]
+    for qm, qi, izap, lfs, pairs in subs:
+        lines.append(_endf_field(qm) + _endf_field(qi) + _endf_field(izap)
+                     + _endf_field(lfs) + _endf_field(1) + _endf_field(len(pairs)))
+        lines.append(_endf_field(len(pairs)) + _endf_field(2))   # NBT, INT=lin-lin
+        row = ""
+        for i, (x, y) in enumerate(pairs):
+            row += _endf_field(float(x)) + _endf_field(float(y))
+            if (i + 1) % 3 == 0:
+                lines.append(row)
+                row = ""
+        if row:
+            lines.append(row)
+    return "\n".join(lines) + "\n"
+
+
+def _fake_mf10_evaluation(mt, subs, **kwargs):
+    """A stand-in evaluation exposing only a synthetic MF=10 section."""
+    return types.SimpleNamespace(
+        section={(10, mt): _mf10_section_text(subs, **kwargs)})
 
 
 @pytest.fixture(scope="module")
@@ -322,3 +360,84 @@ def test_context_manager(tmp_path):
         assert lib.nuclides == ["Fe56"]
         assert lib._files
     assert lib._files == []
+
+
+def test_mf10_shared_lfs_distinct_izap(tmp_path):
+    # A lumped reaction (e.g. TENDL MT=5) can carry several MF=10 partials that
+    # share an LFS but describe different product nuclides (distinct IZAP). All
+    # must be kept, disambiguated by IZAP in the subgroup name, and no duplicate
+    # warning may fire.
+    mt = 5
+    subs = [
+        (0.0, 0.0, 451230, 0, [(1.0, 2.0), (3.0, 4.0)]),
+        (5.0, -3.0, 461230, 0, [(1.0, 0.5), (3.0, 0.25)]),
+    ]
+    ev = _fake_mf10_evaluation(mt, subs)
+
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        with h5py.File(tmp_path / "t.h5", "w") as f:
+            mtg = f.create_group(f"MT{mt}")
+            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"),
+                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+
+            # Both partials stored under IZAP-disambiguated names.
+            assert sorted(mtg.keys()) == ["LFS0_ZAP451230", "LFS0_ZAP461230"]
+            g1 = mtg["LFS0_ZAP451230"]
+            g2 = mtg["LFS0_ZAP461230"]
+            assert (int(g1.attrs["IZAP"]), int(g1.attrs["LFS"])) == (451230, 0)
+            assert (int(g2.attrs["IZAP"]), int(g2.attrs["LFS"])) == (461230, 0)
+            # Each subgroup keeps its own cross section (no data lost/overwritten).
+            np.testing.assert_array_equal(g1["xs"][()], [2.0, 4.0])
+            np.testing.assert_array_equal(g2["xs"][()], [0.5, 0.25])
+
+    assert not records          # legitimate distinct-IZAP data must not warn
+
+
+def test_mf10_true_izap_lfs_duplicate(tmp_path):
+    # A genuine (IZAP, LFS) duplicate: keep the first, warn about the (IZAP, LFS)
+    # duplicate, and skip the rest.
+    mt = 5
+    subs = [
+        (0.0, 0.0, 451230, 0, [(1.0, 2.0)]),
+        (0.0, 0.0, 451230, 0, [(1.0, 9.0)]),   # same (IZAP, LFS): true duplicate
+    ]
+    ev = _fake_mf10_evaluation(mt, subs)
+
+    with h5py.File(tmp_path / "t.h5", "w") as f:
+        mtg = f.create_group(f"MT{mt}")
+        with pytest.warns(UserWarning,
+                          match=r"duplicate MF=10 partial \(IZAP=451230, LFS=0\)"):
+            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"),
+                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+
+        # Only the first partial survives, under the plain LFS name (a duplicate
+        # must not make the survivor's LFS look shared).
+        assert sorted(mtg.keys()) == ["LFS0"]
+        np.testing.assert_array_equal(mtg["LFS0"]["xs"][()], [2.0])
+
+
+def test_mf10_unique_lfs_schema_compatible(tmp_path):
+    # Schema-compatibility guard: a normal reaction whose partials all have
+    # unique LFS (single product nuclide) still lands under the bare LFS{lfs}
+    # names with no IZAP suffix and no warning.
+    mt = 102
+    subs = [
+        (0.0, 0.0, 95242, 0, [(1.0, 2.0)]),
+        (48600.0, 0.0, 95242, 2, [(1.0, 3.0)]),
+    ]
+    ev = _fake_mf10_evaluation(mt, subs, za=95242)
+
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        with h5py.File(tmp_path / "t.h5", "w") as f:
+            mtg = f.create_group(f"MT{mt}")
+            _write_mf10_partials(mtg, ev, mt, "Am241", Path("n-Am241.pendf"),
+                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+
+            assert sorted(mtg.keys()) == ["LFS0", "LFS2"]
+            assert int(mtg["LFS2"].attrs["LFS"]) == 2
+            assert int(mtg["LFS2"].attrs["IZAP"]) == 95242
+            assert mtg["LFS2"].attrs["ELFS"] == pytest.approx(48600.0)
+
+    assert not records

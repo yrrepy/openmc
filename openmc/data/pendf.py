@@ -18,6 +18,7 @@ import io
 import os
 import re
 import tempfile
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
 from warnings import warn
@@ -145,47 +146,75 @@ def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
                          elis_rtol, elis_atol):
     """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
 
-    Each MF=10 partial for reaction ``mt`` is stored as an ``LFS{lfs}`` subgroup
-    of ``mtg`` with its IZAP/LFS/QM/QI/ELFS attributes (and, when ``mapping`` is
-    active, a baked ``product`` name); a duplicate LFS warns and is skipped.
+    Each MF=10 partial for reaction ``mt`` is stored as a subgroup of ``mtg``
+    with its IZAP/LFS/QM/QI/ELFS attributes (and, when ``mapping`` is active, a
+    baked ``product`` name). A partial whose LFS is unique within the reaction
+    keeps the bare ``LFS{lfs}`` name (byte-identical to non-lumped libraries);
+    an LFS shared by several distinct IZAP -- different product nuclides, as in
+    lumped TENDL MT=5 -- is disambiguated as ``LFS{lfs}_ZAP{izap}``. A true
+    ``(IZAP, LFS)`` duplicate warns and is skipped.
     """
-    if (10, mt) in ev.section:
-        fo = io.StringIO(ev.section[10, mt])
-        _, _, _lis, _liso, ns, _ = get_head_record(fo)
-        partials = []
-        for _ in range(ns):
-            (pqm, pqi, izap, lfs), ptab = \
-                get_tab1_record(fo)
-            _check_lin_lin(name, 10, mt, ptab)
-            partials.append((pqm, pqi, izap, lfs, ptab))
+    if (10, mt) not in ev.section:
+        return
 
-        lfs_to_liso = {}
-        if mapping != 'none':
-            lfs_to_liso = map_lfs_to_liso(
-                [{'lfs': lfs, 'izap': izap,
-                  'elfs': pqm - pqi}
-                 for pqm, pqi, izap, lfs, _pt in partials],
-                decay_lookup, mode=mapping,
-                rtol=elis_rtol, atol=elis_atol,
-                context=f"{name} MT={mt}")
+    fo = io.StringIO(ev.section[10, mt])
+    _, _, _lis, _liso, ns, _ = get_head_record(fo)
+    partials = []
+    for _ in range(ns):
+        (pqm, pqi, izap, lfs), ptab = get_tab1_record(fo)
+        _check_lin_lin(name, 10, mt, ptab)
+        partials.append((pqm, pqi, izap, lfs, ptab))
 
-        for pqm, pqi, izap, lfs, ptab in partials:
-            if f'LFS{lfs}' in mtg:
-                warn(f"{path.name}: duplicate MF=10 "
-                     f"partial LFS={lfs} in {name} "
-                     f"MT={mt}; skipping.")
-                continue
-            lg = mtg.create_group(f'LFS{lfs}')
-            lg.attrs['QM'] = pqm
-            lg.attrs['QI'] = pqi
-            lg.attrs['IZAP'] = izap
-            lg.attrs['LFS'] = lfs
-            lg.attrs['ELFS'] = pqm - pqi
-            if lfs in lfs_to_liso:
-                lg.attrs['product'] = np.bytes_(gnds_name(
-                    izap // 1000, izap % 1000,
-                    lfs_to_liso[lfs]))
-            _write_xy(lg, ptab.x, ptab.y)
+    # Drop true (IZAP, LFS) duplicates, keeping the first occurrence. Uniqueness
+    # of an LFS is decided from the distinct (IZAP, LFS) pairs below, so a
+    # duplicate never makes the surviving partial's LFS look shared.
+    seen = set()
+    unique = []
+    for pqm, pqi, izap, lfs, ptab in partials:
+        if (izap, lfs) in seen:
+            warn(f"{path.name}: duplicate MF=10 "
+                 f"partial (IZAP={izap}, LFS={lfs}) in {name} "
+                 f"MT={mt}; skipping.")
+            continue
+        seen.add((izap, lfs))
+        unique.append((pqm, pqi, izap, lfs, ptab))
+
+    # An LFS carried by more than one product nuclide must be disambiguated by
+    # IZAP in the subgroup name; a unique LFS keeps the plain ``LFS{lfs}`` name.
+    lfs_izaps = defaultdict(set)
+    for _pqm, _pqi, izap, lfs, _pt in unique:
+        lfs_izaps[lfs].add(izap)
+
+    # Resolve products per IZAP so a shared LFS bakes the right product for each
+    # nuclide; the result is keyed by (IZAP, LFS). With a single IZAP (the
+    # common, non-lumped case) this is one call with the same partials as before.
+    lfs_to_liso = {}
+    if mapping != 'none':
+        by_izap = defaultdict(list)
+        for pqm, pqi, izap, lfs, _pt in unique:
+            by_izap[izap].append(
+                {'lfs': lfs, 'izap': izap, 'elfs': pqm - pqi})
+        for izap, plist in by_izap.items():
+            for lfs, liso in map_lfs_to_liso(
+                    plist, decay_lookup, mode=mapping,
+                    rtol=elis_rtol, atol=elis_atol,
+                    context=f"{name} MT={mt}").items():
+                lfs_to_liso[izap, lfs] = liso
+
+    for pqm, pqi, izap, lfs, ptab in unique:
+        gname = (f'LFS{lfs}_ZAP{izap}' if len(lfs_izaps[lfs]) > 1
+                 else f'LFS{lfs}')
+        lg = mtg.create_group(gname)
+        lg.attrs['QM'] = pqm
+        lg.attrs['QI'] = pqi
+        lg.attrs['IZAP'] = izap
+        lg.attrs['LFS'] = lfs
+        lg.attrs['ELFS'] = pqm - pqi
+        if (izap, lfs) in lfs_to_liso:
+            lg.attrs['product'] = np.bytes_(gnds_name(
+                izap // 1000, izap % 1000,
+                lfs_to_liso[izap, lfs]))
+        _write_xy(lg, ptab.x, ptab.y)
 
 
 class _TemperatureMismatchError(ValueError):
@@ -327,8 +356,9 @@ class PendfLibrary:
             MF=10 partials.
 
         """
-        return sorted(int(k[3:]) for k in self._reaction(nuclide, mt)
-                      if k.startswith('LFS'))
+        rx = self._reaction(nuclide, mt)
+        return sorted(int(rx[k].attrs['LFS'])
+                      for k in rx if k.startswith('LFS'))
 
     def xs(self, nuclide, mt):
         """Return the MF=3 cross section for a reaction.
