@@ -446,6 +446,19 @@ def _build_xs_table_ce(
         np.array(nuc_idx_list, np.int32), np.array(rxn_idx_list, np.int32))
 
 
+def _flux_is_single(multigroup_flux):
+    """Whether ``multigroup_flux`` is one 1-D flux (True) or a batch of
+    1-D fluxes (False).
+
+    Raises ValueError for anything else.
+    """
+    # A 1-D flux is a single domain; 2-D (or a list of 1-D arrays) is a batch
+    try:
+        return {1: True, 2: False}[1 + np.ndim(multigroup_flux[0])]
+    except (TypeError, IndexError, KeyError):
+        raise ValueError('multigroup_flux must be 1-D or 2-D') from None
+
+
 # Number of fluxes collapsed per GEMM; bounds working memory to the dense
 # scatter buffer of ``chunk * n_nuclides * n_reactions`` floats regardless of
 # the total flux count.
@@ -628,11 +641,7 @@ class MicroXS:
             if not np.all(np.diff(energies) > 0):
                 raise ValueError('Energy group boundaries must be in ascending order')
 
-        # A 1-D flux is a single domain; 2-D (or a list of 1-D arrays) is a batch
-        try:
-            single = {1: True, 2: False}[1 + np.ndim(multigroup_flux[0])]
-        except (TypeError, IndexError, KeyError):
-            raise ValueError('multigroup_flux must be 1-D or 2-D') from None
+        single = _flux_is_single(multigroup_flux)
         fluxes = [np.asarray(multigroup_flux, dtype=float)] if single else multigroup_flux
 
         # check dimension consistency per flux
