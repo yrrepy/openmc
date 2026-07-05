@@ -730,7 +730,10 @@ class Chain:
             nuc_ind = index_nuc[nuc.name]
             nuc_rates = rates[nuc_ind, :]
 
-            for r_type, target, _, br in nuc.reactions:
+            for rx in nuc.reactions:
+                r_type = rx.type
+                target = rx.target
+                br = rx.branching_ratio
                 r_id = index_rx[r_type]
                 path_rate = nuc_rates[r_id]
 

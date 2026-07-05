@@ -96,6 +96,11 @@ element has the following attributes:
   :branching_ratio:
     The branching ratio for the reaction
 
+  :pendf_lfs:
+    Optional informational MF=10 final-state (``LFS``) level index of the PENDF
+    partial the reaction was built from. Absent when the reaction is not backed
+    by an MF=10 partial. Ignored by the depletion solve.
+
 .. _io_chain_nfy:
 
 ------------------------------------

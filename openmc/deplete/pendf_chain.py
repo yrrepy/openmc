@@ -122,7 +122,7 @@ def _chain_closure(decay_dir, nuclides, h5, mt_to_name):
     return closure
 
 
-def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
+def chain_from_pendf(pendf_h5, decay_dir, nuclides=None, record_lfs=False):
     """Build a depletion chain with PENDF isomeric pathway reactions.
 
     .. versionadded:: 0.15.4
@@ -140,6 +140,15 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
         to a fixed point, so seeding only a target keeps that target's whole
         activation network instead of dropping its capture pathways to the
         coverage report. If ``None``, every decay file in ``decay_dir`` is used.
+    record_lfs : bool, optional
+        If ``True``, stamp each reaction built from an MF=10 ``LFS`` subgroup
+        with that subgroup's final-state level index on the reaction's
+        ``pendf_lfs`` field (and hence the chain XML). Reactions from the
+        no-MF=10 fallback branch are left unmarked (``None``), so absence of the
+        field means "not MF=10-backed". This is purely an informational audit
+        trail linking a chain reaction back to its PENDF partial; the PENDF HDF5
+        library remains the authority and the depletion solve ignores it.
+        Defaults to ``False``, which leaves the chain byte-for-byte unchanged.
 
     Returns
     -------
@@ -216,7 +225,8 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                                     parent=nuclide.name, reaction=r_type, product=product,
                                     reason='LFS QI absent; Q defaulted to 0.0'))
                             lfs_q = float(sub.attrs.get('QI', 0.0))
-                            nuclide.add_reaction(r_type, product, lfs_q, 1.0)
+                            lfs = int(sub.attrs['LFS']) if record_lfs else None
+                            nuclide.add_reaction(r_type, product, lfs_q, 1.0, lfs)
                             products_added.add(product)
                         else:
                             coverage.append(dict(
