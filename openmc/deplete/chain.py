@@ -120,6 +120,21 @@ REACTIONS = {
 
 __all__ = ["Chain", "REACTIONS"]
 
+# Matches a trailing metastable state qualifier, e.g. the '_m1' in the
+# nuclide name 'Am242_m1' or in the product-qualified reaction type
+# '(n,gamma)_m1'. Used by :func:`_strip_metastable_suffix`.
+_METASTABLE_SUFFIX = re.compile(r'_m\d+$')
+
+
+def _strip_metastable_suffix(name):
+    """Strip a trailing metastable ``_m<digits>`` qualifier from a string.
+
+    Serves both nuclide names (e.g. ``'Am242_m1'`` -> ``'Am242'``) and
+    product-qualified reaction-type strings (e.g. ``'(n,gamma)_m1'`` ->
+    ``'(n,gamma)'``). Strings without such a suffix are returned unchanged.
+    """
+    return _METASTABLE_SUFFIX.sub('', name)
+
 
 def replace_missing(product, decay_data):
     """Replace missing product with suitable decay daughter.
@@ -736,7 +751,7 @@ class Chain:
                     # produce H2. Product-qualified types ((n,gamma)_m1)
                     # share their base type's secondaries.
                     if path_rate != 0.0:
-                        base_type = re.sub(r'_m\d+$', '', r_type)
+                        base_type = _strip_metastable_suffix(r_type)
                         light_nucs = REACTIONS[base_type].secondaries
                         for light_nuc in light_nucs:
                             k = self.nuclide_dict.get(light_nuc)
@@ -1333,9 +1348,7 @@ class Chain:
         >>> Chain._get_base_name('Ir191_m1')
         'Ir191'
         """
-        if '_m' in nuclide_name:
-            return nuclide_name.rsplit('_m', 1)[0]
-        return nuclide_name
+        return _strip_metastable_suffix(nuclide_name)
 
     def _build_isomeric_families(self):
         """Map each nuclide name to its isomeric family (ground + metastables).

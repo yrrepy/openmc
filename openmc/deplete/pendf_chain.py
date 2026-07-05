@@ -33,6 +33,32 @@ def _decay_filename(name):
     return f'{openmc.data.ATOMIC_SYMBOL[z]}{a:03d}{suffix}'
 
 
+def _baked_product(sub):
+    """Return the decoded MF=10 ``product`` name baked into ``sub``.
+
+    Returns ``None`` when the subgroup carries no ``product`` attribute; the
+    caller decides how an absent pathway product is handled.
+    """
+    product = sub.attrs.get('product')
+    if isinstance(product, bytes):
+        product = product.decode()
+    return product
+
+
+def _ground_product(z, a, r_name):
+    """Return the DADZ ground-state product name for reaction ``r_name``.
+
+    Applies the ``(z, a)`` shifts from :data:`openmc.data.DADZ` and formats the
+    ``Sym{A}`` GNDS name. Returns ``None`` when the shift pushes the product
+    below Z=1 (exotic multi-particle MTs on low-Z targets); no such nuclide
+    exists, so the caller skips it.
+    """
+    delta_a, delta_z = openmc.data.DADZ[r_name]
+    if (z + delta_z) not in openmc.data.ATOMIC_SYMBOL:
+        return None
+    return f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
+
+
 def _reaction_products(h5, name, mt_to_name):
     """Yield the transmutation product names of ``name`` from the PENDF library.
 
@@ -55,18 +81,14 @@ def _reaction_products(h5, name, mt_to_name):
         lfs_keys = [k for k in mt_group if k.startswith('LFS')]
         if lfs_keys:
             for lfs_key in lfs_keys:
-                product = mt_group[lfs_key].attrs.get('product')
+                product = _baked_product(mt_group[lfs_key])
                 if product is None:
                     continue
-                if isinstance(product, bytes):
-                    product = product.decode()
                 yield product
         else:
-            delta_a, delta_z = openmc.data.DADZ[r_name]
-            # Exotic multi-particle MTs on low-Z targets can push the product
-            # below Z=1; no such nuclide exists, so skip it.
-            if (z + delta_z) in openmc.data.ATOMIC_SYMBOL:
-                yield f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
+            product = _ground_product(z, a, r_name)
+            if product is not None:
+                yield product
 
 
 def _chain_closure(decay_dir, nuclides, h5, mt_to_name):
@@ -164,16 +186,17 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                 mt_group = nuc_group[mt_key]
 
                 # Ground product from DADZ (Sym{A}), drives coverage checks.
-                delta_a, delta_z = openmc.data.DADZ[name]
-                if (z + delta_z) not in openmc.data.ATOMIC_SYMBOL:
+                ground = _ground_product(z, a, name)
+                if ground is None:
                     # Exotic multi-particle MT drove the product below Z=1.
                     coverage.append(dict(
                         parent=nuclide.name, reaction=name, product=None,
                         reason='product Z out of range'))
                     continue
-                ground = f'{openmc.data.ATOMIC_SYMBOL[z + delta_z]}{a + delta_a}'
 
-                lfs_keys = sorted(k for k in mt_group if k.startswith('LFS'))
+                lfs_keys = sorted((k for k in mt_group if k.startswith('LFS')),
+                                  key=lambda k: (int(mt_group[k].attrs['LFS']),
+                                                 int(mt_group[k].attrs['IZAP'])))
                 products_added = set()
                 if lfs_keys:
                     # One reaction per MF=10 pathway with a baked product name.
@@ -184,9 +207,7 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None):
                                 parent=nuclide.name, reaction=name, product=None,
                                 reason=f'MF=10 {mt_key}/{lfs_key} has no mapped product'))
                             continue
-                        product = sub.attrs['product']
-                        if isinstance(product, bytes):
-                            product = product.decode()
+                        product = _baked_product(sub)
                         liso = openmc.data.zam(product)[2]
                         r_type = name if liso == 0 else f'{name}_m{liso}'
                         if product in chain_names:
