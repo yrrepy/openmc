@@ -141,6 +141,53 @@ def _discover_pendf_files(pendf_dir):
     return files
 
 
+def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
+                         elis_rtol, elis_atol):
+    """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
+
+    Each MF=10 partial for reaction ``mt`` is stored as an ``LFS{lfs}`` subgroup
+    of ``mtg`` with its IZAP/LFS/QM/QI/ELFS attributes (and, when ``mapping`` is
+    active, a baked ``product`` name); a duplicate LFS warns and is skipped.
+    """
+    if (10, mt) in ev.section:
+        fo = io.StringIO(ev.section[10, mt])
+        _, _, _lis, _liso, ns, _ = get_head_record(fo)
+        partials = []
+        for _ in range(ns):
+            (pqm, pqi, izap, lfs), ptab = \
+                get_tab1_record(fo)
+            _check_lin_lin(name, 10, mt, ptab)
+            partials.append((pqm, pqi, izap, lfs, ptab))
+
+        lfs_to_liso = {}
+        if mapping != 'none':
+            lfs_to_liso = map_lfs_to_liso(
+                [{'lfs': lfs, 'izap': izap,
+                  'elfs': pqm - pqi}
+                 for pqm, pqi, izap, lfs, _pt in partials],
+                decay_lookup, mode=mapping,
+                rtol=elis_rtol, atol=elis_atol,
+                context=f"{name} MT={mt}")
+
+        for pqm, pqi, izap, lfs, ptab in partials:
+            if f'LFS{lfs}' in mtg:
+                warn(f"{path.name}: duplicate MF=10 "
+                     f"partial LFS={lfs} in {name} "
+                     f"MT={mt}; skipping.")
+                continue
+            lg = mtg.create_group(f'LFS{lfs}')
+            lg.attrs['QM'] = pqm
+            lg.attrs['QI'] = pqi
+            lg.attrs['IZAP'] = izap
+            lg.attrs['LFS'] = lfs
+            lg.attrs['ELFS'] = pqm - pqi
+            if lfs in lfs_to_liso:
+                lg.attrs['product'] = np.bytes_(gnds_name(
+                    izap // 1000, izap % 1000,
+                    lfs_to_liso[lfs]))
+            _write_xy(lg, ptab.x, ptab.y)
+
+
 class _TemperatureMismatchError(ValueError):
     """A tape's temperature disagrees with the library temperature.
 
@@ -500,43 +547,9 @@ class PendfLibrary:
                             _write_xy(mtg, tab.x, tab.y)
 
                             # MF=10 isomeric production partials for this reaction
-                            if (10, mt) in ev.section:
-                                fo = io.StringIO(ev.section[10, mt])
-                                _, _, _lis, _liso, ns, _ = get_head_record(fo)
-                                partials = []
-                                for _ in range(ns):
-                                    (pqm, pqi, izap, lfs), ptab = \
-                                        get_tab1_record(fo)
-                                    _check_lin_lin(name, 10, mt, ptab)
-                                    partials.append((pqm, pqi, izap, lfs, ptab))
-
-                                lfs_to_liso = {}
-                                if mapping != 'none':
-                                    lfs_to_liso = map_lfs_to_liso(
-                                        [{'lfs': lfs, 'izap': izap,
-                                          'elfs': pqm - pqi}
-                                         for pqm, pqi, izap, lfs, _pt in partials],
-                                        decay_lookup, mode=mapping,
-                                        rtol=elis_rtol, atol=elis_atol,
-                                        context=f"{name} MT={mt}")
-
-                                for pqm, pqi, izap, lfs, ptab in partials:
-                                    if f'LFS{lfs}' in mtg:
-                                        warn(f"{path.name}: duplicate MF=10 "
-                                             f"partial LFS={lfs} in {name} "
-                                             f"MT={mt}; skipping.")
-                                        continue
-                                    lg = mtg.create_group(f'LFS{lfs}')
-                                    lg.attrs['QM'] = pqm
-                                    lg.attrs['QI'] = pqi
-                                    lg.attrs['IZAP'] = izap
-                                    lg.attrs['LFS'] = lfs
-                                    lg.attrs['ELFS'] = pqm - pqi
-                                    if lfs in lfs_to_liso:
-                                        lg.attrs['product'] = np.bytes_(gnds_name(
-                                            izap // 1000, izap % 1000,
-                                            lfs_to_liso[lfs]))
-                                    _write_xy(lg, ptab.x, ptab.y)
+                            _write_mf10_partials(mtg, ev, mt, name, path,
+                                                 mapping, decay_lookup,
+                                                 elis_rtol, elis_atol)
 
                         # MF=10 partials are written only alongside their MF=3
                         # sibling (loop above). Warn about any MF=10 reaction
