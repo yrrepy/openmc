@@ -539,6 +539,10 @@ def _liso_from_gnds(name: str) -> int:
 # isomeric nuclide at full-library scale.
 CONSISTENCY_RTOL = 1e-5
 
+# Trailing metastable qualifier ('_m1') on nuclide names / qualified
+# reaction types.
+_ISOMER_SUFFIX = re.compile(r'_m\d+$')
+
 
 def _partials_total_max_deviation(total_g, part_sum):
     """Max relative deviation of summed MF=10 partials from the MF=3 total.
@@ -783,7 +787,6 @@ def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
     differences and nuclides present on only one side are left alone (ordinary
     OpenMC behaviour).
     """
-    qualified = re.compile(r'_m\d+$')
     offenders = []
     for nuc in micro_xs.nuclides:
         if nuc not in chain:
@@ -796,7 +799,7 @@ def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
         # (a) MicroXS carries a qualified pathway the chain cannot route -> its
         # rate is dropped when the reaction type is not in the chain.
         for rx in micro_rxns:
-            if qualified.search(rx) and rx not in chain_rxns:
+            if _ISOMER_SUFFIX.search(rx) and rx not in chain_rxns:
                 offenders.append((nuc, rx, 'in MicroXS but not in chain'))
         # (b) Chain carries a qualified pathway whose reaction type is absent
         # from the MicroXS reaction axis while the unqualified base carries data
@@ -804,8 +807,8 @@ def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
         # zero rate. A qualified column that IS in the axis (even if this
         # nuclide's row is zero) means expansion ran, so it is not a mismatch.
         for rx in chain_rxns:
-            if (qualified.search(rx) and rx not in micro_xs.reactions
-                    and qualified.sub('', rx) in micro_rxns):
+            if (_ISOMER_SUFFIX.search(rx) and rx not in micro_xs.reactions
+                    and _ISOMER_SUFFIX.sub('', rx) in micro_rxns):
                 offenders.append((nuc, rx, 'in chain but missing from MicroXS'))
 
     if offenders:
@@ -857,7 +860,7 @@ class MicroXS:
         # Isomeric pathway reactions carry a product-qualified suffix (e.g.
         # '(n,gamma)_m1'); validate the canonical base reaction, ignoring it.
         for reaction in reactions:
-            check_value('reactions', re.sub(r'_m\d+$', '', reaction),
+            check_value('reactions', _ISOMER_SUFFIX.sub('', reaction),
                         _valid_rxns)
 
         self.data = data
