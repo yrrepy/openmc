@@ -5,7 +5,7 @@ IndependentOperator class for depletion.
 """
 
 from __future__ import annotations
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 import re
@@ -592,7 +592,6 @@ def _build_xs_table_pendf(
     reactions: Sequence[str],
     energies: Sequence[float],
     pendf_library,
-    pathways: bool = True,
 ) -> _SparseXSTable:
     """Build a sparse group cross section table from a pointwise PENDF library.
 
@@ -603,7 +602,7 @@ def _build_xs_table_pendf(
     via :func:`_group_average`; all-zero MF=3-total rows (nuclide or reaction
     absent, or a threshold above the group structure) are skipped.
 
-    When ``pathways`` is true and the library exposes isomeric pathway data
+    When the library exposes isomeric pathway data
     (MF=10 partial cross sections, per the ORIGEN-style "Option A" scheme), a
     reaction with mapped MF=10 partials is expanded into one row per product
     isomer instead of the single MF=3 total. The ground product (LISO 0) keeps
@@ -634,10 +633,6 @@ def _build_xs_table_pendf(
         values with MF=10, ``[]`` if none), ``pathway_xs(nuclide, mt, lfs)``
         (``(energy, xs)`` of a partial) and ``product(nuclide, mt, lfs)`` (baked
         GNDS product name, ``None`` if the library was written unmapped).
-    pathways : bool, optional
-        If true (default), expand reactions with mapped MF=10 partials into
-        per-product rows. If false, always emit the single MF=3-total row per
-        reaction (reaction axis equals ``reactions``).
     """
     mts = [REACTION_MT[name] for name in reactions]
     energies = np.asarray(energies, dtype=float)
@@ -664,7 +659,7 @@ def _build_xs_table_pendf(
     # (e.g. an MF=3-only stand-in) transparently falls back to the total row.
     # Grouped libraries expose pre-binned ``pathway_xs_g``; pointwise ones expose
     # ``pathway_xs``.
-    pathways_fn = getattr(pendf_library, 'pathways', None) if pathways else None
+    pathways_fn = getattr(pendf_library, 'pathways', None)
     pathway_xs_fn = getattr(
         pendf_library, 'pathway_xs_g' if grouped else 'pathway_xs', None)
     product_fn = getattr(pendf_library, 'product', None)
@@ -976,9 +971,7 @@ class MicroXS:
         *,
         cross_sections: PathLike | None = None,
         pendf_library=None,
-        pathways: bool = True,
-        urr_material_dilution: bool = False,
-        densities=None,
+        urr_material_dilution: openmc.Material | Mapping[str, float] | bool = False,
         mat_ssf_nuclides=None,
         **init_kwargs: dict,
     ) -> MicroXS | list[MicroXS]:
@@ -1001,8 +994,8 @@ class MicroXS:
         .. versionchanged:: 0.15.4
             ``multigroup_flux`` may be 2-D (or a list of 1-D arrays) to collapse
             several fluxes against a single shared cross section table, returning
-            a list of :class:`MicroXS`. Added the ``cross_sections``,
-            ``pendf_library`` and ``pathways`` arguments. When
+            a list of :class:`MicroXS`. Added the ``cross_sections`` and
+            ``pendf_library`` arguments. When
             ``pendf_library`` is a grouped PENDF library, ``energies`` may be
             omitted and defaults to the library's ``group_edges``.
 
@@ -1044,33 +1037,34 @@ class MicroXS:
             :class:`~openmc.data.PendfLibrary` is flat-weighted onto ``energies``
             at runtime, whereas a pre-binned
             :class:`~openmc.data.GroupedPendfLibrary` (matched to ``energies``)
-            is read directly without rebinning.
-        pathways : bool, optional
-            Only used with ``pendf_library``. If true (default), reactions with
-            mapped isomeric MF=10 partials are expanded into per-product rows
-            (ground keeps the canonical name; metastable products are qualified,
-            e.g. ``(n,gamma)_m1``), so the returned ``reactions`` axis may
-            contain product-qualified names. If false, only MF=3-total rows are
-            emitted.
-        urr_material_dilution : bool, optional
-            Only valid with ``pendf_library``. If true, apply the unresolved
-            resonance region (URR) material-dilution self-shielding correction:
-            the collapsed capture (and fission) reaction rates of flagged
-            resonant nuclides are multiplied, in URR-overlapping groups only, by
-            a per-group self-shielding factor computed from the nuclides'
+            is read directly without rebinning. Reactions with mapped isomeric
+            MF=10 partials are always expanded into per-product rows (ground
+            keeps the canonical name; metastable products are qualified, e.g.
+            ``(n,gamma)_m1``), so the returned ``reactions`` axis may contain
+            product-qualified names.
+        urr_material_dilution : openmc.Material or dict or False, optional
+            Only valid with ``pendf_library``. Enables the unresolved resonance
+            region (URR) material-dilution self-shielding correction: the
+            collapsed capture (and fission) reaction rates of flagged resonant
+            nuclides are multiplied, in URR-overlapping groups only, by a
+            per-group self-shielding factor computed from the nuclides'
             probability tables at a homogeneous background cross section
-            ``sigma_0`` built from ``densities``. The background is
-            infinite-medium (no escape/Dancoff geometry) and uses the single
-            ``densities`` snapshot (diluter build-in over an irradiation is not
-            modelled). Requires ``densities``; raises ``ValueError`` on the
-            continuous-energy path or if ``densities`` is ``None``. Default False,
-            in which case the collapse is unchanged.
-        densities : dict, optional
-            Maps nuclide name to number density (or fraction; only ratios
-            matter) for the ``sigma_0`` background. Required when
-            ``urr_material_dilution`` is true, ignored otherwise. A flagged
-            nuclide absent from this mapping (e.g. a trace transmutation product)
-            is treated as infinitely dilute (self-shielding factor 1).
+            ``sigma_0`` built from the supplied composition. The background is
+            infinite-medium (no escape/Dancoff geometry) from a single
+            composition snapshot (diluter build-in over an irradiation is not
+            modelled). Accepts either an :class:`openmc.Material` (its
+            :meth:`~openmc.Material.get_nuclide_atom_densities` supplies the
+            composition) or a ``{nuclide: number-density-or-fraction}`` mapping
+            (only ratios matter, so number densities or atom/weight fractions are
+            equivalent). A flagged nuclide absent from the composition (e.g. a
+            trace transmutation product) is treated as infinitely dilute
+            (self-shielding factor 1). ``False`` (default) or ``None`` leaves the
+            collapse unchanged; bare ``True`` and an empty mapping raise
+            ``ValueError``. The composition must be given explicitly because this
+            is the transport-free collapse path -- no live session exists, and a
+            model has many materials, so one :class:`MicroXS` is built per
+            material composition. Raises ``ValueError`` on the continuous-energy
+            path.
         mat_ssf_nuclides : iterable of str, optional
             Restricts the URR self-shielding to these nuclides (intersected with
             the default flagged list and the library's ptable coverage). ``None``
@@ -1094,20 +1088,41 @@ class MicroXS:
         if multigroup_flux is None:
             raise ValueError('multigroup_flux is a required argument')
 
-        # The URR material-dilution correction is defined only on the PENDF
-        # path (it needs the library's probability tables) and needs a
-        # composition to build the sigma_0 background from.
-        if urr_material_dilution:
-            if pendf_library is None:
+        # Fuse the URR dilution toggle with its composition: normalize
+        # ``urr_material_dilution`` to a local ``densities`` mapping (or None
+        # when off) here, before any collapse work, so the impossible "on but no
+        # composition" state cannot be represented.
+        if urr_material_dilution is False or urr_material_dilution is None:
+            densities = None
+        elif urr_material_dilution is True:
+            raise ValueError(
+                'urr_material_dilution=True is under-specified: the URR '
+                'self-shielding sigma_0 background needs a composition. Pass '
+                'the openmc.Material being depleted, or a {nuclide: '
+                'density-or-fraction} mapping, instead of True')
+        elif isinstance(urr_material_dilution, openmc.Material):
+            densities = urr_material_dilution.get_nuclide_atom_densities()
+        elif isinstance(urr_material_dilution, Mapping):
+            if not urr_material_dilution:
                 raise ValueError(
-                    'urr_material_dilution requires a pendf_library; the URR '
-                    'self-shielding correction is built from its probability '
-                    'tables and is not available on the continuous-energy path')
-            if densities is None:
-                raise ValueError(
-                    'urr_material_dilution=True requires densities (a mapping '
-                    'of nuclide name to number density or fraction) to build '
-                    'the sigma_0 background')
+                    'urr_material_dilution mapping is empty: with no diluters '
+                    'the sigma_0 background is zero and every flagged nuclide '
+                    'silently degrades to f=1. Pass the depleted composition, '
+                    'or omit the argument to disable the correction')
+            densities = urr_material_dilution
+        else:
+            raise ValueError(
+                'urr_material_dilution must be an openmc.Material, a {nuclide: '
+                'density-or-fraction} mapping, or False; got '
+                f'{type(urr_material_dilution).__name__}')
+
+        # The correction is defined only on the PENDF path -- it is built from
+        # the library's probability tables.
+        if densities is not None and pendf_library is None:
+            raise ValueError(
+                'urr_material_dilution requires a pendf_library; the URR '
+                'self-shielding correction is built from its probability '
+                'tables and is not available on the continuous-energy path')
 
         # Default the group structure to a grouped PENDF library's own edges
         # when the caller omits ``energies``. A grouped library is duck-detected
@@ -1164,11 +1179,11 @@ class MicroXS:
                     'temperature configures the continuous-energy path and '
                     'cannot be combined with pendf_library')
             table = _build_xs_table_pendf(
-                nuclides, reactions, energies, pendf_library, pathways=pathways)
+                nuclides, reactions, energies, pendf_library)
             # URR material-dilution self-shielding: multiply the capture/fission
             # rows of flagged resonant nuclides by their per-group factor in the
             # URR-overlapping groups (in place). The =False path is untouched.
-            if urr_material_dilution:
+            if densities is not None:
                 from .mat_ssf import _apply_mat_ssf
                 _apply_mat_ssf(table, pendf_library, energies, densities,
                                mat_ssf_nuclides)

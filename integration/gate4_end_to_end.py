@@ -150,7 +150,7 @@ def main():
         warnings.simplefilter('ignore')
         off = MicroXS.from_multigroup_flux(**kw)
         on = MicroXS.from_multigroup_flux(
-            urr_material_dilution=True, densities=NAT_W, **kw)
+            urr_material_dilution=NAT_W, **kw)
 
     # --- direct per-group f_g for each W isotope ---
     gtot = _group_totals(glib, W_ISOTOPES)

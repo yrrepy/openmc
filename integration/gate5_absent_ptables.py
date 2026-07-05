@@ -75,7 +75,7 @@ def main():
         warnings.simplefilter('always')
         try:
             on = MicroXS.from_multigroup_flux(
-                urr_material_dilution=True, densities=NAT_W, **kw)
+                urr_material_dilution=NAT_W, **kw)
         except Exception as exc:                       # pragma: no cover
             completed = False
             err = exc
