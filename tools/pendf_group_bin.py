@@ -35,7 +35,10 @@ from openmc.mgxs import GROUP_STRUCTURES
 
 # Grouped-schema constants.
 GROUPED_FORMAT = 'pendf-grouped'
-GROUPED_VERSION = 1
+# Grouped-schema version stamped at the root as the ``version`` attribute:
+#   1 -- MF=10 subgroups are always named ``LFS<l>``.
+#   2 -- an LFS shared by >=2 product IZAPs is named ``LFS<l>_ZAP<izap>``.
+GROUPED_VERSION = 2
 
 
 def chain_relevant_mts() -> set[int]:

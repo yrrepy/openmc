@@ -27,6 +27,12 @@ from openmc.checkvalue import PathLike
 #: ``format`` root attribute identifying a grouped PENDF library.
 GROUPED_FORMAT = 'pendf-grouped'
 
+#: Highest grouped-schema ``version`` root attribute this reader understands.
+#: 1 -- MF=10 subgroups always named ``LFS<l>``; 2 -- a shared LFS may be
+#: named ``LFS<l>_ZAP<izap>``. A file stamped higher was written by a newer
+#: OpenMC and is rejected.
+GROUPED_VERSION = 2
+
 
 def _decode(value):
     """Return a str for a bytes/np.bytes_ attribute, else the value itself."""
@@ -68,6 +74,15 @@ class GroupedPendfLibrary:
                 raise ValueError(
                     f"{self._path} is not a grouped PENDF library "
                     f"(format={fmt!r}, expected {GROUPED_FORMAT!r}).")
+            # Forward-compat: a file stamped a newer schema version than this
+            # reader supports was written by a newer OpenMC. A missing attr or a
+            # version <= supported is an older (valid) file.
+            file_version = self._file.attrs.get('version')
+            if file_version is not None and file_version > GROUPED_VERSION:
+                raise ValueError(
+                    f"{self._path}: grouped PENDF version {int(file_version)} "
+                    f"is newer than the supported version {GROUPED_VERSION}; "
+                    f"this file was written by a newer OpenMC.")
             if 'group_edges' not in self._file:
                 raise ValueError(
                     f"{self._path} is not a grouped PENDF library "
