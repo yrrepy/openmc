@@ -419,7 +419,10 @@ def get_pendf_microxs_and_flux(
         (an :class:`openmc.Material` or ``{nuclide: density}`` mapping) rather
         than each domain's own, call :meth:`MicroXS.from_multigroup_flux`
         directly -- that collapse-level argument takes the Material/mapping form;
-        this wrapper-level argument is bool only.
+        this wrapper-level argument is bool only. The Bondarenko fold uses the
+        temperature baked into the PENDF library's probability tables; no
+        cross-check against the material or transport temperature is performed,
+        so ensure the library's temperature matches the conditions modelled.
     mat_ssf_nuclides : iterable of str, optional
         Restricts the URR self-shielding to these nuclides (intersected with the
         default flagged list and the library's ptable coverage). ``None``
@@ -430,7 +433,9 @@ def get_pendf_microxs_and_flux(
     -------
     list of numpy.ndarray
         Flux in each group in [n-cm/src] for each domain (raw tallied
-        magnitudes, as :func:`get_microxs_and_flux` returns them).
+        magnitudes, as :func:`get_microxs_and_flux` returns them). Unlike
+        :func:`get_gendfxs_and_flux`, which returns ``(flux, energy-bounds)``
+        tuples, this wrapper returns bare flux arrays.
     list of MicroXS
         Cross section data in [b] for each domain.
 
@@ -1315,7 +1320,10 @@ class MicroXS:
             is the transport-free collapse path -- no live session exists, and a
             model has many materials, so one :class:`MicroXS` is built per
             material composition. Raises ``ValueError`` on the continuous-energy
-            path.
+            path. The Bondarenko fold uses the temperature baked into the PENDF
+            library's probability tables; no cross-check against the material or
+            transport temperature is performed, so ensure the library's
+            temperature matches the conditions modelled.
         mat_ssf_nuclides : iterable of str, optional
             Restricts the URR self-shielding to these nuclides (intersected with
             the default flagged list and the library's ptable coverage). ``None``
