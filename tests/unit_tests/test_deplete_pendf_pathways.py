@@ -29,10 +29,18 @@ class _FakePendf:
     """Duck-typed stand-in exposing the frozen §4.2 pathway accessors."""
 
     def __init__(self, mf3, mf10=None):
-        # mf3:  {nuclide: {mt: (energy, xs)}}                      MF=3 totals
-        # mf10: {nuclide: {mt: {lfs: (product|None, (energy, xs))}}}  MF=10
+        # mf3:  {nuclide: {mt: (energy, xs)}}                       MF=3 totals
+        # mf10: {nuclide: {mt: {lfs or (lfs, izap): (product|None, (energy, xs))}}}
+        # An MF=10 key may be a bare LFS (the common non-lumped partial: one
+        # product per level, IZAP defaulted) or an explicit (LFS, IZAP) pair (a
+        # lumped level shared by several product nuclides, as MT=5 does). Both
+        # normalize to (LFS, IZAP) so ``pathways`` yields the frozen pairs.
         self._mf3 = mf3
-        self._mf10 = mf10 or {}
+        self._mf10 = {
+            nuc: {mt: {(k if isinstance(k, tuple) else (k, 0)): v
+                       for k, v in parts.items()}
+                  for mt, parts in by_mt.items()}
+            for nuc, by_mt in (mf10 or {}).items()}
 
     @property
     def nuclides(self):
@@ -45,13 +53,13 @@ class _FakePendf:
         return self._mf3[nuclide][mt]
 
     def pathways(self, nuclide, mt):
-        return list(self._mf10.get(nuclide, {}).get(mt, {}))
+        return sorted(self._mf10.get(nuclide, {}).get(mt, {}))
 
-    def pathway_xs(self, nuclide, mt, lfs):
-        return self._mf10[nuclide][mt][lfs][1]
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
+        return self._mf10[nuclide][mt][(lfs, izap)][1]
 
-    def product(self, nuclide, mt, lfs):
-        return self._mf10[nuclide][mt][lfs][0]
+    def product(self, nuclide, mt, lfs, izap=None):
+        return self._mf10[nuclide][mt][(lfs, izap)][0]
 
 
 # Constant cross sections over the full span so every group average equals the
@@ -162,6 +170,24 @@ def test_duplicate_zero_then_nonzero_row_sums_once():
     row = next(table.xs_matrix[i]
                for i, r in enumerate(table.rxn_indices) if r == m1_idx)
     np.testing.assert_allclose(row, [3.0, 3.0])
+
+
+def test_lumped_multiproduct_channel_raises():
+    # A lumped reaction (MT=5 (n,misc)) whose MF=10 partials name two DIFFERENT
+    # daughter nuclides at one collapse row is refused: summing unrelated
+    # daughters into a single reaction row is never valid. Contrast
+    # test_duplicate_product_rows_sum, where two levels of the SAME daughter do
+    # sum. Here two products share LFS 0 (the ground row) but differ by IZAP.
+    fake = _FakePendf(
+        mf3={"Fe56": {5: _const(5.0)}},
+        mf10={"Fe56": {5: {
+            (0, 26057): ("Fe57", _const(3.0)),   # one daughter
+            (0, 25056): ("Mn56", _const(2.0)),   # a DIFFERENT daughter, same LFS
+        }}})
+    edges = np.array([0.0, 2.0e7])
+
+    with pytest.raises(ValueError, match="lumped"):
+        _build_xs_table_pendf(["Fe56"], ["(n,misc)"], edges, fake)
 
 
 def test_reaction_without_mf10_single_row():
