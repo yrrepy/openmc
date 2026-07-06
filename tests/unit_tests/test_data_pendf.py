@@ -212,7 +212,7 @@ def test_roundtrip(tmp_path, evaluations):
         assert reader._reaction("Am241", 102).attrs["QM"] == pytest.approx(_qm)
 
         # MF=10 partials present with correct LFS values and ELFS = QM - QI
-        assert reader.pathways("Am241", 102) == [0, 2]
+        assert reader.pathways("Am241", 102) == [(0, 95242), (2, 95242)]
         _ns, subs = _mf10(evaluations["Am241"], 102)
         for pqm, pqi, izap, lfs, ptab in subs:
             penergy, pxs = reader.pathway_xs("Am241", 102, lfs)
@@ -224,7 +224,7 @@ def test_roundtrip(tmp_path, evaluations):
             # mapping='none' -> no baked product name
             assert reader.product("Am241", 102, lfs) is None
 
-        assert reader.pathways("In115", 102) == [0, 1, 4]
+        assert reader.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
 
         # Nuclide-level attrs correct
         nuc = reader._nuclide("Am241")
@@ -275,13 +275,13 @@ def test_elis_mapping_bake(tmp_path):
 
         # Am241(n,gamma): LFS 0 -> ground Am242, LFS 2 -> Am242_m1 (ELFS ~48.6 keV,
         # NOT LISO 2 -- LFS is a level index, LISO comes from ELIS matching).
-        assert reader.pathways("Am241", 102) == [0, 2]
+        assert reader.pathways("Am241", 102) == [(0, 95242), (2, 95242)]
         assert reader.product("Am241", 102, 0) == "Am242"
         assert reader.product("Am241", 102, 2) == "Am242_m1"
 
         # In115(n,gamma): LFS 0/1/4 -> In116 / In116_m1 (~127.3 keV) / In116_m2
         # (~289.7 keV). In116_m2 is present in the decay source, so LFS 4 maps.
-        assert reader.pathways("In115", 102) == [0, 1, 4]
+        assert reader.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
         assert reader.product("In115", 102, 0) == "In116"
         assert reader.product("In115", 102, 1) == "In116_m1"
         assert reader.product("In115", 102, 4) == "In116_m2"
@@ -320,7 +320,7 @@ def test_skips_unparseable_file(tmp_path):
 
     # Output is a valid library: root attrs present and the reader reopens it.
     with h5py.File(out, "r") as f:
-        assert f.attrs["format_version"] == 1
+        assert f.attrs["format_version"] == 2
         assert f.attrs["library"].decode() == "TENDL-2017"
         assert f.attrs["temperature"] == pytest.approx(293.16)
     reader = PendfLibrary(out)
@@ -362,6 +362,53 @@ def test_context_manager(tmp_path):
         assert lib.nuclides == ["Fe56"]
         assert lib._files
     assert lib._files == []
+
+
+def test_format_version_written(tmp_path):
+    # A freshly written library stamps the current format version (2).
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+
+    with h5py.File(out, "r") as f:
+        assert f.attrs["format_version"] == 2
+
+
+def test_format_version_newer_rejected(tmp_path):
+    # A file stamped a newer format than this reader supports is refused, with a
+    # message naming the file, the found version, and the supported version.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+
+    with h5py.File(out, "r+") as f:
+        f.attrs["format_version"] = 99
+    with pytest.raises(ValueError, match="newer than the supported version"):
+        PendfLibrary(out)
+
+
+def test_format_version_missing_loads(tmp_path):
+    # An old file predating the version attr (attr deleted) still loads.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+
+    with h5py.File(out, "r+") as f:
+        del f.attrs["format_version"]
+    with PendfLibrary(out) as lib:
+        assert lib.nuclides == ["Fe56"]
 
 
 def test_mf10_shared_lfs_distinct_izap(tmp_path):
@@ -443,6 +490,110 @@ def test_mf10_unique_lfs_schema_compatible(tmp_path):
             assert mtg["LFS2"].attrs["ELFS"] == pytest.approx(48600.0)
 
     assert not records
+
+
+# ---------------------------------------------------------------------------
+# Read-back tests for the (lfs, izap) partial accessors. A lumped reaction can
+# store several MF=10 partials that share an LFS but describe different product
+# nuclides; pathways() must enumerate each, and pathway_xs()/product() must be
+# able to pick one by IZAP. Fixtures are minimal PendfLibrary-openable files
+# built through the real _write_mf10_partials writer.
+
+
+def _mf10_library(tmp_path, nuclide, mt, subs, mapping="none", products=None):
+    """Write a minimal PendfLibrary-openable .h5 with one MF=10 reaction.
+
+    ``subs`` (the ``_fake_mf10_evaluation`` format) is written through the real
+    ``_write_mf10_partials`` under a single nuclide/MT group. ``products`` maps
+    IZAP -> baked product name and, when given, stamps a ``product`` attr onto
+    each partial so product() can be exercised without the decay-mapping
+    machinery (that baking is covered by test_elis_mapping_bake). Returns the
+    file path.
+    """
+    ev = _fake_mf10_evaluation(mt, subs)
+    out = tmp_path / f"{nuclide}.h5"
+    with h5py.File(out, "w") as f:
+        f.attrs["format_version"] = 2
+        f.attrs["library"] = np.bytes_("TENDL-2017")
+        f.attrs["temperature"] = 293.16
+        f.attrs["mapping"] = np.bytes_(mapping)
+        mtg = f.create_group(nuclide).create_group(f"MT{mt}")
+        _write_mf10_partials(mtg, ev, mt, nuclide, Path(f"n-{nuclide}.pendf"),
+                             mapping, None, ELIS_RTOL, ELIS_ATOL)
+        if products:
+            for k in mtg:
+                if k.startswith("LFS"):
+                    mtg[k].attrs["product"] = np.bytes_(
+                        products[int(mtg[k].attrs["IZAP"])])
+    return out
+
+
+# A lumped reaction (MT=5): two partials share LFS=0 but produce Ag108 (IZAP
+# 47108) and Cd108 (IZAP 48108), each with its own cross section.
+_LUMPED_MT = 5
+_LUMPED_SUBS = [
+    (0.0, 0.0, 47108, 0, [(1.0, 2.0), (3.0, 4.0)]),
+    (5.0, -3.0, 48108, 0, [(1.0, 0.5), (3.0, 0.25)]),
+]
+_LUMPED_PRODUCTS = {47108: "Ag108", 48108: "Cd108"}
+
+
+def test_pathways_lumped_repeats_lfs(tmp_path):
+    # (a) On a lumped reaction, pathways() returns one (lfs, izap) pair per
+    # stored partial -- the shared LFS repeats with distinct IZAP -- sorted.
+    out = _mf10_library(tmp_path, "Xx100", _LUMPED_MT, _LUMPED_SUBS)
+    with PendfLibrary(out) as lib:
+        assert lib.pathways("Xx100", _LUMPED_MT) == [(0, 47108), (0, 48108)]
+
+
+def test_pathway_lumped_izap_selects_partial(tmp_path):
+    # (b) With izap=, pathway_xs()/product() resolve the shared LFS to the one
+    # matching partial and return its cross section / baked product name.
+    out = _mf10_library(tmp_path, "Xx100", _LUMPED_MT, _LUMPED_SUBS,
+                        products=_LUMPED_PRODUCTS)
+    with PendfLibrary(out) as lib:
+        _e, xs = lib.pathway_xs("Xx100", _LUMPED_MT, 0, izap=47108)
+        np.testing.assert_array_equal(xs, [2.0, 4.0])
+        _e, xs = lib.pathway_xs("Xx100", _LUMPED_MT, 0, izap=48108)
+        np.testing.assert_array_equal(xs, [0.5, 0.25])
+        assert lib.product("Xx100", _LUMPED_MT, 0, izap=47108) == "Ag108"
+        assert lib.product("Xx100", _LUMPED_MT, 0, izap=48108) == "Cd108"
+        # An LFS/IZAP pair that is not stored still raises, naming the izap.
+        with pytest.raises(KeyError, match="LFS=0, IZAP=999"):
+            lib.pathway_xs("Xx100", _LUMPED_MT, 0, izap=999)
+
+
+def test_pathway_lumped_ambiguous_without_izap(tmp_path):
+    # (c) Without izap=, the shared LFS is ambiguous: raise ValueError naming
+    # both candidate IZAPs and pointing the caller at izap=.
+    out = _mf10_library(tmp_path, "Xx100", _LUMPED_MT, _LUMPED_SUBS,
+                        products=_LUMPED_PRODUCTS)
+    with PendfLibrary(out) as lib:
+        with pytest.raises(
+                ValueError,
+                match=r"shared by IZAP values.*47108.*48108.*izap="):
+            lib.pathway_xs("Xx100", _LUMPED_MT, 0)
+        with pytest.raises(ValueError, match=r"shared by IZAP values.*izap="):
+            lib.product("Xx100", _LUMPED_MT, 0)
+
+
+def test_pathway_non_lumped_bare_lfs_unchanged(tmp_path):
+    # (d) A non-lumped reaction (each LFS unique): bare-LFS pathways()/
+    # pathway_xs()/product() behave exactly as before -- no izap needed -- and a
+    # missing LFS raises the same KeyError.
+    mt = 102
+    subs = [
+        (0.0, 0.0, 95242, 0, [(1.0, 2.0)]),
+        (48600.0, 0.0, 95242, 2, [(1.0, 3.0)]),
+    ]
+    out = _mf10_library(tmp_path, "Am241", mt, subs)
+    with PendfLibrary(out) as lib:
+        assert lib.pathways("Am241", mt) == [(0, 95242), (2, 95242)]
+        _e, xs = lib.pathway_xs("Am241", mt, 2)
+        np.testing.assert_array_equal(xs, [3.0])
+        assert lib.product("Am241", mt, 0) is None
+        with pytest.raises(KeyError, match="no MF=10 partial LFS=9"):
+            lib.pathway_xs("Am241", mt, 9)
 
 
 # ---------------------------------------------------------------------------
