@@ -260,3 +260,57 @@ def test_reaction_products_skips_out_of_range_z():
         grp.create_group("MT999")  # no LFS -> DADZ/ATOMIC_SYMBOL ground path
         products = list(_reaction_products(h5, "H1", {999: "(n,3a)"}))
     assert products == []
+
+
+def _write_mt5_h5(path, with_lfs):
+    """Hand-build a PENDF h5 with a single Fe56 MT=5 lumped channel.
+
+    MT=5 ((n,misc)) is deliberately absent from deplete REACTIONS. The group
+    always carries cross-section data; ``with_lfs`` adds an MF=10 LFS partial
+    (attrs consistent with the real library's LFS subgroups).
+    """
+    with h5py.File(path, "w") as h5:
+        mt5 = h5.create_group("Fe56").create_group("MT5")
+        mt5.attrs["QI"] = 0.0
+        mt5.attrs["QM"] = 0.0
+        mt5.create_dataset("energy", data=[1.0, 2.0e7])
+        mt5.create_dataset("xs", data=[0.0, 0.1])
+        if with_lfs:
+            lfs = mt5.create_group("LFS0")
+            lfs.attrs["LFS"] = 0
+            lfs.attrs["IZAP"] = 26056  # Fe56 product ZA (1000*Z + A)
+            lfs.attrs["product"] = "Fe56"
+            lfs.attrs["QI"] = 0.0
+            lfs.attrs["QM"] = 0.0
+            lfs.attrs["ELFS"] = 0.0
+            lfs.create_dataset("energy", data=[1.0, 2.0e7])
+            lfs.create_dataset("xs", data=[0.0, 0.1])
+    return path
+
+
+def test_mt5_with_lfs_surfaces_coverage(tmp_path):
+    # An unmapped lumped channel (MT=5) that carries MF=10 partials must stay
+    # out of the chain but leave a loud coverage trace instead of vanishing.
+    h5_path = _write_mt5_h5(tmp_path / "mt5_lfs.h5", with_lfs=True)
+    chain = chain_from_pendf(h5_path, _DECAY_DIR, nuclides=["Fe56"])
+
+    # The lumped channel is still excluded from the chain.
+    assert "(n,misc)" not in chain.reactions
+    assert chain["Fe56"].reactions == []
+
+    entries = [c for c in chain.coverage
+               if c["parent"] == "Fe56" and c["reaction"] == "MT5"]
+    assert len(entries) == 1
+    assert set(entries[0]) == {"parent", "reaction", "product", "reason"}
+    assert entries[0]["product"] is None
+    assert "lumped channel" in entries[0]["reason"]
+
+
+def test_mt5_without_lfs_no_coverage(tmp_path):
+    # A lumped channel with cross-section data but no MF=10 partials is a normal
+    # silent skip -- no coverage flood for the vast majority of unmapped MTs.
+    h5_path = _write_mt5_h5(tmp_path / "mt5_nolfs.h5", with_lfs=False)
+    chain = chain_from_pendf(h5_path, _DECAY_DIR, nuclides=["Fe56"])
+
+    assert "(n,misc)" not in chain.reactions
+    assert chain.coverage == []

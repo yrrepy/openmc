@@ -189,10 +189,21 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None, record_lfs=False):
                 if not mt_key.startswith('MT'):
                     continue
                 mt = int(mt_key[2:])
+                mt_group = nuc_group[mt_key]
                 name = mt_to_name.get(mt)
                 if name is None:
+                    # MTs with no depletion reaction name are skipped, but a
+                    # lumped channel (e.g. MT=5 (n,misc)) that carries MF=10
+                    # partials would vanish without the coverage trace every
+                    # other unsatisfiable pathway leaves. Surface it (still
+                    # excluded from the chain) when it does; the common unmapped
+                    # MTs (1/2/3/...) have no LFS subgroup and stay silent.
+                    if any(k.startswith('LFS') for k in mt_group):
+                        coverage.append(dict(
+                            parent=nuclide.name, reaction=mt_key, product=None,
+                            reason='MT not in depletion reaction set '
+                                   '(lumped channel, e.g. (n,misc))'))
                     continue
-                mt_group = nuc_group[mt_key]
 
                 # Ground product from DADZ (Sym{A}), drives coverage checks.
                 ground = _ground_product(z, a, name)
