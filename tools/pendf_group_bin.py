@@ -5,7 +5,7 @@ Flat-weights every chain-relevant MF=3 total and MF=10 partial cross section
 onto a fixed energy group structure with
 :func:`openmc.deplete.microxs._group_average` and stores the results dense
 (gzip-compressed) so the depletion collapse can skip runtime binning. The
-output schema is ``format='pendf-grouped'`` version 1:
+output schema is ``format='pendf-grouped'`` version 2:
 
 * root attrs: ``format``, ``version``, ``source`` (abs path of the pointwise
   file), ``dtype``, plus the source's ``library``/``temperature`` attrs;
@@ -35,7 +35,10 @@ from openmc.mgxs import GROUP_STRUCTURES
 
 # Grouped-schema constants.
 GROUPED_FORMAT = 'pendf-grouped'
-GROUPED_VERSION = 1
+# Grouped-schema version stamped at the root as the ``version`` attribute:
+#   1 -- MF=10 subgroups are always named ``LFS<l>``.
+#   2 -- an LFS shared by >=2 product IZAPs is named ``LFS<l>_ZAP<izap>``.
+GROUPED_VERSION = 2
 
 
 def chain_relevant_mts() -> set[int]:

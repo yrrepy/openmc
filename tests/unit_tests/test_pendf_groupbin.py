@@ -258,6 +258,40 @@ def test_missing_group_edges_raises_and_closes(tmp_path):
         GroupedPendfLibrary(path)
 
 
+def test_grouped_version_written(libs):
+    """A freshly written grouped library stamps the current schema version (2)."""
+    _, _, grouped_path = libs
+    with h5py.File(grouped_path, "r") as f:
+        assert f.attrs["version"] == 2
+
+
+def test_grouped_version_newer_rejected(tmp_path):
+    """A grouped file stamped a newer version than supported is refused, naming
+    the file, the found version, and the supported version."""
+    src = tmp_path / "pointwise.h5"
+    grouped = tmp_path / "grouped.h5"
+    _make_pointwise_h5(src)
+    pgb.bin_pendf_library(src, grouped, EDGES)
+
+    with h5py.File(grouped, "r+") as f:
+        f.attrs["version"] = 99
+    with pytest.raises(ValueError, match="newer than the supported version"):
+        GroupedPendfLibrary(grouped)
+
+
+def test_grouped_version_missing_loads(tmp_path):
+    """An old grouped file lacking the version attr still loads."""
+    src = tmp_path / "pointwise.h5"
+    grouped = tmp_path / "grouped.h5"
+    _make_pointwise_h5(src)
+    pgb.bin_pendf_library(src, grouped, EDGES)
+
+    with h5py.File(grouped, "r+") as f:
+        del f.attrs["version"]
+    with GroupedPendfLibrary(grouped) as lib:
+        assert set(lib.nuclides) == {"In115", "Fe56"}
+
+
 def test_writer_summary(tmp_path):
     """Writer reports rows and a tiny (passing) consistency deviation."""
     src = tmp_path / "pointwise.h5"
