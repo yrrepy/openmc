@@ -705,13 +705,17 @@ def _build_xs_table_pendf(
                 energy, xs = pendf_library.xs(nuc, mt)
                 total_g = _group_average(energy, xs, energies)
 
-            lfs_list = list(pathways_fn(nuc, mt)) if have_pathways else []
-            if not lfs_list:
+            # Each MF=10 partial is keyed by (LFS, IZAP): an LFS is a level
+            # index, and a single LFS may be shared by several product nuclides
+            # (a lumped channel), so IZAP disambiguates the product.
+            pathway_list = list(pathways_fn(nuc, mt)) if have_pathways else []
+            if not pathway_list:
                 # No MF=10 partials -> single canonical (ground) row
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
-            products = [product_fn(nuc, mt, lfs) for lfs in lfs_list]
+            products = [product_fn(nuc, mt, lfs, izap)
+                        for lfs, izap in pathway_list]
             if any(p is None for p in products):
                 # Library written with mapping='none': product names are unknown
                 # so pathway rows cannot be named. Fall back to the MF=3 total.
@@ -726,15 +730,34 @@ def _build_xs_table_pendf(
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
+            # A lumped reaction (e.g. MT=5 (n,misc)) can carry MF=10 partials for
+            # several distinct daughter nuclides. Two LFS levels of the SAME
+            # daughter mapping to one isomer row is the designed sum case, but two
+            # DIFFERENT daughters landing on one row would silently sum unrelated
+            # cross sections. Refuse a collapse row (isomer ordinal) claimed by
+            # more than one daughter -- compared by base nuclide, i.e. ignoring
+            # the isomer suffix.
+            row_daughter: dict[int, str] = {}
+            for p in products:
+                base = _ISOMER_SUFFIX.sub('', p)
+                claimed = row_daughter.setdefault(_liso_from_gnds(p), base)
+                if claimed != base:
+                    raise ValueError(
+                        f'PENDF reaction {nuc} MT={mt} has MF=10 partials for '
+                        f'multiple daughter nuclides ({claimed}, {base}) mapping '
+                        f'to the same collapse row; multi-product lumped channels '
+                        f'(e.g. MT=5 (n,misc)) are not supported as collapse '
+                        f'rows.')
+
             # All partials mapped: one row per product, valued from its MF=10
             # partial (never a branching ratio). Consistency-check the partials
             # against the MF=3 total before staging.
             partial_g = []
-            for lfs in lfs_list:
+            for lfs, izap in pathway_list:
                 if grouped:
-                    partial_g.append(pathway_xs_fn(nuc, mt, lfs))
+                    partial_g.append(pathway_xs_fn(nuc, mt, lfs, izap))
                 else:
-                    pe, pxs = pathway_xs_fn(nuc, mt, lfs)
+                    pe, pxs = pathway_xs_fn(nuc, mt, lfs, izap)
                     partial_g.append(_group_average(pe, pxs, energies))
             part_sum = np.sum(partial_g, axis=0)
             worst, g = _partials_total_max_deviation(total_g, part_sum)
