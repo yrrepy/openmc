@@ -46,7 +46,9 @@ except AttributeError:
     pass
 
 
-ReactionTuple = namedtuple('ReactionTuple', 'type target Q branching_ratio')
+ReactionTuple = namedtuple(
+    'ReactionTuple', 'type target Q branching_ratio pendf_lfs',
+    defaults=(None,))
 ReactionTuple.__doc__ = """\
 Transmutation reaction information
 
@@ -63,6 +65,11 @@ Q : float
     Q value of the reaction in [eV]
 branching_ratio : float
     Branching ratio of the reaction
+pendf_lfs : int or None
+    Informational MF=10 final-state (``LFS``) level index of the PENDF
+    partial this reaction was built from, or ``None`` when the reaction is
+    not backed by an MF=10 partial. Purely an audit record; nothing in the
+    depletion solve keys on it.
 
 """
 try:
@@ -70,6 +77,7 @@ try:
     ReactionTuple.target.__doc__ = None
     ReactionTuple.Q.__doc__ = None
     ReactionTuple.branching_ratio.__doc__ = None
+    ReactionTuple.pendf_lfs.__doc__ = None
 except AttributeError:
     pass
 
@@ -99,7 +107,8 @@ class Nuclide:
         Number of possible reaction pathways.
     reactions : list of openmc.deplete.ReactionTuple
         Reaction information. Each element of the list is a named tuple with
-        attribute 'type', 'target', 'Q', and 'branching_ratio'.
+        attributes 'type', 'target', 'Q', 'branching_ratio', and the optional
+        informational 'pendf_lfs'.
     sources : dict
         Dictionary mapping particle type as string to energy distribution of
         decay source represented as :class:`openmc.stats.Univariate`
@@ -182,7 +191,7 @@ class Nuclide:
             DecayTuple(type, target, branching_ratio)
         )
 
-    def add_reaction(self, type, target, Q, branching_ratio):
+    def add_reaction(self, type, target, Q, branching_ratio, pendf_lfs=None):
         """Add transmutation reaction to the nuclide
 
         Parameters
@@ -198,10 +207,14 @@ class Nuclide:
             Q value of the reaction in [eV]
         branching_ratio : float
             Branching ratio of the reaction
+        pendf_lfs : int or None, optional
+            Informational MF=10 final-state (``LFS``) level index of the PENDF
+            partial this reaction was built from. ``None`` (the default) marks a
+            reaction that is not backed by an MF=10 partial.
 
         """
         self.reactions.append(
-            ReactionTuple(type, target, Q, branching_ratio)
+            ReactionTuple(type, target, Q, branching_ratio, pendf_lfs)
         )
 
     @classmethod
@@ -255,6 +268,11 @@ class Nuclide:
             Q = float(get_text(reaction_elem, "Q", 0.0))
             branching_ratio = float(get_text(reaction_elem, "branching_ratio", 1.0))
 
+            # Optional informational MF=10 LFS level; absent -> not MF=10-backed
+            pendf_lfs = get_text(reaction_elem, "pendf_lfs")
+            if pendf_lfs is not None:
+                pendf_lfs = int(pendf_lfs)
+
             # If the type is not fission, get target and Q value, otherwise
             # just set null values
             if r_type != 'fission':
@@ -268,7 +286,7 @@ class Nuclide:
 
             # Append reaction
             nuc.reactions.append(ReactionTuple(
-                r_type, target, Q, branching_ratio))
+                r_type, target, Q, branching_ratio, pendf_lfs))
 
         fpy_elem = element.find('neutron_fission_yields')
         if fpy_elem is not None:
@@ -322,14 +340,16 @@ class Nuclide:
                 elem.append(src_elem)
 
         elem.set('reactions', str(len(self.reactions)))
-        for rx, daughter, Q, br in self.reactions:
+        for rx in self.reactions:
             rx_elem = ET.SubElement(elem, 'reaction')
-            rx_elem.set('type', rx)
-            rx_elem.set('Q', str(Q))
-            if daughter is not None:
-                rx_elem.set('target', daughter)
-            if br != 1.0:
-                rx_elem.set('branching_ratio', str(br))
+            rx_elem.set('type', rx.type)
+            rx_elem.set('Q', str(rx.Q))
+            if rx.target is not None:
+                rx_elem.set('target', rx.target)
+            if rx.branching_ratio != 1.0:
+                rx_elem.set('branching_ratio', str(rx.branching_ratio))
+            if rx.pendf_lfs is not None:
+                rx_elem.set('pendf_lfs', str(rx.pendf_lfs))
 
         if self.yield_data:
             fpy_elem = ET.SubElement(elem, 'neutron_fission_yields')

@@ -202,6 +202,46 @@ def test_export_to_xml(run_in_tmpdir):
     assert _TEST_CHAIN == chain_xml
 
 
+def test_pendf_lfs_absent_defaults_none(simple_chain):
+    """A chain XML without ``pendf_lfs`` (all existing chains) parses with the
+    field defaulted to None."""
+    for nuc in simple_chain.nuclides:
+        for rx in nuc.reactions:
+            assert rx.pendf_lfs is None
+
+
+def test_pendf_lfs_xml_roundtrip(run_in_tmpdir):
+    """The informational ``pendf_lfs`` field survives an XML round-trip and is
+    written only for MF=10-backed reactions."""
+    filename = 'pendf_lfs_{}.xml'.format(comm.rank)
+
+    parent = nuclide.Nuclide("In115")
+    # MF=10-backed pathways carry an LFS index; the fallback (n,p) does not.
+    parent.add_reaction("(n,gamma)", "In116", 6784730.0, 1.0, 0)
+    parent.add_reaction("(n,gamma)_m1", "In116_m1", 6657460.0, 1.0, 1)
+    parent.add_reaction("(n,p)", "Cd115", 0.0, 1.0)
+
+    chain = Chain()
+    chain.nuclides = [parent]
+    chain.export_to_xml(filename)
+
+    xml_text = Path(filename).read_text()
+    # Written as the last attribute, only for the MF=10-backed reactions.
+    assert ('<reaction type="(n,gamma)_m1" Q="6657460.0" target="In116_m1"'
+            ' pendf_lfs="1"/>') in xml_text
+    assert 'pendf_lfs="0"' in xml_text
+    # The fallback reaction carries no attribute.
+    assert '<reaction type="(n,p)" Q="0.0" target="Cd115"/>' in xml_text
+
+    reread = Chain.from_xml(filename)
+    rxns = {rx.type: rx.pendf_lfs for rx in reread["In115"].reactions}
+    assert rxns["(n,gamma)"] == 0
+    assert rxns["(n,gamma)_m1"] == 1
+    assert rxns["(n,p)"] is None
+    # Read back as int, not str.
+    assert isinstance(rxns["(n,gamma)"], int)
+
+
 def test_form_matrix(simple_chain):
     """ Using chain_test, and a dummy reaction rate, compute the matrix. """
     # Relies on test_from_xml passing.

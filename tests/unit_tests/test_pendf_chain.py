@@ -31,6 +31,12 @@ def small_chain():
 
 
 @pytest.fixture(scope="module")
+def small_chain_lfs():
+    return chain_from_pendf(_PENDF_H5, _DECAY_DIR, nuclides=_NUCLIDES,
+                            record_lfs=True)
+
+
+@pytest.fixture(scope="module")
 def in115_seed_chain():
     # Seeding ONLY the target: the closure must follow transmutation products
     # (not just decay daughters) so the capture pathways survive. This walks
@@ -48,6 +54,11 @@ def _reactions(chain, parent):
 def _reaction_q(chain, parent):
     """Map reaction type -> Q value for a parent nuclide."""
     return {rx.type: rx.Q for rx in chain[parent].reactions}
+
+
+def _reaction_lfs(chain, parent):
+    """Map reaction type -> pendf_lfs for a parent nuclide."""
+    return {rx.type: rx.pendf_lfs for rx in chain[parent].reactions}
 
 
 def test_am241_ground_and_metastable(small_chain):
@@ -185,6 +196,59 @@ def test_reactions_populated_in_memory(small_chain, tmp_path):
     small_chain.export_to_xml(path)
     reread = Chain.from_xml(path)
     assert small_chain.reactions == reread.reactions
+
+
+def test_record_lfs_marks_mf10_pathways(small_chain_lfs):
+    # Every MF=10 LFS subgroup stamps its own final-state level index. The GNDS
+    # metastable ordinal need not equal the LFS index: In116_m2 is LFS 4 and
+    # Am242_m1 is LFS 2.
+    lfs = _reaction_lfs(small_chain_lfs, "In115")
+    assert lfs["(n,gamma)"] == 0
+    assert lfs["(n,gamma)_m1"] == 1
+    assert lfs["(n,gamma)_m2"] == 4
+    assert lfs["(n,n')"] == 0
+    assert lfs["(n,n')_m1"] == 1
+    assert _reaction_lfs(small_chain_lfs, "Am241")["(n,gamma)_m1"] == 2
+
+
+def test_record_lfs_fallback_branch_is_none(small_chain_lfs):
+    # Fe56/W186 capture has no MF=10 LFS subgroup, so the fallback ground branch
+    # emits the reaction with no LFS mark even when record_lfs=True.
+    assert _reaction_lfs(small_chain_lfs, "Fe56")["(n,gamma)"] is None
+    assert _reaction_lfs(small_chain_lfs, "W186")["(n,gamma)"] is None
+
+
+def test_record_lfs_default_off(small_chain):
+    # The default build stamps nothing on any reaction.
+    for parent in ("In115", "Am241", "Fe56", "W186"):
+        assert all(rx.pendf_lfs is None
+                   for rx in small_chain[parent].reactions)
+
+
+def test_record_lfs_absent_from_default_xml(tmp_path, small_chain):
+    # Byte-compat guard: the default (record_lfs=False) export must not contain
+    # the attribute anywhere in the file.
+    path = tmp_path / "default_chain.xml"
+    small_chain.export_to_xml(path)
+    assert "pendf_lfs" not in path.read_text()
+
+
+def test_record_lfs_xml_roundtrip(tmp_path, small_chain_lfs):
+    # Export -> re-import preserves each integer LFS mark exactly, and the
+    # fallback reactions stay unmarked.
+    from openmc.deplete import Chain
+
+    path = tmp_path / "pendf_chain_lfs.xml"
+    small_chain_lfs.export_to_xml(path)
+
+    # The mark is written as the last attribute on the reaction element.
+    assert ('<reaction type="(n,gamma)_m2" Q="6495070.0" target="In116_m2"'
+            ' pendf_lfs="4"/>') in path.read_text()
+
+    reread = Chain.from_xml(path)
+    assert _reaction_lfs(reread, "In115") == _reaction_lfs(small_chain_lfs, "In115")
+    assert _reaction_lfs(reread, "Am241")["(n,gamma)_m1"] == 2
+    assert _reaction_lfs(reread, "Fe56")["(n,gamma)"] is None
 
 
 def test_reaction_products_skips_out_of_range_z():
