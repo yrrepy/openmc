@@ -512,7 +512,9 @@ def material_dilution_sigma0(densities, resonant, group_totals, n_groups=None):
         if group_totals:
             n_groups = len(next(iter(group_totals.values())))
         elif diluters:
-            n_groups = len(group_totals[diluters[0]])  # triggers KeyError below
+            raise ValueError(
+                f"diluter {diluters[0]!r} has a density but no entry in "
+                "group_totals")
         else:
             raise ValueError(
                 "cannot infer n_groups: no diluters and n_groups not given")
