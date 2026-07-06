@@ -630,10 +630,12 @@ def _build_xs_table_pendf(
         Pointwise PENDF library, duck-typed with ``nuclides`` (list of GNDS
         names), ``reactions(nuclide)`` (list of MTs with MF=3 data) and
         ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple). Isomeric
-        pathway expansion additionally uses ``pathways(nuclide, mt)`` (LFS
-        values with MF=10, ``[]`` if none), ``pathway_xs(nuclide, mt, lfs)``
-        (``(energy, xs)`` of a partial) and ``product(nuclide, mt, lfs)`` (baked
-        GNDS product name, ``None`` if the library was written unmapped).
+        pathway expansion additionally uses ``pathways(nuclide, mt)``
+        (sorted ``(lfs, izap)`` int pairs, ``[]`` if none),
+        ``pathway_xs(nuclide, mt, lfs, izap=None)`` (``(energy, xs)`` of a
+        partial) and ``product(nuclide, mt, lfs, izap=None)`` (baked GNDS
+        product name, ``None`` if the library was written unmapped; ``izap``
+        selects one product of a shared/lumped LFS).
     pathways : bool, optional
         If true (default), expand reactions with mapped MF=10 partials into
         per-product rows. If false, always emit the single MF=3-total row per
