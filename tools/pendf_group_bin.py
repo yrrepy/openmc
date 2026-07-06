@@ -5,7 +5,7 @@ Flat-weights every chain-relevant MF=3 total and MF=10 partial cross section
 onto a fixed energy group structure with
 :func:`openmc.deplete.microxs._group_average` and stores the results dense
 (gzip-compressed) so the depletion collapse can skip runtime binning. The
-output schema is ``format='pendf-grouped'`` version 1:
+output schema is ``format='pendf-grouped'`` version 2:
 
 * root attrs: ``format``, ``version``, ``source`` (abs path of the pointwise
   file), ``dtype``, plus the source's ``library``/``temperature`` attrs;
