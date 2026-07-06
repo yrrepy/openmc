@@ -35,8 +35,11 @@ from .isomeric import (ELIS_ATOL, ELIS_RTOL, map_lfs_to_liso,
 
 __all__ = ['PendfLibrary']
 
-# Version of the PENDF HDF5 format written/read by this module
-_FORMAT_VERSION = 1
+# Version of the PENDF HDF5 format written/read by this module.
+#   1 -- MF=10 subgroups are always named ``LFS{lfs}``.
+#   2 -- an LFS shared by >=2 distinct product IZAPs is named
+#        ``LFS{lfs}_ZAP{izap}`` (a unique LFS keeps the bare ``LFS{lfs}``).
+_FORMAT_VERSION = 2
 
 # MF=3 reactions retained only when ``keep_extra_mts=True``: resonance
 # parameters/derived (151-153), particle production (203-207), average
@@ -313,6 +316,18 @@ class PendfLibrary:
         for p in paths:
             f = h5py.File(p, 'r')
             self._files.append(f)
+            # Forward-compat: a file stamped a newer format than this reader
+            # understands was written by a newer OpenMC. A missing attr or a
+            # version <= supported is an older (valid) file. Checked once per
+            # file, before any dataset access.
+            file_version = f.attrs.get('format_version')
+            if file_version is not None and file_version > _FORMAT_VERSION:
+                for handle in self._files:
+                    handle.close()
+                raise ValueError(
+                    f"{p}: PENDF format_version {int(file_version)} is newer "
+                    f"than the supported version {_FORMAT_VERSION}; this file "
+                    f"was written by a newer OpenMC.")
             library = _attr_str(f.attrs, 'library')
             temperature = float(f.attrs['temperature'])
             mapping = _attr_str(f.attrs, 'mapping')

@@ -320,7 +320,7 @@ def test_skips_unparseable_file(tmp_path):
 
     # Output is a valid library: root attrs present and the reader reopens it.
     with h5py.File(out, "r") as f:
-        assert f.attrs["format_version"] == 1
+        assert f.attrs["format_version"] == 2
         assert f.attrs["library"].decode() == "TENDL-2017"
         assert f.attrs["temperature"] == pytest.approx(293.16)
     reader = PendfLibrary(out)
@@ -362,6 +362,53 @@ def test_context_manager(tmp_path):
         assert lib.nuclides == ["Fe56"]
         assert lib._files
     assert lib._files == []
+
+
+def test_format_version_written(tmp_path):
+    # A freshly written library stamps the current format version (2).
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+
+    with h5py.File(out, "r") as f:
+        assert f.attrs["format_version"] == 2
+
+
+def test_format_version_newer_rejected(tmp_path):
+    # A file stamped a newer format than this reader supports is refused, with a
+    # message naming the file, the found version, and the supported version.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+
+    with h5py.File(out, "r+") as f:
+        f.attrs["format_version"] = 99
+    with pytest.raises(ValueError, match="newer than the supported version"):
+        PendfLibrary(out)
+
+
+def test_format_version_missing_loads(tmp_path):
+    # An old file predating the version attr (attr deleted) still loads.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    (src / _FIXTURES["Fe56"]).symlink_to(_PENDF_DIR / _FIXTURES["Fe56"])
+
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+
+    with h5py.File(out, "r+") as f:
+        del f.attrs["format_version"]
+    with PendfLibrary(out) as lib:
+        assert lib.nuclides == ["Fe56"]
 
 
 def test_mf10_shared_lfs_distinct_izap(tmp_path):
