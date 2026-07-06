@@ -338,6 +338,257 @@ def get_microxs_and_flux(
     return fluxes, micros
 
 
+def get_pendf_microxs_and_flux(
+    model: openmc.Model,
+    domains: DomainTypes,
+    pendf_library,                                   # PendfLibrary | GroupedPendfLibrary object
+    nuclides: Sequence[str] | None = None,
+    reactions: Sequence[str] | None = None,
+    energies: Sequence[float] | str | None = None,   # None -> pendf_library.group_edges
+    chain_file: PathLike | Chain | None = None,
+    path_statepoint: PathLike | None = None,
+    path_input: PathLike | None = None,
+    run_kwargs=None,
+    *,
+    urr_material_dilution: bool = False,
+    mat_ssf_nuclides: Sequence[str] | None = None,
+) -> tuple[list[np.ndarray], list[MicroXS]]:
+    """Generate PENDF microscopic cross sections and fluxes for multiple domains.
+
+    This is the transport-coupled counterpart of
+    :meth:`MicroXS.from_multigroup_flux` with a ``pendf_library``. It runs one
+    neutron transport solve that tallies **only** the multigroup flux in each
+    domain (no reaction-rate tallies), then collapses group cross sections out of
+    ``pendf_library`` per domain against that domain's flux. Given identical
+    flux, each returned :class:`MicroXS` is exactly the direct
+    :meth:`MicroXS.from_multigroup_flux` call for that domain -- the point of the
+    design.
+
+    .. versionadded:: 0.15.4
+
+    Parameters
+    ----------
+    model : openmc.Model
+        OpenMC model object. Must contain geometry, materials, and settings. The
+        transport solve is continuous-energy; ``pendf_library`` supplies only the
+        group cross sections used for the collapse.
+    domains : list of openmc.Material or openmc.Cell or openmc.Universe, or openmc.MeshBase, or openmc.Filter, or list of openmc.Filter
+        Domains in which to tally flux, or a spatial tally filter. When
+        ``urr_material_dilution=True`` every domain must be an
+        :class:`openmc.Material` (see that argument).
+    pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary
+        PENDF cross section library object (duck-typed with ``nuclides``,
+        ``reactions(nuclide)`` and ``xs(nuclide, mt)``; a grouped library is
+        detected via ``group_edges``/``xs_g``). Required. Group cross sections are
+        taken from this library rather than from continuous-energy data.
+    nuclides : list of str, optional
+        Nuclides to get cross sections for. If not specified, all burnable
+        nuclides from the depletion chain file are used.
+    reactions : list of str, optional
+        Reactions to get cross sections for. If not specified, all neutron
+        reactions listed in the depletion chain file are used.
+    energies : iterable of float or str or None, optional
+        Energy group boundaries in [eV] or the name of a group structure. These
+        define both the flux tally and the collapse group structure. May be
+        omitted (``None``) only when ``pendf_library`` is a grouped PENDF library
+        (:class:`~openmc.data.GroupedPendfLibrary`), in which case the library's
+        own ``group_edges`` supply the structure; omitting it with a pointwise
+        library raises ``ValueError`` (there are no ``group_edges`` to default
+        from, and a group structure is needed to build the flux tally).
+    chain_file : PathLike or Chain, optional
+        Path to the depletion chain XML file or an instance of
+        openmc.deplete.Chain. Used to default ``nuclides``/``reactions``.
+        Defaults to ``openmc.config['chain_file']``.
+    path_statepoint : path-like, optional
+        Path to write the statepoint file from the neutron transport solve to.
+        By default it is written to a temporary directory and not kept.
+    path_input : path-like, optional
+        Path to write the model XML file from the neutron transport solve to.
+        By default it is written to a temporary directory and not kept.
+    run_kwargs : dict, optional
+        Keyword arguments passed to :meth:`openmc.Model.run`.
+    urr_material_dilution : bool, optional
+        Enable the URR material-dilution self-shielding correction on the
+        collapse. This wrapper owns the domains, so the toggle is a plain
+        **bool**: ``True`` shields each domain with **that domain's own
+        composition** automatically (via
+        :meth:`~openmc.Material.get_nuclide_atom_densities`), so every domain must
+        be an :class:`openmc.Material`; cells, universes, meshes and filters have
+        no single composition and raise ``ValueError``. ``False`` (default)
+        leaves the collapse unchanged. To supply an *explicit* composition
+        (an :class:`openmc.Material` or ``{nuclide: density}`` mapping) rather
+        than each domain's own, call :meth:`MicroXS.from_multigroup_flux`
+        directly -- that collapse-level argument takes the Material/mapping form;
+        this wrapper-level argument is bool only.
+    mat_ssf_nuclides : iterable of str, optional
+        Restricts the URR self-shielding to these nuclides (intersected with the
+        default flagged list and the library's ptable coverage). ``None``
+        (default) uses the full flagged list. Only used when
+        ``urr_material_dilution`` is ``True``.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        Flux in each group in [n-cm/src] for each domain (raw tallied
+        magnitudes, as :func:`get_microxs_and_flux` returns them).
+    list of MicroXS
+        Cross section data in [b] for each domain.
+
+    See Also
+    --------
+    openmc.deplete.get_microxs_and_flux
+    openmc.deplete.MicroXS.from_multigroup_flux
+    openmc.deplete.IndependentOperator
+
+    """
+    # --- Pre-run validation (all before the expensive model.run) -------------
+
+    # This wrapper-level toggle is a plain bool (the wrapper owns the domains).
+    # A Material/mapping belongs one level down, at the collapse.
+    if not isinstance(urr_material_dilution, bool):
+        raise ValueError(
+            "urr_material_dilution must be a bool for "
+            "get_pendf_microxs_and_flux(); True uses each domain's own "
+            "composition automatically. To supply an explicit composition "
+            "(openmc.Material or {nuclide: density} mapping), call "
+            "MicroXS.from_multigroup_flux directly.")
+
+    # Resolve the group structure. Explicit ``energies`` win; otherwise fall back
+    # to a grouped PENDF library's own ``group_edges`` (duck-detected exactly as
+    # in the collapse). A pointwise library carries none, so ``energies=None``
+    # with a pointwise library is an error -- and we need the edges here anyway
+    # to build the flux tally's energy filter.
+    if energies is None:
+        energies = getattr(pendf_library, 'group_edges', None)
+        if energies is None:
+            raise ValueError(
+                'energies must be provided unless pendf_library is a grouped '
+                'PENDF library (openmc.data.GroupedPendfLibrary), whose '
+                'group_edges then define the group structure')
+    if isinstance(energies, str):
+        energies = GROUP_STRUCTURES[energies]
+
+    # ``urr_material_dilution=True`` shields each domain with its own
+    # composition, so every domain must carry one (be an openmc.Material).
+    if urr_material_dilution:
+        material_domains = (
+            not isinstance(domains, (openmc.MeshBase, openmc.Filter))
+            and isinstance(domains, Sequence)
+            and len(domains) > 0
+            and all(isinstance(d, openmc.Material) for d in domains))
+        if not material_domains:
+            raise ValueError(
+                'urr_material_dilution=True requires every domain to be an '
+                'openmc.Material: the URR self-shielding sigma_0 background is '
+                "built from each domain's own composition "
+                '(domain.get_nuclide_atom_densities()). Cells, universes, '
+                'meshes and filters have no single composition -- pass '
+                'materials, or set urr_material_dilution=False.')
+
+    # Save any original tallies on the model
+    original_tallies = list(model.tallies)
+
+    # The flux tally's energy filter uses the resolved group structure.
+    energy_filter = openmc.EnergyFilter(energies)
+
+    # Build list of domain filters (mirrors get_microxs_and_flux)
+    if isinstance(domains, openmc.Filter):
+        domain_filters = [domains]
+    elif isinstance(domains, openmc.MeshBase):
+        domain_filters = [openmc.MeshFilter(domains)]
+    elif isinstance(domains, Sequence) and len(domains) > 0 and \
+            isinstance(domains[0], openmc.Filter):
+        domain_filters = list(domains)
+    elif isinstance(domains[0], openmc.Material):
+        domain_filters = [openmc.MaterialFilter(domains)]
+    elif isinstance(domains[0], openmc.Cell):
+        domain_filters = [openmc.CellFilter(domains)]
+    elif isinstance(domains[0], openmc.Universe):
+        domain_filters = [openmc.UniverseFilter(domains)]
+    else:
+        raise ValueError(f"Unsupported domain type: {type(domains[0])}")
+
+    # One flux-only tally per domain filter -- no reaction-rate tallies.
+    flux_tallies = []
+    model.tallies = []
+    for i, domain_filter in enumerate(domain_filters):
+        flux_tally = openmc.Tally(name=f'MicroXS flux {i}')
+        flux_tally.filters = [domain_filter, energy_filter]
+        flux_tally.scores = ['flux']
+        model.tallies.append(flux_tally)
+        flux_tallies.append(flux_tally)
+
+    if openmc.lib.is_initialized:
+        openmc.lib.finalize()
+
+        if comm.rank == 0:
+            model.export_to_model_xml()
+        comm.barrier()
+        # Reinitialize with tallies
+        openmc.lib.init(intracomm=comm)
+
+    with TemporaryDirectory() as temp_dir:
+        # Indicate to run in temporary directory unless being executed through
+        # openmc.lib, in which case we don't need to specify the cwd
+        run_kwargs = dict(run_kwargs) if run_kwargs else {}
+        if not openmc.lib.is_initialized:
+            run_kwargs.setdefault('cwd', temp_dir)
+
+        # Run transport simulation and synchronize
+        statepoint_path = model.run(**run_kwargs)
+        comm.barrier()
+
+        if comm.rank == 0:
+            # Move the statepoint file if it is being saved to a specific path
+            if path_statepoint is not None:
+                shutil.move(statepoint_path, path_statepoint)
+                statepoint_path = path_statepoint
+
+            # Export the model to path_input if provided
+            if path_input is not None:
+                model.export_to_model_xml(path_input)
+
+        # Broadcast updated statepoint path to all ranks
+        statepoint_path = comm.bcast(statepoint_path)
+
+        # Read in tally results (on all ranks)
+        with StatePoint(statepoint_path) as sp:
+            for i in range(len(flux_tallies)):
+                flux_tallies[i] = sp.tallies[flux_tallies[i].id]
+                flux_tallies[i]._read_results()
+
+    # Concatenate flux results across all domain filters (raw magnitudes -- the
+    # IndependentOperator normalization depends on them, so do not normalize).
+    fluxes = []
+    for flux_tally in flux_tallies:
+        # Get flux values and make energy groups last dimension.
+        # (domains, groups, 1, 1) -> (domains, 1, 1, groups)
+        flux = np.moveaxis(flux_tally.get_reshaped_data(), 1, -1)
+        fluxes.extend(flux.squeeze((1, 2)))
+
+    # Per-domain collapse against the PENDF library. When dilution is on, each
+    # domain shields with its own composition (the Material object is passed to
+    # the collapse layer); off passes False, an exact no-op relative to the
+    # plain flux-supplied collapse.
+    if urr_material_dilution:
+        dilution_per_domain = list(domains)
+    else:
+        dilution_per_domain = [False] * len(fluxes)
+
+    micros = [
+        MicroXS.from_multigroup_flux(
+            energies=energies, multigroup_flux=flux_i, chain_file=chain_file,
+            nuclides=nuclides, reactions=reactions, pendf_library=pendf_library,
+            urr_material_dilution=dilution, mat_ssf_nuclides=mat_ssf_nuclides)
+        for flux_i, dilution in zip(fluxes, dilution_per_domain)
+    ]
+
+    # Reset tallies
+    model.tallies = original_tallies
+
+    return fluxes, micros
+
+
 @dataclass
 class _SparseXSTable:
     """Sparse group cross sections for vectorized flux collapse.
