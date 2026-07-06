@@ -155,8 +155,11 @@ def chain_from_pendf(pendf_h5, decay_dir, nuclides=None, record_lfs=False):
     openmc.deplete.Chain
         Chain whose ``reactions`` carry product-qualified isomeric pathways.
         A ``coverage`` attribute (list of dicts with keys ``parent``,
-        ``reaction``, ``product``, ``reason``) records pathways the physics
-        implies but the data cannot supply.
+        ``reaction``, ``product``, ``reason``) records pathways the chain
+        cannot include: those the data cannot supply (no mapped product, no
+        MF=10) and MF=10-carrying lumped channels absent from the depletion
+        reaction set (e.g. MT=5 ``(n,misc)``), which are traced here instead of
+        dropped silently.
 
     """
     decay_dir = Path(decay_dir)
