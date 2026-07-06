@@ -37,14 +37,17 @@ REACTIONS = ["(n,gamma)", "(n,p)", "(n,2n)"]  # MTs 102, 103, 16
 def _make_pointwise_h5(path):
     """Write a tiny synthetic pointwise PENDF HDF5 file."""
     with h5py.File(path, "w") as f:
-        f.attrs["format_version"] = 1
+        f.attrs["format_version"] = 2
         f.attrs["library"] = np.bytes_("TEST")
         f.attrs["temperature"] = np.float64(293.16)
 
         # In115: MT102 (n,gamma) with three MF=10 partials on a grid holding a
-        # coincident-duplicate node (1e6); LFS4 is an all-zero partial. MT103
-        # (n,p) has no partials; MT16 (n,2n) is a threshold reaction that bins to
-        # zero below 8e6. MT1 is non-chain-relevant and must be dropped.
+        # coincident-duplicate node (1e6); LFS4 is an all-zero partial (all three
+        # levels -> In116, so each keeps a bare ``LFS<l>`` name). MT103 (n,p) has
+        # no partials; MT16 (n,2n) is a threshold reaction that bins to zero below
+        # 8e6. MT107 (n,a) is a synthetic LUMPED channel: one LFS shared by two
+        # product nuclides (``LFS0_ZAP<izap>`` subgroups). MT1 is
+        # non-chain-relevant and must be dropped.
         g = f.create_group("In115")
         g.attrs["ZA"] = np.int64(49115)
         g.attrs["LISO"] = np.int64(0)
@@ -66,6 +69,7 @@ def _make_pointwise_h5(path):
             sub = mt.create_group(f"LFS{lfs}")
             sub.attrs["product"] = np.bytes_(prod)
             sub.attrs["LFS"] = np.int64(lfs)
+            sub.attrs["IZAP"] = np.int64(49116)   # all three levels -> In116
             sub.attrs["QI"] = np.float64(6784730.0)
             sub.create_dataset("energy", data=e)
             sub.create_dataset("xs", data=xs)
@@ -79,6 +83,27 @@ def _make_pointwise_h5(path):
         mt16.attrs["QI"] = np.float64(-8.0e6)
         mt16.create_dataset("energy", data=np.array([1e-5, 8e6, 1e7, 2e7]))
         mt16.create_dataset("xs", data=np.array([0.0, 0.0, 1.2, 2.0]))
+
+        # MT107 (n,a): a synthetic LUMPED channel -- one LFS (0) shared by two
+        # distinct product nuclides, stored as ``LFS0_ZAP<izap>`` subgroups
+        # (schema v2), exactly as a real multi-daughter MT=5 (n,misc) is. The
+        # total equals the sum of the two partials so binning stays consistent.
+        e107 = np.array([1e-5, 1e6, 2e7])
+        a_xs = np.array([0.0, 0.2, 0.4])   # LFS0 -> Ag110 (IZAP 47110)
+        b_xs = np.array([0.0, 0.1, 0.3])   # LFS0 -> Ag112 (IZAP 47112)
+        mt107 = g.create_group("MT107")
+        mt107.attrs["QI"] = np.float64(0.0)
+        mt107.create_dataset("energy", data=e107)
+        mt107.create_dataset("xs", data=a_xs + b_xs)
+        for izap, (prod, xs) in {47110: ("Ag110", a_xs),
+                                 47112: ("Ag112", b_xs)}.items():
+            sub = mt107.create_group(f"LFS0_ZAP{izap}")
+            sub.attrs["product"] = np.bytes_(prod)
+            sub.attrs["LFS"] = np.int64(0)
+            sub.attrs["IZAP"] = np.int64(izap)
+            sub.attrs["QI"] = np.float64(0.0)
+            sub.create_dataset("energy", data=e107)
+            sub.create_dataset("xs", data=xs)
 
         mt1 = g.create_group("MT1")  # non-chain-relevant: must not be written
         mt1.create_dataset("energy", data=np.array([1e-5, 2e7]))
@@ -111,15 +136,26 @@ class _PointwiseShim:
         return g["energy"][()], g["xs"][()]
 
     def pathways(self, nuc, mt):
+        # Read the (LFS, IZAP) attrs rather than parsing the subgroup name, so a
+        # lumped ``LFS<l>_ZAP<izap>`` subgroup is handled the same as a bare one.
         g = self._f[f"{nuc}/MT{mt}"]
-        return sorted(int(k[3:]) for k in g if k.startswith("LFS"))
+        return sorted((int(g[k].attrs["LFS"]), int(g[k].attrs["IZAP"]))
+                      for k in g if k.startswith("LFS"))
 
-    def pathway_xs(self, nuc, mt, lfs):
-        g = self._f[f"{nuc}/MT{mt}/LFS{lfs}"]
+    def _partial(self, nuc, mt, lfs, izap):
+        g = self._f[f"{nuc}/MT{mt}"]
+        for k in g:
+            if (k.startswith("LFS") and int(g[k].attrs["LFS"]) == lfs
+                    and (izap is None or int(g[k].attrs["IZAP"]) == izap)):
+                return g[k]
+        raise KeyError((nuc, mt, lfs, izap))
+
+    def pathway_xs(self, nuc, mt, lfs, izap=None):
+        g = self._partial(nuc, mt, lfs, izap)
         return g["energy"][()], g["xs"][()]
 
-    def product(self, nuc, mt, lfs):
-        p = self._f[f"{nuc}/MT{mt}/LFS{lfs}"].attrs.get("product")
+    def product(self, nuc, mt, lfs, izap=None):
+        p = self._partial(nuc, mt, lfs, izap).attrs.get("product")
         return p.decode() if isinstance(p, (bytes, np.bytes_)) else p
 
 
@@ -157,11 +193,34 @@ def test_reader_api(libs):
     assert np.array_equal(grouped.group_edges, EDGES)
     assert set(grouped.nuclides) == {"In115", "Fe56"}
     # MT1 was non-chain-relevant and must have been dropped.
-    assert set(grouped.reactions("In115")) == {16, 102, 103}
-    assert grouped.pathways("In115", 102) == [0, 1, 4]
+    assert set(grouped.reactions("In115")) == {16, 102, 103, 107}
+    # pathways() yields sorted (LFS, IZAP) pairs, one per stored partial.
+    assert grouped.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
     assert grouped.pathways("In115", 103) == []
+    # A unique LFS resolves with a bare-LFS call (no izap needed).
     assert grouped.product("In115", 102, 1) == "In116_m1"
     assert grouped.xs_g("In115", 102).shape == (len(EDGES) - 1,)
+
+
+def test_reader_lumped_pathways(libs):
+    """A lumped MT (one LFS shared by two product IZAPs) enumerates as repeated
+    (lfs, izap) pairs; product/xs need the izap to disambiguate."""
+    _, grouped, _ = libs
+    # MT107 carries LFS0 shared by two daughters -> two pairs at the same LFS.
+    assert grouped.pathways("In115", 107) == [(0, 47110), (0, 47112)]
+    # izap selects the product and its partial cross section.
+    assert grouped.product("In115", 107, 0, 47110) == "Ag110"
+    assert grouped.product("In115", 107, 0, 47112) == "Ag112"
+    assert grouped.pathway_xs_g("In115", 107, 0, 47112).shape == (len(EDGES) - 1,)
+    # A bare-LFS call on the shared LFS is ambiguous -> ValueError naming the
+    # candidate IZAPs and telling the caller to pass izap.
+    with pytest.raises(ValueError, match="pass izap"):
+        grouped.product("In115", 107, 0)
+    with pytest.raises(ValueError, match="pass izap"):
+        grouped.pathway_xs_g("In115", 107, 0)
+    # A missing pathway is a KeyError that mentions the izap when one was given.
+    with pytest.raises(KeyError, match="IZAP=99999"):
+        grouped.product("In115", 107, 0, 99999)
 
 
 def test_zero_partial_row_preserved(libs):
@@ -205,8 +264,9 @@ def test_writer_summary(tmp_path):
     out = tmp_path / "grouped.h5"
     _make_pointwise_h5(src)
     stats = pgb.bin_pendf_library(src, out, EDGES)
-    # 3 In115 MTs (102,103,16) + 3 LFS partials + 1 Fe56 MT = 7 rows.
-    assert stats["rows"] == 7
+    # 4 In115 MT totals (102,103,16,107) + 3 MT102 partials + 2 MT107 lumped
+    # partials + 1 Fe56 MT = 10 rows.
+    assert stats["rows"] == 10
     assert stats["n_warnings"] == 0
     assert stats["worst_dev"] < 1e-5
 

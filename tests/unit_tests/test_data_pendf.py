@@ -212,7 +212,7 @@ def test_roundtrip(tmp_path, evaluations):
         assert reader._reaction("Am241", 102).attrs["QM"] == pytest.approx(_qm)
 
         # MF=10 partials present with correct LFS values and ELFS = QM - QI
-        assert reader.pathways("Am241", 102) == [0, 2]
+        assert reader.pathways("Am241", 102) == [(0, 95242), (2, 95242)]
         _ns, subs = _mf10(evaluations["Am241"], 102)
         for pqm, pqi, izap, lfs, ptab in subs:
             penergy, pxs = reader.pathway_xs("Am241", 102, lfs)
@@ -224,7 +224,7 @@ def test_roundtrip(tmp_path, evaluations):
             # mapping='none' -> no baked product name
             assert reader.product("Am241", 102, lfs) is None
 
-        assert reader.pathways("In115", 102) == [0, 1, 4]
+        assert reader.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
 
         # Nuclide-level attrs correct
         nuc = reader._nuclide("Am241")
@@ -275,13 +275,13 @@ def test_elis_mapping_bake(tmp_path):
 
         # Am241(n,gamma): LFS 0 -> ground Am242, LFS 2 -> Am242_m1 (ELFS ~48.6 keV,
         # NOT LISO 2 -- LFS is a level index, LISO comes from ELIS matching).
-        assert reader.pathways("Am241", 102) == [0, 2]
+        assert reader.pathways("Am241", 102) == [(0, 95242), (2, 95242)]
         assert reader.product("Am241", 102, 0) == "Am242"
         assert reader.product("Am241", 102, 2) == "Am242_m1"
 
         # In115(n,gamma): LFS 0/1/4 -> In116 / In116_m1 (~127.3 keV) / In116_m2
         # (~289.7 keV). In116_m2 is present in the decay source, so LFS 4 maps.
-        assert reader.pathways("In115", 102) == [0, 1, 4]
+        assert reader.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
         assert reader.product("In115", 102, 0) == "In116"
         assert reader.product("In115", 102, 1) == "In116_m1"
         assert reader.product("In115", 102, 4) == "In116_m2"
