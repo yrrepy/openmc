@@ -380,6 +380,31 @@ class PendfLibrary:
             raise KeyError(f"Nuclide {nuclide!r} has no MF=3 reaction MT={mt}.")
         return group
 
+    def _mf10_group(self, nuclide, mt, lfs, izap=None):
+        """Resolve the single MF=10 partial subgroup for ``mt``/``lfs``.
+
+        The reaction's ``LFS*`` subgroups are matched by their ``LFS`` (and,
+        when ``izap`` is given, ``IZAP``) attributes rather than by name, so a
+        lumped reaction -- one whose LFS is shared by several product nuclides
+        (distinct IZAP) -- is disambiguated. Raises ``KeyError`` if nothing
+        matches and ``ValueError`` if a shared LFS needs ``izap`` to pick one.
+        """
+        rx = self._reaction(nuclide, mt)
+        matches = [rx[k] for k in rx if k.startswith('LFS')
+                   and int(rx[k].attrs['LFS']) == lfs
+                   and (izap is None or int(rx[k].attrs['IZAP']) == izap)]
+        if not matches:
+            which = (f"LFS={lfs}" if izap is None
+                     else f"LFS={lfs}, IZAP={izap}")
+            raise KeyError(
+                f"Nuclide {nuclide!r} MT={mt} has no MF=10 partial {which}.")
+        if len(matches) > 1:
+            izaps = sorted(int(g.attrs['IZAP']) for g in matches)
+            raise ValueError(
+                f"Nuclide {nuclide!r} MT={mt} LFS={lfs} is shared by IZAP "
+                f"values {izaps}; pass izap= to disambiguate.")
+        return matches[0]
+
     def reactions(self, nuclide):
         """Return the MTs with MF=3 cross sections for a nuclide.
 
@@ -398,7 +423,7 @@ class PendfLibrary:
                       if k.startswith('MT'))
 
     def pathways(self, nuclide, mt):
-        """Return the MF=10 partial (LFS) values available for a reaction.
+        """Return the MF=10 partials available for a reaction.
 
         Parameters
         ----------
@@ -409,13 +434,15 @@ class PendfLibrary:
 
         Returns
         -------
-        list of int
-            Sorted LFS (final-level) indices; empty if the reaction has no
-            MF=10 partials.
+        list of tuple of int
+            One ``(lfs, izap)`` pair per stored MF=10 partial, sorted by
+            ``(lfs, izap)``; empty if the reaction has no MF=10 partials. A
+            lumped reaction (a shared LFS produced by several nuclides) repeats
+            an ``lfs`` with different ``izap`` values.
 
         """
         rx = self._reaction(nuclide, mt)
-        return sorted(int(rx[k].attrs['LFS'])
+        return sorted((int(rx[k].attrs['LFS']), int(rx[k].attrs['IZAP']))
                       for k in rx if k.startswith('LFS'))
 
     def xs(self, nuclide, mt):
@@ -437,7 +464,7 @@ class PendfLibrary:
         group = self._reaction(nuclide, mt)
         return group['energy'][()], group['xs'][()]
 
-    def pathway_xs(self, nuclide, mt, lfs):
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
         """Return the MF=10 partial cross section for a reaction/final level.
 
         Parameters
@@ -448,6 +475,10 @@ class PendfLibrary:
             Reaction MT number.
         lfs : int
             Final-level index (LFS).
+        izap : int, optional
+            Product IZAP (``1000*Z + A``) selecting one partial when ``lfs`` is
+            shared by several product nuclides (a lumped reaction such as
+            MT=5). Not needed when the LFS is unique.
 
         Returns
         -------
@@ -455,13 +486,10 @@ class PendfLibrary:
             Energy grid (eV) and partial cross section (barn).
 
         """
-        group = self._reaction(nuclide, mt).get(f'LFS{lfs}')
-        if group is None:
-            raise KeyError(
-                f"Nuclide {nuclide!r} MT={mt} has no MF=10 partial LFS={lfs}.")
+        group = self._mf10_group(nuclide, mt, lfs, izap)
         return group['energy'][()], group['xs'][()]
 
-    def product(self, nuclide, mt, lfs):
+    def product(self, nuclide, mt, lfs, izap=None):
         """Return the baked product name for an MF=10 partial, if mapped.
 
         Parameters
@@ -472,6 +500,10 @@ class PendfLibrary:
             Reaction MT number.
         lfs : int
             Final-level index (LFS).
+        izap : int, optional
+            Product IZAP (``1000*Z + A``) selecting one partial when ``lfs`` is
+            shared by several product nuclides (a lumped reaction such as
+            MT=5). Not needed when the LFS is unique.
 
         Returns
         -------
@@ -480,10 +512,7 @@ class PendfLibrary:
             mapping, otherwise ``None``.
 
         """
-        group = self._reaction(nuclide, mt).get(f'LFS{lfs}')
-        if group is None:
-            raise KeyError(
-                f"Nuclide {nuclide!r} MT={mt} has no MF=10 partial LFS={lfs}.")
+        group = self._mf10_group(nuclide, mt, lfs, izap)
         if 'product' in group.attrs:
             return _attr_str(group.attrs, 'product')
         return None
