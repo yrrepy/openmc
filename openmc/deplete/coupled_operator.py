@@ -203,6 +203,16 @@ class CoupledOperator(OpenMCOperator):
         With ``reaction_rate_mode='gendf-flux'`` (where it is required), it
         additionally provides the group-wise cross sections used to collapse
         one-group reaction rates. Default is None.
+    gendf_mt4_fallback : bool, optional
+        Whether to compute (n,n') reaction rates by collapsing the tallied
+        flux spectrum with GENDF MT=4 cross sections in the
+        "direct_with_flux" and "flux" reaction rate modes. Most
+        continuous-energy HDF5 libraries carry only the partial inelastic
+        reactions (MT=51-91), so direct (n,n') tallies are silently zero.
+        Requires ``gendf_library``. Has no effect in "gendf-flux" mode,
+        which computes (n,n') natively. Default is False.
+
+        .. versionadded:: 0.15.4
 
         .. versionadded:: 0.15.4
         .. versionchanged:: 0.15.4
@@ -251,7 +261,8 @@ class CoupledOperator(OpenMCOperator):
                  reaction_rate_mode="direct", reaction_rate_opts=None,
                  reduce_chain_level=None,
                  keep_isomeric_siblings=True,
-                 gendf_library=None):
+                 gendf_library=None,
+                 gendf_mt4_fallback=False):
 
         # check for old call to constructor
         if isinstance(model, openmc.Geometry):
@@ -303,6 +314,21 @@ class CoupledOperator(OpenMCOperator):
         # Store GENDF library for isomeric branching support
         # Used with direct_with_flux mode to enable σ×φ-weighted branching
         self._gendf_library = gendf_library
+
+        # Opt-in (n,n') fallback for CE modes lacking lumped MT=4 data
+        if gendf_mt4_fallback:
+            if gendf_library is None:
+                raise ValueError(
+                    "gendf_mt4_fallback requires the gendf_library argument.")
+            if reaction_rate_mode == "direct":
+                raise ValueError(
+                    "gendf_mt4_fallback requires a flux-tallying reaction "
+                    "rate mode ('direct_with_flux' or 'flux').")
+            if reaction_rate_mode == "gendf-flux":
+                warn("gendf_mt4_fallback has no effect in 'gendf-flux' mode; "
+                     "(n,n') rates are computed natively from GENDF MT=4.")
+                gendf_mt4_fallback = False
+        self._gendf_mt4_fallback = gendf_mt4_fallback
 
         # Placeholder for isomeric branching data - set up after super().__init__()
         self._isomeric_branching = None
@@ -475,13 +501,16 @@ class CoupledOperator(OpenMCOperator):
                 )
 
         elif reaction_rate_mode == "direct_with_flux":
-            if has_isomeric and self._gendf_library is not None:
+            if ((has_isomeric or self._gendf_mt4_fallback)
+                    and self._gendf_library is not None):
                 energy_structure = self._gendf_library.energy_structure
                 energies = GROUP_STRUCTURES[energy_structure]
                 self._rate_helper = DirectWithFluxHelper(
                     self.reaction_rates.n_nuc,
                     self.reaction_rates.n_react,
-                    energies
+                    energies,
+                    gendf_library=self._gendf_library,
+                    gendf_mt4_fallback=self._gendf_mt4_fallback
                 )
             else:
                 # No isomeric data or no GENDF library — fall back to pure direct mode
@@ -501,6 +530,20 @@ class CoupledOperator(OpenMCOperator):
                         "Energy group boundaries must be specified in the "
                         "reaction_rate_opts argument when reaction_rate_mode is"
                         "set to 'flux'.")
+
+            if self._gendf_mt4_fallback:
+                expected = GROUP_STRUCTURES[
+                    self._gendf_library.energy_structure]
+                if not np.array_equal(reaction_rate_opts['energies'], expected):
+                    raise ValueError(
+                        "gendf_mt4_fallback requires the flux tally energy "
+                        "group boundaries to match the GENDF library's "
+                        f"'{self._gendf_library.energy_structure}' group "
+                        "structure. Omit reaction_rate_opts['energies'] to "
+                        "use it automatically.")
+                reaction_rate_opts = dict(reaction_rate_opts)
+                reaction_rate_opts['gendf_library'] = self._gendf_library
+                reaction_rate_opts['gendf_mt4_fallback'] = True
 
             self._rate_helper = FluxCollapseHelper(
                 self.reaction_rates.n_nuc,

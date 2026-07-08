@@ -234,7 +234,58 @@ class DirectReactionRateHelper(ReactionRateHelper):
         return self._results_cache
 
 
-class DirectWithFluxHelper(ReactionRateHelper):
+class _GENDFMT4FallbackMixin:
+    """Fill the (n,n') column by collapsing the tallied flux with GENDF MT=4.
+
+    Continuous-energy HDF5 libraries typically carry only the partial
+    inelastic reactions (MT=51-91), so direct (n,n') tallies are silently
+    zero. When enabled, the lumped GENDF MT=4 cross section is collapsed
+    with the helper's own flux tally instead. Requires the flux tally to
+    use the GENDF library's group structure.
+    """
+
+    def _init_mt4_fallback(self, gendf_library, enabled):
+        self._mt4_gendf = gendf_library if enabled else None
+        self._mt4_map = None
+        self._mt4_nuclides = None
+        self._mt4_msg_shown = False
+
+    def _build_mt4_map(self):
+        """Map nuclide -> GENDF MT=4 group XS for the current nuclide set."""
+        available = self._mt4_gendf.available_nuclides_set()
+        self._mt4_map = {}
+        for name in self.nuclides:
+            if name in available:
+                xs = self._mt4_gendf.get_all_xs(name, mts=[4])
+                if 4 in xs:
+                    self._mt4_map[name] = xs[4]
+        self._mt4_nuclides = list(self.nuclides)
+        if not self._mt4_msg_shown and comm.rank == 0:
+            print(f" (n,n') reaction rates computed from GENDF MT=4 flux "
+                  f"collapse (not CE transport tallies) for "
+                  f"{len(self._mt4_map)} nuclides")
+        self._mt4_msg_shown = True
+
+    def _apply_mt4_fallback(self, rates, mat_index, nuc_index, react_index):
+        """Override the (n,n') column of ``rates`` for one material."""
+        if self._mt4_gendf is None:
+            return
+        try:
+            i_score = self._scores.index("(n,n')")
+        except ValueError:
+            return
+        if self._mt4_nuclides != self.nuclides:
+            self._build_mt4_map()
+
+        i_rx = react_index[i_score]
+        flux = self.get_flux_spectrum(mat_index)
+        for name, i_nuc in zip(self.nuclides, nuc_index):
+            sigma4 = self._mt4_map.get(name)
+            if sigma4 is not None:
+                rates[i_nuc, i_rx] = sigma4 @ flux
+
+
+class DirectWithFluxHelper(_GENDFMT4FallbackMixin, ReactionRateHelper):
     """Direct reaction rates with flux tallying for isomeric branching.
 
     This helper provides the accuracy of direct reaction rate tallies
@@ -252,6 +303,11 @@ class DirectWithFluxHelper(ReactionRateHelper):
         Number of reactions tracked
     energies : numpy.ndarray
         Energy group boundaries (CCFE-709 or UKAEA-1102)
+    gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
+        GENDF library used for the (n,n') MT=4 fallback
+    gendf_mt4_fallback : bool, optional
+        Whether to fill the (n,n') column by collapsing the tallied flux
+        with GENDF MT=4 cross sections. Default is False.
 
     Attributes
     ----------
@@ -261,12 +317,14 @@ class DirectWithFluxHelper(ReactionRateHelper):
         Energy group boundaries in [eV]
     """
 
-    def __init__(self, n_nuc: int, n_react: int, energies: np.ndarray) -> None:
+    def __init__(self, n_nuc: int, n_react: int, energies: np.ndarray,
+                 gendf_library=None, gendf_mt4_fallback: bool = False) -> None:
         super().__init__(n_nuc, n_react)
         self._direct_helper = DirectReactionRateHelper(n_nuc, n_react)
         self._energies: np.ndarray = np.asarray(energies)
         self._flux_tally: Optional[Tally] = None
         self._materials: Optional[List] = None
+        self._init_mt4_fallback(gendf_library, gendf_mt4_fallback)
 
     @ReactionRateHelper.nuclides.setter
     def nuclides(self, nuclides: List[str]) -> None:
@@ -288,6 +346,7 @@ class DirectWithFluxHelper(ReactionRateHelper):
             Reaction identifiers needed for the reaction rate tally
         """
         self._materials = list(materials)
+        self._scores = list(scores)
 
         # Generate direct rate tallies (delegate to inner helper)
         self._direct_helper.generate_tallies(self._materials, scores)
@@ -329,7 +388,10 @@ class DirectWithFluxHelper(ReactionRateHelper):
             Array with shape ``(n_nuclides, n_rxns)`` with the
             reaction rates in this material
         """
-        return self._direct_helper.get_material_rates(mat_index, nuc_index, rx_index)
+        rates = self._direct_helper.get_material_rates(
+            mat_index, nuc_index, rx_index)
+        self._apply_mt4_fallback(rates, mat_index, nuc_index, rx_index)
+        return rates
 
     @property
     def energies(self) -> np.ndarray:
@@ -360,7 +422,7 @@ class DirectWithFluxHelper(ReactionRateHelper):
         return self._flux_tally.mean.reshape(shape)[mat_index]
 
 
-class FluxCollapseHelper(ReactionRateHelper):
+class FluxCollapseHelper(_GENDFMT4FallbackMixin, ReactionRateHelper):
     """Class that generates one-group reaction rates using multigroup flux
 
     This class generates a multigroup flux tally that is used afterward to
@@ -386,6 +448,12 @@ class FluxCollapseHelper(ReactionRateHelper):
     nuclides : iterable of str
         Nuclides for which some reaction rates should be directly tallied. If
         None, then ``reactions`` will be used for all nuclides.
+    gendf_library : openmc.deplete.gendf.GENDFLibrary, optional
+        GENDF library used for the (n,n') MT=4 fallback
+    gendf_mt4_fallback : bool, optional
+        Whether to fill the (n,n') column by collapsing the tallied flux
+        with GENDF MT=4 cross sections. Requires ``energies`` to match the
+        GENDF library's group structure. Default is False.
 
     Attributes
     ----------
@@ -393,11 +461,13 @@ class FluxCollapseHelper(ReactionRateHelper):
         All nuclides with desired reaction rates.
 
     """
-    def __init__(self, n_nucs, n_reacts, energies, reactions=None, nuclides=None):
+    def __init__(self, n_nucs, n_reacts, energies, reactions=None, nuclides=None,
+                 gendf_library=None, gendf_mt4_fallback=False):
         super().__init__(n_nucs, n_reacts)
         self._energies = asarray(energies)
         self._reactions_direct = list(reactions) if reactions is not None else []
         self._nuclides_direct = list(nuclides) if nuclides is not None else None
+        self._init_mt4_fallback(gendf_library, gendf_mt4_fallback)
 
     @ReactionRateHelper.nuclides.setter
     def nuclides(self, nuclides):
@@ -554,6 +624,9 @@ class FluxCollapseHelper(ReactionRateHelper):
                         mt, mat.temperature, self._energies, flux)
 
                     self._results_cache[i_nuc, i_rx] = rate_per_nuc
+
+        self._apply_mt4_fallback(
+            self._results_cache, mat_index, nuc_index, react_index)
 
         return self._results_cache
 
