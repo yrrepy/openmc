@@ -61,6 +61,7 @@ def get_microxs_and_flux(
     run_kwargs=None,
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary' | None = None,
     reaction_rate_opts: dict | None = None,
+    gendf_mt4_fallback: bool = False,
 ) -> tuple[list[np.ndarray], list[MicroXS]]:
     """Generate microscopic cross sections and fluxes for multiple domains.
 
@@ -122,6 +123,15 @@ def get_microxs_and_flux(
         automatically set from the library's energy bounds.
 
         .. versionadded:: 0.15.4
+    gendf_mt4_fallback : bool, optional
+        If True, fill the (n,n') cross section from GENDF MT=4 data. CE HDF5
+        libraries typically lack the lumped MT=4 reaction, so (n,n') cross
+        sections are otherwise silently zero. Applied only to nuclides
+        present in both the CE library and the GENDF library. Requires
+        ``gendf_library``; the energy group structure must match the GENDF
+        library's.
+
+        .. versionadded:: 0.15.4
 
     Returns
     -------
@@ -136,19 +146,12 @@ def get_microxs_and_flux(
 
     """
     check_value('reaction_rate_mode', reaction_rate_mode, {'direct', 'flux'})
+    if gendf_mt4_fallback and gendf_library is None:
+        raise ValueError(
+            "gendf_mt4_fallback requires the gendf_library argument.")
 
     # Save any original tallies on the model
     original_tallies = list(model.tallies)
-
-    # Determine what reactions and nuclides are available in chain
-    chain = _get_chain(chain_file)
-    if reactions is None:
-        reactions = chain.reactions
-    if not nuclides:
-        cross_sections = _find_cross_sections(model)
-        nuclides_with_data = _get_nuclides_with_data(cross_sections)
-        nuclides = [nuc.name for nuc in chain.nuclides
-                    if nuc.name in nuclides_with_data]
 
     # Auto-detect energy structure from GENDF library
     if gendf_library is not None:
@@ -168,6 +171,27 @@ def get_microxs_and_flux(
         energy_filter = openmc.EnergyFilter.from_group_structure(energies)
     else:
         energy_filter = openmc.EnergyFilter(energies)
+
+    if gendf_mt4_fallback:
+        bounds = np.asarray(gendf_library.energy_bounds)
+        if (len(energy_filter.values) != len(bounds)
+                or not np.allclose(energy_filter.values, bounds)):
+            raise ValueError(
+                "gendf_mt4_fallback requires the energy group structure to "
+                f"match the GENDF library ('{gendf_library.energy_structure}')."
+                " Omit the energies argument to use it automatically.")
+
+    # Determine what reactions and nuclides are available in chain
+    chain = _get_chain(chain_file)
+    if reactions is None:
+        reactions = chain.reactions
+    nuclides_with_data = None
+    if not nuclides or gendf_mt4_fallback:
+        cross_sections = _find_cross_sections(model)
+        nuclides_with_data = _get_nuclides_with_data(cross_sections)
+    if not nuclides:
+        nuclides = [nuc.name for nuc in chain.nuclides
+                    if nuc.name in nuclides_with_data]
 
     if isinstance(domains, openmc.Filter):
         domain_filter = domains
@@ -306,6 +330,11 @@ def get_microxs_and_flux(
         micros = direct_micros
     else:
         micros = flux_micros
+
+    # Substitute GENDF MT=4 for the silently-zero CE (n,n') column
+    if gendf_mt4_fallback:
+        _apply_gendf_mt4_fallback(micros, fluxes, gendf_library,
+                                  nuclides_with_data)
 
     # Reset tallies
     model.tallies = original_tallies
@@ -500,6 +529,46 @@ def get_gendfxs_and_flux(
     # Package flux with energy information for isomeric branching
     fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
     return fluxes_with_energy, micros
+
+
+def _apply_gendf_mt4_fallback(micros, fluxes, gendf_library,
+                              nuclides_with_data):
+    """Substitute GENDF MT=4 data into the (n,n') column of each MicroXS.
+
+    CE HDF5 libraries typically lack the lumped MT=4 reaction, so the (n,n')
+    column is silently zero. Modifies micros in place, restricted to nuclides
+    present in BOTH the CE library (nuclides_with_data) and the GENDF library
+    so a GENDF-only nuclide is never activated through (n,n') alone.
+    """
+    if "(n,n')" not in micros[0].reactions:
+        return
+
+    available = gendf_library.available_nuclides_set()
+    sigma4 = {}
+    for nuc in micros[0].nuclides:
+        if nuc in available and nuc in nuclides_with_data:
+            xs = gendf_library.get_all_xs(nuc, mts=[4])
+            if 4 in xs:
+                sigma4[nuc] = xs[4]
+
+    if comm.rank == 0:
+        print(f" (n,n') cross sections computed from GENDF MT=4 "
+              f"(not CE data) for {len(sigma4)} nuclides")
+
+    n_groups = gendf_library.n_groups
+    for micro, flux_i in zip(micros, fluxes):
+        i_nn = micro.reactions.index("(n,n')")
+        for nuc, sigma4_g in sigma4.items():
+            i_nuc = micro._index_nuc.get(nuc)
+            if i_nuc is None:
+                continue
+            if micro.data.shape[2] == n_groups:
+                # direct mode: groups are GENDF-aligned (validated upstream)
+                micro.data[i_nuc, i_nn, :] = sigma4_g
+            elif micro.data.shape[2] == 1:
+                flux_sum = flux_i.sum()
+                if flux_sum > 0.0:
+                    micro.data[i_nuc, i_nn, 0] = sigma4_g @ flux_i / flux_sum
 
 
 @dataclass
