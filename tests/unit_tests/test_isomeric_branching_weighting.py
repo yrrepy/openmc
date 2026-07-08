@@ -393,7 +393,7 @@ def test_coupled_operator_isomeric_disabled_without_direct_with_flux():
     mock_coupled._rate_helper = Mock(spec=DirectReactionRateHelper)
     mock_coupled.chain = create_mock_chain_with_isomeric_targets()
 
-    with pytest.warns(UserWarning, match="not 'direct_with_flux'"):
+    with pytest.warns(UserWarning, match="flux spectrum"):
         CoupledOperator._setup_isomeric_branching(mock_coupled)
 
     assert mock_coupled._isomeric_helper is None

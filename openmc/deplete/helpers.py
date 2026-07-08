@@ -18,6 +18,7 @@ import numpy as np
 from openmc.mpi import comm
 from openmc.checkvalue import check_type, check_greater_than
 from openmc.data import JOULE_PER_EV, REACTION_MT
+from openmc.mgxs import GROUP_STRUCTURES
 from openmc.exceptions import OpenMCError
 from openmc.deplete.gendf import REACTION_TO_MT
 from openmc.lib import (
@@ -34,7 +35,7 @@ __all__ = (
     "EnergyScoreHelper", "SourceRateHelper", "TalliedFissionYieldHelper",
     "ConstantFissionYieldHelper", "FissionYieldCutoffHelper",
     "AveragedFissionYieldHelper", "FluxCollapseHelper",
-    "IsomericBranchingHelper")
+    "GENDFFluxCollapseHelper", "IsomericBranchingHelper")
 
 
 class TalliedFissionYieldHelper(FissionYieldHelper):
@@ -534,6 +535,243 @@ class FluxCollapseHelper(ReactionRateHelper):
                         mt, mat.temperature, self._energies, flux)
 
                     self._results_cache[i_nuc, i_rx] = rate_per_nuc
+
+        return self._results_cache
+
+
+class GENDFFluxCollapseHelper(ReactionRateHelper):
+    """Class that generates one-group reaction rates from a GENDF flux collapse
+
+    This class tallies a multigroup flux in the GENDF library's energy group
+    structure (CCFE-709 or UKAEA-1102) and collapses it with GENDF group-wise
+    cross sections using a sparse table (one matrix-vector product per
+    material). GENDF MF=3 data includes lumped reactions such as (n,n') that
+    are absent from most continuous-energy HDF5 libraries, so those rates are
+    obtained natively. Select reactions can still be treated with a direct
+    continuous-energy reaction rate tally; fission is direct-tallied by
+    default so that normalization retains continuous-energy fidelity. The
+    flux tally also provides the spectrum used for isomeric branching.
+
+    .. versionadded:: 0.15.4
+
+    Parameters
+    ----------
+    n_nucs : int
+        Number of burnable nuclides tracked by
+        :class:`openmc.deplete.CoupledOperator`
+    n_reacts : int
+        Number of reactions tracked by :class:`openmc.deplete.CoupledOperator`
+    gendf_library : openmc.deplete.gendf.GENDFLibrary
+        GENDF library providing group-wise cross sections
+    reactions : iterable of str, optional
+        Reactions for which rates should be directly tallied with
+        continuous-energy data. Defaults to ``['fission']``; pass an empty
+        list to collapse all reactions from GENDF data.
+    nuclides : iterable of str, optional
+        Nuclides for which some reaction rates should be directly tallied. If
+        None, then ``reactions`` will be used for all nuclides.
+
+    Attributes
+    ----------
+    nuclides : list of str
+        All nuclides with desired reaction rates.
+    energies : numpy.ndarray
+        Energy group boundaries in [eV]
+    """
+
+    def __init__(self, n_nucs, n_reacts, gendf_library, reactions=None,
+                 nuclides=None):
+        super().__init__(n_nucs, n_reacts)
+        if gendf_library.energy_structure is None:
+            raise ValueError(
+                "GENDF library has no detected energy group structure; "
+                "'gendf-flux' mode requires a library using CCFE-709 or "
+                "UKAEA-1102.")
+        self._gendf_library = gendf_library
+        self._energies = asarray(
+            GROUP_STRUCTURES[gendf_library.energy_structure])
+        self._reactions_direct = (
+            ['fission'] if reactions is None else list(reactions))
+        self._nuclides_direct = list(nuclides) if nuclides is not None else None
+        self._xs_table = None
+        self._table_index = {}
+        self._table_nuclides = None
+        self._missing = frozenset()
+
+    @ReactionRateHelper.nuclides.setter
+    def nuclides(self, nuclides):
+        ReactionRateHelper.nuclides.fset(self, nuclides)
+        if self._reactions_direct and self._nuclides_direct is None:
+            # Direct tally spans all reaction nuclides; some may not be
+            # loaded from the initial materials
+            for nuclide in nuclides:
+                if nuclide not in openmc.lib.nuclides:
+                    load_nuclide(nuclide)
+            self._rate_tally.nuclides = nuclides
+
+    def generate_tallies(self, materials, scores):
+        """Produce multigroup flux and direct reaction rate tallies
+
+        Parameters
+        ----------
+        materials : iterable of :class:`openmc.lib.Material`
+            Burnable materials in the problem. Used to construct a
+            :class:`openmc.lib.MaterialFilter`
+        scores : iterable of str
+            Reaction identifiers, e.g. ``"(n, gamma)"``, needed for the
+            reaction rate tally.
+        """
+        self._materials = materials
+        self._mts = [REACTION_MT[x] for x in scores]
+        self._scores = list(scores)
+
+        # Direct tallies only make sense for tracked reactions
+        self._reactions_direct = [
+            r for r in self._reactions_direct if r in self._scores]
+
+        # Create flux tally with material and energy filters
+        self._flux_tally = Tally()
+        self._flux_tally.writable = False
+        self._flux_tally.filters = [
+            MaterialFilter(materials),
+            EnergyFilter(self._energies)
+        ]
+        self._flux_tally.scores = ['flux']
+        self._flux_tally_means_cache = None
+
+        # Create reaction rate tally
+        if self._reactions_direct:
+            self._rate_tally = Tally()
+            self._rate_tally.writable = False
+            self._rate_tally.scores = self._reactions_direct
+            self._rate_tally.filters = [MaterialFilter(materials)]
+            self._rate_tally.multiply_density = False
+            self._rate_tally_means_cache = None
+            if self._nuclides_direct is not None:
+                # check if any direct tally nuclides are requested that are not
+                # already loaded with the materials. Load separately if so.
+                mat_nuclides = {n for mat in materials for n in mat.nuclides}
+                extra_nuclides = set(self._nuclides_direct) - mat_nuclides
+                for nuc in extra_nuclides:
+                    load_nuclide(nuc)
+                self._rate_tally.nuclides = self._nuclides_direct
+
+    @property
+    def rate_tally_means(self):
+        """The mean results of the tally of every material's reaction rates for this cycle
+        """
+        if self._rate_tally_means_cache is None:
+            self._rate_tally_means_cache = self._rate_tally.mean
+        return self._rate_tally_means_cache
+
+    @property
+    def flux_tally_means(self):
+        # If the mean cache is empty, fill it once for this transport cycle's results
+        if self._flux_tally_means_cache is None:
+            self._flux_tally_means_cache = self._flux_tally.mean
+        return self._flux_tally_means_cache
+
+    def reset_tally_means(self):
+        """Reset the cached mean rate and flux tallies.
+        .. note::
+
+                This step must be performed after each transport cycle
+        """
+        self._flux_tally_means_cache = None
+        if self._reactions_direct:
+            self._rate_tally_means_cache = None
+
+    @property
+    def energies(self):
+        """Energy group boundaries in [eV]."""
+        return self._energies
+
+    def get_flux_spectrum(self, mat_index):
+        """Get flux spectrum for a specific material.
+
+        Parameters
+        ----------
+        mat_index : int
+            Index of the material
+
+        Returns
+        -------
+        numpy.ndarray
+            Flux spectrum with shape (n_groups,)
+        """
+        shape = (len(self._materials), len(self._energies) - 1)
+        return self.flux_tally_means.reshape(shape)[mat_index]
+
+    def _ensure_xs_table(self):
+        """Build the sparse GENDF XS table; rebuild if the nuclide set grew."""
+        if self._table_nuclides == self.nuclides:
+            return
+        from .microxs import _build_sparse_xs_table
+
+        available = self._gendf_library.available_nuclides_set()
+        table_nucs = [n for n in self.nuclides if n in available]
+        missing = frozenset(self.nuclides) - available
+        if missing and missing != self._missing:
+            names = ' '.join(sorted(missing)[:10])
+            more = ' ...' if len(missing) > 10 else ''
+            warnings.warn(
+                f"{len(missing)} nuclides not in GENDF library will have "
+                f"zero reaction rates unless directly tallied: {names}{more}")
+        self._missing = missing
+        self._xs_table = _build_sparse_xs_table(
+            self._gendf_library, table_nucs, self._scores, self._mts)
+        self._table_index = {n: i for i, n in enumerate(table_nucs)}
+        self._table_nuclides = list(self.nuclides)
+
+    def get_material_rates(self, mat_index, nuc_index, react_index):
+        """Return an array of reaction rates for a material
+
+        Parameters
+        ----------
+        mat_index : int
+            Index for material
+        nuc_index : iterable of int
+            Index for each nuclide in :attr:`nuclides` in the
+            desired reaction rate matrix
+        react_index : iterable of int
+            Index for each reaction scored in the tally
+
+        Returns
+        -------
+        rates : numpy.ndarray
+            Array with shape ``(n_nuclides, n_rxns)`` with the reaction rates
+            in this material
+
+        """
+        self._results_cache.fill(0.0)
+        self._ensure_xs_table()
+
+        # Collapse GENDF group XS with this material's flux spectrum. Result
+        # is sigma [b] times volume-integrated flux [particle-cm/src] -- the
+        # same convention as direct tallies with multiply_density=False.
+        flux = self.get_flux_spectrum(mat_index)
+        collapsed = self._xs_table.collapse(flux)
+
+        for name, i_nuc in zip(self.nuclides, nuc_index):
+            i_table = self._table_index.get(name)
+            if i_table is not None:
+                self._results_cache[i_nuc, react_index] = collapsed[i_table]
+
+        # Overlay direct tally results
+        if self._reactions_direct:
+            nuclides_direct = self._rate_tally.nuclides
+            shape = (len(nuclides_direct), len(self._reactions_direct))
+            rx_rates = self.rate_tally_means[mat_index].reshape(shape)
+            direct_rx_index = {score: i for i, score in enumerate(self._reactions_direct)}
+            direct_nuc_index = {nuc: i for i, nuc in enumerate(nuclides_direct)}
+            for name, i_nuc in zip(self.nuclides, nuc_index):
+                i_direct = direct_nuc_index.get(name)
+                if i_direct is None:
+                    continue
+                for score, i_rx in zip(self._scores, react_index):
+                    if score in direct_rx_index:
+                        self._results_cache[i_nuc, i_rx] = \
+                            rx_rates[i_direct, direct_rx_index[score]]
 
         return self._results_cache
 

@@ -28,7 +28,8 @@ from openmc.mgxs import GROUP_STRUCTURES
 from .helpers import (
     DirectReactionRateHelper, DirectWithFluxHelper, ChainFissionHelper,
     ConstantFissionYieldHelper, FissionYieldCutoffHelper, AveragedFissionYieldHelper,
-    EnergyScoreHelper, SourceRateHelper, FluxCollapseHelper, IsomericBranchingHelper)
+    EnergyScoreHelper, SourceRateHelper, FluxCollapseHelper,
+    GENDFFluxCollapseHelper, IsomericBranchingHelper)
 
 
 __all__ = ["CoupledOperator", "Operator", "OperatorResult"]
@@ -139,7 +140,7 @@ class CoupledOperator(OpenMCOperator):
         ``fission_yield_mode``. Will be passed directly on to the
         helper. Passing a value of None will use the defaults for
         the associated helper.
-    reaction_rate_mode : {"direct", "direct_with_flux", "flux"}, optional
+    reaction_rate_mode : {"direct", "direct_with_flux", "flux", "gendf-flux"}, optional
         Indicate how one-group reaction rates should be calculated. The "direct"
         method tallies transmutation reaction rates directly. The "flux" method
         tallies a multigroup flux spectrum and then collapses one-group reaction
@@ -147,12 +148,19 @@ class CoupledOperator(OpenMCOperator):
         rates directly). The "direct_with_flux" method combines direct reaction
         rate tallies with a flux spectrum tally for automatic isomeric branching
         support; the energy structure is auto-detected from chain isomeric
-        branching data (CCFE-709 or UKAEA-1102).
+        branching data (CCFE-709 or UKAEA-1102). The "gendf-flux" method
+        tallies a multigroup flux spectrum in the GENDF library's group
+        structure and collapses it with GENDF group-wise cross sections
+        (fission is direct-tallied by default); this provides reaction rates
+        for lumped reactions such as (n,n') that are absent from most
+        continuous-energy HDF5 libraries, and supports isomeric branching.
+        Requires the ``gendf_library`` argument.
 
         .. versionadded:: 0.12.1
 
         .. versionchanged:: 0.15.4
-            Added "direct_with_flux" mode for isomeric branching support.
+            Added "direct_with_flux" mode for isomeric branching support and
+            "gendf-flux" mode for GENDF-based reaction rates.
     reaction_rate_opts : dict, optional
         Keyword arguments that are passed to the reaction rate helper class.
         When ``reaction_rate_mode`` is set to "flux", energy group boundaries
@@ -189,7 +197,9 @@ class CoupledOperator(OpenMCOperator):
         automatic isomeric branching calculations using σ×φ weighting.
         The GENDF library provides multigroup cross-sections, and the
         ``DirectWithFluxHelper`` provides the tallied flux spectrum.
-        Default is None.
+        With ``reaction_rate_mode='gendf-flux'`` (where it is required), it
+        additionally provides the group-wise cross sections used to collapse
+        one-group reaction rates. Default is None.
 
         .. versionadded:: 0.15.4
         .. versionchanged:: 0.15.4
@@ -257,7 +267,7 @@ class CoupledOperator(OpenMCOperator):
         check_value('normalization mode', normalization_mode,
                     ('energy-deposition', 'fission-q', 'source-rate'))
         check_value('reaction rate mode', reaction_rate_mode,
-                    ('direct', 'direct_with_flux', 'flux'))
+                    ('direct', 'direct_with_flux', 'flux', 'gendf-flux'))
         if normalization_mode != "fission-q":
             if fission_q is not None:
                 warn("Fission Q dictionary will not be used")
@@ -316,16 +326,16 @@ class CoupledOperator(OpenMCOperator):
 
         Isomeric branching is enabled when:
         1. A GENDF library is provided (for multigroup cross-sections)
-        2. The ``direct_with_flux`` reaction rate mode is used (for flux tallying)
+        2. A flux-tallying reaction rate mode is used ("direct_with_flux"
+           or "gendf-flux")
         3. Isomeric branching data exists in the chain
 
         When enabled, uses the GENDF library for on-the-fly cross-section
         lookup combined with the tallied flux spectrum to compute σ×φ-weighted
         isomeric branching ratios after each transport solve.
 
-        When not enabled (missing GENDF or not using direct_with_flux mode),
-        isomeric branching is disabled and default chain branching ratios
-        are used.
+        When not enabled (missing GENDF or no flux spectrum tally), isomeric
+        branching is disabled and default chain branching ratios are used.
         """
         # Check if we can enable isomeric branching
         if self._gendf_library is None:
@@ -334,13 +344,14 @@ class CoupledOperator(OpenMCOperator):
             self._isomeric_branching = None
             return
 
-        if not isinstance(self._rate_helper, DirectWithFluxHelper):
+        if not hasattr(self._rate_helper, 'get_flux_spectrum'):
             # Not using flux tallying - disable isomeric branching
             if self.chain.isomeric_branching_targets:
                 warn(
-                    "GENDF library provided but reaction_rate_mode is not 'direct_with_flux'. "
-                    "Isomeric branching requires 'direct_with_flux' mode to tally flux spectrum. "
-                    "Isomeric branching will be disabled."
+                    "GENDF library provided but the reaction rate helper does "
+                    "not tally a flux spectrum. Isomeric branching requires "
+                    "'direct_with_flux' or 'gendf-flux' mode. Isomeric "
+                    "branching will be disabled."
                 )
             self._isomeric_helper = None
             self._isomeric_branching = None
@@ -366,7 +377,7 @@ class CoupledOperator(OpenMCOperator):
         """Calculate σ×φ-weighted isomeric branching from tallied flux spectra."""
         if self._isomeric_helper is None:
             return None
-        if not isinstance(self._rate_helper, DirectWithFluxHelper):
+        if not hasattr(self._rate_helper, 'get_flux_spectrum'):
             return None
 
         energy_bins = self._rate_helper.energies
@@ -468,6 +479,18 @@ class CoupledOperator(OpenMCOperator):
             self._rate_helper = FluxCollapseHelper(
                 self.reaction_rates.n_nuc,
                 self.reaction_rates.n_react,
+                **reaction_rate_opts
+            )
+        elif reaction_rate_mode == "gendf-flux":
+            if self._gendf_library is None:
+                raise ValueError(
+                    "The gendf_library argument must be provided when "
+                    "reaction_rate_mode is set to 'gendf-flux'.")
+
+            self._rate_helper = GENDFFluxCollapseHelper(
+                self.reaction_rates.n_nuc,
+                self.reaction_rates.n_react,
+                self._gendf_library,
                 **reaction_rate_opts
             )
         else:
