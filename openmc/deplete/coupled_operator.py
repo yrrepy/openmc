@@ -164,9 +164,12 @@ class CoupledOperator(OpenMCOperator):
     reaction_rate_opts : dict, optional
         Keyword arguments that are passed to the reaction rate helper class.
         When ``reaction_rate_mode`` is set to "flux", energy group boundaries
-        can be set using the "energies" key. See the
-        :class:`~openmc.deplete.helpers.FluxCollapseHelper` class for all
-        options.
+        can be set using the "energies" key (when omitted and a
+        ``gendf_library`` is given, the GENDF group structure is used, which
+        is required for isomeric branching). See the
+        :class:`~openmc.deplete.helpers.FluxCollapseHelper` and
+        :class:`~openmc.deplete.helpers.GENDFFluxCollapseHelper` classes for
+        all options.
 
         .. versionadded:: 0.12.1
     reduce_chain_level : int, optional
@@ -357,6 +360,23 @@ class CoupledOperator(OpenMCOperator):
             self._isomeric_branching = None
             return
 
+        # The flux tally must use the GENDF group structure for the
+        # branching-ratio weights to apply (only 'flux' mode can differ)
+        expected = GROUP_STRUCTURES[self._gendf_library.energy_structure]
+        if not np.array_equal(self._rate_helper.energies, expected):
+            if self.chain.isomeric_branching_targets:
+                raise ValueError(
+                    "Isomeric branching requires the flux tally energy group "
+                    "boundaries to match the GENDF library's "
+                    f"'{self._gendf_library.energy_structure}' group "
+                    f"structure ({len(expected) - 1} groups); got "
+                    f"{len(self._rate_helper.energies) - 1} groups. Omit "
+                    "reaction_rate_opts['energies'] to use the GENDF "
+                    "structure automatically.")
+            self._isomeric_helper = None
+            self._isomeric_branching = None
+            return
+
         if not hasattr(self._gendf_library, 'get_branching_ratios'):
             warn(
                 "GENDF library backend does not support get_branching_ratios(). "
@@ -469,12 +489,18 @@ class CoupledOperator(OpenMCOperator):
                     self.reaction_rates.n_nuc, self.reaction_rates.n_react)
 
         elif reaction_rate_mode == "flux":
-            # Ensure energy group boundaries were specified
+            # Ensure energy group boundaries were specified; default to the
+            # GENDF library's group structure when one is available
             if 'energies' not in reaction_rate_opts:
-                raise ValueError(
-                    "Energy group boundaries must be specified in the "
-                    "reaction_rate_opts argument when reaction_rate_mode is"
-                    "set to 'flux'.")
+                if self._gendf_library is not None:
+                    reaction_rate_opts = dict(reaction_rate_opts)
+                    reaction_rate_opts['energies'] = GROUP_STRUCTURES[
+                        self._gendf_library.energy_structure]
+                else:
+                    raise ValueError(
+                        "Energy group boundaries must be specified in the "
+                        "reaction_rate_opts argument when reaction_rate_mode is"
+                        "set to 'flux'.")
 
             self._rate_helper = FluxCollapseHelper(
                 self.reaction_rates.n_nuc,

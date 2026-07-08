@@ -414,6 +414,7 @@ def test_coupled_operator_isomeric_enabled_with_gendf():
     )
     mock_coupled._gendf_library = mock_gendf
     mock_coupled._rate_helper = Mock(spec=DirectWithFluxHelper)
+    mock_coupled._rate_helper.energies = GROUP_STRUCTURES['CCFE-709']
     mock_coupled.chain = create_mock_chain_with_isomeric_targets()
 
     CoupledOperator._setup_isomeric_branching(mock_coupled)

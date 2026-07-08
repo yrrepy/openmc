@@ -474,6 +474,27 @@ class FluxCollapseHelper(ReactionRateHelper):
             self._flux_tally_means_cache = self._flux_tally.mean
         return self._flux_tally_means_cache
 
+    @property
+    def energies(self):
+        """Energy group boundaries in [eV]."""
+        return self._energies
+
+    def get_flux_spectrum(self, mat_index):
+        """Get flux spectrum for a specific material.
+
+        Parameters
+        ----------
+        mat_index : int
+            Index of the material
+
+        Returns
+        -------
+        numpy.ndarray
+            Flux spectrum with shape (n_groups,)
+        """
+        shape = (len(self._materials), len(self._energies) - 1)
+        return self.flux_tally_means.reshape(shape)[mat_index]
+
     def reset_tally_means(self):
         """Reset the cached mean rate and flux tallies.
         .. note::
@@ -507,9 +528,7 @@ class FluxCollapseHelper(ReactionRateHelper):
         self._results_cache.fill(0.0)
 
         # Get flux for specified material
-        shape = (len(self._materials), len(self._energies) - 1)
-        mean_value = self.flux_tally_means.reshape(shape)
-        flux = mean_value[mat_index]
+        flux = self.get_flux_spectrum(mat_index)
 
         # Get direct reaction rates
         if self._reactions_direct:
