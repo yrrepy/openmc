@@ -19,6 +19,7 @@ from .abc import ReactionRateHelper, OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
 from .microxs import MicroXS, _check_pathway_consistency
+from .nuclide import _ISOMER_SUFFIX
 from .results import Results
 from .helpers import ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper
 
@@ -160,6 +161,23 @@ class IndependentOperator(OpenMCOperator):
         # one built above). Ordinary non-isomeric usage is untouched.
         for micro in self.cross_sections:
             _check_pathway_consistency(self.chain, micro)
+
+        # Announce PENDF isomeric branching once at setup, mirroring the GENDF
+        # operator's banner idiom (plain rank-0 print; see openmc/deplete/abc.py).
+        # Two-sided guard: the reduced chain must carry a pendf_lfs-qualified
+        # '_m'-suffixed reaction AND the MicroXS must actually resolve at least
+        # one product-qualified ('_m'-suffixed) reaction. A stock chain or an
+        # all-fallback MicroXS with zero qualified rows stays silent.
+        chain_has_isomeric = any(
+            rx.pendf_lfs is not None and _ISOMER_SUFFIX.search(rx.type)
+            for nuc in self.chain.nuclides
+            for rx in nuc.reactions)
+        micro_has_isomeric = any(
+            _ISOMER_SUFFIX.search(rx)
+            for micro in self.cross_sections
+            for rx in micro.reactions)
+        if comm.rank == 0 and chain_has_isomeric and micro_has_isomeric:
+            print("[openmc.deplete] Depletion is using PENDF Isomeric Branching")
 
     @classmethod
     def from_nuclides(cls, volume, nuclides,
