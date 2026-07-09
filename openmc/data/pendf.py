@@ -27,11 +27,8 @@ import h5py
 import numpy as np
 
 import openmc
-import openmc.checkvalue as cv
 from .data import gnds_name
 from .endf import Evaluation, get_head_record, get_list_record, get_tab1_record
-from .isomeric import (ELIS_ATOL, ELIS_RTOL, map_lfs_to_liso,
-                       parse_decay_isomeric_levels)
 
 __all__ = ['PendfLibrary']
 
@@ -39,6 +36,10 @@ __all__ = ['PendfLibrary']
 #   1 -- MF=10 subgroups are always named ``LFS{lfs}``.
 #   2 -- an LFS shared by >=2 distinct product IZAPs is named
 #        ``LFS{lfs}_ZAP{izap}`` (a unique LFS keeps the bare ``LFS{lfs}``).
+# The library is written source-faithful (raw IZAP/LFS/QM/QI/ELFS attrs only);
+# the isomer<->LFS product mapping lives on the depletion chain, not baked here.
+# Files written by older OpenMC carried baked ``product``/``mapping`` attrs; the
+# reader accepts them and ignores those attrs (see :class:`PendfLibrary`).
 _FORMAT_VERSION = 2
 
 # MF=3 reactions retained only when ``keep_extra_mts=True``: resonance
@@ -210,17 +211,17 @@ def _iter_mf10_partials(ev, mt, name):
         yield pqm, pqi, izap, lfs, ptab
 
 
-def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
-                         elis_rtol, elis_atol):
+def _write_mf10_partials(mtg, ev, mt, name, path):
     """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
 
     Each MF=10 partial for reaction ``mt`` is stored as a subgroup of ``mtg``
-    with its IZAP/LFS/QM/QI/ELFS attributes (and, when ``mapping`` is active, a
-    baked ``product`` name). A partial whose LFS is unique within the reaction
-    keeps the bare ``LFS{lfs}`` name (byte-identical to non-lumped libraries);
-    an LFS shared by several distinct IZAP -- different product nuclides, as in
-    lumped TENDL MT=5 -- is disambiguated as ``LFS{lfs}_ZAP{izap}``. A true
-    ``(IZAP, LFS)`` duplicate warns and is skipped.
+    with its raw IZAP/LFS/QM/QI/ELFS attributes (source-faithful; no product
+    name is baked -- the isomer<->LFS mapping lives on the depletion chain). A
+    partial whose LFS is unique within the reaction keeps the bare ``LFS{lfs}``
+    name (byte-identical to non-lumped libraries); an LFS shared by several
+    distinct IZAP -- different product nuclides, as in lumped TENDL MT=5 -- is
+    disambiguated as ``LFS{lfs}_ZAP{izap}``. A true ``(IZAP, LFS)`` duplicate
+    warns and is skipped.
     """
     partials = list(_iter_mf10_partials(ev, mt, name))
     if not partials:
@@ -246,22 +247,6 @@ def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
     for _pqm, _pqi, izap, lfs, _pt in unique:
         lfs_izaps[lfs].add(izap)
 
-    # Resolve products per IZAP so a shared LFS bakes the right product for each
-    # nuclide; the result is keyed by (IZAP, LFS). With a single IZAP (the
-    # common, non-lumped case) this is one call with the same partials as before.
-    lfs_to_liso = {}
-    if mapping != 'none':
-        by_izap = defaultdict(list)
-        for pqm, pqi, izap, lfs, _pt in unique:
-            by_izap[izap].append(
-                {'lfs': lfs, 'izap': izap, 'elfs': pqm - pqi})
-        for izap, plist in by_izap.items():
-            for lfs, liso in map_lfs_to_liso(
-                    plist, decay_lookup, mode=mapping,
-                    rtol=elis_rtol, atol=elis_atol,
-                    context=f"{name} MT={mt}").items():
-                lfs_to_liso[izap, lfs] = liso
-
     for pqm, pqi, izap, lfs, ptab in unique:
         gname = (f'LFS{lfs}_ZAP{izap}' if len(lfs_izaps[lfs]) > 1
                  else f'LFS{lfs}')
@@ -271,10 +256,6 @@ def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
         lg.attrs['IZAP'] = izap
         lg.attrs['LFS'] = lfs
         lg.attrs['ELFS'] = pqm - pqi
-        if (izap, lfs) in lfs_to_liso:
-            lg.attrs['product'] = np.bytes_(gnds_name(
-                izap // 1000, izap % 1000,
-                lfs_to_liso[izap, lfs]))
         _write_xy(lg, ptab.x, ptab.y)
 
 
@@ -369,9 +350,11 @@ class PendfLibrary:
         GNDS names of the nuclides in the library.
     temperature : float
         Temperature of the library in kelvin.
-    mapping : str
-        Product-mapping mode used at preprocessing time
-        (``'none'``, ``'elis'``, or ``'lfs_order'``).
+    mapping : str or None
+        Legacy product-mapping mode read from an old baked file's root attr
+        (``'none'``, ``'elis'``, or ``'lfs_order'``), or ``None`` for a de-baked
+        (source-faithful) file. Informational only -- the isomer<->LFS product
+        mapping is now carried on the depletion chain, not the library.
     library : str
         Name of the source data library.
 
@@ -410,16 +393,21 @@ class PendfLibrary:
                     f"was written by a newer OpenMC.")
             library = _attr_str(f.attrs, 'library')
             temperature = float(f.attrs['temperature'])
-            mapping = _attr_str(f.attrs, 'mapping')
+            # ``mapping`` is a legacy root attr from the old baked-product build
+            # path; de-baked files omit it. Read it when present (informational
+            # only -- product naming is now chain-sourced), else ``None``.
+            mapping = _attr_str(f.attrs, 'mapping') if 'mapping' in f.attrs \
+                else None
             if self.temperature is None:
                 self.library = library
                 self.temperature = temperature
                 self.mapping = mapping
             else:
                 # Directory mode: every file must share the first file's
-                # library identity, temperature, and product mapping, or data
-                # would be served silently under mismatched metadata. Compare
-                # root attributes only (no dataset reads).
+                # library identity and temperature, or data would be served
+                # silently under mismatched metadata. Compare root attributes
+                # only (no dataset reads). ``mapping`` is no longer authoritative
+                # (raw attrs are always stored), so it is not cross-checked.
                 mismatches = []
                 if library != self.library:
                     mismatches.append(
@@ -427,9 +415,6 @@ class PendfLibrary:
                 if abs(temperature - self.temperature) > 0.1:
                     mismatches.append(
                         f"temperature {temperature} K != {self.temperature} K")
-                if mapping != self.mapping:
-                    mismatches.append(
-                        f"mapping {mapping!r} != {self.mapping!r}")
                 if mismatches:
                     for handle in self._files:
                         handle.close()
@@ -569,34 +554,6 @@ class PendfLibrary:
         group = self._mf10_group(nuclide, mt, lfs, izap)
         return group['energy'][()], group['xs'][()]
 
-    def product(self, nuclide, mt, lfs, izap=None):
-        """Return the baked product name for an MF=10 partial, if mapped.
-
-        Parameters
-        ----------
-        nuclide : str
-            GNDS name of the nuclide.
-        mt : int
-            Reaction MT number.
-        lfs : int
-            Final-level index (LFS).
-        izap : int, optional
-            Product IZAP (``1000*Z + A``) selecting one partial when ``lfs`` is
-            shared by several product nuclides (a lumped reaction such as
-            MT=5). Not needed when the LFS is unique.
-
-        Returns
-        -------
-        str or None
-            GNDS product name if the library was written with a product
-            mapping, otherwise ``None``.
-
-        """
-        group = self._mf10_group(nuclide, mt, lfs, izap)
-        if 'product' in group.attrs:
-            return _attr_str(group.attrs, 'product')
-        return None
-
     def has_ptables(self, nuclide):
         """Return whether the nuclide carries URR probability tables.
 
@@ -664,16 +621,19 @@ class PendfLibrary:
 
     @staticmethod
     def from_endf_directory(pendf_dir, out, library=None, temperature=None,
-                            keep_extra_mts=False, mapping='none',
-                            decay_file=None, elis_rtol=ELIS_RTOL,
-                            elis_atol=ELIS_ATOL):
+                            keep_extra_mts=False):
         """Preprocess a directory of PENDF files into an HDF5 library.
 
         Nuclide identity (Z, A, isomeric state) is always taken from the
         MF=1/MT=451 header and validated against the isomeric state implied by
         the filename (a mismatch warns; the header is trusted). MF=3 cross
         sections are stored per reaction; MF=10 isomeric production cross
-        sections are stored as ``LFS{lfs}`` subgroups of their reaction.
+        sections are stored source-faithfully as ``LFS{lfs}`` subgroups of their
+        reaction (raw IZAP/LFS/QM/QI/ELFS attributes only). No product name is
+        baked onto the partials: the isomer<->LFS product mapping is carried on
+        the depletion chain (built with
+        ``tools/add_pendf_isomeric_branching_to_chain.py``), which is where the
+        collapse sources isomeric row names from.
 
         Parameters
         ----------
@@ -693,21 +653,6 @@ class PendfLibrary:
             Retain non-activation MF=3 reactions (particle production, HEATR
             heating/damage, average secondary quantities, resonance
             parameters). Default is ``False``.
-        mapping : {'none', 'elis', 'lfs_order'}
-            Product-mapping mode for MF=10 partials. ``'none'`` stores only the
-            raw IZAP/LFS/ELFS attributes. ``'elis'`` bakes a product GNDS name
-            onto each partial by matching ELFS (= QM - QI) to decay-library
-            excitation energies (:mod:`openmc.data.isomeric`); ``'lfs_order'``
-            uses the positional FISPACT-like fallback. Both require
-            ``decay_file``.
-        decay_file : str or path-like, optional
-            Decay data used for product mapping (required when ``mapping`` is not
-            ``'none'``). A directory of per-nuclide ENDF decay files or a single
-            concatenated decay file.
-        elis_rtol, elis_atol : float
-            Relative and absolute tolerances for ELFS/ELIS matching
-            (``mapping='elis'``). Default to the values in
-            :mod:`openmc.data.isomeric`.
 
         Returns
         -------
@@ -715,20 +660,11 @@ class PendfLibrary:
             Reader for the file just written.
 
         """
-        cv.check_value('mapping', mapping, ('none', 'elis', 'lfs_order'))
-
         pendf_dir = Path(pendf_dir)
         out = Path(out)
         entries = _discover_pendf_files(pendf_dir)
         if not entries:
             raise ValueError(f"No PENDF files found in {pendf_dir}.")
-
-        decay_lookup = None
-        if mapping != 'none':
-            if decay_file is None:
-                raise ValueError(
-                    f"mapping={mapping!r} requires decay_file.")
-            decay_lookup = parse_decay_isomeric_levels(decay_file)
 
         lib_temperature = temperature
         n_converted = 0
@@ -796,9 +732,7 @@ class PendfLibrary:
                             _write_xy(mtg, tab.x, tab.y)
 
                             # MF=10 isomeric production partials for this reaction
-                            _write_mf10_partials(mtg, ev, mt, name, path,
-                                                 mapping, decay_lookup,
-                                                 elis_rtol, elis_atol)
+                            _write_mf10_partials(mtg, ev, mt, name, path)
 
                         # MF=10 partials are written only alongside their MF=3
                         # sibling (loop above). Warn about any MF=10 reaction
@@ -842,12 +776,6 @@ class PendfLibrary:
                 h5.attrs['temperature'] = float(lib_temperature)
                 h5.attrs['source_path'] = np.bytes_(str(pendf_dir))
                 h5.attrs['created'] = np.bytes_(date.today().isoformat())
-                h5.attrs['mapping'] = np.bytes_(mapping)
-                if mapping != 'none':
-                    h5.attrs['decay_file'] = np.bytes_(str(decay_file))
-                    if mapping == 'elis':
-                        h5.attrs['elis_rtol'] = float(elis_rtol)
-                        h5.attrs['elis_atol'] = float(elis_atol)
                 h5.attrs['openmc_version'] = np.bytes_(openmc.__version__)
 
             os.replace(tmp, out)

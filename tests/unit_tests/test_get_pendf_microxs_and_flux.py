@@ -12,6 +12,7 @@ equals the direct :meth:`MicroXS.from_multigroup_flux` call for that domain
 The duck-typed PENDF library carrying a probability table is reused from
 ``test_deplete_mat_ssf`` -- no data files are required.
 """
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -27,6 +28,11 @@ from tests.unit_tests.test_deplete_mat_ssf import (
 )
 
 N_GROUPS = len(EDGES) - 1  # 3
+
+# The PENDF collapse now always needs a chain. The fake library exposes no MF=10
+# pathways, so the chain is never consulted for naming -- any loadable chain
+# satisfies the requirement.
+CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +123,7 @@ def test_tally_setup_flux_only_explicit_energies():
     with patch.object(model, 'run', side_effect=capture_run):
         with pytest.raises(StopIteration):
             get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib,
+                model, [mat], pendf_library=lib, chain_file=CHAIN_FILE,
                 nuclides=["U238"], reactions=["(n,gamma)"],
                 energies=EDGES,
             )
@@ -151,7 +157,7 @@ def test_tally_setup_energies_default_from_grouped_group_edges():
     with patch.object(model, 'run', side_effect=capture_run):
         with pytest.raises(StopIteration):
             get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib,
+                model, [mat], pendf_library=lib, chain_file=CHAIN_FILE,
                 nuclides=["U238"], reactions=["(n,gamma)"],
                 energies=None,
             )
@@ -165,23 +171,53 @@ def test_tally_setup_energies_default_from_grouped_group_edges():
 # Pre-run validation (all raise BEFORE model.run -- proven by a run spy)
 # ---------------------------------------------------------------------------
 
-def test_dilution_true_with_cell_domains_raises_before_run():
-    """dilution=True requires Material domains; a Cell domain raises pre-run."""
+def test_dilution_true_with_void_cell_raises_before_run():
+    """dilution=True with a void (fill-less) Cell has no composition -> raise
+    pre-run (a material-filled Cell is accepted; see the passing test below)."""
     model = _bare_model()
-    cell = openmc.Cell()
+    cell = openmc.Cell()  # no fill -> void, no single composition
     lib = _fake_library()
     run_spy = Mock()
 
     with patch.object(model, 'run', run_spy):
         with pytest.raises(ValueError,
-                           match="every domain to be an openmc.Material"):
+                           match="filled with a single openmc.Material"):
             get_pendf_microxs_and_flux(
-                model, [cell], pendf_library=lib,
+                model, [cell], pendf_library=lib, chain_file=CHAIN_FILE,
                 nuclides=["U238"], reactions=["(n,gamma)"],
                 energies=EDGES, urr_material_dilution=True,
             )
 
     run_spy.assert_not_called()
+
+
+def test_dilution_true_cell_with_material_fill_resolves_composition():
+    """A Cell filled with a single Material passes the dilution domain check and
+    shields with that fill's composition (the tally domain stays the Cell)."""
+    from openmc.deplete.microxs import _pendf_dilution_material
+
+    mat = _uo2_material(12.5)
+    cell = openmc.Cell(fill=mat)
+
+    # The composition resolver returns the cell's fill Material.
+    assert _pendf_dilution_material(cell) is mat
+    # A bare Material still resolves to itself; a mixed sequence is allowed.
+    assert _pendf_dilution_material(mat) is mat
+
+    # End to end: a material-filled Cell domain drives the collapse without
+    # raising, and its MicroXS equals the direct dilution call with the fill.
+    lib = _fake_library()
+    flux0 = [1.0, 2.0, 3.0]
+    canned = np.array([flux0]).reshape(1, N_GROUPS, 1, 1)
+    model = _bare_model()
+    _, micros = _run_wrapper_with_canned_flux(
+        model, [cell], lib, canned, urr_material_dilution=True)
+
+    direct = MicroXS.from_multigroup_flux(
+        energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
+        nuclides=["U238"], reactions=["(n,gamma)"],
+        pendf_library=_fake_library(), urr_material_dilution=mat)
+    np.testing.assert_array_equal(micros[0].data, direct.data)
 
 
 def test_non_bool_dilution_raises_redirect_before_run():
@@ -256,7 +292,7 @@ def _run_wrapper_with_canned_flux(model, domains, lib, canned, **kwargs):
     with patch.object(model, 'run', return_value='sp.h5'), \
             patch('openmc.deplete.microxs.StatePoint', return_value=fake_sp):
         return get_pendf_microxs_and_flux(
-            model, domains, pendf_library=lib,
+            model, domains, pendf_library=lib, chain_file=CHAIN_FILE,
             nuclides=["U238"], reactions=["(n,gamma)"],
             energies=EDGES, **kwargs)
 
@@ -280,11 +316,11 @@ def test_geq_dilution_on_equals_direct_per_domain():
     np.testing.assert_array_equal(fluxes[1], np.array(flux1))
 
     direct0 = MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=flux0,
+        energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=mat0)
     direct1 = MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=flux1,
+        energies=EDGES, multigroup_flux=flux1, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=mat1)
 
@@ -312,11 +348,11 @@ def test_goff_dilution_off_equals_direct_false_per_domain():
         model, [mat0, mat1], lib, canned, urr_material_dilution=False)
 
     direct0 = MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=flux0,
+        energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=False)
     direct1 = MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=flux1,
+        energies=EDGES, multigroup_flux=flux1, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=False)
 

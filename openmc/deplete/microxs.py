@@ -338,6 +338,67 @@ def get_microxs_and_flux(
     return fluxes, micros
 
 
+def _pendf_dilution_material(domain) -> openmc.Material:
+    """Return the :class:`openmc.Material` shielding ``domain`` for URR dilution.
+
+    A :class:`~openmc.Material` shields with itself; a :class:`~openmc.Cell`
+    shields with its ``fill`` when that fill is a single Material (the tally
+    domain stays the Cell, so the flux is still per-cell). Any other domain -- a
+    Cell filled with void, a Universe, a Lattice or a distributed material, or a
+    non-Material/Cell object -- has no single composition and raises
+    ``ValueError``.
+    """
+    if isinstance(domain, openmc.Material):
+        return domain
+    if isinstance(domain, openmc.Cell):
+        fill = domain.fill
+        if isinstance(fill, openmc.Material):
+            return fill
+        kind = 'void' if fill is None else type(fill).__name__
+        raise ValueError(
+            'urr_material_dilution=True requires each openmc.Cell domain to be '
+            'filled with a single openmc.Material (its composition builds the '
+            f'URR self-shielding sigma_0 background); cell {domain.id} has a '
+            f'{kind} fill, which has no single composition. Pass a '
+            'material-filled cell or a Material, or set '
+            'urr_material_dilution=False.')
+    raise ValueError(
+        'urr_material_dilution=True requires every domain to be an '
+        'openmc.Material or an openmc.Cell filled with a single openmc.Material; '
+        f'got {type(domain).__name__}. Meshes, tally filters, universes and '
+        'lattices have no single composition -- pass materials or '
+        'material-filled cells, or set urr_material_dilution=False.')
+
+
+def _pendf_domain_filters(domains: DomainTypes) -> list:
+    """Build the flux-tally domain filters, one flux per domain in input order.
+
+    Mirrors :func:`get_microxs_and_flux` for a single spatial filter, a
+    :class:`~openmc.MeshBase`, an explicit list of filters, or a homogeneous
+    sequence of materials / cells / universes. A *mixed* Material/Cell sequence
+    (allowed under ``urr_material_dilution``) is handled by emitting one filter
+    per domain so the per-domain flux ordering matches the input sequence.
+    """
+    if isinstance(domains, openmc.Filter):
+        return [domains]
+    if isinstance(domains, openmc.MeshBase):
+        return [openmc.MeshFilter(domains)]
+    if (isinstance(domains, Sequence) and len(domains) > 0
+            and isinstance(domains[0], openmc.Filter)):
+        return list(domains)
+    if all(isinstance(d, openmc.Material) for d in domains):
+        return [openmc.MaterialFilter(domains)]
+    if all(isinstance(d, openmc.Cell) for d in domains):
+        return [openmc.CellFilter(domains)]
+    if all(isinstance(d, openmc.Universe) for d in domains):
+        return [openmc.UniverseFilter(domains)]
+    if all(isinstance(d, (openmc.Material, openmc.Cell)) for d in domains):
+        # Mixed Material/Cell: one filter per domain preserves input order.
+        return [openmc.MaterialFilter([d]) if isinstance(d, openmc.Material)
+                else openmc.CellFilter([d]) for d in domains]
+    raise ValueError(f"Unsupported domain type: {type(domains[0])}")
+
+
 def get_pendf_microxs_and_flux(
     model: openmc.Model,
     domains: DomainTypes,
@@ -374,8 +435,10 @@ def get_pendf_microxs_and_flux(
         group cross sections used for the collapse.
     domains : list of openmc.Material or openmc.Cell or openmc.Universe, or openmc.MeshBase, or openmc.Filter, or list of openmc.Filter
         Domains in which to tally flux, or a spatial tally filter. When
-        ``urr_material_dilution=True`` every domain must be an
-        :class:`openmc.Material` (see that argument).
+        ``urr_material_dilution=True`` every domain must resolve to a single
+        composition -- an :class:`openmc.Material`, or an :class:`openmc.Cell`
+        filled with a single Material (mixed Material/Cell sequences allowed);
+        see that argument.
     pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary
         PENDF cross section library object (duck-typed with ``nuclides``,
         ``reactions(nuclide)`` and ``xs(nuclide, mt)``; a grouped library is
@@ -413,9 +476,14 @@ def get_pendf_microxs_and_flux(
         **bool**: ``True`` shields each domain with **that domain's own
         composition** automatically (via
         :meth:`~openmc.Material.get_nuclide_atom_densities`), so every domain must
-        be an :class:`openmc.Material`; cells, universes, meshes and filters have
-        no single composition and raise ``ValueError``. ``False`` (default)
-        leaves the collapse unchanged. To supply an *explicit* composition
+        resolve to a single composition -- an :class:`openmc.Material` (shields
+        with itself) or an :class:`openmc.Cell` filled with a single Material
+        (shields with its fill; the tally domain stays the Cell, so the flux is
+        per-cell). Mixed Material/Cell sequences are allowed. Universes,
+        lattices, meshes, tally filters and cells with void/universe/lattice/
+        distributed fills have no single composition and raise ``ValueError``.
+        ``False`` (default) leaves the collapse unchanged. To supply an
+        *explicit* composition
         (an :class:`openmc.Material` or ``{nuclide: density}`` mapping) rather
         than each domain's own, call :meth:`MicroXS.from_multigroup_flux`
         directly -- that collapse-level argument takes the Material/mapping form;
@@ -474,21 +542,32 @@ def get_pendf_microxs_and_flux(
         energies = GROUP_STRUCTURES[energies]
 
     # ``urr_material_dilution=True`` shields each domain with its own
-    # composition, so every domain must carry one (be an openmc.Material).
+    # composition. Every domain must therefore resolve to a single Material: a
+    # Material shields with itself, an openmc.Cell with its single-Material fill
+    # (the tally domain stays the Cell, so the flux is per-cell). Mixed
+    # Material/Cell sequences are allowed; meshes, tally filters, universes and
+    # lattices (and cells with void/universe/lattice/distributed fills) have no
+    # single composition and raise. Resolve the per-domain shielding compositions
+    # up front so a bad domain fails before the expensive model.run.
+    dilution_materials = None
     if urr_material_dilution:
-        material_domains = (
-            not isinstance(domains, (openmc.MeshBase, openmc.Filter))
-            and isinstance(domains, Sequence)
-            and len(domains) > 0
-            and all(isinstance(d, openmc.Material) for d in domains))
-        if not material_domains:
+        if (isinstance(domains, (openmc.MeshBase, openmc.Filter))
+                or not isinstance(domains, Sequence) or len(domains) == 0
+                or isinstance(domains[0], openmc.Filter)):
             raise ValueError(
-                'urr_material_dilution=True requires every domain to be an '
-                'openmc.Material: the URR self-shielding sigma_0 background is '
-                "built from each domain's own composition "
-                '(domain.get_nuclide_atom_densities()). Cells, universes, '
-                'meshes and filters have no single composition -- pass '
-                'materials, or set urr_material_dilution=False.')
+                'urr_material_dilution=True requires a sequence of '
+                'openmc.Material or material-filled openmc.Cell domains: the URR '
+                "self-shielding sigma_0 background is built from each domain's "
+                'own composition. Meshes and tally filters have no single '
+                'composition -- pass materials or material-filled cells, or set '
+                'urr_material_dilution=False.')
+        dilution_materials = [_pendf_dilution_material(d) for d in domains]
+
+    # The PENDF collapse always needs the chain (it names the MF=10 pathway
+    # rows). Resolve it once, before the expensive model.run and after the
+    # cheaper argument/domain validation, so a missing chain fails fast; the
+    # resolved Chain is shared across every domain's collapse.
+    chain = _get_pendf_chain(chain_file)
 
     # Save any original tallies on the model
     original_tallies = list(model.tallies)
@@ -496,22 +575,9 @@ def get_pendf_microxs_and_flux(
     # The flux tally's energy filter uses the resolved group structure.
     energy_filter = openmc.EnergyFilter(energies)
 
-    # Build list of domain filters (mirrors get_microxs_and_flux)
-    if isinstance(domains, openmc.Filter):
-        domain_filters = [domains]
-    elif isinstance(domains, openmc.MeshBase):
-        domain_filters = [openmc.MeshFilter(domains)]
-    elif isinstance(domains, Sequence) and len(domains) > 0 and \
-            isinstance(domains[0], openmc.Filter):
-        domain_filters = list(domains)
-    elif isinstance(domains[0], openmc.Material):
-        domain_filters = [openmc.MaterialFilter(domains)]
-    elif isinstance(domains[0], openmc.Cell):
-        domain_filters = [openmc.CellFilter(domains)]
-    elif isinstance(domains[0], openmc.Universe):
-        domain_filters = [openmc.UniverseFilter(domains)]
-    else:
-        raise ValueError(f"Unsupported domain type: {type(domains[0])}")
+    # Build list of domain filters (mirrors get_microxs_and_flux, plus mixed
+    # Material/Cell support for the URR material-dilution path)
+    domain_filters = _pendf_domain_filters(domains)
 
     # One flux-only tally per domain filter -- no reaction-rate tallies.
     flux_tallies = []
@@ -572,17 +638,18 @@ def get_pendf_microxs_and_flux(
         fluxes.extend(flux.squeeze((1, 2)))
 
     # Per-domain collapse against the PENDF library. When dilution is on, each
-    # domain shields with its own composition (the Material object is passed to
-    # the collapse layer); off passes False, an exact no-op relative to the
-    # plain flux-supplied collapse.
+    # domain shields with its own composition (a Material, or a material-filled
+    # Cell's fill -- resolved above); off passes False, an exact no-op relative
+    # to the plain flux-supplied collapse. The chain resolved up front is shared
+    # across every domain (loaded once).
     if urr_material_dilution:
-        dilution_per_domain = list(domains)
+        dilution_per_domain = dilution_materials
     else:
         dilution_per_domain = [False] * len(fluxes)
 
     micros = [
         MicroXS.from_multigroup_flux(
-            energies=energies, multigroup_flux=flux_i, chain_file=chain_file,
+            energies=energies, multigroup_flux=flux_i, chain_file=chain,
             nuclides=nuclides, reactions=reactions, pendf_library=pendf_library,
             urr_material_dilution=dilution, mat_ssf_nuclides=mat_ssf_nuclides)
         for flux_i, dilution in zip(fluxes, dilution_per_domain)
@@ -843,11 +910,95 @@ def _partials_total_max_deviation(total_g, part_sum):
     return worst, int(np.nonzero(nz)[0][dev.argmax()])
 
 
+def _dedupe_base_reactions(reactions: Sequence[str]) -> list[str]:
+    """Strip ``_mN`` product qualifiers and dedupe, preserving first-seen order.
+
+    Product-qualified names (e.g. ``(n,gamma)_m1``) are pathway-expansion
+    *outputs*, not collapse inputs. Reducing a reaction list to its distinct base
+    names keeps ``REACTION_MT[name]`` from raising on a qualified name and lets a
+    chain-defaulted list (which carries qualified reaction types) feed the
+    collapse unchanged.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in reactions:
+        base = _ISOMER_SUFFIX.sub('', name)
+        if base not in seen:
+            seen.add(base)
+            out.append(base)
+    return out
+
+
+def _default_pendf_reactions(chain: Chain) -> list[str]:
+    """Base reaction list for the PENDF collapse defaulted from a chain.
+
+    Strips ``_mN``, dedupes (see :func:`_dedupe_base_reactions`), and drops any
+    reaction the collapse cannot map to an MT (no ``REACTION_MT`` entry) -- an
+    activation chain carries transmutation channels the pointwise collapse does
+    not support -- with a single summary warning. Unlike an explicitly passed
+    reaction list, a defaulted one must not crash the build.
+    """
+    base = _dedupe_base_reactions(chain.reactions)
+    known = [r for r in base if r in REACTION_MT]
+    dropped = [r for r in base if r not in REACTION_MT]
+    if dropped:
+        warn('PENDF collapse skipping depletion-chain reaction(s) with no '
+             f'REACTION_MT mapping: {", ".join(dropped)}.')
+    return known
+
+
+def _get_pendf_chain(chain_file: PathLike | Chain | None) -> Chain:
+    """Resolve the depletion chain required by the PENDF collapse.
+
+    The PENDF collapse always needs a chain: it is the authority for isomeric
+    row names (each MF=10 ``LFS`` partial is bound to the chain reaction carrying
+    that ``pendf_lfs``). Raises a clear error when no chain can be resolved.
+    """
+    if chain_file is None and 'chain_file' not in openmc.config:
+        raise ValueError(
+            'PENDF collapse requires chain_file -- the chain carries the '
+            'isomer<->LFS mapping; build one with '
+            'tools/add_pendf_isomeric_branching_to_chain.py')
+    return _get_chain(chain_file)
+
+
+def _chain_lfs_reactions(chain: Chain, nuc: str, base_reaction: str) -> dict:
+    """Map MF=10 ``LFS`` levels to the chain reactions that consume them.
+
+    Returns ``{pendf_lfs: ReactionTuple}`` for ``nuc``'s chain reactions whose
+    base type (``_mN`` stripped) equals ``base_reaction`` and that carry a
+    ``pendf_lfs``. A nuclide absent from the chain yields an empty map.
+
+    Raises ``ValueError`` if a *qualified* (metastable) reaction for this base
+    carries ``pendf_lfs=None``: such a chain was built without LFS recording and
+    cannot bind MF=10 partials, so it must be regenerated with the patcher tool.
+    An *unqualified* base reaction without an LFS (e.g. a plain total-fallback
+    channel) is simply not bindable and is skipped.
+    """
+    if nuc not in chain:
+        return {}
+    by_lfs = {}
+    for rx in chain[nuc].reactions:
+        if _ISOMER_SUFFIX.sub('', rx.type) != base_reaction:
+            continue
+        if rx.pendf_lfs is None:
+            if _ISOMER_SUFFIX.search(rx.type):
+                raise ValueError(
+                    f'Depletion chain reaction {nuc} {rx.type!r} carries no '
+                    'pendf_lfs, so its MF=10 partials cannot be bound by LFS. '
+                    'This chain was built without LFS recording; regenerate it '
+                    'with tools/add_pendf_isomeric_branching_to_chain.py.')
+            continue
+        by_lfs[rx.pendf_lfs] = rx
+    return by_lfs
+
+
 def _build_xs_table_pendf(
     nuclides: Sequence[str],
     reactions: Sequence[str],
     energies: Sequence[float],
     pendf_library,
+    chain: Chain,
 ) -> _SparseXSTable:
     """Build a sparse group cross section table from a pointwise PENDF library.
 
@@ -858,27 +1009,41 @@ def _build_xs_table_pendf(
     via :func:`_group_average`; all-zero MF=3-total rows (nuclide or reaction
     absent, or a threshold above the group structure) are skipped.
 
-    When the library exposes isomeric pathway data
-    (MF=10 partial cross sections, per the ORIGEN-style "Option A" scheme), a
-    reaction with mapped MF=10 partials is expanded into one row per product
-    isomer instead of the single MF=3 total. The ground product (LISO 0) keeps
-    the canonical reaction name (e.g. ``(n,gamma)``) and each metastable product
-    is product-qualified (``(n,gamma)_m1``); the suffix is the product's LISO.
-    Rows come exclusively from the MF=10 partials -- never from static branching
-    ratios. The result's ``reactions`` axis is the expanded list: for each base
-    reaction in input order, the base name first then its ``_m{n}`` variants in
-    ascending isomer order. Unlike MF=3-total rows, a pathway-expanded partial
-    row is staged even when it group-averages to zero (a metastable threshold
-    above the group structure), so a product-qualified name in the reaction axis
-    reliably marks that the collapse resolved pathways for that reaction.
+    When the library exposes isomeric pathway data (MF=10 partial cross
+    sections, per the ORIGEN-style "Option A" scheme), a reaction is expanded
+    into one row per product isomer instead of the single MF=3 total. **The
+    depletion** ``chain`` **is the row-naming authority**: for base reaction
+    ``R`` (MT) and each ``(lfs, izap)`` from ``pathways(nuclide, mt)``, the
+    partial is bound to ``nuclide``'s chain reaction whose base type is ``R`` and
+    whose ``pendf_lfs`` equals ``lfs``; the row name is that reaction's ``type``
+    (the ground ``LFS 0`` keeps the canonical name ``R``, a metastable is
+    ``R_m{n}``). Rows come exclusively from the MF=10 partials -- never from
+    static branching ratios.
+
+    A partial whose ``lfs`` is absent from the chain cannot be named. Mirroring
+    the historical partially-mapped fallback, if *any* partial of a reaction is
+    unbound the single MF=3 total row is emitted instead of pathway rows, and the
+    unbound ``(nuclide, R, lfs)`` triples are collected into one summary warning
+    per build (directing the user to the chain patcher tool). A chain whose
+    *qualified* reactions carry ``pendf_lfs=None`` (built without LFS recording)
+    is a hard error (see :func:`_chain_lfs_reactions`).
+
+    The result's ``reactions`` axis is the expanded list: for each base reaction
+    in input order, the base name first then its ``_m{n}`` variants in ascending
+    isomer order. Unlike MF=3-total rows, a pathway-expanded partial row is
+    staged even when it group-averages to zero (a metastable threshold above the
+    group structure), so a product-qualified name in the reaction axis reliably
+    marks that the collapse resolved pathways for that reaction.
 
     Parameters
     ----------
     nuclides : sequence of str
         Nuclide names defining the result's nuclide axis.
     reactions : sequence of str
-        Base reaction names. The result's reaction axis contains these plus any
-        product-qualified names emitted from MF=10 partials.
+        Reaction names. Product ``_mN`` qualifiers are stripped and the list is
+        deduped (qualified names are expansion outputs, not inputs); the result's
+        reaction axis contains the base names plus any product-qualified names
+        emitted from MF=10 partials.
     energies : sequence of float
         Ascending energy group boundaries in [eV], length ``n_groups + 1``.
     pendf_library : openmc.data.PendfLibrary
@@ -886,12 +1051,17 @@ def _build_xs_table_pendf(
         names), ``reactions(nuclide)`` (list of MTs with MF=3 data) and
         ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple). Isomeric
         pathway expansion additionally uses ``pathways(nuclide, mt)``
-        (sorted ``(lfs, izap)`` int pairs, ``[]`` if none),
+        (sorted ``(lfs, izap)`` int pairs, ``[]`` if none) and
         ``pathway_xs(nuclide, mt, lfs, izap=None)`` (``(energy, xs)`` of a
-        partial) and ``product(nuclide, mt, lfs, izap=None)`` (baked GNDS
-        product name, ``None`` if the library was written unmapped; ``izap``
-        selects one product of a shared/lumped LFS).
+        partial; ``izap`` selects one product of a shared/lumped LFS).
+    chain : openmc.deplete.Chain
+        Depletion chain supplying isomeric row names (see above). Each MF=10
+        ``LFS`` partial is bound to the chain reaction carrying that
+        ``pendf_lfs``.
     """
+    # Qualified names are expansion outputs, not inputs; reduce to distinct base
+    # reactions so a qualified name never reaches ``REACTION_MT`` (KeyError).
+    reactions = _dedupe_base_reactions(reactions)
     mts = [REACTION_MT[name] for name in reactions]
     energies = np.asarray(energies, dtype=float)
     n_groups = len(energies) - 1
@@ -913,15 +1083,19 @@ def _build_xs_table_pendf(
                 f'library must be collapsed on its own edges (no rebinning). '
                 f'Edge arrays differ (counts and/or values).')
 
-    # Pathway expansion needs all three MF=10 accessors; a library lacking them
+    # Pathway expansion needs both MF=10 accessors; a library lacking them
     # (e.g. an MF=3-only stand-in) transparently falls back to the total row.
     # Grouped libraries expose pre-binned ``pathway_xs_g``; pointwise ones expose
-    # ``pathway_xs``.
+    # ``pathway_xs``. Product names come from the chain, not the library.
     pathways_fn = getattr(pendf_library, 'pathways', None)
     pathway_xs_fn = getattr(
         pendf_library, 'pathway_xs_g' if grouped else 'pathway_xs', None)
-    product_fn = getattr(pendf_library, 'product', None)
-    have_pathways = None not in (pathways_fn, pathway_xs_fn, product_fn)
+    have_pathways = None not in (pathways_fn, pathway_xs_fn)
+
+    # Unbound (nuclide, base reaction, LFS) triples: a library MF=10 partial with
+    # no matching chain reaction. Collected across the whole build so the fallback
+    # to the MF=3 total is reported once, not once per reaction.
+    unbound: list[tuple[str, str, int]] = []
 
     # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
     # ordinals seen per base reaction are collected to build the expanded axis.
@@ -983,42 +1157,41 @@ def _build_xs_table_pendf(
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
-            products = [product_fn(nuc, mt, lfs, izap)
-                        for lfs, izap in pathway_list]
-            if any(p is None for p in products):
-                # Library written with mapping='none': product names are unknown
-                # so pathway rows cannot be named. Fall back to the MF=3 total.
-                # Chain-carried mapping is the B3 integration TODO (plan §1.7:
-                # HDF5-baked mapping supersedes chain mapping; if absent the
-                # chain must carry it). warn() fires once per (nuclide, mt) since
-                # each pair is visited exactly once here.
-                warn(f'PENDF library has MF=10 partials for {nuc} MT={mt} but no '
-                     f'baked product names (mapping=none); emitting the MF=3 '
-                     f'total instead of pathway rows. Use a product-mapped '
-                     f'library to resolve isomeric pathways.')
+            # Bind each library LFS partial to the chain reaction carrying that
+            # ``pendf_lfs``: the chain is the row-naming authority (raises on an
+            # lfs-less chain). ``None`` marks a partial the chain cannot name.
+            lfs_reactions = _chain_lfs_reactions(chain, nuc, name)
+            bound = [lfs_reactions.get(lfs) for lfs, _izap in pathway_list]
+            if any(rx is None for rx in bound):
+                # Mirror the historical partially-mapped fallback: if ANY partial
+                # is unnamed, emit the single MF=3 total row instead of pathway
+                # rows. Collect the unbound triples for one summary warning.
+                for (lfs, _izap), rx in zip(pathway_list, bound):
+                    if rx is None:
+                        unbound.append((nuc, name, lfs))
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
             # A lumped reaction (e.g. MT=5 (n,misc)) can carry MF=10 partials for
-            # several distinct daughter nuclides. Two LFS levels of the SAME
-            # daughter mapping to one isomer row is the designed sum case, but two
-            # DIFFERENT daughters landing on one row would silently sum unrelated
-            # cross sections. Refuse a collapse row (isomer ordinal) claimed by
-            # more than one daughter -- compared by base nuclide, i.e. ignoring
-            # the isomer suffix.
-            row_daughter: dict[int, str] = {}
-            for p in products:
-                base = _ISOMER_SUFFIX.sub('', p)
-                claimed = row_daughter.setdefault(_liso_from_gnds(p), base)
-                if claimed != base:
+            # several distinct daughter nuclides that share an LFS and therefore
+            # bind to one chain reaction. Two LFS levels of the SAME daughter
+            # (same IZAP) summing into one isomer row is the designed case, but
+            # two DIFFERENT daughters (distinct IZAP) landing on one row would
+            # silently sum unrelated cross sections. Refuse a collapse row (chain
+            # reaction) claimed by more than one daughter, identified by IZAP
+            # (= 1000*Z + A, the product nuclide ignoring its isomeric state).
+            row_izap: dict[str, int] = {}
+            for (_lfs, izap), rx in zip(pathway_list, bound):
+                claimed = row_izap.setdefault(rx.type, izap)
+                if claimed != izap:
                     raise ValueError(
                         f'PENDF reaction {nuc} MT={mt} has MF=10 partials for '
-                        f'multiple daughter nuclides ({claimed}, {base}) mapping '
-                        f'to the same collapse row; multi-product lumped channels '
-                        f'(e.g. MT=5 (n,misc)) are not supported as collapse '
-                        f'rows.')
+                        f'multiple daughter nuclides (IZAP {claimed}, {izap}) '
+                        f'mapping to the same collapse row {rx.type!r}; '
+                        f'multi-product lumped channels (e.g. MT=5 (n,misc)) are '
+                        f'not supported as collapse rows.')
 
-            # All partials mapped: one row per product, valued from its MF=10
+            # All partials bound: one row per product, valued from its MF=10
             # partial (never a branching ratio). Consistency-check the partials
             # against the MF=3 total before staging.
             partial_g = []
@@ -1035,13 +1208,23 @@ def _build_xs_table_pendf(
                      f'{part_sum[g]:.6e} b but the MF=3 total is '
                      f'{total_g[g]:.6e} b in group {g} (max relative '
                      f'deviation {worst:.3e} > {CONSISTENCY_RTOL:.0e}).')
-            # Emit ground first, then ascending isomer order
-            for liso, xs_g in sorted(
-                    ((_liso_from_gnds(p), pg)
-                     for p, pg in zip(products, partial_g)),
-                    key=lambda t: t[0]):
-                row_name = name if liso == 0 else f'{name}_m{liso}'
-                stage(nuc_idx, base_idx, row_name, xs_g, keep_zero=True)
+            # Emit ground first, then ascending isomer order; the row name is the
+            # bound chain reaction's type (ground keeps the base name R).
+            for rx, xs_g in sorted(
+                    zip(bound, partial_g),
+                    key=lambda t: _liso_from_gnds(t[0].type)):
+                stage(nuc_idx, base_idx, rx.type, xs_g, keep_zero=True)
+
+    # One summary warning for every MF=10 partial that fell back to the MF=3
+    # total because the chain had no reaction carrying its LFS (emitted once per
+    # build, not per reaction/group).
+    if unbound:
+        summary = ', '.join(f'{n} {r} LFS={lfs}' for n, r, lfs in unbound)
+        warn('PENDF library has MF=10 isomeric partials with no matching '
+             'depletion-chain reaction, so the MF=3 total was emitted instead '
+             f'of pathway rows for: {summary}. Add these isomeric branches to '
+             'the chain with tools/add_pendf_isomeric_branching_to_chain.py to '
+             'resolve them.')
 
     # Build the expanded reaction axis: every base name (always present, so the
     # dense result keeps a column for each requested reaction) followed by its
@@ -1295,6 +1478,9 @@ class MicroXS:
         chain_file : PathLike or Chain, optional
             Path to the depletion chain XML file or an instance of
             openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
+            **Required on the PENDF path** (``pendf_library`` given): the chain
+            supplies the isomer<->LFS mapping that names the MF=10 pathway rows,
+            and a clear error is raised when it cannot be resolved.
         temperature : float, optional
             Temperature for cross section evaluation in [K]. Default 293.6 K.
         nuclides : list of str, optional
@@ -1302,7 +1488,11 @@ class MicroXS:
             nuclides from the depletion chain file are used.
         reactions : list of str, optional
             Reactions to get cross sections for. If not specified, all neutron
-            reactions listed in the depletion chain file are used.
+            reactions listed in the depletion chain file are used. Product
+            ``_mN`` qualifiers are stripped and the list is deduped (qualified
+            names are pathway-expansion outputs, not inputs); on the PENDF path a
+            chain-defaulted list additionally drops channels with no MT mapping
+            with one summary warning.
         cross_sections : PathLike, optional
             Cross section library used to resolve nuclide data availability and
             evaluate cross sections. Defaults to ``openmc.config['cross_sections']``.
@@ -1318,11 +1508,14 @@ class MicroXS:
             :class:`~openmc.data.PendfLibrary` is flat-weighted onto ``energies``
             at runtime, whereas a pre-binned
             :class:`~openmc.data.GroupedPendfLibrary` (matched to ``energies``)
-            is read directly without rebinning. Reactions with mapped isomeric
-            MF=10 partials are always expanded into per-product rows (ground
-            keeps the canonical name; metastable products are qualified, e.g.
-            ``(n,gamma)_m1``), so the returned ``reactions`` axis may contain
-            product-qualified names.
+            is read directly without rebinning. Reactions with isomeric MF=10
+            partials are always expanded into per-product rows, with the row
+            names sourced from ``chain_file`` (each ``LFS`` partial is bound to
+            the chain reaction carrying that ``pendf_lfs``): the ground keeps the
+            canonical name and metastable products are qualified, e.g.
+            ``(n,gamma)_m1``, so the returned ``reactions`` axis may contain
+            product-qualified names. A partial with no matching chain reaction
+            falls back to the MF=3 total (one summary warning).
         urr_material_dilution : openmc.Material or dict or False, optional
             Only valid with ``pendf_library``. Enables the unresolved resonance
             region (URR) material-dilution self-shielding correction: the
@@ -1439,15 +1632,9 @@ class MicroXS:
             if len(flux) != n_groups:
                 raise ValueError('Length of flux array should be len(energies)-1')
 
-        # Default nuclides/reactions from the chain only when needed
-        if not nuclides or reactions is None:
-            chain = _get_chain(chain_file)
-            if not nuclides:
-                nuclides = [nuc.name for nuc in chain.nuclides]
-            if reactions is None:
-                reactions = chain.reactions
-
-        # Build the group cross section table once and collapse every flux
+        # Validate the pendf_library argument combination before loading any
+        # data (the chain below), so an invalid CE-vs-PENDF mix raises its own
+        # clear error rather than a downstream "requires chain_file".
         if pendf_library is not None:
             # The pointwise PENDF path is mutually exclusive with the
             # continuous-energy openmc.lib session path
@@ -1462,8 +1649,32 @@ class MicroXS:
                 raise ValueError(
                     'temperature configures the continuous-energy path and '
                     'cannot be combined with pendf_library')
+
+        # Resolve the depletion chain. The PENDF collapse ALWAYS needs it (it is
+        # the isomer<->LFS row-naming authority; see _build_xs_table_pendf); the
+        # continuous-energy path needs it only to default nuclides/reactions.
+        # Load it once here and share it with both defaulting and the table build.
+        if pendf_library is not None:
+            chain = _get_pendf_chain(chain_file)
+        elif not nuclides or reactions is None:
+            chain = _get_chain(chain_file)
+        else:
+            chain = None
+
+        if chain is not None:
+            if not nuclides:
+                nuclides = [nuc.name for nuc in chain.nuclides]
+            if reactions is None:
+                # A chain-defaulted reaction list carries qualified reaction
+                # types and channels the pointwise collapse cannot map; sanitize
+                # it for the PENDF path (strip _mN, dedupe, drop unmappable).
+                reactions = (_default_pendf_reactions(chain)
+                             if pendf_library is not None else chain.reactions)
+
+        # Build the group cross section table once and collapse every flux
+        if pendf_library is not None:
             table = _build_xs_table_pendf(
-                nuclides, reactions, energies, pendf_library)
+                nuclides, reactions, energies, pendf_library, chain)
             # URR material-dilution self-shielding: multiply the capture/fission
             # rows of flagged resonant nuclides by their per-group factor in the
             # URR-overlapping groups (in place). The =False path is untouched.

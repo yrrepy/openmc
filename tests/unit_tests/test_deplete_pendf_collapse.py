@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from openmc.deplete.chain import Chain
 from openmc.deplete.microxs import (
     MicroXS,
     _SparseXSTable,
@@ -169,9 +170,10 @@ def test_build_xs_table_pendf_skips_absent():
         "U235": {18: (e, np.array([4.0, 4.0]))},   # no (n,gamma)
     })
     edges = np.array([0.0, 1.0e7, 2.0e7])
-    # Request a nuclide that is absent (Gd157) and an MT that is absent for U235
+    # Request a nuclide that is absent (Gd157) and an MT that is absent for U235.
+    # This fake has no MF=10 pathways, so the chain is unused (empty Chain).
     table = _build_xs_table_pendf(
-        ["Gd157", "U235"], ["(n,gamma)", "fission"], edges, fake)
+        ["Gd157", "U235"], ["(n,gamma)", "fission"], edges, fake, Chain())
 
     # Only (U235, fission) survives -> one row mapping to (nuc=1, rxn=1)
     assert table.xs_matrix.shape == (1, 2)
@@ -275,6 +277,6 @@ def test_group_average_vs_tabulated_integral():
 
     # Same values must come out of the sparse-table builder via the duck type
     fake = _FakePendf({"Fe56": {102: (energy, xs)}})
-    table = _build_xs_table_pendf(["Fe56"], ["(n,gamma)"], edges, fake)
+    table = _build_xs_table_pendf(["Fe56"], ["(n,gamma)"], edges, fake, Chain())
     assert table.xs_matrix.shape == (1, len(edges) - 1)
     np.testing.assert_allclose(table.xs_matrix[0], result, rtol=1e-12)

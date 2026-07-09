@@ -20,6 +20,8 @@ import pytest
 from openmc.data import GroupedPendfLibrary
 from openmc.data.pendf_grouped import GROUPED_FORMAT
 from openmc.deplete import MicroXS
+from openmc.deplete.chain import Chain
+from openmc.deplete.nuclide import Nuclide
 from openmc.deplete.microxs import _build_xs_table_pendf
 
 # Load the writer CLI module (tools/ is not a package) by path.
@@ -32,6 +34,23 @@ _spec.loader.exec_module(pgb)
 # (8e6), so both are exercised at a group boundary.
 EDGES = np.array([1e-5, 1e3, 1e6, 5e6, 8e6, 1e7, 2e7])
 REACTIONS = ["(n,gamma)", "(n,p)", "(n,2n)"]  # MTs 102, 103, 16
+
+
+def _groupbin_chain():
+    """Chain binding In115 (n,gamma) MF=10 LFS {0,1,4} to product-qualified rows.
+
+    The collapse now sources isomeric row names from the chain (each MF=10 LFS
+    partial binds to the chain reaction carrying that ``pendf_lfs``), so the
+    grouped-vs-pointwise tests need a chain that names In116 / In116_m1 / In116_m2
+    (LFS 0 / 1 / 4). Only MT102 has partials in the requested REACTIONS.
+    """
+    chain = Chain()
+    nuc = Nuclide("In115")
+    nuc.add_reaction("(n,gamma)", "In116", 0.0, 1.0, pendf_lfs=0)
+    nuc.add_reaction("(n,gamma)_m1", "In116_m1", 0.0, 1.0, pendf_lfs=1)
+    nuc.add_reaction("(n,gamma)_m2", "In116_m2", 0.0, 1.0, pendf_lfs=4)
+    chain.add_nuclide(nuc)
+    return chain
 
 
 def _make_pointwise_h5(path):
@@ -154,10 +173,6 @@ class _PointwiseShim:
         g = self._partial(nuc, mt, lfs, izap)
         return g["energy"][()], g["xs"][()]
 
-    def product(self, nuc, mt, lfs, izap=None):
-        p = self._partial(nuc, mt, lfs, izap).attrs.get("product")
-        return p.decode() if isinstance(p, (bytes, np.bytes_)) else p
-
 
 @pytest.fixture
 def libs(tmp_path):
@@ -173,9 +188,10 @@ def test_bit_exact_table(libs):
     """Grouped collapse reproduces the pointwise table exactly (axes + values)."""
     pointwise, grouped, _ = libs
     nucs = ["In115", "Fe56"]
+    chain = _groupbin_chain()
 
-    ref = _build_xs_table_pendf(nucs, REACTIONS, EDGES, pointwise)
-    got = _build_xs_table_pendf(nucs, REACTIONS, EDGES, grouped)
+    ref = _build_xs_table_pendf(nucs, REACTIONS, EDGES, pointwise, chain)
+    got = _build_xs_table_pendf(nucs, REACTIONS, EDGES, grouped, chain)
 
     assert got.nuclides == ref.nuclides
     assert got.reactions == ref.reactions
@@ -197,30 +213,27 @@ def test_reader_api(libs):
     # pathways() yields sorted (LFS, IZAP) pairs, one per stored partial.
     assert grouped.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
     assert grouped.pathways("In115", 103) == []
-    # A unique LFS resolves with a bare-LFS call (no izap needed).
-    assert grouped.product("In115", 102, 1) == "In116_m1"
+    # A unique LFS resolves its partial with a bare-LFS call (no izap needed).
+    assert grouped.pathway_xs_g("In115", 102, 1).shape == (len(EDGES) - 1,)
     assert grouped.xs_g("In115", 102).shape == (len(EDGES) - 1,)
 
 
 def test_reader_lumped_pathways(libs):
     """A lumped MT (one LFS shared by two product IZAPs) enumerates as repeated
-    (lfs, izap) pairs; product/xs need the izap to disambiguate."""
+    (lfs, izap) pairs; the partial cross section needs the izap to disambiguate."""
     _, grouped, _ = libs
     # MT107 carries LFS0 shared by two daughters -> two pairs at the same LFS.
     assert grouped.pathways("In115", 107) == [(0, 47110), (0, 47112)]
-    # izap selects the product and its partial cross section.
-    assert grouped.product("In115", 107, 0, 47110) == "Ag110"
-    assert grouped.product("In115", 107, 0, 47112) == "Ag112"
+    # izap selects the one partial cross section.
+    assert grouped.pathway_xs_g("In115", 107, 0, 47110).shape == (len(EDGES) - 1,)
     assert grouped.pathway_xs_g("In115", 107, 0, 47112).shape == (len(EDGES) - 1,)
     # A bare-LFS call on the shared LFS is ambiguous -> ValueError naming the
     # candidate IZAPs and telling the caller to pass izap.
     with pytest.raises(ValueError, match="pass izap"):
-        grouped.product("In115", 107, 0)
-    with pytest.raises(ValueError, match="pass izap"):
         grouped.pathway_xs_g("In115", 107, 0)
     # A missing pathway is a KeyError that mentions the izap when one was given.
     with pytest.raises(KeyError, match="IZAP=99999"):
-        grouped.product("In115", 107, 0, 99999)
+        grouped.pathway_xs_g("In115", 107, 0, 99999)
 
 
 def test_zero_partial_row_preserved(libs):
@@ -239,8 +252,9 @@ def test_edge_mismatch_hard_error(libs):
     """Collapsing a grouped library on foreign edges is a hard ValueError."""
     _, grouped, _ = libs
     other = np.array([1e-5, 1e3, 2e7])  # different count -> mismatch
+    # The edge check fires before any naming, so the chain is unused here.
     with pytest.raises(ValueError, match="group edges"):
-        _build_xs_table_pendf(["In115"], REACTIONS, other, grouped)
+        _build_xs_table_pendf(["In115"], REACTIONS, other, grouped, Chain())
 
 
 def test_missing_group_edges_raises_and_closes(tmp_path):
@@ -314,12 +328,13 @@ def test_energies_default_to_group_edges(libs):
     _, grouped, _ = libs
     flux = np.ones(len(EDGES) - 1)
     nucs = ["In115", "Fe56"]
+    chain = _groupbin_chain()
 
     explicit = MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=flux,
+        energies=EDGES, multigroup_flux=flux, chain_file=chain,
         nuclides=nucs, reactions=REACTIONS, pendf_library=grouped)
     default = MicroXS.from_multigroup_flux(
-        multigroup_flux=flux,
+        multigroup_flux=flux, chain_file=chain,
         nuclides=nucs, reactions=REACTIONS, pendf_library=grouped)
 
     assert isinstance(default, MicroXS)
@@ -353,7 +368,7 @@ def test_explicit_mismatched_edges_still_hard_error(libs):
     flux = np.ones(len(other) - 1)
     with pytest.raises(ValueError, match="group edges"):
         MicroXS.from_multigroup_flux(
-            energies=other, multigroup_flux=flux,
+            energies=other, multigroup_flux=flux, chain_file=_groupbin_chain(),
             nuclides=["In115"], reactions=REACTIONS, pendf_library=grouped)
 
 

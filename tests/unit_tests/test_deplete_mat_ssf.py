@@ -9,10 +9,17 @@ an empty mapping) raise ``ValueError``. These tests exercise the normalization
 and the end-to-end correction against a duck-typed PENDF library that carries a
 probability table (no data files required).
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from openmc.deplete.microxs import MicroXS
+
+# The PENDF collapse now always needs a chain. The fake library exposes no MF=10
+# pathways, so the chain is never consulted for naming -- any loadable chain
+# satisfies the requirement.
+CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
 
 
 class _FakePtab:
@@ -95,7 +102,7 @@ def _capture(mx):
 
 def _collapse(**dilution):
     return MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=FLUX,
+        energies=EDGES, multigroup_flux=FLUX, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), **dilution)
 

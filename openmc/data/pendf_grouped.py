@@ -7,10 +7,12 @@ pointwise layout one level deeper: ``/<Nuclide>/MT<mt>/xs_g`` holds the MF=3
 group cross section and ``/<Nuclide>/MT<mt>/LFS<l>/xs_g`` each MF=10 partial,
 all length ``n_groups`` on the shared ``/group_edges`` grid. The class exposes
 the same duck-typed accessor names as the pointwise reader
-(``nuclides``, ``reactions``, ``pathways``, ``product``) plus the grouped
-accessors :meth:`xs_g` and :meth:`pathway_xs_g`, so
+(``nuclides``, ``reactions``, ``pathways``) plus the grouped accessors
+:meth:`xs_g` and :meth:`pathway_xs_g`, so
 :func:`openmc.deplete.microxs._build_xs_table_pendf` can source rows from either
-library without rebinning.
+library without rebinning. Isomeric row names come from the depletion chain (the
+library stores only the raw MF=10 ``LFS``/``IZAP`` attributes, never a baked
+product name).
 
 .. versionadded:: 0.15.4
 """
@@ -158,15 +160,6 @@ class GroupedPendfLibrary:
                 f"Nuclide {nuclide!r} MT={mt} LFS={lfs} is shared by products "
                 f"with IZAP {izaps}; pass izap to select one.")
         return matches[0]
-
-    def product(self, nuclide: str, mt: int, lfs: int, izap=None):
-        """Return the baked GNDS product name for a partial, or ``None``.
-
-        ``izap`` selects among the products of a lumped LFS; omit it for a
-        non-lumped reaction (a unique LFS).
-        """
-        prod = self._partial(nuclide, mt, lfs, izap).attrs.get('product')
-        return _decode(prod) if prod is not None else None
 
     def has_ptables(self, nuclide: str) -> bool:
         """Return whether the nuclide carries URR probability tables.

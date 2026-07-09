@@ -11,7 +11,6 @@ import pytest
 
 import openmc.data
 from openmc.data import Tabulated1D
-from openmc.data.isomeric import ELIS_ATOL, ELIS_RTOL
 from openmc.data.pendf import (PendfLibrary, _check_lin_lin,
                                _discover_pendf_files, _write_mf10_partials,
                                _TENDL_RE)
@@ -25,13 +24,6 @@ _FIXTURES = {
     "Am241": "n-Am241.pendf",
     "In115": "n-In115.pendf",
 }
-
-# Decay library used for ELIS-based product mapping. FISPACT-style directory of
-# per-nuclide ENDF decay files (ground/m1/m2 as separate materials).
-_DECAY_DIR = Path("/home/perry/NukeData/Activation/DecayData/decay_2020")
-
-# Decay files providing product-nuclide level energies for the Am241/In115 bake.
-_DECAY_FILES = ["Am242", "Am242m", "Am242n", "In116", "In116m", "In116n"]
 
 pytestmark = pytest.mark.skipif(
     not _PENDF_DIR.is_dir(),
@@ -197,7 +189,8 @@ def test_roundtrip(tmp_path, evaluations):
     assert sorted(lib.nuclides) == ["Am241", "Fe56", "In115", "W186"]
     assert lib.library == "TENDL-2017"
     assert lib.temperature == pytest.approx(293.16)
-    assert lib.mapping == "none"
+    # De-baked (source-faithful) build writes no mapping root attr.
+    assert lib.mapping is None
 
     # Reopen from disk to exercise the reader path
     reader = PendfLibrary(out)
@@ -221,8 +214,8 @@ def test_roundtrip(tmp_path, evaluations):
             grp = reader._reaction("Am241", 102)[f"LFS{lfs}"]
             assert grp.attrs["ELFS"] == pytest.approx(pqm - pqi)
             assert grp.attrs["IZAP"] == izap
-            # mapping='none' -> no baked product name
-            assert reader.product("Am241", 102, lfs) is None
+            # Source-faithful build: no baked product name on the partial.
+            assert "product" not in grp.attrs
 
         assert reader.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
 
@@ -238,62 +231,63 @@ def test_roundtrip(tmp_path, evaluations):
         reader.close()
 
 
-@pytest.mark.skipif(
-    not _DECAY_DIR.is_dir(),
-    reason=f"Decay data not available at {_DECAY_DIR}",
-)
-def test_elis_mapping_bake(tmp_path):
-    # Isolate the two parents that have MF=10 isomeric production, and a minimal
-    # decay directory holding just their product states.
+def test_raw_mf10_attrs_not_baked(tmp_path):
+    # Source-faithful build: the two parents that carry MF=10 isomeric production
+    # are converted and the result bakes NO product/mapping provenance. The root
+    # has none of the retired mapping/decay_file/elis_* attrs and an LFS subgroup
+    # carries only the raw IZAP/LFS/QM/QI/ELFS attrs -- never a product name.
     src = tmp_path / "pendf"
     src.mkdir()
     for name in ("Am241", "In115"):
         fn = _FIXTURES[name]
         (src / fn).symlink_to(_PENDF_DIR / fn)
 
-    dk = tmp_path / "decay"
-    dk.mkdir()
-    for fn in _DECAY_FILES:
-        (dk / fn).symlink_to(_DECAY_DIR / fn)
-
-    out = tmp_path / "tendl_elis.h5"
+    out = tmp_path / "tendl_raw.h5"
     lib = PendfLibrary.from_endf_directory(
-        src, out, library="TENDL-2017", temperature=293.16,
-        mapping="elis", decay_file=dk)
-
-    # Root-level provenance attrs (frozen schema §4.1)
-    assert lib.mapping == "elis"
-    with h5py.File(out, "r") as f:
-        assert f.attrs["mapping"].decode() == "elis"
-        assert f.attrs["decay_file"].decode() == str(dk)
-        assert f.attrs["elis_rtol"] == pytest.approx(0.50)
-        assert f.attrs["elis_atol"] == pytest.approx(0.0)
-
-    reader = PendfLibrary(out)
+        src, out, library="TENDL-2017", temperature=293.16)
     try:
-        assert reader.mapping == "elis"
-
-        # Am241(n,gamma): LFS 0 -> ground Am242, LFS 2 -> Am242_m1 (ELFS ~48.6 keV,
-        # NOT LISO 2 -- LFS is a level index, LISO comes from ELIS matching).
-        assert reader.pathways("Am241", 102) == [(0, 95242), (2, 95242)]
-        assert reader.product("Am241", 102, 0) == "Am242"
-        assert reader.product("Am241", 102, 2) == "Am242_m1"
-
-        # In115(n,gamma): LFS 0/1/4 -> In116 / In116_m1 (~127.3 keV) / In116_m2
-        # (~289.7 keV). In116_m2 is present in the decay source, so LFS 4 maps.
-        assert reader.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
-        assert reader.product("In115", 102, 0) == "In116"
-        assert reader.product("In115", 102, 1) == "In116_m1"
-        assert reader.product("In115", 102, 4) == "In116_m2"
-
-        # Baked product name lives on the LFS group; raw MF=10 attrs still present
-        grp = reader._reaction("In115", 102)["LFS4"]
-        assert grp.attrs["product"].decode() == "In116_m2"
-        assert grp.attrs["IZAP"] == 49116
-        assert grp.attrs["LFS"] == 4
-        assert grp.attrs["ELFS"] == pytest.approx(289660.0)
+        # A de-baked build writes no mapping root attr.
+        assert lib.mapping is None
     finally:
-        reader.close()
+        lib.close()
+
+    with h5py.File(out, "r") as f:
+        # No baked-product provenance at the root.
+        for key in ("mapping", "decay_file", "elis_rtol", "elis_atol"):
+            assert key not in f.attrs
+
+        # In115(n,gamma) LFS 4 -> In116_m2 (~289.7 keV). The partial keeps its raw
+        # MF=10 attrs (IZAP 49116, LFS 4, ELFS ~289660 eV) but no baked product.
+        grp = f["In115"]["MT102"]["LFS4"]
+        assert "product" not in grp.attrs
+        assert int(grp.attrs["IZAP"]) == 49116
+        assert int(grp.attrs["LFS"]) == 4
+        assert grp.attrs["ELFS"] == pytest.approx(289660.0)
+
+
+def test_reader_ignores_baked_attrs_on_old_file(tmp_path):
+    # Backward compatibility: an OLD baked file carried per-LFS ``product`` attrs
+    # and a legacy ``mapping`` root attr. Synthesize one with ``_mf10_library``
+    # (which stamps both via h5py) and prove the reader opens it cleanly and
+    # neither requires nor chokes on the baked attrs: pathways()/pathway_xs()
+    # still work, the legacy ``mapping`` root attr is read back informationally,
+    # and the stamped ``product`` attr survives untouched at the h5py level.
+    out = _mf10_library(tmp_path, "Xx100", _LUMPED_MT, _LUMPED_SUBS,
+                        products=_LUMPED_PRODUCTS)
+    with PendfLibrary(out) as lib:
+        # Legacy ``mapping`` root attr is read back (informational only).
+        assert lib.mapping == "none"
+        assert lib.pathways("Xx100", _LUMPED_MT) == [(0, 47108), (0, 48108)]
+        _e, xs = lib.pathway_xs("Xx100", _LUMPED_MT, 0, izap=47108)
+        np.testing.assert_array_equal(xs, [2.0, 4.0])
+
+    # The baked product attrs remain on disk (the reader neither strips nor needs
+    # them); only reachable at the h5py level now that product() is gone.
+    with h5py.File(out, "r") as f:
+        g = f["Xx100"]["MT5"]
+        stamped = {int(g[k].attrs["IZAP"]): g[k].attrs["product"].decode()
+                   for k in g if k.startswith("LFS")}
+        assert stamped == {47108: "Ag108", 48108: "Cd108"}
 
 
 def _write_garbage(path):
@@ -427,8 +421,7 @@ def test_mf10_shared_lfs_distinct_izap(tmp_path):
         warnings.simplefilter("always")
         with h5py.File(tmp_path / "t.h5", "w") as f:
             mtg = f.create_group(f"MT{mt}")
-            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"),
-                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"))
 
             # Both partials stored under IZAP-disambiguated names.
             assert sorted(mtg.keys()) == ["LFS0_ZAP451230", "LFS0_ZAP461230"]
@@ -457,8 +450,7 @@ def test_mf10_true_izap_lfs_duplicate(tmp_path):
         mtg = f.create_group(f"MT{mt}")
         with pytest.warns(UserWarning,
                           match=r"duplicate MF=10 partial \(IZAP=451230, LFS=0\)"):
-            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"),
-                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+            _write_mf10_partials(mtg, ev, mt, "Xx100", Path("n-Xx100.pendf"))
 
         # Only the first partial survives, under the plain LFS name (a duplicate
         # must not make the survivor's LFS look shared).
@@ -481,8 +473,7 @@ def test_mf10_unique_lfs_schema_compatible(tmp_path):
         warnings.simplefilter("always")
         with h5py.File(tmp_path / "t.h5", "w") as f:
             mtg = f.create_group(f"MT{mt}")
-            _write_mf10_partials(mtg, ev, mt, "Am241", Path("n-Am241.pendf"),
-                                 "none", None, ELIS_RTOL, ELIS_ATOL)
+            _write_mf10_partials(mtg, ev, mt, "Am241", Path("n-Am241.pendf"))
 
             assert sorted(mtg.keys()) == ["LFS0", "LFS2"]
             assert int(mtg["LFS2"].attrs["LFS"]) == 2
@@ -495,20 +486,21 @@ def test_mf10_unique_lfs_schema_compatible(tmp_path):
 # ---------------------------------------------------------------------------
 # Read-back tests for the (lfs, izap) partial accessors. A lumped reaction can
 # store several MF=10 partials that share an LFS but describe different product
-# nuclides; pathways() must enumerate each, and pathway_xs()/product() must be
-# able to pick one by IZAP. Fixtures are minimal PendfLibrary-openable files
-# built through the real _write_mf10_partials writer.
+# nuclides; pathways() must enumerate each, and pathway_xs() must be able to
+# pick one by IZAP. Fixtures are minimal PendfLibrary-openable files built
+# through the real _write_mf10_partials writer.
 
 
 def _mf10_library(tmp_path, nuclide, mt, subs, mapping="none", products=None):
     """Write a minimal PendfLibrary-openable .h5 with one MF=10 reaction.
 
     ``subs`` (the ``_fake_mf10_evaluation`` format) is written through the real
-    ``_write_mf10_partials`` under a single nuclide/MT group. ``products`` maps
-    IZAP -> baked product name and, when given, stamps a ``product`` attr onto
-    each partial so product() can be exercised without the decay-mapping
-    machinery (that baking is covered by test_elis_mapping_bake). Returns the
-    file path.
+    ``_write_mf10_partials`` under a single nuclide/MT group. To synthesize an
+    OLD baked file (so the reader's tolerance of retired attrs can be exercised),
+    ``mapping`` is written as the legacy ``mapping`` root attr and ``products``,
+    when given, maps IZAP -> product name and manually stamps a ``product`` attr
+    onto each partial via h5py -- neither is produced by the current writer.
+    Returns the file path.
     """
     ev = _fake_mf10_evaluation(mt, subs)
     out = tmp_path / f"{nuclide}.h5"
@@ -518,8 +510,7 @@ def _mf10_library(tmp_path, nuclide, mt, subs, mapping="none", products=None):
         f.attrs["temperature"] = 293.16
         f.attrs["mapping"] = np.bytes_(mapping)
         mtg = f.create_group(nuclide).create_group(f"MT{mt}")
-        _write_mf10_partials(mtg, ev, mt, nuclide, Path(f"n-{nuclide}.pendf"),
-                             mapping, None, ELIS_RTOL, ELIS_ATOL)
+        _write_mf10_partials(mtg, ev, mt, nuclide, Path(f"n-{nuclide}.pendf"))
         if products:
             for k in mtg:
                 if k.startswith("LFS"):
@@ -547,8 +538,8 @@ def test_pathways_lumped_repeats_lfs(tmp_path):
 
 
 def test_pathway_lumped_izap_selects_partial(tmp_path):
-    # (b) With izap=, pathway_xs()/product() resolve the shared LFS to the one
-    # matching partial and return its cross section / baked product name.
+    # (b) With izap=, pathway_xs() resolves the shared LFS to the one matching
+    # partial and returns its cross section.
     out = _mf10_library(tmp_path, "Xx100", _LUMPED_MT, _LUMPED_SUBS,
                         products=_LUMPED_PRODUCTS)
     with PendfLibrary(out) as lib:
@@ -556,8 +547,6 @@ def test_pathway_lumped_izap_selects_partial(tmp_path):
         np.testing.assert_array_equal(xs, [2.0, 4.0])
         _e, xs = lib.pathway_xs("Xx100", _LUMPED_MT, 0, izap=48108)
         np.testing.assert_array_equal(xs, [0.5, 0.25])
-        assert lib.product("Xx100", _LUMPED_MT, 0, izap=47108) == "Ag108"
-        assert lib.product("Xx100", _LUMPED_MT, 0, izap=48108) == "Cd108"
         # An LFS/IZAP pair that is not stored still raises, naming the izap.
         with pytest.raises(KeyError, match="LFS=0, IZAP=999"):
             lib.pathway_xs("Xx100", _LUMPED_MT, 0, izap=999)
@@ -573,14 +562,12 @@ def test_pathway_lumped_ambiguous_without_izap(tmp_path):
                 ValueError,
                 match=r"shared by IZAP values.*47108.*48108.*izap="):
             lib.pathway_xs("Xx100", _LUMPED_MT, 0)
-        with pytest.raises(ValueError, match=r"shared by IZAP values.*izap="):
-            lib.product("Xx100", _LUMPED_MT, 0)
 
 
 def test_pathway_non_lumped_bare_lfs_unchanged(tmp_path):
     # (d) A non-lumped reaction (each LFS unique): bare-LFS pathways()/
-    # pathway_xs()/product() behave exactly as before -- no izap needed -- and a
-    # missing LFS raises the same KeyError.
+    # pathway_xs() behave exactly as before -- no izap needed -- and a missing
+    # LFS raises the same KeyError.
     mt = 102
     subs = [
         (0.0, 0.0, 95242, 0, [(1.0, 2.0)]),
@@ -591,7 +578,6 @@ def test_pathway_non_lumped_bare_lfs_unchanged(tmp_path):
         assert lib.pathways("Am241", mt) == [(0, 95242), (2, 95242)]
         _e, xs = lib.pathway_xs("Am241", mt, 2)
         np.testing.assert_array_equal(xs, [3.0])
-        assert lib.product("Am241", mt, 0) is None
         with pytest.raises(KeyError, match="no MF=10 partial LFS=9"):
             lib.pathway_xs("Am241", mt, 9)
 
