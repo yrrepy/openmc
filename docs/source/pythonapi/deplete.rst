@@ -69,14 +69,12 @@ cross sections. The following function can be used to generate this information:
 
 A depletion chain whose reactions follow the isomeric production pathways of a
 preprocessed PENDF library (rather than tabulated branching ratios) can be built
-with:
-
-.. autosummary::
-   :toctree: generated
-   :nosignatures:
-   :template: myfunction.rst
-
-   pendf_chain.chain_from_pendf
+by patching an existing chain with the
+``tools/add_pendf_isomeric_branching_to_chain.py`` command-line tool. It reads
+MF=10 isomeric production cross sections from a PENDF HDF5 library (or a
+directory of ASC PENDF tapes), maps each metastable final level to the correct
+``_m{n}`` product via decay-library excitation-energy matching, and writes the
+folded ``<isomeric_branching>`` chain form.
 
 Minimal Example
 ---------------

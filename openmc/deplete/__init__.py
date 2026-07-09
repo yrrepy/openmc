@@ -7,7 +7,6 @@ A depletion front-end tool.
 
 from .nuclide import *
 from .chain import *
-from .pendf_chain import *
 from .openmc_operator import *
 from .coupled_operator import *
 from .independent_operator import *

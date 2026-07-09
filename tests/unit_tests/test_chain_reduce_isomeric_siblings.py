@@ -163,8 +163,3 @@ def test_reduce_after_add_nuclide_respects_new_sibling():
     assert nuclide_names == {'Ag108', 'Ag109', 'Ag109_m1', 'Ag109_m2'}
     # The family mapping must not persist on the chain between reductions.
     assert not hasattr(chain, '_isomeric_families')
-
-
-def test_chain_from_pendf_exported():
-    """chain_from_pendf is re-exported at the openmc.deplete package level."""
-    assert hasattr(openmc.deplete, 'chain_from_pendf')

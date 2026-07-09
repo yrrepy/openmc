@@ -188,6 +188,28 @@ def _discover_pendf_files(pendf_dir):
     return files
 
 
+def _iter_mf10_partials(ev, mt, name):
+    """Yield the MF=10 isomeric-production partials of reaction ``mt``.
+
+    Each yielded tuple is ``(QM, QI, IZAP, LFS, tab)`` -- the partial's mass-
+    difference Q, level Q, product ZA identifier, final-level index, and the
+    TAB1 (energy, xs) record. Yields nothing when the evaluation has no MF=10
+    section for ``mt``. Every partial is checked for lin-lin interpolation.
+
+    Shared by :func:`_write_mf10_partials` (HDF5 build) and the ASC-tape source
+    adapter in ``tools/add_pendf_isomeric_branching_to_chain.py`` so the ENDF-6
+    record parsing lives in one place.
+    """
+    if (10, mt) not in ev.section:
+        return
+    fo = io.StringIO(ev.section[10, mt])
+    _, _, _lis, _liso, ns, _ = get_head_record(fo)
+    for _ in range(ns):
+        (pqm, pqi, izap, lfs), ptab = get_tab1_record(fo)
+        _check_lin_lin(name, 10, mt, ptab)
+        yield pqm, pqi, izap, lfs, ptab
+
+
 def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
                          elis_rtol, elis_atol):
     """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
@@ -200,16 +222,9 @@ def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
     lumped TENDL MT=5 -- is disambiguated as ``LFS{lfs}_ZAP{izap}``. A true
     ``(IZAP, LFS)`` duplicate warns and is skipped.
     """
-    if (10, mt) not in ev.section:
+    partials = list(_iter_mf10_partials(ev, mt, name))
+    if not partials:
         return
-
-    fo = io.StringIO(ev.section[10, mt])
-    _, _, _lis, _liso, ns, _ = get_head_record(fo)
-    partials = []
-    for _ in range(ns):
-        (pqm, pqi, izap, lfs), ptab = get_tab1_record(fo)
-        _check_lin_lin(name, 10, mt, ptab)
-        partials.append((pqm, pqi, izap, lfs, ptab))
 
     # Drop true (IZAP, LFS) duplicates, keeping the first occurrence. Uniqueness
     # of an LFS is decided from the distinct (IZAP, LFS) pairs below, so a
