@@ -4,6 +4,7 @@ Contains the per-nuclide components of a depletion chain.
 """
 
 import bisect
+import re
 from collections.abc import Mapping
 from collections import namedtuple, defaultdict
 from warnings import warn
@@ -80,6 +81,78 @@ try:
     ReactionTuple.pendf_lfs.__doc__ = None
 except AttributeError:
     pass
+
+
+# Trailing metastable qualifier, e.g. the '_m1' in the product name 'In116_m1'
+# or in the product-qualified reaction type '(n,gamma)_m1'. The captured group
+# is the isomer ordinal used when folding/unfolding <isomeric_branching>.
+_ISOMER_SUFFIX = re.compile(r'_m(\d+)$')
+
+
+def _isomer_ordinal(name):
+    """Return the ``_m<n>`` isomer ordinal of a name, or 0 when it has none."""
+    match = _ISOMER_SUFFIX.search(name)
+    return int(match.group(1)) if match else 0
+
+
+def _unfold_isomeric_branching(base_type, iso_elem, elem_Q):
+    """Expand a folded ``<isomeric_branching>`` child into ReactionTuples.
+
+    Each index-parallel list entry becomes one qualified
+    :class:`ReactionTuple`. The ground pathway keeps ``base_type``; a metastable
+    pathway gets an ``_m<n>`` suffix where ``n`` is the isomer ordinal parsed
+    from the *target* name (not the LFS value). See the Phase 1 chain spec.
+
+    Parameters
+    ----------
+    base_type : str
+        Reaction type from the parent ``<reaction>`` element, e.g. ``'(n,gamma)'``.
+    iso_elem : lxml.etree._Element
+        The ``<isomeric_branching>`` child.
+    elem_Q : float
+        Q value on the parent element, used as the per-entry fallback when the
+        child omits ``q_values``.
+    """
+    targets = get_text(iso_elem, "targets", "").split()
+
+    # LFS list: canonical 'pendf_lfs', or the GENDF-convention 'gendf_lfs'.
+    lfs_text = iso_elem.get("pendf_lfs")
+    if lfs_text is None:
+        lfs_text = iso_elem.get("gendf_lfs")
+    lfs_vals = [int(v) for v in lfs_text.split()] if lfs_text is not None else None
+    if lfs_vals is not None and len(lfs_vals) != len(targets):
+        warn(f"isomeric_branching LFS count ({len(lfs_vals)}) != target count "
+             f"({len(targets)}) for reaction '{base_type}'; ignoring LFS")
+        lfs_vals = None
+
+    # Per-entry Q values, else the element Q (or 0.0) applies to every entry.
+    q_text = iso_elem.get("q_values")
+    q_vals = [float(v) for v in q_text.split()] if q_text is not None else None
+    if q_vals is not None and len(q_vals) != len(targets):
+        warn(f"isomeric_branching q_values count ({len(q_vals)}) != target "
+             f"count ({len(targets)}) for reaction '{base_type}'; using element Q")
+        q_vals = None
+
+    reactions = []
+    for i, target in enumerate(targets):
+        lfs = lfs_vals[i] if lfs_vals is not None else None
+        Q = q_vals[i] if q_vals is not None else elem_Q
+
+        # Ground vs metastable: keyed on LFS when known, else the target suffix.
+        ordinal = _isomer_ordinal(target)
+        is_ground = (lfs == 0) if lfs is not None else (ordinal == 0)
+        if is_ground:
+            r_type = base_type
+        elif ordinal == 0:
+            raise ValueError(
+                f"isomeric_branching entry with lfs={lfs} for reaction "
+                f"'{base_type}' has target '{target}' without an _m<n> isomer "
+                "suffix")
+        else:
+            r_type = f"{base_type}_m{ordinal}"
+        reactions.append(ReactionTuple(r_type, target, Q, 1.0, lfs))
+
+    return reactions
 
 
 class Nuclide:
@@ -265,6 +338,18 @@ class Nuclide:
         # Check for reaction paths
         for reaction_elem in element.iter('reaction'):
             r_type = get_text(reaction_elem, "type")
+
+            # Folded canonical form: an <isomeric_branching> child carries all
+            # pathways (ground + metastables) in index-parallel lists. Unfold it
+            # into one qualified ReactionTuple per entry; the element Q/target
+            # are ignored (the child is authoritative) beyond the Q fallback.
+            iso_elem = reaction_elem.find('isomeric_branching')
+            if iso_elem is not None:
+                elem_Q = float(get_text(reaction_elem, "Q", 0.0))
+                nuc.reactions.extend(
+                    _unfold_isomeric_branching(r_type, iso_elem, elem_Q))
+                continue
+
             Q = float(get_text(reaction_elem, "Q", 0.0))
             branching_ratio = float(get_text(reaction_elem, "branching_ratio", 1.0))
 
@@ -340,16 +425,59 @@ class Nuclide:
                 elem.append(src_elem)
 
         elem.set('reactions', str(len(self.reactions)))
+
+        # Refold isomeric pathway groups into the canonical type-only
+        # <reaction> + <isomeric_branching> form. Folding demands complete,
+        # unambiguous pathway data: a product-qualified member plus a target
+        # and a DISTINCT known LFS on every member. Legacy chains can carry
+        # duplicate per-level entries (same base type, several Q values, no
+        # LFS) alongside the qualified pair -- those groups, and any group
+        # with missing data, serialize stock so the round trip is lossless.
+        grouped = defaultdict(list)
         for rx in self.reactions:
-            rx_elem = ET.SubElement(elem, 'reaction')
-            rx_elem.set('type', rx.type)
-            rx_elem.set('Q', str(rx.Q))
-            if rx.target is not None:
-                rx_elem.set('target', rx.target)
-            if rx.branching_ratio != 1.0:
-                rx_elem.set('branching_ratio', str(rx.branching_ratio))
-            if rx.pendf_lfs is not None:
-                rx_elem.set('pendf_lfs', str(rx.pendf_lfs))
+            grouped[_ISOMER_SUFFIX.sub('', rx.type)].append(rx)
+
+        def _foldable(group):
+            if not any(_ISOMER_SUFFIX.search(rx.type) for rx in group):
+                return False
+            if any(rx.target is None or rx.pendf_lfs is None for rx in group):
+                return False
+            lfs = [rx.pendf_lfs for rx in group]
+            return len(set(lfs)) == len(lfs)
+
+        foldable = {base for base, group in grouped.items()
+                    if _foldable(group)}
+
+        # Emit in original reaction order; a folded group appears once, at its
+        # first member's position.
+        emitted = set()
+        for rx in self.reactions:
+            base_type = _ISOMER_SUFFIX.sub('', rx.type)
+            if base_type in foldable:
+                if base_type in emitted:
+                    continue
+                emitted.add(base_type)
+                ordered = sorted(grouped[base_type],
+                                 key=lambda r: r.pendf_lfs)
+                rx_elem = ET.SubElement(elem, 'reaction')
+                rx_elem.set('type', base_type)
+                iso_elem = ET.SubElement(rx_elem, 'isomeric_branching')
+                iso_elem.set('targets',
+                             ' '.join(r.target for r in ordered))
+                iso_elem.set('pendf_lfs',
+                             ' '.join(str(r.pendf_lfs) for r in ordered))
+                iso_elem.set('q_values',
+                             ' '.join(str(r.Q) for r in ordered))
+            else:
+                rx_elem = ET.SubElement(elem, 'reaction')
+                rx_elem.set('type', rx.type)
+                rx_elem.set('Q', str(rx.Q))
+                if rx.target is not None:
+                    rx_elem.set('target', rx.target)
+                if rx.branching_ratio != 1.0:
+                    rx_elem.set('branching_ratio', str(rx.branching_ratio))
+                if rx.pendf_lfs is not None:
+                    rx_elem.set('pendf_lfs', str(rx.pendf_lfs))
 
         if self.yield_data:
             fpy_elem = ET.SubElement(elem, 'neutron_fission_yields')

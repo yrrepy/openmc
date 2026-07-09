@@ -3,9 +3,10 @@
 
 #include "openmc/chain.h"
 
-#include <cstdlib> // for getenv
-#include <memory>  // for make_unique
-#include <string>  // for stod
+#include <cstdlib>   // for getenv
+#include <memory>    // for make_unique
+#include <stdexcept> // for invalid_argument
+#include <string>    // for stod
 
 #include <fmt/core.h>
 #include <pugixml.hpp>
@@ -42,7 +43,17 @@ ChainNuclide::ChainNuclide(pugi::xml_node node)
       branching_ratio =
         std::stod(get_node_value(reaction_node, "branching_ratio"));
     }
-    int mt = reaction_mt(rx_name);
+    int mt;
+    try {
+      mt = reaction_mt(rx_name);
+    } catch (const std::invalid_argument&) {
+      // Legacy product-qualified chain types (e.g. "(n,gamma)_m1") have no MT
+      // number. Skip them defensively so the chain still loads; canonical
+      // folded chains carry such pathways in target-less type-only elements,
+      // which are already skipped by the target check above.
+      warning("Skipping unknown reaction type '" + rx_name + "' in chain file");
+      continue;
+    }
     reaction_products_[mt].push_back({rx_target, branching_ratio});
   }
 

@@ -241,9 +241,13 @@ def test_record_lfs_xml_roundtrip(tmp_path, small_chain_lfs):
     path = tmp_path / "pendf_chain_lfs.xml"
     small_chain_lfs.export_to_xml(path)
 
-    # The mark is written as the last attribute on the reaction element.
-    assert ('<reaction type="(n,gamma)_m2" Q="6495070.0" target="In116_m2"'
-            ' pendf_lfs="4"/>') in path.read_text()
+    # The In115 (n,gamma) pathways refold into one type-only element whose
+    # isomeric_branching child lists targets/LFS/Q in ascending-LFS order
+    # (In116_m2 sits at LFS 4).
+    xml_text = path.read_text()
+    assert 'targets="In116 In116_m1 In116_m2"' in xml_text
+    assert 'pendf_lfs="0 1 4"' in xml_text
+    assert '6495070.0' in xml_text  # In116_m2 Q value in q_values
 
     reread = Chain.from_xml(path)
     assert _reaction_lfs(reread, "In115") == _reaction_lfs(small_chain_lfs, "In115")

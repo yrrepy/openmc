@@ -211,8 +211,10 @@ def test_pendf_lfs_absent_defaults_none(simple_chain):
 
 
 def test_pendf_lfs_xml_roundtrip(run_in_tmpdir):
-    """The informational ``pendf_lfs`` field survives an XML round-trip and is
-    written only for MF=10-backed reactions."""
+    """The informational ``pendf_lfs`` field survives an XML round-trip. The
+    two MF=10-backed pathways refold into a single type-only ``<reaction>``
+    with an ``<isomeric_branching>`` child (Phase 1 canonical form); the
+    fallback ``(n,p)`` stays a stock element."""
     filename = 'pendf_lfs_{}.xml'.format(comm.rank)
 
     parent = nuclide.Nuclide("In115")
@@ -226,11 +228,13 @@ def test_pendf_lfs_xml_roundtrip(run_in_tmpdir):
     chain.export_to_xml(filename)
 
     xml_text = Path(filename).read_text()
-    # Written as the last attribute, only for the MF=10-backed reactions.
-    assert ('<reaction type="(n,gamma)_m1" Q="6657460.0" target="In116_m1"'
-            ' pendf_lfs="1"/>') in xml_text
-    assert 'pendf_lfs="0"' in xml_text
-    # The fallback reaction carries no attribute.
+    # The (n,gamma) ground + m1 pathways fold into one type-only element with
+    # LFS-ordered parallel lists on the isomeric_branching child.
+    assert 'type="(n,gamma)"' in xml_text
+    assert 'targets="In116 In116_m1"' in xml_text
+    assert 'pendf_lfs="0 1"' in xml_text
+    assert 'q_values="6784730.0 6657460.0"' in xml_text
+    # The fallback reaction has no isomeric pathway -> stock element.
     assert '<reaction type="(n,p)" Q="0.0" target="Cd115"/>' in xml_text
 
     reread = Chain.from_xml(filename)
