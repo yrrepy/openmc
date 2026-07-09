@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from warnings import warn
 
@@ -204,6 +205,7 @@ def main():
     parser.add_argument('--mts',      type=int,   default=None, nargs='+', help='Explicit MT override list (default: chain-relevant MTs)')
     parser.add_argument('--nuclides', type=str,   default=None, nargs='+', help='Subset of nuclides to bin (default: all)')
     parser.add_argument('--force',    action='store_true',            help='Overwrite --out if it already exists (default: refuse)')
+    parser.add_argument('--log-file', type=Path,  default=None,       help='Write a warning-summary log (counts + top-10 partials-vs-total offenders) here')
     args = parser.parse_args()
 
     edges = _resolve_edges(args.edges, args.groups)
@@ -235,9 +237,21 @@ def main():
     except OSError as exc:
         parser.error(f'cannot open output file {args.out} for writing: {exc}')
 
-    bin_pendf_library(
-        args.pendf_in, args.out, edges, dtype=args.dtype,
-        mts=args.mts, nuclides=args.nuclides)
+    # Capture binning warnings only when a log is requested; otherwise the hook
+    # is never installed so default behaviour is unchanged.
+    if args.log_file is not None:
+        from pendf_warning_log import WarningCapture, write_warning_log
+        capture = WarningCapture()
+    else:
+        capture = None
+
+    with (capture if capture is not None else nullcontext()):
+        bin_pendf_library(
+            args.pendf_in, args.out, edges, dtype=args.dtype,
+            mts=args.mts, nuclides=args.nuclides)
+
+    if capture is not None:
+        write_warning_log(args.log_file, capture)
 
 
 if __name__ == '__main__':
