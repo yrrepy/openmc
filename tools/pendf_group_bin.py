@@ -167,6 +167,12 @@ def bin_pendf_library(
                              f'relative deviation {worst:.3e} > '
                              f'{CONSISTENCY_RTOL:.0e}).')
 
+            # Carry the URR probability tables through verbatim: they are
+            # energy-pointwise (the collapse folds them onto groups at runtime),
+            # so a recursive copy preserves them bit-for-bit in the grouped file.
+            if 'urr' in src_nuc:
+                src.copy(src_nuc['urr'], dst_nuc, name='urr')
+
     wall = time.perf_counter() - t0
     print(f'Wrote {rows} rows to {out}: worst Sum(partials)-vs-total deviation '
           f'{worst_dev:.3e} ({n_warnings} > {CONSISTENCY_RTOL:.0e}), '

@@ -29,7 +29,7 @@ import numpy as np
 import openmc
 import openmc.checkvalue as cv
 from .data import gnds_name
-from .endf import Evaluation, get_head_record, get_tab1_record
+from .endf import Evaluation, get_head_record, get_list_record, get_tab1_record
 from .isomeric import (ELIS_ATOL, ELIS_RTOL, map_lfs_to_liso,
                        parse_decay_isomeric_levels)
 
@@ -261,6 +261,71 @@ def _write_mf10_partials(mtg, ev, mt, name, path, mapping, decay_lookup,
                 izap // 1000, izap % 1000,
                 lfs_to_liso[izap, lfs]))
         _write_xy(lg, ptab.x, ptab.y)
+
+
+# MF=2 MT=153 (NJOY PURR) probability-table layout: each URR energy carries a
+# leading energy value followed by six band columns -- probability, total,
+# elastic, fission, capture, heating -- so NPL = NUNR * (1 + 6*NBAND).
+_URR_PTABLE_COLS = 6
+
+
+def _write_urr_ptables(nuc, ev, name, path):
+    """Ingest MF=2 MT=153 probability tables into <nuclide>/urr/<Tkey>/."""
+    if (2, 153) not in ev.section:
+        return
+    fo = io.StringIO(ev.section[2, 153])
+    # HEAD: N1 = #xs columns (5), N2 = #bands (NBAND=20)
+    _za, _awr, _l1, _l2, _n1, nband = get_head_record(fo)
+    # LIST: C1 = temperature [K], L1 = LSSF flag, N2 = #URR energies (NUNR).
+    # LSSF (self-shielding flag, carried through from MF=2 MT=151) governs the
+    # band convention: 0 -> bands are ABSOLUTE cross sections; 1 -> bands are
+    # FACTORS relative to the smooth (infinite-dilution) MF=3 cross section.
+    # Empirically verified across all 24 JEFF-3.3 flagged nuclides (LIST L1 is
+    # the only record field matching the 5/19 absolute/factor split): LSSF=0 for
+    # W182/183/184/186 & Ta181, LSSF=1 for the other 19. Cross-checked against
+    # the data (prob-weighted band-total ~1 iff factor-form). The fold needs this
+    # to know whether to multiply the bands by the smooth XS (mat_ssf.py).
+    (temp, _c2, lssf, _ll2, npl, nunr), values = get_list_record(fo)
+    per_energy = 1 + _URR_PTABLE_COLS * nband
+    if nunr <= 0 or nband <= 0 or npl != nunr * per_energy:
+        warn(f"{path.name}: {name} MF=2 MT=153 NPL={npl} incompatible with "
+             f"NUNR={nunr}, NBAND={nband}; skipping probability tables.")
+        return
+    block = np.asarray(values, dtype=np.float64).reshape(nunr, per_energy)
+    energy = np.array(block[:, 0], dtype=np.float64)                    # eV
+    table = block[:, 1:].reshape(nunr, _URR_PTABLE_COLS, nband).copy()  # col-major
+    # OpenMC stores CUMULATIVE probability in column 0; ENDF gives raw per-band.
+    table[:, 0, :] = np.cumsum(table[:, 0, :], axis=1)
+    grp = nuc.create_group(f'urr/{round(float(temp))}K')
+    grp.attrs['interpolation'] = 2
+    grp.attrs['inelastic'] = -1
+    grp.attrs['absorption'] = -1
+    grp.attrs['multiply_smooth'] = int(lssf)
+    grp.create_dataset('energy', data=energy)
+    grp.create_dataset('table', data=table)
+
+
+def _select_urr_tkey(tkeys, temperature, default_temperature):
+    """Pick the ``<nuclide>/urr`` temperature key to read.
+
+    A single-temperature PENDF library stores exactly one ``<Tkey>`` (e.g.
+    ``'294K'``), which is returned regardless of ``temperature``. With several,
+    the key whose temperature is nearest to ``temperature`` is chosen (falling
+    back to ``default_temperature`` when ``temperature`` is ``None``). Returns
+    ``None`` for an empty ``urr`` group.
+    """
+    if not tkeys:
+        return None
+    if len(tkeys) == 1:
+        return tkeys[0]
+    target = default_temperature if temperature is None else temperature
+    if target is None:
+        return sorted(tkeys)[0]
+
+    def _temp(k):
+        return float(k[:-1]) if k.endswith('K') else float(k)
+
+    return min(tkeys, key=lambda k: abs(_temp(k) - float(target)))
 
 
 class _TemperatureMismatchError(ValueError):
@@ -517,6 +582,58 @@ class PendfLibrary:
             return _attr_str(group.attrs, 'product')
         return None
 
+    def has_ptables(self, nuclide):
+        """Return whether the nuclide carries URR probability tables.
+
+        Parameters
+        ----------
+        nuclide : str
+            GNDS name of the nuclide.
+
+        Returns
+        -------
+        bool
+            ``True`` if a ``<nuclide>/urr`` group is present (ingested from
+            MF=2 MT=153 at build time), otherwise ``False``. A nuclide absent
+            from the library answers ``False`` gracefully (the group is not
+            present) rather than raising.
+
+        """
+        group = self._groups.get(nuclide)
+        return group is not None and 'urr' in group
+
+    def ptables(self, nuclide, temperature=None):
+        """Return the URR probability tables for a nuclide, or ``None``.
+
+        Parameters
+        ----------
+        nuclide : str
+            GNDS name of the nuclide.
+        temperature : float, optional
+            Requested temperature in kelvin. When a nuclide carries a single
+            temperature (the usual case for a single-temperature PENDF library)
+            it is returned regardless of this value; when several are present
+            the nearest ``<Tkey>`` is chosen. Defaults to the library
+            temperature.
+
+        Returns
+        -------
+        openmc.data.ProbabilityTables or None
+            Probability tables read from ``<nuclide>/urr/<Tkey>``, or ``None``
+            if the nuclide has no ``/urr`` group (including a nuclide absent
+            from the library).
+
+        """
+        group = self._groups.get(nuclide)
+        if group is None or 'urr' not in group:
+            return None
+        urr = group['urr']
+        tkey = _select_urr_tkey(
+            list(urr.keys()), temperature, self.temperature)
+        if tkey is None:
+            return None
+        return openmc.data.urr.ProbabilityTables.from_hdf5(urr[tkey])
+
     def close(self):
         """Close the underlying HDF5 file handles."""
         for f in self._files:
@@ -678,6 +795,12 @@ class PendfLibrary:
                         for mt in sorted(mf10_mts - mf3_mts):
                             warn(f"{path.name}: {name} MF=10 MT={mt} has no "
                                  f"MF=3 section; isomeric partials dropped.")
+
+                        # MF=2 MT=153 probability tables (URR). Ingested
+                        # unconditionally (independent of keep_extra_mts, which
+                        # only gates the MF=3 loop) so a rebuilt library always
+                        # carries /urr for downstream self-shielding.
+                        _write_urr_ptables(nuc, ev, name, path)
 
                         n_converted += 1
                     except _TemperatureMismatchError:

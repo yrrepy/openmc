@@ -4,7 +4,7 @@ Covers the ORIGEN-style "Option A" per-product rows built by
 ``_build_xs_table_pendf`` (ground row keeps the canonical reaction name,
 metastable products get an ``_m{n}`` suffix parsed from the product's GNDS
 name), the mapping='none' fallback, the Sigma(partials) vs MF=3-total
-consistency check, and the ``pathways`` dispatch through
+consistency check, and the always-on expansion through
 :meth:`MicroXS.from_multigroup_flux`. Pathway rows come exclusively from MF=10
 partial cross sections -- never from static branching ratios.
 """
@@ -19,6 +19,7 @@ from openmc.deplete.microxs import (
     MicroXS,
     _build_xs_table_pendf,
     _check_pathway_consistency,
+    _group_average,
     _liso_from_gnds,
 )
 
@@ -108,13 +109,12 @@ def test_pathway_rows_mapped():
     np.testing.assert_allclose(table.xs_matrix[0], [4.0, 4.0])   # ground
     np.testing.assert_allclose(table.xs_matrix[1], [1.0, 1.0])   # m1
 
-    # A no-pathway build gives the single MF=3 total, and the partials sum to it
-    total = _build_xs_table_pendf(
-        ["Am241"], ["(n,gamma)"], edges, fake, pathways=False)
-    assert total.reactions == ["(n,gamma)"]
-    np.testing.assert_allclose(total.xs_matrix[0], [5.0, 5.0])
+    # Conservation: the partial rows sum to the MF=3 total collapsed with the
+    # same flat-in-bin kernel the table builder uses.
+    total_g = _group_average(*fake.xs("Am241", 102), edges)
+    np.testing.assert_allclose(total_g, [5.0, 5.0])
     np.testing.assert_allclose(
-        table.xs_matrix[0] + table.xs_matrix[1], total.xs_matrix[0])
+        table.xs_matrix[0] + table.xs_matrix[1], total_g)
 
 
 def test_duplicate_product_rows_sum():
@@ -278,13 +278,15 @@ def test_from_multigroup_flux_pathways_end_to_end():
     assert micro["Am241", "(n,gamma)"] == pytest.approx([4.0])
     assert micro["Am241", "(n,gamma)_m1"] == pytest.approx([1.0])
 
-    # pathways=False collapses back to the MF=3 total under the canonical name
-    micro_no = MicroXS.from_multigroup_flux(
-        energies=edges, multigroup_flux=flux, chain_file=CHAIN_FILE,
-        nuclides=["Am241"], reactions=["(n,gamma)"], pendf_library=fake,
-        pathways=False)
-    assert micro_no.reactions == ["(n,gamma)"]
-    assert micro_no["Am241", "(n,gamma)"] == pytest.approx([5.0])
+    # Conservation: the expanded rows sum to the MF=3 total collapsed with the
+    # same flux weighting (sum_g sigma_g phi_g / sum_g phi_g).
+    total_g = _group_average(
+        *fake.xs("Am241", 102), np.asarray(edges, dtype=float))
+    phi = np.asarray(flux, dtype=float)
+    total = float(total_g @ phi / phi.sum())
+    assert total == pytest.approx(5.0)
+    assert (micro["Am241", "(n,gamma)"] + micro["Am241", "(n,gamma)_m1"]
+            == pytest.approx([total]))
 
 
 # ---------------------------------------------------------------------------

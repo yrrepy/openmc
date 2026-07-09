@@ -23,6 +23,8 @@ import h5py
 import numpy as np
 
 from openmc.checkvalue import PathLike
+from openmc.data.pendf import _select_urr_tkey
+from openmc.data.urr import ProbabilityTables
 
 #: ``format`` root attribute identifying a grouped PENDF library.
 GROUPED_FORMAT = 'pendf-grouped'
@@ -165,6 +167,48 @@ class GroupedPendfLibrary:
         """
         prod = self._partial(nuclide, mt, lfs, izap).attrs.get('product')
         return _decode(prod) if prod is not None else None
+
+    def has_ptables(self, nuclide: str) -> bool:
+        """Return whether the nuclide carries URR probability tables.
+
+        Grouped libraries copy the pointwise ``<nuclide>/urr`` group through
+        verbatim (probability tables are energy-pointwise), so this mirrors
+        :meth:`openmc.data.PendfLibrary.has_ptables`. A nuclide absent from the
+        library answers ``False`` gracefully rather than raising.
+        """
+        return nuclide in self._file and 'urr' in self._file[nuclide]
+
+    def ptables(self, nuclide: str, temperature=None):
+        """Return the URR probability tables for a nuclide, or ``None``.
+
+        Parameters
+        ----------
+        nuclide : str
+            GNDS name of the nuclide.
+        temperature : float, optional
+            Requested temperature in kelvin. A nuclide with a single stored
+            temperature returns it regardless; with several the nearest
+            ``<Tkey>`` is chosen. Defaults to the library temperature.
+
+        Returns
+        -------
+        openmc.data.ProbabilityTables or None
+            Probability tables read from ``<nuclide>/urr/<Tkey>``, or ``None``
+            if the nuclide has no ``/urr`` group (including a nuclide absent
+            from the library).
+        """
+        if nuclide not in self._file:
+            return None
+        group = self._file[nuclide]
+        if 'urr' not in group:
+            return None
+        urr = group['urr']
+        temp_attr = self._file.attrs.get('temperature')
+        default_temp = None if temp_attr is None else float(temp_attr)
+        tkey = _select_urr_tkey(list(urr.keys()), temperature, default_temp)
+        if tkey is None:
+            return None
+        return ProbabilityTables.from_hdf5(urr[tkey])
 
     def xs_g(self, nuclide: str, mt: int) -> np.ndarray:
         """Return the MF=3 group cross section [b], length ``n_groups``."""
