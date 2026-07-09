@@ -1328,9 +1328,12 @@ class Chain:
                         previous.yield_data.restrict_products(name_sort))
                     if new_yields is not None:
                         new_nuclide.add_reaction(*rx)
-                # Maintain total destruction rates but set no target
+                # Maintain total destruction rates but set no target. Keep the
+                # pendf_lfs so the PENDF collapse can still bind this
+                # pathway's MF=10 partial to its (now untracked) row.
                 else:
-                    new_nuclide.add_reaction(rx.type, None, rx.Q, rx.branching_ratio)
+                    new_nuclide.add_reaction(rx.type, None, rx.Q,
+                                             rx.branching_ratio, rx.pendf_lfs)
 
             new_chain.add_nuclide(new_nuclide)
 

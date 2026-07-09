@@ -240,3 +240,28 @@ def test_duplicate_lfs_group_exports_stock():
     assert 'isomeric_branching' not in sub
     reparsed = _nuclide_from_xml('<nuclide name="X1">' + sub + '</nuclide>')
     assert reparsed.reactions == nuc.reactions
+
+
+def test_reduce_preserves_pendf_lfs_on_dropped_target():
+    """reduce() keeps pendf_lfs when a pathway's target is not retained --
+    the PENDF collapse still needs the LFS to bind the MF=10 partial
+    (regression: Zn70 (n,2p)_m1 lost its lfs through r2s chain.reduce)."""
+    import lxml.etree as _ET
+    from openmc.deplete import Chain
+    chain = Chain()
+    for name, xml in [
+        ('In115',
+         '<nuclide name="In115" reactions="1">'
+         '<reaction type="(n,gamma)">'
+         '<isomeric_branching targets="In116 In116_m1" pendf_lfs="0 1"'
+         ' q_values="6784720.0 6657450.0"/>'
+         '</reaction></nuclide>'),
+        ('In116', '<nuclide name="In116" half_life="14.1" decay_modes="0" reactions="0"/>'),
+        ('In116_m1', '<nuclide name="In116_m1" half_life="3257.0" decay_modes="0" reactions="0"/>'),
+    ]:
+        chain.add_nuclide(Nuclide.from_xml(_ET.fromstring(xml)))
+    reduced = chain.reduce(['In115'], 0)
+    rxns = {rx.type: rx for rx in reduced['In115'].reactions}
+    assert rxns['(n,gamma)_m1'].target is None
+    assert rxns['(n,gamma)_m1'].pendf_lfs == 1
+    assert rxns['(n,gamma)'].pendf_lfs == 0
