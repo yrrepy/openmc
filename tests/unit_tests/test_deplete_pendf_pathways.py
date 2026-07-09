@@ -286,6 +286,51 @@ def test_partially_unbound_partials_fall_back():
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
 
 
+def test_ground_only_unbound_falls_back_silently(recwarn):
+    """A ground-only MF=10 reaction (pathway LFS set == {0}) whose ground pathway
+    is unbound falls back to the MF=3 total WITHOUT warning: the patcher leaves
+    such a reaction stock in the chain by design, and the MF=3 total equals the
+    LFS=0 partial, so the fallback warning would be pure noise (e.g. H2 (n,gamma)
+    -> H3)."""
+    fake = _FakePendf(
+        mf3={"H2": {102: _const(5.5e-4)}},
+        mf10={"H2": {102: {
+            0: (None, _const(5.5e-4)),   # sole ground pathway, unmappable
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    # Product None -> the chain carries no reaction for LFS 0 (stock element).
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+
+    table = _build_xs_table_pendf(["H2"], ["(n,gamma)"], edges, fake, chain)
+
+    # Fell back to the single MF=3-total row, with no warning of any kind.
+    assert table.reactions == ["(n,gamma)"]
+    assert table.rxn_indices.tolist() == [0]
+    np.testing.assert_allclose(table.xs_matrix[0], [5.5e-4])
+    assert len(recwarn) == 0
+
+
+def test_unbound_metastable_lfs_still_warns():
+    """A reaction whose pathway LFS set contains a nonzero (metastable) LFS keeps
+    the loud fallback warning even when the ground pathway is bound -- only the
+    ground-only ({LFS=0}) class is silenced."""
+    fake = _FakePendf(
+        mf3={"Ir193": {102: _const(5.0)}},
+        mf10={"Ir193": {102: {
+            0: ("Ir194", _const(4.0)),   # ground: bound
+            38: (None, _const(1.0)),     # metastable LFS: unbound -> loud warning
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+
+    with pytest.warns(UserWarning, match="depletion-chain reaction"):
+        table = _build_xs_table_pendf(
+            ["Ir193"], ["(n,gamma)"], edges, fake, chain)
+
+    assert table.reactions == ["(n,gamma)"]
+    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
+
+
 def test_lfs_less_chain_raises():
     """A chain whose QUALIFIED reaction carries pendf_lfs=None cannot bind
     partials -> hard error directing the user at the patcher tool."""

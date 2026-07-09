@@ -1165,10 +1165,14 @@ def _build_xs_table_pendf(
             if any(rx is None for rx in bound):
                 # Mirror the historical partially-mapped fallback: if ANY partial
                 # is unnamed, emit the single MF=3 total row instead of pathway
-                # rows. Collect the unbound triples for one summary warning.
-                for (lfs, _izap), rx in zip(pathway_list, bound):
-                    if rx is None:
-                        unbound.append((nuc, name, lfs))
+                # rows. A ground-only pathway set ({LFS=0}) is deliberately left
+                # stock in the chain (its MF=3 total equals the LFS=0 partial), so
+                # that fallback is silent; only an unbound metastable LFS (a
+                # nonzero LFS present) collects the triples for the summary warning.
+                if {lfs for lfs, _izap in pathway_list} != {0}:
+                    for (lfs, _izap), rx in zip(pathway_list, bound):
+                        if rx is None:
+                            unbound.append((nuc, name, lfs))
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
