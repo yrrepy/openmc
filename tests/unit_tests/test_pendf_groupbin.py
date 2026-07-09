@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from openmc.data import GroupedPendfLibrary
-from openmc.data.pendf_grouped import GROUPED_FORMAT
+from openmc.data.pendf import GROUPED_FORMAT
 from openmc.deplete import MicroXS
 from openmc.deplete.chain import Chain
 from openmc.deplete.nuclide import Nuclide

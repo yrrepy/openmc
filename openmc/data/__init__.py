@@ -35,7 +35,6 @@ from .multipole import *
 from .grid import *
 from .function import *
 from .vectfit import *
-from .pendf_grouped import GroupedPendfLibrary
 
 from .dose.dose import dose_coefficients
 from .dose.mass_attenuation import \
