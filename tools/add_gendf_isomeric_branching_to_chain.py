@@ -1464,10 +1464,25 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     'target': target
                 })
 
-            # Update reactions count attribute
-            if reactions_to_remove:
-                remaining_reactions = len(nuc_elem.findall('reaction'))
-                nuc_elem.set('reactions', str(remaining_reactions))
+    # Recount 'reactions' per unfolded pathway to match the PENDF chains: a
+    # branched reaction counts once per target (ground + each metastable), not
+    # once per <reaction> element. Runs after pruning.
+    for nuc_elem in root.findall('nuclide'):
+        if 'reactions' not in nuc_elem.attrib:
+            continue
+        n_pathways = 0
+        for rx_elem in nuc_elem.findall('reaction'):
+            iso = rx_elem.find('isomeric_branching')
+            if iso is not None and iso.get('targets'):
+                n_pathways += len(iso.get('targets').split())
+                continue
+            yld = rx_elem.find('isomeric_yields')
+            tgt = yld.find('targets') if yld is not None else None
+            if tgt is not None and tgt.text:
+                n_pathways += len(tgt.text.split())
+                continue
+            n_pathways += 1
+        nuc_elem.set('reactions', str(n_pathways))
 
     # Write output
     xml_str = ET.tostring(root, encoding='unicode')
