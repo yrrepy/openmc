@@ -255,8 +255,9 @@ def _in115_ng_offender():
     On grid E=[1,2,3] eV the MF=3 total is [10,20,30] b; the partials sum to
     [10,20,27] b, so the worst relative deviation is 3/30 = 0.10 at E=3 eV. The
     v2 lethargy-weighted (int sigma/E dE) integral ratio is 19.5/20 = 0.975
-    (all three grid points fall in the resonance band, so ratio_resonance is
-    the same 0.975 while thermal/fast have no points -> None).
+    (all three grid points fall in the epithermal band [0.625 eV, 1e5 eV), so
+    ratio_epithermal is the same 0.975 while the other three bands have no
+    points -> None).
     """
     grid = [1.0, 2.0, 3.0]
     return dict(qm=6784720.0, qi=6784720.0, energy=grid, xs=[10.0, 20.0, 30.0],
@@ -293,9 +294,11 @@ def test_audit_worst_dev_and_integral_ratio():
     assert audit["total"] == pytest.approx(30.0)
     assert audit["sum_partials"] == pytest.approx(27.0)
     assert audit["integral_ratio"] == pytest.approx(0.975)
-    # All three grid points sit in the resonance band -> thermal/fast are None.
+    # All three grid points sit in the epithermal band [0.625, 1e5) -> the other
+    # three bands have no points and read None.
     assert audit["ratio_thermal"] is None
-    assert audit["ratio_resonance"] == pytest.approx(0.975)
+    assert audit["ratio_epithermal"] == pytest.approx(0.975)
+    assert audit["ratio_intermediate"] is None
     assert audit["ratio_fast"] is None
     assert audit["notes"] == ""
 
@@ -443,20 +446,57 @@ def test_audit_mismatch_above_emax_invisible():
 
 
 def test_audit_band_ratios_thermal_only():
-    # partials = 0.5x total in the thermal band [<1 eV) and = total elsewhere
-    # -> ratio_thermal ~ 0.5, ratio_resonance ~ 1.0, ratio_fast ~ 1.0.
-    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
-    total = [10.0] * 8
-    ground = [5.0, 5.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    # partials = 0.5x total in the thermal band [<0.625 eV) and = total
+    # elsewhere -> ratio_thermal ~ 0.5; epithermal/intermediate/fast ~ 1.0. The
+    # grid seeds >=2 points in every one of the four windows.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 2.0e5, 5.0e5, 2.0e6, 1.0e7]
+    total = [10.0] * 9
+    ground = [5.0, 5.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
     rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
         dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
              energy=grid, xs=ground)])
     source = _FakeSource({"In115": {102: rxn}})
     audit = _audit_reaction(source, "In115", 102, rxn["partials"])
     assert audit["ratio_thermal"] == pytest.approx(0.5)
-    assert audit["ratio_resonance"] == pytest.approx(1.0)
+    assert audit["ratio_epithermal"] == pytest.approx(1.0)
+    assert audit["ratio_intermediate"] == pytest.approx(1.0)
     assert audit["ratio_fast"] == pytest.approx(1.0)
     assert audit["notes"] == ""
+
+
+def test_audit_four_way_split_intermediate_only():
+    # A fixture broken ONLY in the intermediate band [1e5, 1e6): partials are
+    # 0.5x total there and = total in the thermal/epithermal/fast bands. The
+    # four-way split isolates it -> ratio_intermediate ~ 0.5 while the other
+    # three read ~ 1.0. With reject_band_ratio=0.3 only that band exceeds, so the
+    # reaction is left stock and the criterion records band_ratio:intermediate.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 2.0e5, 5.0e5, 2.0e6, 1.0e7]
+    total = [10.0] * 9
+    ground = [10.0, 10.0, 10.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0]  # 0.5x in [1e5,1e6)
+    rxn = dict(qm=6784720.0, qi=6784720.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=6784720.0, qm=6784720.0, elfs=0.0,
+             energy=grid, xs=ground),
+        # metastable maps to In116_m1 (would decorate absent rejection)
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[0.0] * 9)])
+    source = _FakeSource({"In115": {102: rxn}})
+
+    audit = _audit_reaction(source, "In115", 102, rxn["partials"])
+    assert audit["ratio_thermal"] == pytest.approx(1.0)
+    assert audit["ratio_epithermal"] == pytest.approx(1.0)
+    assert audit["ratio_intermediate"] == pytest.approx(0.5)
+    assert audit["ratio_fast"] == pytest.approx(1.0)
+
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 6784720.0)]})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0,
+                                   reject_rtol=None, reject_band_ratio=0.3)
+    assert stats["rejected_count"] == 1
+    rej = stats["rejected"][0]
+    assert rej["parent"] == "In115"
+    assert rej["criterion"] == "band_ratio:intermediate"
+    assert "In115" not in branching                  # rejected -> not decorated
 
 
 def test_reject_band_ratio_leaves_offender_stock(tmp_path):
@@ -505,9 +545,10 @@ def test_reject_band_ratio_leaves_offender_stock(tmp_path):
 
 
 def test_band_ratio_none_when_grid_misses_band(tmp_path):
-    # A grid that never enters the thermal or fast band leaves those ratios None
-    # ('n/a' in the log) and they can NEVER trigger band rejection.
-    grid = [10.0, 100.0, 1000.0]                     # all in the resonance band
+    # A grid that only enters the epithermal band leaves the thermal,
+    # intermediate, and fast ratios None ('n/a' in the log) and they can NEVER
+    # trigger band rejection.
+    grid = [10.0, 100.0, 1000.0]                     # all in the epithermal band
     total = [10.0, 20.0, 30.0]
     rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
         dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
@@ -517,8 +558,9 @@ def test_band_ratio_none_when_grid_misses_band(tmp_path):
     source = _FakeSource({"In115": {102: rxn}})
     audit = _audit_reaction(source, "In115", 102, rxn["partials"])
     assert audit["ratio_thermal"] is None
+    assert audit["ratio_intermediate"] is None
     assert audit["ratio_fast"] is None
-    assert audit["ratio_resonance"] is not None
+    assert audit["ratio_epithermal"] is not None
     assert audit["worst_dev"] > 1e-5                 # an offender -> logged
 
     chain = _chain_with(["In115", "In116", "In116_m1"],
@@ -584,7 +626,7 @@ def test_band_dust_floor_thermal_none_no_reject():
     # (1e-15 b) -- evaluator dust -- so ratio_thermal is None and can NEVER
     # trigger band rejection, even at a tiny threshold, despite the ground
     # partial reading 0 there (a spurious ~0 ratio absent the floor). The real
-    # resonance/fast bands stay consistent, so nothing is rejected.
+    # epithermal/fast bands stay consistent, so nothing is rejected.
     grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
     total = [1e-20, 1e-20, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
     ground = [0.0, 0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]   # 0 in thermal dust
@@ -596,7 +638,7 @@ def test_band_dust_floor_thermal_none_no_reject():
     source = _FakeSource({"In115": {102: rxn}})
     audit = _audit_reaction(source, "In115", 102, rxn["partials"])
     assert audit["ratio_thermal"] is None
-    assert audit["ratio_resonance"] == pytest.approx(1.0)
+    assert audit["ratio_epithermal"] == pytest.approx(1.0)
     assert audit["ratio_fast"] == pytest.approx(1.0)
 
     chain = _chain_with(["In115", "In116", "In116_m1"],

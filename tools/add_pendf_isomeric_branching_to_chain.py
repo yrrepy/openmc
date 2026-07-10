@@ -368,11 +368,13 @@ def open_pendf_source(path, library=None):
 # Pointwise MF=10-vs-MF=3 consistency audit
 # =============================================================================
 
-# Lethargy band edges (eV): thermal [grid_min, 1), resonance [1, 1e5),
-# fast [1e5, emax]. The three ratios diagnose WHERE the MF=10 partials
+# Lethargy band edges (eV): thermal [grid_min, 0.625), epithermal [0.625, 1e5),
+# intermediate [1e5, 1e6), fast [1e6, emax]. The 0.625 eV thermal/epithermal
+# split is the cadmium cutoff. The four ratios diagnose WHERE the MF=10 partials
 # depart from the MF=3 total, which the single full-range number hides.
-_BAND_THERMAL_HI = 1.0
-_BAND_RESONANCE_HI = 1.0e5
+_BAND_THERMAL_HI = 0.625
+_BAND_EPITHERMAL_HI = 1.0e5
+_BAND_INTERMEDIATE_HI = 1.0e6
 
 
 def _lethargy_integral(e, xs):
@@ -444,8 +446,9 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
     ``None`` when only floor dust qualified), ``sum_partials``/``total`` (barn
     there), ``integral_ratio`` (full-range, capped, LETHARGY-weighted
     ``int Sum(partials)/E dE`` / ``int total/E dE`` -- in v1 this was an
-    unweighted ``dE`` ratio), the three per-band lethargy ratios
-    ``ratio_thermal``/``ratio_resonance``/``ratio_fast`` (``None`` for a band
+    unweighted ``dE`` ratio), the four per-band lethargy ratios
+    ``ratio_thermal``/``ratio_epithermal``/``ratio_intermediate``/``ratio_fast``
+    (``None`` for a band
     with <2 grid points, zero total integral, or a below-threshold total whose
     ``max < CONSISTENCY_ABS_FLOOR`` -- see :func:`_band_ratio`), and ``notes``
     (a string flagging any band whose partials integrate nonzero against a zero
@@ -485,13 +488,17 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
 
     ratio_thermal, flag_th = _band_ratio(
         mf3_e, mf3_xs, part_sum, 0.0, _BAND_THERMAL_HI, False)
-    ratio_resonance, flag_re = _band_ratio(
-        mf3_e, mf3_xs, part_sum, _BAND_THERMAL_HI, _BAND_RESONANCE_HI, False)
+    ratio_epithermal, flag_ep = _band_ratio(
+        mf3_e, mf3_xs, part_sum, _BAND_THERMAL_HI, _BAND_EPITHERMAL_HI, False)
+    ratio_intermediate, flag_in = _band_ratio(
+        mf3_e, mf3_xs, part_sum, _BAND_EPITHERMAL_HI, _BAND_INTERMEDIATE_HI,
+        False)
     ratio_fast, flag_fa = _band_ratio(
-        mf3_e, mf3_xs, part_sum, _BAND_RESONANCE_HI, emax, True)
+        mf3_e, mf3_xs, part_sum, _BAND_INTERMEDIATE_HI, emax, True)
 
     flagged = [name for name, flag in
-               (('thermal', flag_th), ('resonance', flag_re), ('fast', flag_fa))
+               (('thermal', flag_th), ('epithermal', flag_ep),
+                ('intermediate', flag_in), ('fast', flag_fa))
                if flag]
     notes = (f"partials nonzero vs zero total in {', '.join(flagged)}"
              if flagged else '')
@@ -503,7 +510,8 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
         total=(float(mf3_xs[idx]) if idx >= 0 else None),
         integral_ratio=ratio,
         ratio_thermal=ratio_thermal,
-        ratio_resonance=ratio_resonance,
+        ratio_epithermal=ratio_epithermal,
+        ratio_intermediate=ratio_intermediate,
         ratio_fast=ratio_fast,
         notes=notes)
 
@@ -688,7 +696,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                 band_fired = []
                 if reject_band_ratio is not None:
                     for key, band in (('ratio_thermal', 'thermal'),
-                                      ('ratio_resonance', 'resonance'),
+                                      ('ratio_epithermal', 'epithermal'),
+                                      ('ratio_intermediate', 'intermediate'),
                                       ('ratio_fast', 'fast')):
                         r = audit.get(key)
                         if r is not None and abs(r - 1.0) > reject_band_ratio:
@@ -1192,11 +1201,14 @@ def _write_consistency_audit_section(f, offenders, audit_clean, emax=2.0e7):
     f.write(f"Groups where BOTH sides sit below {CONSISTENCY_ABS_FLOOR:.0e} b "
             "(evaluator floor dust) are exempt -- their relative deviation is "
             "meaningless.\n")
-    f.write("IntRatio and the Thermal/Resonance/Fast ratios are LETHARGY-"
-            "weighted (int sigma/E dE) partials/total; bands are thermal "
-            f"[grid_min, {_BAND_THERMAL_HI:.0e} eV), resonance "
-            f"[{_BAND_THERMAL_HI:.0e} eV, {_BAND_RESONANCE_HI:.0e} eV), fast "
-            f"[{_BAND_RESONANCE_HI:.0e} eV, {emax:.3e} eV]. "
+    f.write("IntRatio and the Thermal/Epithermal/Intermed/Fast ratios are "
+            "LETHARGY-weighted (int sigma/E dE) partials/total; bands are "
+            f"thermal [grid_min, {_BAND_THERMAL_HI:g} eV) "
+            f"({_BAND_THERMAL_HI:g} eV = Cd cutoff), epithermal "
+            f"[{_BAND_THERMAL_HI:g} eV, {_BAND_EPITHERMAL_HI:.0e} eV), "
+            f"intermediate [{_BAND_EPITHERMAL_HI:.0e} eV, "
+            f"{_BAND_INTERMEDIATE_HI:.0e} eV), fast "
+            f"[{_BAND_INTERMEDIATE_HI:.0e} eV, {emax:.3e} eV]. "
             "'n/a' = band has <2 grid points, a zero total integral, or a "
             f"below-threshold total (max < {CONSISTENCY_ABS_FLOOR:.0e} b, "
             "evaluator dust -- spurious ratios suppressed).\n")
@@ -1209,9 +1221,9 @@ def _write_consistency_audit_section(f, offenders, audit_clean, emax=2.0e7):
     f.write(f"Total offenders: {len(offenders)}\n\n")
     header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
               f"{'E[eV]@max':>14}  {'Sum-part[b]':>14}  {'Total[b]':>14}  "
-              f"{'IntRatio':>12}  {'Thermal':>10}  {'Resonance':>10}  "
-              f"{'Fast':>10}  {'Notes':<40}")
-    sep = "-" * 180
+              f"{'IntRatio':>12}  {'Thermal':>10}  {'Epithermal':>10}  "
+              f"{'Intermed':>10}  {'Fast':>10}  {'Notes':<40}")
+    sep = "-" * 195
     f.write(header + "\n" + sep + "\n")
     for o in sorted(offenders, key=lambda x: x['worst_dev'], reverse=True):
         e = o.get('energy')
@@ -1224,7 +1236,8 @@ def _write_consistency_audit_section(f, offenders, audit_clean, emax=2.0e7):
                 f"{o['worst_dev']:>12.4e}  {e_str:>14}  {sp_str:>14}  "
                 f"{tot_str:>14}  {_fmt_ratio(o.get('integral_ratio')):>12}  "
                 f"{_fmt_ratio(o.get('ratio_thermal')):>10}  "
-                f"{_fmt_ratio(o.get('ratio_resonance')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_epithermal')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_intermediate')):>10}  "
                 f"{_fmt_ratio(o.get('ratio_fast')):>10}  "
                 f"{o.get('notes', ''):<40}\n")
 
