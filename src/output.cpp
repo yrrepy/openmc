@@ -651,10 +651,10 @@ void write_tallies()
       continue;
     }
 
-    // rma tallies keep only owned moment rows on each rank; the full results
-    // are gathered only into the statepoint, so tallies.out points the user
-    // there.
-    if (tally.storage_ == TallyStorage::RMA) {
+    // Multi-rank rma tallies keep only owned moment rows on each rank; the
+    // full results are gathered only into the statepoint, so tallies.out
+    // points the user there. A single-rank rma tally prints normally.
+    if (tally.rma_distributed()) {
       fmt::print(tallies_out,
         " Results for this tally use 'rma' storage and are written to the "
         "statepoint file only.\n\n");

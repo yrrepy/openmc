@@ -1075,7 +1075,9 @@ void read_settings_xml(pugi::xml_node root)
     } else if (storage == "rma") {
       tally_storage = TallyStorage::RMA;
     } else {
-      fatal_error(fmt::format("Unrecognized tally storage mode: {}", storage));
+      fatal_error(fmt::format("Unrecognized tally storage mode: {}. Valid "
+                              "options are 'replicated', 'shared', and 'rma'.",
+        storage));
     }
   }
 

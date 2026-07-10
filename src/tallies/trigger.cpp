@@ -61,7 +61,7 @@ bool has_rma_triggers()
 {
 #ifdef OPENMC_MPI
   for (const auto& t : model::tallies) {
-    if (t->storage_ != TallyStorage::RMA)
+    if (t->storage() != TallyStorage::RMA)
       continue;
     for (const auto& trigger : t->triggers_) {
       if (trigger.metric != TriggerMetric::not_active)
@@ -88,7 +88,7 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
     // homes the moments on the master, so only the master walks those. A rank
     // that owns nothing (or a non-master rank on a replicated tally) simply
     // contributes ratio 0 to the reduction below.
-    const bool is_rma = (t.storage_ == TallyStorage::RMA);
+    const bool is_rma = (t.storage() == TallyStorage::RMA);
     if (!is_rma && !mpi::master)
       continue;
     const int64_t n_rows = is_rma ? t.rma_n_rows() : t.n_filter_bins();
@@ -175,12 +175,11 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
     MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, mpi::intracomm);
     ratio = out.val;
     if (out.rank != 0) {
-      constexpr int TRIGGER_TAG = 42;
       int buf[2] {tally_id, score};
       if (mpi::rank == out.rank) {
-        MPI_Send(buf, 2, MPI_INT, 0, TRIGGER_TAG, mpi::intracomm);
+        MPI_Send(buf, 2, MPI_INT, 0, TAG_RMA_TRIGGER, mpi::intracomm);
       } else if (mpi::master) {
-        MPI_Recv(buf, 2, MPI_INT, out.rank, TRIGGER_TAG, mpi::intracomm,
+        MPI_Recv(buf, 2, MPI_INT, out.rank, TAG_RMA_TRIGGER, mpi::intracomm,
           MPI_STATUS_IGNORE);
         tally_id = buf[0];
         score = buf[1];

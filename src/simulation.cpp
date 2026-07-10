@@ -392,7 +392,7 @@ void initialize_batch()
   // here rather than at input validation. The scan runs only in CMFD runs.
   if (settings::cmfd_run) {
     for (const auto& t : model::tallies) {
-      if (t->storage_ != TallyStorage::REPLICATED) {
+      if (t->storage() != TallyStorage::REPLICATED) {
         fatal_error(fmt::format("Tally {} uses a non-replicated storage mode, "
                                 "which is not compatible with CMFD.",
           t->id_));
@@ -850,7 +850,7 @@ void broadcast_results()
     // Distributed modes keep their results where they live (rank 0 for shared,
     // the owning rank for rma) and are read there by design, so they are not
     // broadcast. Only replicated tallies serve full results on every rank.
-    if (t->storage_ != TallyStorage::REPLICATED)
+    if (t->storage() != TallyStorage::REPLICATED)
       continue;
 
     // Non-master ranks drop their moments during a reduced run, so allocate a

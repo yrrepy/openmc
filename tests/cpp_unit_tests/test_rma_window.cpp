@@ -14,10 +14,10 @@
 //
 // The three cases share one driver but vary the staging depth K via the
 // OPENMC_RMA_STAGING_ROWS test seam: default (mostly drain), K=2 (repeated
-// buffer wrap + both-in-flight flush_local_all), and K larger than any target's
-// row count (pure end-of-batch drain of partial buffers). All MPI collectives
-// (window teardown included) complete before any assertion so a failing check
-// on one rank cannot deadlock another.
+// buffer wrap + both-in-flight MPI_Win_flush_local(target)), and K larger than
+// any target's row count (pure end-of-batch drain of partial buffers). All MPI
+// collectives (window teardown included) complete before any assertion so a
+// failing check on one rank cannot deadlock another.
 
 #include <mpi.h>
 
@@ -78,7 +78,7 @@ static bool run_rma_cycle(int64_t n_bins, int n_scores)
   Tally* tally = Tally::create();
   tally->set_filters({&f, 1});
   tally->set_scores(scores);
-  tally->storage_ = TallyStorage::RMA;
+  tally->set_storage(TallyStorage::RMA);
   tally->set_strides();
   tally->init_results();
 
@@ -161,7 +161,7 @@ static bool run_rma_revisit(int64_t n_bins, int n_scores, int revisits)
   Tally* tally = Tally::create();
   tally->set_filters({&f, 1});
   tally->set_scores(scores);
-  tally->storage_ = TallyStorage::RMA;
+  tally->set_storage(TallyStorage::RMA);
   tally->set_strides();
   tally->init_results();
 
@@ -214,9 +214,9 @@ TEST_CASE("rma remote-scoring hammer", "[rma][hammer]")
 TEST_CASE("rma staging buffer wrap and flush", "[rma][liveness]")
 {
   // K forced to 2: each remote target receives many rows, so the double buffers
-  // wrap repeatedly and the both-in-flight -> flush_local_all path must retire
-  // an origin payload before it is reused. A premature reuse would corrupt an
-  // in-flight accumulate and drop the sum.
+  // wrap repeatedly and the both-in-flight -> MPI_Win_flush_local(target) path
+  // must retire an origin payload before it is reused. A premature reuse would
+  // corrupt an in-flight accumulate and drop the sum.
   setenv("OPENMC_RMA_STAGING_ROWS", "2", 1);
   bool ok = run_rma_cycle(/*n_bins=*/64, /*n_scores=*/1);
   unsetenv("OPENMC_RMA_STAGING_ROWS");

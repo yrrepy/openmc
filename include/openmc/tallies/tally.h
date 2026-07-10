@@ -55,6 +55,22 @@ public:
 
   void set_writable(bool writable) { writable_ = writable; }
 
+  //! Where accum_ (and, for rma, the moments) is homed.
+  TallyStorage storage() const { return storage_; }
+
+  //! \brief Set the storage mode, validating the distributed modes'
+  //! prerequisites (MPI + OpenMP build, tally reduction on, Monte Carlo
+  //! solver, MPI thread level, not event-based). Must run before
+  //! init_results(), which homes the storage. Tallies created through the C
+  //! API keep the replicated default; the settings::tally_storage global
+  //! applies only to tallies read from XML.
+  void set_storage(TallyStorage storage);
+
+  //! True when the moments are genuinely block-distributed across ranks (rma
+  //! storage on a multi-rank run). A single-rank rma tally holds the complete,
+  //! globally-indexed moments and serves every replicated readout path.
+  bool rma_distributed() const;
+
   void set_scores(pugi::xml_node node);
 
   void set_scores(const vector<std::string>& scores);
@@ -258,9 +274,6 @@ public:
   //! fold in accumulate(). This layout matches the on-disk statepoint dataset.
   tensor::Tensor<double> moments_;
 
-  //! Where accum_ (and, for rma, moments_) is homed.
-  TallyStorage storage_ {TallyStorage::REPLICATED};
-
   //! Keep moments_ allocated on every rank, not just the master. In reduced
   //! mode moments are otherwise homed on the master alone and distributed to
   //! the other ranks only at the end-of-run broadcast. Tallies whose moments
@@ -300,6 +313,10 @@ private:
   //! Innermost dimension of the results: number of score x nuclide combinations
   int n_score_bins_ {0};
 
+  //! Where accum_ (and, for rma, moments_) is homed. Set through
+  //! set_storage(), which validates the distributed modes' prerequisites.
+  TallyStorage storage_ {TallyStorage::REPLICATED};
+
 #ifdef OPENMC_MPI
   //! Distributed-window state for the rma storage mode. accum_win_ (reused from
   //! the shared mode) holds this rank's contiguous block of owned filter-bin
@@ -321,7 +338,9 @@ private:
   //! per-target double-buffered staging feeding batched MPI_Accumulate calls.
   //! Sized num_threads(); each element is written by one thread alone, so the
   //! only cross-thread contention is the named critical around the MPI calls.
-  struct RmaThreadStaging {
+  //! Cache-line aligned so neighboring threads' hot coalescer fields never
+  //! share a line.
+  struct alignas(64) RmaThreadStaging {
     //! Row coalescer: consecutive score_add calls to the same remote filter bin
     //! accumulate into row before it is flushed to a target's staging buffer.
     int64_t coalesce_bin {-1}; //!< global filter bin held open, -1 == none

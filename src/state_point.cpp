@@ -55,12 +55,12 @@ inline int64_t results_row_len(const Tally& tally)
   return static_cast<int64_t>(tally.n_score_bins()) * tally.n_moments();
 }
 
-// Filter-bin rows moved per MPI/HDF5 chunk: the 2^27-double (1 GiB) cap from
-// reduce_in_place_chunked applied at row granularity (at least one row).
+// Filter-bin rows moved per MPI/HDF5 chunk: the shared 1 GiB cap applied at
+// row granularity (at least one row).
 inline int64_t results_rows_per_chunk(int64_t row_len)
 {
-  constexpr int64_t MAX_CHUNK = int64_t {1} << 27;
-  return std::max<int64_t>(1, MAX_CHUNK / std::max<int64_t>(1, row_len));
+  return std::max<int64_t>(
+    1, MAX_MPI_CHUNK_DOUBLES / std::max<int64_t>(1, row_len));
 }
 
 // Write a contiguous block of n_rows filter-bin rows, starting at global row
@@ -122,9 +122,6 @@ void read_owned_rows_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
   H5Sclose(filespace);
 }
 
-// MPI tag for the point-to-point statepoint-write gather.
-constexpr int RMA_GATHER_TAG = 43;
-
 // Master side of the statepoint write: create the full results dataset, write
 // the master's own owned rows, then receive each other rank's owned rows in
 // chunks and write them into their hyperslab.
@@ -141,6 +138,9 @@ void gather_rma_tally_results(hid_t tally_group, const Tally& tally)
   const int64_t row_len = results_row_len(tally);
   const int64_t rows_per_chunk = results_rows_per_chunk(row_len);
 
+  // One receive buffer reused for every chunk (chunks share a common size
+  // except tails), instead of a fresh up-to-1-GiB allocation per chunk.
+  vector<double> buf;
   for (int r = 0; r < mpi::n_procs; ++r) {
     const int64_t first = tally.rma_first_row(r);
     const int64_t nrows = tally.rma_rows_owned(r);
@@ -152,9 +152,9 @@ void gather_rma_tally_results(hid_t tally_group, const Tally& tally)
         write_results_hyperslab(dset, first + off, crows, n_score, n_moments,
           tally.moments().data() + off * row_len);
       } else {
-        vector<double> buf(count);
+        buf.resize(count);
         MPI_Recv(buf.data(), static_cast<int>(count), MPI_DOUBLE, r,
-          RMA_GATHER_TAG, mpi::intracomm, MPI_STATUS_IGNORE);
+          TAG_RMA_GATHER, mpi::intracomm, MPI_STATUS_IGNORE);
         write_results_hyperslab(
           dset, first + off, crows, n_score, n_moments, buf.data());
       }
@@ -176,7 +176,7 @@ void send_rma_tally_results(const Tally& tally)
     const int64_t crows = std::min(rows_per_chunk, nrows - off);
     const int64_t count = crows * row_len;
     MPI_Send(data + off * row_len, static_cast<int>(count), MPI_DOUBLE, 0,
-      RMA_GATHER_TAG, mpi::intracomm);
+      TAG_RMA_GATHER, mpi::intracomm);
   }
 }
 
@@ -193,7 +193,7 @@ void read_distributed_rma_tally_results(hid_t file_id)
   // Nothing to do without a genuinely distributed rma tally.
   bool any = false;
   for (const auto& t : model::tallies) {
-    if (t->storage_ == TallyStorage::RMA && mpi::n_procs > 1) {
+    if (t->rma_distributed()) {
       any = true;
       break;
     }
@@ -211,7 +211,7 @@ void read_distributed_rma_tally_results(hid_t file_id)
 
   hid_t tallies_group = open_group(file_id, "tallies");
   for (auto& tally : model::tallies) {
-    if (!(tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1))
+    if (!tally->rma_distributed())
       continue;
 
     std::string name = "tally " + std::to_string(tally->id_);
@@ -507,10 +507,11 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
           std::string name = "tally " + std::to_string(tally->id_);
           hid_t tally_group = open_group(tallies_group, name.c_str());
 #ifdef OPENMC_MPI
-          // Under rma the master holds only its own owned rows, so gather every
-          // rank's rows into the full dataset. The matching sends are issued by
-          // the non-master ranks just after this master-only block.
-          if (tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1) {
+          // Under multi-rank rma the master holds only its own owned rows, so
+          // gather every rank's rows into the full dataset. The matching sends
+          // are issued by the non-master ranks just after this master-only
+          // block.
+          if (tally->rma_distributed()) {
             gather_rma_tally_results(tally_group, *tally);
             close_group(tally_group);
             continue;
@@ -540,7 +541,7 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
     for (const auto& tally : model::tallies) {
       if (!tally->writable_)
         continue;
-      if (tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1)
+      if (tally->rma_distributed())
         send_rma_tally_results(*tally);
     }
   }
@@ -762,11 +763,12 @@ extern "C" int openmc_statepoint_load(const char* filename)
 
       for (auto& tally : model::tallies) {
         // rma tally moments are block-distributed; each rank reads its owned
-        // rows in a separate all-ranks pass (read_distributed_rma_tally_results,
-        // called below) so no rank temp-allocates the full moments. Skip them
-        // here -- consistently on every rank, keeping the Parallel HDF5
-        // collective group/dataset calls below in lock-step.
-        if (tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1) {
+        // rows in a separate all-ranks pass
+        // (read_distributed_rma_tally_results, called below) so no rank
+        // temp-allocates the full moments. Skip them here -- consistently on
+        // every rank, keeping the Parallel HDF5 collective group/dataset calls
+        // below in lock-step.
+        if (tally->rma_distributed()) {
           continue;
         }
 
@@ -1078,10 +1080,11 @@ void write_unstructured_mesh_results()
       if (!umesh->output_)
         continue;
 
-      // rma tallies hold only owned moment rows on each rank; the gather this
-      // per-rank mesh output would need is not yet implemented. Point the user
-      // at the statepoint instead.
-      if (tally->storage_ == TallyStorage::RMA) {
+      // A multi-rank rma tally holds only owned moment rows on each rank; the
+      // gather this per-rank mesh output would need is not yet implemented, so
+      // point the user at the statepoint. A single-rank rma tally holds the
+      // full array and writes normally.
+      if (tally->rma_distributed()) {
         if (mpi::master)
           warning(fmt::format(
             "Unstructured mesh output for tally {} is skipped because it uses "
@@ -1230,7 +1233,7 @@ void write_tally_results_nr(hid_t file_id)
 
     // rma requires reduce_tallies at input validation, so an rma tally can
     // never reach the no-reduction writer.
-    assert(t->storage_ != TallyStorage::RMA);
+    assert(t->storage() != TallyStorage::RMA);
 
     if (mpi::master && !attribute_exists(file_id, "tallies_present")) {
       write_attribute(file_id, "tallies_present", 1);

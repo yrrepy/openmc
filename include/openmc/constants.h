@@ -310,6 +310,14 @@ enum class TallyMoment { SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
 //   RMA        - accumulator and moments block-distributed across all ranks
 enum class TallyStorage { REPLICATED, SHARED, RMA };
 
+// Maximum doubles moved per MPI/HDF5 call by the chunked tally paths (1 GiB);
+// keeps element counts below the int limit of the MPI C interface.
+constexpr int64_t MAX_MPI_CHUNK_DOUBLES {int64_t {1} << 27};
+
+// MPI point-to-point tags used by the distributed (rma) tally paths.
+constexpr int TAG_RMA_TRIGGER {42}; // limiting-trigger info to the master
+constexpr int TAG_RMA_GATHER {43};  // statepoint owned-rows gather
+
 enum class TallyType { VOLUME, MESH_SURFACE, SURFACE, PULSE_HEIGHT };
 
 enum class TallyEstimator { ANALOG, TRACKLENGTH, COLLISION };

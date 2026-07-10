@@ -342,8 +342,12 @@ class Tally(_FortranObjectWithID):
         The array has shape ``(n_filter_bins, n_score_bins, n_moments)`` where
         the innermost axis holds the cross-batch moments in order
         ``[SUM, SUM_SQ, ...]``. This matches the on-disk statepoint layout; there
-        is no leading ``VALUE`` column. Results are available on rank 0 during a
-        run and on all ranks after the run has finished.
+        is no leading ``VALUE`` column. Availability depends on the tally's
+        storage mode: ``replicated`` tallies serve results on rank 0 during a
+        run and on every rank once the run has finished; ``shared`` tallies
+        serve them on rank 0 only; ``rma`` tallies on a multi-rank run keep no
+        full in-memory array (read those from the statepoint file), while a
+        single-rank rma tally serves them like replicated.
         """
         data = POINTER(c_double)()
         shape = (c_size_t*3)()

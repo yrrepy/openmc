@@ -533,10 +533,11 @@ MPI ranks. Accepted values are:
     node divided by the number of nodes. During transport a rank scores its own
     filter bins into a private plane and stages remote contributions into
     batched one-sided ``MPI_Accumulate`` operations. Results are written to (and
-    restarted from) the statepoint file via an owner-to-master gather; the
-    ``tallies.out`` summary and in-memory ``openmc.lib`` readout are not
-    available for ``rma`` tallies. Requires an MPI- and OpenMP-enabled build and
-    the Monte Carlo solver, and is not compatible with ``no_reduce``, CMFD,
+    restarted from) the statepoint file via an owner-to-master gather; on
+    multi-rank runs the ``tallies.out`` summary and in-memory ``openmc.lib``
+    readout are not available for ``rma`` tallies (a single-rank ``rma`` tally
+    holds its full results and serves them normally). Requires an MPI- and
+    OpenMP-enabled build and the Monte Carlo solver, and is not compatible with
     ``no_reduce``, CMFD, or event-based transport. A tally whose moments are
     required on all ranks (the weight-window-generation tally) always keeps
     ``replicated`` storage; the global ``tally_storage`` setting does not apply

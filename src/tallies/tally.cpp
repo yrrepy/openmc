@@ -393,74 +393,25 @@ Tally::Tally(pugi::xml_node node)
   }
 
   // Resolve the storage mode: a per-tally <storage> element overrides the
-  // global settings::tally_storage default (the same idiom as <estimator>).
-  storage_ = settings::tally_storage;
+  // global settings::tally_storage default (the same idiom as <estimator>);
+  // set_storage validates the mode's prerequisites either way.
+  TallyStorage storage = settings::tally_storage;
   if (check_for_node(node, "storage")) {
-    std::string storage = get_node_value(node, "storage", true, true);
-    if (storage == "replicated") {
-      storage_ = TallyStorage::REPLICATED;
-    } else if (storage == "shared") {
-      storage_ = TallyStorage::SHARED;
-    } else if (storage == "rma") {
-      storage_ = TallyStorage::RMA;
+    std::string mode = get_node_value(node, "storage", true, true);
+    if (mode == "replicated") {
+      storage = TallyStorage::REPLICATED;
+    } else if (mode == "shared") {
+      storage = TallyStorage::SHARED;
+    } else if (mode == "rma") {
+      storage = TallyStorage::RMA;
     } else {
       throw std::runtime_error {
-        fmt::format("Invalid storage mode '{}' on tally {}", storage, id_)};
+        fmt::format("Invalid storage mode '{}' on tally {}. Valid options are "
+                    "'replicated', 'shared', and 'rma'.",
+          mode, id_)};
     }
   }
-
-  // Validate the storage mode. The distributed modes carry hard prerequisites.
-  if (storage_ != TallyStorage::REPLICATED) {
-#ifndef OPENMC_MPI
-    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
-                            "which requires an MPI-enabled build.",
-      id_));
-#endif
-#ifndef _OPENMP
-    // Shared scoring updates one plane from several ranks through omp atomic;
-    // with OpenMP disabled that pragma is a no-op and the updates would race.
-    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
-                            "which requires an OpenMP-enabled build.",
-      id_));
-#endif
-    if (!settings::reduce_tallies) {
-      fatal_error(
-        fmt::format("Tally {} cannot combine a non-replicated storage mode "
-                    "with the no-reduction (no_reduce) option.",
-          id_));
-    }
-    if (settings::solver_type != SolverType::MONTE_CARLO) {
-      fatal_error(
-        fmt::format("Tally {} requests a non-replicated storage mode, which is "
-                    "only supported by the Monte Carlo solver.",
-          id_));
-    }
-    if (storage_ == TallyStorage::RMA) {
-#if defined(OPENMC_MPI) && defined(_OPENMP)
-      // The remote-scoring arm issues MPI from inside the OpenMP scoring
-      // region. Until MPI is initialized with MPI_THREAD_SERIALIZED, reject a
-      // threaded rma run whose MPI cannot serialize those calls; a
-      // single-thread run is safe regardless of the provided level.
-      int provided;
-      MPI_Query_thread(&provided);
-      if (provided < MPI_THREAD_SERIALIZED && num_threads() > 1) {
-        fatal_error(fmt::format(
-          "Tally {} requests storage mode 'rma' with more than one OpenMP "
-          "thread, but MPI does not provide MPI_THREAD_SERIALIZED. Run with a "
-          "single thread or an MPI build providing thread serialization.",
-          id_));
-      }
-#endif
-      // Event-based transport reorders scoring; the rma coalescer assumes the
-      // history-based order.
-      if (settings::event_based) {
-        fatal_error(
-          fmt::format("Tally {} requests storage mode 'rma', which is "
-                      "not supported in event-based mode.",
-            id_));
-      }
-    }
-  }
+  this->set_storage(storage);
 
 #ifdef OPENMC_LIBMESH_ENABLED
   // ensure a tracklength tally isn't used with a libMesh filter
@@ -840,6 +791,72 @@ void Tally::set_nuclides(const vector<std::string>& nuclides)
   }
 }
 
+void Tally::set_storage(TallyStorage storage)
+{
+  // Validate the storage mode. The distributed modes carry hard prerequisites.
+  if (storage != TallyStorage::REPLICATED) {
+#ifndef OPENMC_MPI
+    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
+                            "which requires an MPI-enabled build.",
+      id_));
+#endif
+#ifndef _OPENMP
+    // Shared scoring updates one plane from several ranks through omp atomic;
+    // with OpenMP disabled that pragma is a no-op and the updates would race.
+    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
+                            "which requires an OpenMP-enabled build.",
+      id_));
+#endif
+    if (!settings::reduce_tallies) {
+      fatal_error(
+        fmt::format("Tally {} cannot combine a non-replicated storage mode "
+                    "with the no-reduction (no_reduce) option.",
+          id_));
+    }
+    if (settings::solver_type != SolverType::MONTE_CARLO) {
+      fatal_error(
+        fmt::format("Tally {} requests a non-replicated storage mode, which is "
+                    "only supported by the Monte Carlo solver.",
+          id_));
+    }
+    if (storage == TallyStorage::RMA) {
+#if defined(OPENMC_MPI) && defined(_OPENMP)
+      // The remote-scoring arm issues MPI from inside the OpenMP scoring
+      // region. Until MPI is initialized with MPI_THREAD_SERIALIZED, reject a
+      // threaded rma run whose MPI cannot serialize those calls; a
+      // single-thread run is safe regardless of the provided level.
+      int provided;
+      MPI_Query_thread(&provided);
+      if (provided < MPI_THREAD_SERIALIZED && num_threads() > 1) {
+        fatal_error(fmt::format(
+          "Tally {} requests storage mode 'rma' with more than one OpenMP "
+          "thread, but MPI does not provide MPI_THREAD_SERIALIZED. Run with a "
+          "single thread or an MPI build providing thread serialization.",
+          id_));
+      }
+#endif
+      // Event-based transport reorders scoring; the rma coalescer assumes the
+      // history-based order.
+      if (settings::event_based) {
+        fatal_error(
+          fmt::format("Tally {} requests storage mode 'rma', which is "
+                      "not supported in event-based mode.",
+            id_));
+      }
+    }
+  }
+  storage_ = storage;
+}
+
+bool Tally::rma_distributed() const
+{
+#ifdef OPENMC_MPI
+  return storage_ == TallyStorage::RMA && mpi::n_procs > 1;
+#else
+  return false;
+#endif
+}
+
 void Tally::init_triggers(pugi::xml_node node)
 {
   for (auto trigger_node : node.children("trigger")) {
@@ -916,34 +933,50 @@ void Tally::init_triggers(pugi::xml_node node)
 #ifdef OPENMC_MPI
 void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
 {
-  // Local arm: a bin this rank owns is scored into the private owned-rows plane
-  // (accum_), locally indexed. The window block itself receives only
-  // MPI_Accumulate, so a NIC-side remote atomic never races a CPU store on the
-  // same cell (the two classes target disjoint address ranges by construction).
-  const int owner = rma_owner(filter_index);
-  if (owner == mpi::rank) {
-    int64_t local =
-      (filter_index - rma_first_row_) * n_score_bins_ + score_index;
-    atomic_score_add(&accum_[local], val);
-    return;
-  }
+  // rma_k_ > 0 exactly when a remote bin is possible (a multi-rank run), and
+  // then init_rma_staging() has allocated a slot for every thread. The state
+  // is per-thread, so nothing here races another thread; only the accumulate
+  // itself is serialized (a critical).
+  if (rma_k_ > 0) {
+    // Coalescer hit first: the dominant pattern is the scores loop -- several
+    // consecutive calls with the same filter bin -- and an open coalescer row
+    // only ever holds a REMOTE bin, so this one compare routes the repeat case
+    // with no ownership arithmetic at all.
+    RmaThreadStaging& ts = rma_staging_[thread_num()];
+    if (filter_index == ts.coalesce_bin) {
+      ts.row[score_index] += val;
+      return;
+    }
 
-  // Remote arm (C2): coalesce consecutive contributions to a single filter bin
-  // into a thread-local row, then stage rows for a batched MPI_Accumulate to
-  // the owning rank. Design follows Dun et al. (2015): origin-side buffering of
-  // one-sided accumulates cuts the per-score RMA cost. A remote bin implies
-  // n_procs > 1, so init_rma_staging() has allocated a slot for every thread.
-  // The state is per-thread, so nothing here races another thread; only the
-  // accumulate itself is serialized (a critical).
-  RmaThreadStaging& ts = rma_staging_[thread_num()];
-  if (filter_index != ts.coalesce_bin) {
+    // Local arm: a bin this rank owns is scored into the private owned-rows
+    // plane (accum_), locally indexed. The window block itself receives only
+    // MPI_Accumulate, so a NIC-side remote atomic never races a CPU store on
+    // the same cell (the two classes target disjoint address ranges by
+    // construction). The unsigned compare is the range test
+    // rma_first_row_ <= filter_index < rma_first_row_ + rma_n_rows_.
+    const int64_t local_row = filter_index - rma_first_row_;
+    if (static_cast<uint64_t>(local_row) < static_cast<uint64_t>(rma_n_rows_)) {
+      atomic_score_add(&accum_[local_row * n_score_bins_ + score_index], val);
+      return;
+    }
+
+    // Remote arm (C2), coalescer miss: open a row for this bin, flushing any
+    // previous one to its target's staging buffer for a batched
+    // MPI_Accumulate to the owning rank. Design follows Dun et al. (2015):
+    // origin-side buffering of one-sided accumulates cuts the per-score RMA
+    // cost. The owner division runs only here -- once per coalesced row, not
+    // once per score.
     if (ts.coalesce_bin >= 0)
       rma_coalescer_flush(ts);
     ts.coalesce_bin = filter_index;
-    ts.coalesce_owner = owner;
+    ts.coalesce_owner = rma_owner(filter_index);
     std::fill(ts.row.begin(), ts.row.end(), 0.0);
+    ts.row[score_index] += val;
+    return;
   }
-  ts.row[score_index] += val;
+
+  // Single-rank run: every bin is local (rma_first_row_ == 0).
+  atomic_score_add(&accum_[filter_index * n_score_bins_ + score_index], val);
 }
 
 int Tally::rma_owner(int64_t filter_index) const
@@ -999,15 +1032,18 @@ void Tally::rma_coalescer_flush(RmaThreadStaging& ts)
   const int nb = 1 - b;
   if (ts.in_flight[t * 2 + nb]) {
     // Both buffers for this target are outstanding, so the one we are about to
-    // reuse still owns an in-flight payload. flush_local_all retires every
-    // origin buffer this rank has issued at once; clear this thread's flags to
-    // match (other threads stay conservatively marked -- a redundant flush at
-    // worst, never a reused-in-flight payload).
+    // reuse still owns an in-flight payload. flush_local(t) locally retires
+    // every accumulate this rank has issued to that one target -- unlike a
+    // flush_local_all it does not stall on the other targets' pipelines -- so
+    // both of this thread's buffers for t are reusable. Clear only those two
+    // flags (other threads' flags for t stay conservatively marked: a
+    // redundant flush at worst, never a reused-in-flight payload).
 #pragma omp critical(openmc_rma)
     {
-      MPI_Win_flush_local_all(accum_win_);
+      MPI_Win_flush_local(t, accum_win_);
     }
-    std::fill(ts.in_flight.begin(), ts.in_flight.end(), 0);
+    ts.in_flight[t * 2] = 0;
+    ts.in_flight[t * 2 + 1] = 0;
   }
   ts.cur[t] = nb;
   ts.fill[t * 2 + nb] = 0;
@@ -1216,13 +1252,13 @@ void Tally::init_rma_accum()
   accum_buffer_.assign(rma_plane_size_, 0.0);
   accum_ = accum_buffer_.data();
 
-  // Distributed window: each rank contributes its owned block. same_op_no_op +
-  // no ordering lets the implementation use hardware atomics for the SUM-only
-  // accumulates and drops ordering overhead (we never mix ops or rely on
-  // order).
+  // Distributed window: each rank contributes its owned block. same_op (every
+  // accumulate is MPI_SUM; MPI_NO_OP is never used) + no ordering lets the
+  // implementation use hardware atomics for the SUM-only accumulates and drops
+  // ordering overhead (we never mix ops or rely on order).
   MPI_Info info;
   MPI_Info_create(&info);
-  MPI_Info_set(info, "accumulate_ops", "same_op_no_op");
+  MPI_Info_set(info, "accumulate_ops", "same_op");
   MPI_Info_set(info, "accumulate_ordering", "none");
   MPI_Aint bytes = static_cast<MPI_Aint>(rma_plane_size_) * sizeof(double);
   void* base = nullptr;
@@ -1285,10 +1321,18 @@ void Tally::init_rma_staging()
   if (const char* env = std::getenv("OPENMC_RMA_STAGING_ROWS")) {
     rma_k_ = std::max<int64_t>(1, std::atoll(env));
   } else {
-    constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank
+    // Fixed per-rank budget covering ALL rma tallies (each carries its own
+    // staging), split across tallies, threads, targets, and the two buffers.
+    constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank, total
+    int64_t n_rma = 0;
+    for (const auto& t : model::tallies) {
+      if (t->storage_ == TallyStorage::RMA)
+        ++n_rma;
+    }
     const int64_t row_bytes =
       static_cast<int64_t>(n_score_bins_) * sizeof(double);
-    const int64_t denom = static_cast<int64_t>(nt) * mpi::n_procs * 2 *
+    const int64_t denom = std::max<int64_t>(1, n_rma) *
+                          static_cast<int64_t>(nt) * mpi::n_procs * 2 *
                           std::max<int64_t>(1, row_bytes);
     rma_k_ = std::clamp<int64_t>(BUDGET / std::max<int64_t>(1, denom), 8, 4096);
   }
@@ -1692,11 +1736,11 @@ void read_tallies_xml(pugi::xml_node root)
 #ifdef OPENMC_MPI
 void reduce_in_place_chunked(double* data, int64_t n, MPI_Comm comm)
 {
-  // 2^27 doubles = 1 GiB per call; keeps the int MPI count below 2^31 for the
-  // very large planes (up to ~4.3e9 elements) these tallies can reach.
-  constexpr int64_t MAX_CHUNK = int64_t {1} << 27;
-  for (int64_t offset = 0; offset < n; offset += MAX_CHUNK) {
-    int count = static_cast<int>(std::min<int64_t>(MAX_CHUNK, n - offset));
+  // 1 GiB per call keeps the int MPI count below 2^31 for the very large
+  // planes (up to ~4.3e9 elements) these tallies can reach.
+  for (int64_t offset = 0; offset < n; offset += MAX_MPI_CHUNK_DOUBLES) {
+    int count =
+      static_cast<int>(std::min<int64_t>(MAX_MPI_CHUNK_DOUBLES, n - offset));
     if (mpi::master) {
       MPI_Reduce(
         MPI_IN_PLACE, data + offset, count, MPI_DOUBLE, MPI_SUM, 0, comm);
@@ -1714,7 +1758,7 @@ void reduce_tally_results()
       // Skip any tallies that are not active
       auto& tally {model::tallies[i_tally]};
 
-      if (tally->storage_ == TallyStorage::SHARED) {
+      if (tally->storage() == TallyStorage::SHARED) {
         // Publish this node's scores and combine the node planes onto the
         // master, replacing the intracomm reduce. The plane then belongs to the
         // node leader until accumulate() folds/zeroes it and resumes.
@@ -1722,7 +1766,7 @@ void reduce_tally_results()
         continue;
       }
 
-      if (tally->storage_ == TallyStorage::RMA) {
+      if (tally->storage() == TallyStorage::RMA) {
         // Complete every rank's accumulates into the distributed window and
         // barrier so nothing is in flight; accumulate() then folds each rank's
         // owned rows. No intracomm reduce -- the data is already at its owner.
@@ -2281,16 +2325,16 @@ extern "C" int openmc_tally_results(
   }
 
   const auto& t {model::tallies[index]};
-#ifdef OPENMC_MPI
-  if (t->storage_ == TallyStorage::RMA) {
-    // Under rma each rank holds only its owned moment rows, so there is no
-    // global in-memory array to return. Consume rma results from the
-    // statepoint.
+  if (t->rma_distributed()) {
+    // Under multi-rank rma each rank holds only its owned moment rows, so
+    // there is no global in-memory array to return; consume those results
+    // from the statepoint. A single-rank rma tally holds the full array and
+    // is served below.
     set_errmsg("In-memory results are not available for a tally using 'rma' "
-               "storage; read them from the statepoint file instead.");
+               "storage on a multi-rank run; read them from the statepoint "
+               "file instead.");
     return OPENMC_E_ALLOCATE;
   }
-#endif
   if (!t->has_moments()) {
     set_errmsg("Tally results have not been allocated yet.");
     return OPENMC_E_ALLOCATE;
