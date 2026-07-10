@@ -9,6 +9,7 @@ decorate -> export -> reload fold round-trip.
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import openmc.deplete
@@ -20,7 +21,7 @@ _TOOLS = Path(openmc.deplete.__file__).parents[2] / "tools"
 sys.path.insert(0, str(_TOOLS))
 
 from add_pendf_isomeric_branching_to_chain import (  # noqa: E402
-    _classify_metastables, map_library, decorate_chain,
+    _classify_metastables, map_library, decorate_chain, _audit_reaction,
 )
 
 
@@ -52,7 +53,14 @@ def _in115_ng_metastables():
 
 
 class _FakeSource:
-    """Minimal PENDF source adapter over a dict of per-nuclide reactions."""
+    """Minimal PENDF source adapter over a dict of per-nuclide reactions.
+
+    A reaction dict may carry an ``energy``/``xs`` pair (the MF=3 total) and each
+    partial dict may carry its own ``energy``/``xs`` (an MF=10 partial); when
+    present these back the pointwise consistency audit. Reactions/partials
+    without arrays make ``total_xs``/``pathway_xs`` raise, so the audit becomes a
+    no-op for them -- keeping the array-free legacy tests unchanged.
+    """
 
     kind = "fake"
     library = "synthetic"
@@ -64,6 +72,21 @@ class _FakeSource:
 
     def reactions(self, nuclide):
         return self._data[nuclide]
+
+    def total_xs(self, nuclide, mt):
+        rx = self._data[nuclide][mt]
+        if "energy" in rx and "xs" in rx:
+            return np.asarray(rx["energy"], float), np.asarray(rx["xs"], float)
+        raise KeyError(f"{nuclide} MT={mt} has no MF=3 total array.")
+
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
+        for p in self._data[nuclide][mt]["partials"]:
+            if p["lfs"] == lfs and (izap is None or p["izap"] == izap):
+                if "energy" in p and "xs" in p:
+                    return (np.asarray(p["energy"], float),
+                            np.asarray(p["xs"], float))
+                break
+        raise KeyError(f"{nuclide} MT={mt} LFS={lfs} has no partial array.")
 
     def close(self):
         pass
@@ -210,3 +233,204 @@ def test_elis_matched_stat_counts():
     _, stats = map_library(source, chain, _decay_lookup(), "elis", 0.50, 0.0)
     assert stats["matched"] == 2
     assert stats["nuclides_with_branching"] == 1
+
+
+# ---------------------------------------------------------------------------
+# MF=10 consistency audit + threshold-gated rejection + decay-gap log
+# ---------------------------------------------------------------------------
+
+def _decay_lookup_with_in114():
+    """`_decay_lookup` plus In114 (ground + m1 at ~190 keV)."""
+    d = _decay_lookup()
+    d[(49, 114)] = [
+        DecayState(49, 114, 0.0, 0, half_life=None),
+        DecayState(49, 114, 190000.0, 1, half_life=4.3e6),
+    ]
+    return d
+
+
+def _in115_ng_offender():
+    """In115 (n,gamma): ground+m1+m4 partials whose sum trails the MF=3 total.
+
+    On grid E=[1,2,3] the MF=3 total is [10,20,30] b; the partials sum to
+    [10,20,27] b, so the worst relative deviation is 3/30 = 0.10 at E=3 eV, and
+    the integral ratio is 38.5/40 = 0.9625.
+    """
+    grid = [1.0, 2.0, 3.0]
+    return dict(qm=6784720.0, qi=6784720.0, energy=grid, xs=[10.0, 20.0, 30.0],
+                partials=[
+                    dict(lfs=0, izap=49116, qi=6784720.0, qm=6784720.0,
+                         elfs=0.0, energy=grid, xs=[6.0, 12.0, 15.0]),
+                    dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0,
+                         elfs=127270.0, energy=grid, xs=[3.0, 6.0, 9.0]),
+                    dict(lfs=4, izap=49116, qi=6495060.0, qm=6784720.0,
+                         elfs=289660.0, energy=grid, xs=[1.0, 2.0, 3.0])])
+
+
+def _in113_ng_clean():
+    """In113 (n,gamma): ground+m1 partials that sum exactly to the MF=3 total."""
+    grid = [1.0, 2.0, 3.0]
+    return dict(qm=0.0, qi=0.0, energy=grid, xs=[10.0, 20.0, 30.0],
+                partials=[
+                    dict(lfs=0, izap=49114, qi=0.0, qm=0.0, elfs=0.0,
+                         energy=grid, xs=[7.0, 14.0, 21.0]),
+                    dict(lfs=1, izap=49114, qi=-190000.0, qm=0.0,
+                         elfs=190000.0, energy=grid, xs=[3.0, 6.0, 9.0])])
+
+
+def test_audit_worst_dev_and_integral_ratio():
+    # Directly exercise the pointwise audit on a constructed mismatch.
+    source = _FakeSource({"In115": {102: _in115_ng_offender()}})
+    audit = _audit_reaction(source, "In115", 102,
+                            source.reactions("In115")[102]["partials"])
+    assert audit is not None
+    assert audit["worst_dev"] == pytest.approx(0.10)
+    assert audit["energy"] == pytest.approx(3.0)
+    assert audit["total"] == pytest.approx(30.0)
+    assert audit["sum_partials"] == pytest.approx(27.0)
+    assert audit["integral_ratio"] == pytest.approx(0.9625)
+
+
+def test_audit_floor_dust_not_offender():
+    # Both the MF=3 total and the summed partials sit below CONSISTENCY_ABS_FLOOR
+    # (1e-15 b): floor dust, exempt -> worst_dev 0.0, no energy recorded.
+    grid = [1.0, 2.0]
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=[1e-20, 1e-20], partials=[
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=[1e-20, 1e-20]),
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[5e-21, 5e-21])])
+    source = _FakeSource({"In115": {102: rxn}})
+    audit = _audit_reaction(source, "In115", 102, rxn["partials"])
+    assert audit["worst_dev"] == 0.0
+    assert audit["energy"] is None
+
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 0.0)]})
+    _, stats = map_library(source, chain, _decay_lookup(), "elis", 0.50, 0.0)
+    assert stats["audit_offenders"] == 0
+
+
+def _audit_scene():
+    """Chain + source with one offender (In115) and one clean (In113) reaction."""
+    chain = _chain_with(
+        ["In113", "In114", "In114_m1", "In115", "In116", "In116_m1",
+         "In116_m2"],
+        reactions={"In115": [("(n,gamma)", "In116", 6784720.0)],
+                   "In113": [("(n,gamma)", "In114", 0.0)]})
+    source = _FakeSource({
+        "In115": {102: _in115_ng_offender()},
+        "In113": {102: _in113_ng_clean()},
+    })
+    return chain, source
+
+
+def test_audit_offender_logged_when_rejection_off():
+    # Default (flag off): the offender is detected + counted but STILL decorated.
+    chain, source = _audit_scene()
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0, reject_rtol=None)
+    assert stats["audit_offenders"] == 1
+    assert stats["audit_clean"] == 1
+    assert stats["rejected_count"] == 0
+    assert "In115" in branching                      # bad reaction decorated
+    assert "In113" in branching
+
+    off = stats["audit_offenders_list"][0]
+    assert off["parent"] == "In115"
+    assert off["worst_dev"] == pytest.approx(0.10)
+
+    decorate_chain(chain, branching)
+    assert "(n,gamma)_m1" in {rx.type for rx in chain["In115"].reactions}
+
+
+def test_rejection_leaves_offender_stock(tmp_path):
+    # Flag on with a threshold below the offender's dev: In115 stays stock while
+    # the clean In113 reaction is still decorated.
+    chain, source = _audit_scene()
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0, reject_rtol=0.05)
+    assert stats["rejected_count"] == 1
+    assert stats["audit_offenders"] == 1
+    assert stats["rejected"][0]["parent"] == "In115"
+    assert stats["rejected"][0]["threshold"] == 0.05
+    assert "In115" not in branching                  # rejected -> not decorated
+    assert "In113" in branching                      # clean -> decorated
+
+    reactions_added = decorate_chain(chain, branching)
+    stats["reactions_added"] = reactions_added
+
+    out = tmp_path / "chain.xml"
+    chain.export_to_xml(out)
+    import xml.etree.ElementTree as ET
+    root = ET.parse(out).getroot()
+
+    def nuc(name):
+        return next(n for n in root.findall("nuclide")
+                    if n.get("name") == name)
+
+    assert nuc("In115").find(".//isomeric_branching") is None
+    assert nuc("In113").find(".//isomeric_branching") is not None
+
+    # The rejection is recorded in the log, not the chain XML.
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain=str(out), chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "MF=10 REJECTED REACTIONS" in text
+    assert "MF=10 CONSISTENCY AUDIT" in text
+    assert "In115" in text.split("MF=10 REJECTED REACTIONS", 1)[1]
+
+
+def test_rejected_section_disabled_message(tmp_path):
+    # With the flag off, the rejected section shows the audit-only one-liner.
+    chain, source = _audit_scene()
+    _, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                           "elis", 0.50, 0.0, reject_rtol=None)
+    stats["reactions_added"] = 0
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "rejection disabled (audit only)" in text
+
+
+def test_absent_from_decay_section_unique_and_grouped(tmp_path):
+    # Y89 (no decay data at all) surfaced by TWO reactions must be listed once;
+    # Zn66 (present, ground-only) lands under no_metastables.
+    chain = _chain_with(["Co59", "Zn64"])
+    source = _FakeSource({
+        "Co59": {
+            102: dict(qm=0.0, qi=0.0, partials=[
+                dict(lfs=1, izap=39089, qi=0.0, qm=100000.0, elfs=100000.0)]),
+            16: dict(qm=0.0, qi=0.0, partials=[
+                dict(lfs=1, izap=39089, qi=0.0, qm=120000.0, elfs=120000.0)]),
+        },
+        "Zn64": {
+            102: dict(qm=0.0, qi=0.0, partials=[
+                dict(lfs=1, izap=30066, qi=0.0, qm=90000.0, elfs=90000.0)]),
+        },
+    })
+    decay = {(30, 66): [DecayState(30, 66, 0.0, 0, half_life=None)]}
+    _, stats = map_library(source, chain, decay, "elis", 0.50, 0.0)
+
+    assert stats["absent_unique_count"] == 2
+    assert stats["absent_by_status"]["no_decay_data"] == ["Y89"]
+    assert stats["absent_by_status"]["no_metastables"] == ["Zn66"]
+
+    stats["reactions_added"] = 0
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    section = log.read_text().split(
+        "NUCLIDES ABSENT FROM DECAY LIBRARY", 1)[1]
+    assert section.count("Y89") == 1
+    assert "Zn66" in section
+    assert "no_decay_data" in section
+    assert "no_metastables" in section

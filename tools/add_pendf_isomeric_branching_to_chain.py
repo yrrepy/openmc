@@ -28,6 +28,8 @@ from collections import defaultdict, Counter
 from itertools import combinations
 from pathlib import Path
 
+import numpy as np
+
 import openmc.data
 from openmc.data import gnds_name, zam, ATOMIC_SYMBOL, DADZ
 from openmc.deplete import Chain
@@ -36,6 +38,13 @@ from openmc.deplete.chain import REACTIONS
 from openmc.deplete.decay_elis import (
     parse_decay_isomeric_levels, lookup_liso, ELIS_RTOL, ELIS_ATOL,
 )
+from openmc.deplete.microxs import (
+    _partials_total_max_deviation, CONSISTENCY_ABS_FLOOR, CONSISTENCY_RTOL,
+)
+
+# ``numpy.trapz`` was renamed to ``numpy.trapezoid`` in NumPy 2.0; fall back so
+# the audit's integral ratio works on either.
+_TRAPEZOID = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
 
 
 # =============================================================================
@@ -96,6 +105,7 @@ def build_parser():
     parser.add_argument('-m', '--map',          choices=['elis', 'lfs_order'],                default='elis',   help="Mapping mode: 'elis' (production, default) or 'lfs_order' (FISPACT validation)")
     parser.add_argument('-r', '--rtol',         type=float,                                   default=0.50,     help='Relative tolerance for ELIS matching (default: 0.50 = 50%%)')
     parser.add_argument('-a', '--atol',         type=float,                                   default=0.0,      help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
+    parser.add_argument('--mf10-reject-rtol',   type=float,                                   default=None,     help='Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (default: None = audit only, reject nothing)')
     parser.add_argument('-v', '--verbose',      action='store_true',                          default=True,     help='Enable verbose output (default: True)')
     parser.add_argument('-q', '--quiet',        action='store_true',                          default=False,    help='Disable verbose output')
     return parser
@@ -168,6 +178,14 @@ class _H5Source:
                            partials=partials)
         return out
 
+    def total_xs(self, nuclide, mt):
+        """(energy, xs) of the MF=3 total cross section (barn vs eV)."""
+        return self._lib.xs(nuclide, mt)
+
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
+        """(energy, xs) of one MF=10 isomeric-production partial."""
+        return self._lib.pathway_xs(nuclide, mt, lfs, izap)
+
     def close(self):
         self._lib.close()
 
@@ -191,6 +209,9 @@ class _AscSource:
         self.library = library or 'unknown'
         self.mapping = None
         self._data = {}
+        self._tapes = {}                 # GNDS name -> tape path
+        self._xs_cache_name = None       # single-nuclide (energy, xs) cache
+        self._xs_cache = None
         for tape, _implied in _discover_pendf_files(Path(path)):
             try:
                 ev = Evaluation(tape)
@@ -219,10 +240,73 @@ class _AscSource:
                 reactions[mt] = dict(qm=float(qm), qi=float(qi),
                                      partials=partials)
             self._data[name] = reactions
+            self._tapes[name] = tape
         self.nuclides = sorted(self._data)
 
     def reactions(self, nuclide):
         return self._data[nuclide]
+
+    def _load_xs(self, nuclide):
+        """Parse one tape's MF=3 totals + MF=10 partial (energy, xs) arrays.
+
+        Cached one nuclide at a time: ``map_library`` audits a parent's
+        reactions back-to-back before moving on, so only the tape currently
+        under audit is held in memory -- never the whole library.
+        """
+        if self._xs_cache_name == nuclide:
+            return self._xs_cache
+        from openmc.data.pendf import _iter_mf10_partials
+        from openmc.data.endf import (Evaluation, get_head_record,
+                                       get_tab1_record)
+        import io
+
+        ev = Evaluation(self._tapes[nuclide])
+        z = ev.target['atomic_number']
+        a = ev.target['mass_number']
+        liso = ev.target['isomeric_state']
+        name = gnds_name(z, a, liso)
+        cache = {}
+        mf10_mts = {mt for (mf, mt) in ev.section if mf == 10}
+        for mt in mf10_mts:
+            total = None
+            if (3, mt) in ev.section:
+                fo = io.StringIO(ev.section[3, mt])
+                get_head_record(fo)
+                (_qm, _qi, _l1, _lr), tab = get_tab1_record(fo)
+                total = (np.asarray(tab.x, dtype=float),
+                         np.asarray(tab.y, dtype=float))
+            partials = {}
+            for pqm, pqi, izap, lfs, ptab in _iter_mf10_partials(ev, mt, name):
+                partials[(int(lfs), int(izap))] = (
+                    np.asarray(ptab.x, dtype=float),
+                    np.asarray(ptab.y, dtype=float))
+            cache[mt] = dict(total=total, partials=partials)
+        self._xs_cache_name = nuclide
+        self._xs_cache = cache
+        return cache
+
+    def total_xs(self, nuclide, mt):
+        """(energy, xs) of the MF=3 total cross section (barn vs eV)."""
+        rx = self._load_xs(nuclide).get(mt)
+        if rx is None or rx['total'] is None:
+            raise KeyError(f"{nuclide!r} MT={mt} has no MF=3 total.")
+        return rx['total']
+
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
+        """(energy, xs) of one MF=10 isomeric-production partial."""
+        rx = self._load_xs(nuclide).get(mt)
+        if rx is None:
+            raise KeyError(f"{nuclide!r} MT={mt} has no MF=10 partials.")
+        parts = rx['partials']
+        if izap is not None:
+            return parts[(lfs, izap)]
+        matches = [v for (l, _z), v in parts.items() if l == lfs]
+        if not matches:
+            raise KeyError(f"{nuclide!r} MT={mt} has no MF=10 partial LFS={lfs}.")
+        if len(matches) > 1:
+            raise ValueError(f"{nuclide!r} MT={mt} LFS={lfs} shared by several "
+                             f"IZAP; pass izap= to disambiguate.")
+        return matches[0]
 
     def close(self):
         pass
@@ -240,6 +324,60 @@ def open_pendf_source(path, library=None):
     if path.is_file():
         return _H5Source(path)
     raise FileNotFoundError(str(path))
+
+
+# =============================================================================
+# Pointwise MF=10-vs-MF=3 consistency audit
+# =============================================================================
+
+def _audit_reaction(source, parent, mt, partials):
+    """Pointwise consistency of a reaction's MF=10 partials against its MF=3 total.
+
+    Every MF=10 partial (ground + metastable) is interpolated lin-lin onto the
+    MF=3 energy grid (``np.interp(..., left=0, right=0)`` -- PENDF is lin-lin;
+    outside a partial's tabulated range it contributes nothing) and summed. The
+    summed partials are compared to the MF=3 total with the same
+    :func:`_partials_total_max_deviation` used by the collapse, so the audit and
+    the runtime warning share one definition of "consistent" (including the
+    ``CONSISTENCY_ABS_FLOOR`` both-sides floor-dust exemption).
+
+    Returns ``None`` when the MF=3 total is unavailable (nothing to compare
+    against), else a dict with ``worst_dev`` (max relative deviation),
+    ``energy`` (eV at that group; ``None`` when only floor dust qualified),
+    ``sum_partials``/``total`` (barn there), and ``integral_ratio``
+    (``int Sum(partials) / int total`` over the MF=3 grid).
+    """
+    try:
+        mf3_e, mf3_xs = source.total_xs(parent, mt)
+    except Exception:
+        return None
+    mf3_e = np.asarray(mf3_e, dtype=float)
+    mf3_xs = np.asarray(mf3_xs, dtype=float)
+    if mf3_e.size == 0:
+        return None
+
+    part_sum = np.zeros_like(mf3_xs)
+    for p in partials:
+        try:
+            pe, pxs = source.pathway_xs(parent, mt, p['lfs'], p['izap'])
+        except Exception:
+            continue
+        part_sum = part_sum + np.interp(mf3_e, np.asarray(pe, dtype=float),
+                                        np.asarray(pxs, dtype=float),
+                                        left=0.0, right=0.0)
+
+    worst, idx = _partials_total_max_deviation(mf3_xs, part_sum)
+
+    int_total = float(_TRAPEZOID(mf3_xs, mf3_e))
+    int_part = float(_TRAPEZOID(part_sum, mf3_e))
+    ratio = (int_part / int_total) if int_total != 0.0 else float('inf')
+
+    return dict(
+        worst_dev=worst,
+        energy=(float(mf3_e[idx]) if idx >= 0 else None),
+        sum_partials=(float(part_sum[idx]) if idx >= 0 else None),
+        total=(float(mf3_xs[idx]) if idx >= 0 else None),
+        integral_ratio=ratio)
 
 
 # =============================================================================
@@ -304,7 +442,7 @@ def _classify_metastables(parent, mt, r_name, metastables, decay_lookup,
             rec.update(bucket='zero_elis',
                        skipped_states=res.get('skipped_states', []))
         else:  # no_decay_data / no_metastables / no_match
-            rec.update(bucket='no_dk')
+            rec.update(bucket='no_dk', status=status)
         records.append(rec)
     return records
 
@@ -335,13 +473,20 @@ def _classify_lfs_order(parent, mt, r_name, metastables, decay_lookup,
     return records
 
 
-def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
+def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
+                reject_rtol=None):
     """Map every PENDF nuclide's MF=10 metastable partials against the chain.
 
     Returns ``(branching, stats)`` where ``branching`` is
     ``{parent: {r_name: {'mt', 'ground', 'metastables'}}}`` restricted to the
     matched-and-in-chain pathways, and ``stats`` carries the counters and the
     per-parent log records.
+
+    Every reaction carrying >=1 metastable pathway is run through the pointwise
+    MF=10-vs-MF=3 consistency audit (:func:`_audit_reaction`) regardless of
+    ``reject_rtol``. When ``reject_rtol`` is not ``None``, a reaction whose audit
+    max relative deviation exceeds it is left stock -- no ``<isomeric_branching>``
+    is created -- and recorded in ``stats['rejected']``.
     """
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
@@ -351,6 +496,11 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
     products_not_in_chain = []    # matched but target absent from chain
     duplicate_errors = []         # kept-closest, others discarded
     lfs_order_dropped = []
+
+    audit_offenders = []          # reactions with worst_dev > CONSISTENCY_RTOL
+    audit_clean = 0               # auditable reactions within CONSISTENCY_RTOL
+    rejected = []                 # audit-rejected (left stock) when flag set
+    absent_status = {}            # base GNDS name -> lookup_liso status (no_dk)
 
     nuclides_with_branching = set()
     total_lfs = 0
@@ -380,6 +530,24 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
                 continue
 
             total_lfs += len(metastables)
+
+            # Pointwise MF=10-vs-MF=3 consistency audit. Always runs (the
+            # decoration candidates are exactly the reactions with >=1
+            # metastable pathway); rejection is a separate, opt-in gate below.
+            audit = _audit_reaction(source, parent, mt, partials)
+            reject_this = False
+            if audit is not None:
+                if audit['worst_dev'] > CONSISTENCY_RTOL:
+                    audit_offenders.append(dict(
+                        parent=parent, mt=mt, reaction=r_name, **audit))
+                else:
+                    audit_clean += 1
+                if reject_rtol is not None and audit['worst_dev'] > reject_rtol:
+                    reject_this = True
+                    rejected.append(dict(
+                        parent=parent, mt=mt, reaction=r_name,
+                        threshold=reject_rtol, **audit))
+
             records = _classify_metastables(
                 parent, mt, r_name, metastables, decay_lookup,
                 chain_names, mode, rtol, atol)
@@ -430,10 +598,16 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
                         skipped_states=rec.get('skipped_states', [])))
                 elif bucket == 'no_dk':
                     nuclides_with_branching.add(parent)
+                    base_nuc = gnds_name(rec['z'], rec['a'], 0)
+                    # Status (no_decay_data / no_metastables / no_match) is a
+                    # property of (Z, A) + decay library, so one base name maps
+                    # to one status regardless of which reaction surfaced it.
+                    absent_status.setdefault(base_nuc,
+                                             rec.get('status', 'no_decay_data'))
                     elis_errors.append(dict(
                         type='no_metastable_decay_data', parent=parent, mt=mt,
                         reaction=r_name, lfs=rec['lfs'], elis=rec['elfs'],
-                        base_nuclide=gnds_name(rec['z'], rec['a'], 0),
+                        base_nuclide=base_nuc,
                         target_z=rec['z'], target_a=rec['a']))
                 elif bucket == 'duplicate':
                     dup_by_liso[rec['liso']].append(rec)
@@ -455,7 +629,10 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
                                for d in dups]))
 
             # Record the branching for decoration (parent must be in chain).
-            if mapped and parent_in_chain:
+            # A reaction the audit rejected (reject_this) is skipped here: no
+            # <isomeric_branching> is created, the base reaction stays stock, and
+            # the collapse's MF=3 fallback routes the total to the ground target.
+            if mapped and parent_in_chain and not reject_this:
                 ground = next((p for p in partials if p['lfs'] == 0), None)
                 branching[parent][r_name] = dict(
                     mt=mt, ground=ground, qm=rxinfo['qm'], qi=rxinfo['qi'],
@@ -464,6 +641,14 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
                 # MF=10 metastables present but none mapped into the chain:
                 # the base reaction is left stock.
                 ground_only += 1
+
+    # Unique base names absent from the decay library, grouped by lookup_liso
+    # status (no_decay_data / no_metastables / no_match).
+    absent_by_status = defaultdict(list)
+    for base, status in absent_status.items():
+        absent_by_status[status].append(base)
+    absent_by_status = {status: sorted(names)
+                        for status, names in absent_by_status.items()}
 
     stats = dict(
         pendf_nuclides_total=len(source.nuclides),
@@ -483,6 +668,15 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True):
         products_not_in_chain_errors=products_not_in_chain,
         duplicate_errors=duplicate_errors,
         lfs_order_dropped_list=lfs_order_dropped,
+        # MF=10 consistency audit + threshold-gated rejection + decay-gap log.
+        reject_rtol=reject_rtol,
+        audit_offenders=len(audit_offenders),
+        audit_clean=audit_clean,
+        audit_offenders_list=audit_offenders,
+        rejected_count=len(rejected),
+        rejected=rejected,
+        absent_by_status=absent_by_status,
+        absent_unique_count=len(absent_status),
     )
     return branching, stats
 
@@ -599,6 +793,9 @@ def print_stats(stats, mode):
     print(f"                        Products not in chain: {stats['products_not_in_chain']:5d}")
     print(f"                      Reactions added to chain: {stats['reactions_added']:5d}")
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
+    print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
+    print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
+    print(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}")
 
 
 # =============================================================================
@@ -788,6 +985,123 @@ def _write_duplicate_section(f, duplicate_errors):
         f.write("\n")
 
 
+def _write_consistency_audit_section(f, offenders, audit_clean):
+    """MF=10 CONSISTENCY AUDIT section: offenders (worst_dev > rtol) worst-first."""
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("MF=10 CONSISTENCY AUDIT\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("Pointwise Sum(MF=10 partials) interpolated onto the MF=3 energy "
+            "grid, compared against the MF=3 total, for every reaction carrying "
+            ">=1 metastable pathway.\n")
+    f.write(f"Groups where BOTH sides sit below {CONSISTENCY_ABS_FLOOR:.0e} b "
+            "(evaluator floor dust) are exempt -- their relative deviation is "
+            "meaningless.\n")
+    f.write(f"Offenders (max rel dev > {CONSISTENCY_RTOL:.0e}) are listed "
+            f"worst-first; {audit_clean} audited reaction(s) are clean.\n\n")
+    if not offenders:
+        f.write("No offenders: all audited reactions agree within "
+                f"{CONSISTENCY_RTOL:.0e}.\n")
+        return
+    f.write(f"Total offenders: {len(offenders)}\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
+              f"{'E[eV]@max':>14}  {'Sum-part[b]':>14}  {'Total[b]':>14}  "
+              f"{'IntRatio':>12}")
+    sep = "-" * 120
+    f.write(header + "\n" + sep + "\n")
+    for o in sorted(offenders, key=lambda x: x['worst_dev'], reverse=True):
+        e = o.get('energy')
+        sp = o.get('sum_partials')
+        tot = o.get('total')
+        ratio = o.get('integral_ratio')
+        e_str = f"{e:.4e}" if e is not None else "-"
+        sp_str = f"{sp:.4e}" if sp is not None else "-"
+        tot_str = f"{tot:.4e}" if tot is not None else "-"
+        ratio_str = f"{ratio:.4f}" if ratio not in (None, float('inf')) else "inf"
+        f.write(f"{o['parent']:<12}  {o['mt']:>5}  {o['reaction']:<12}  "
+                f"{o['worst_dev']:>12.4e}  {e_str:>14}  {sp_str:>14}  "
+                f"{tot_str:>14}  {ratio_str:>12}\n")
+
+
+def _write_rejected_section(f, rejected, reject_rtol):
+    """MF=10 REJECTED REACTIONS section: audit-gated reactions left stock."""
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("MF=10 REJECTED REACTIONS\n")
+    f.write("=" * 220 + "\n\n")
+    if reject_rtol is None:
+        f.write("rejection disabled (audit only): --mf10-reject-rtol was not "
+                "set, so no reaction was rejected on audit grounds.\n")
+        return
+    f.write(f"Threshold: --mf10-reject-rtol = {reject_rtol:.3e}\n")
+    f.write("Criterion: a reaction whose MF=10-vs-MF=3 audit max relative "
+            f"deviation exceeds {reject_rtol:.3e} is left stock (no "
+            "<isomeric_branching> child).\n")
+    f.write("Consequence: MF=3 total routes to the ground target; isomeric "
+            "branching discarded.\n\n")
+    if not rejected:
+        f.write(f"No reactions exceeded the threshold {reject_rtol:.3e}.\n")
+        return
+    f.write(f"Total rejected: {len(rejected)}\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
+              f"{'Threshold':>12}  {'E[eV]@max':>14}  {'Sum-part[b]':>14}  "
+              f"{'Total[b]':>14}  {'Consequence':<52}")
+    sep = "-" * 160
+    f.write(header + "\n" + sep + "\n")
+    consequence = "left stock: MF=3 total -> ground target; branching discarded"
+    for o in sorted(rejected, key=lambda x: x['worst_dev'], reverse=True):
+        e = o.get('energy')
+        sp = o.get('sum_partials')
+        tot = o.get('total')
+        e_str = f"{e:.4e}" if e is not None else "-"
+        sp_str = f"{sp:.4e}" if sp is not None else "-"
+        tot_str = f"{tot:.4e}" if tot is not None else "-"
+        f.write(f"{o['parent']:<12}  {o['mt']:>5}  {o['reaction']:<12}  "
+                f"{o['worst_dev']:>12.4e}  {o['threshold']:>12.3e}  "
+                f"{e_str:>14}  {sp_str:>14}  {tot_str:>14}  {consequence:<52}\n")
+
+
+_ABSENT_STATUS_LABELS = (
+    ('no_decay_data', 'ABSENT ENTIRELY (no decay data for this Z,A)'),
+    ('no_metastables', 'PRESENT BUT NO METASTABLE DATA (only a ground state)'),
+    ('no_match', 'NO ELIS MATCH (metastables exist; none within tolerance)'),
+)
+
+
+def _write_absent_decay_section(f, absent_by_status):
+    """NUCLIDES ABSENT FROM DECAY LIBRARY section: unique base names by status."""
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("NUCLIDES ABSENT FROM DECAY LIBRARY\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("Unique product base nuclides (GNDS ground name) whose MF=10 "
+            "metastable partials could not be mapped because the decay library "
+            "carries no usable metastable data,\n")
+    f.write("grouped by the reason lookup_liso returned. Each name is listed "
+            "once regardless of how many reactions produced it.\n\n")
+    total = sum(len(absent_by_status.get(s, [])) for s, _ in _ABSENT_STATUS_LABELS)
+    # Include any status not in the fixed label set (defensive).
+    other = {s: n for s, n in absent_by_status.items()
+             if s not in {s0 for s0, _ in _ABSENT_STATUS_LABELS}}
+    total += sum(len(n) for n in other.values())
+    if total == 0:
+        f.write("No product nuclides were absent from the decay library.\n")
+        return
+    f.write(f"Total unique nuclides absent: {total}\n")
+    for status, label in _ABSENT_STATUS_LABELS:
+        names = absent_by_status.get(status, [])
+        f.write(f"\n{label} [{status}]: {len(names)}\n")
+        f.write("-" * 120 + "\n")
+        if names:
+            for i in range(0, len(names), 8):
+                f.write("  " + "  ".join(f"{n:<12}" for n in names[i:i + 8])
+                        + "\n")
+        else:
+            f.write("  (none)\n")
+    for status, names in sorted(other.items()):
+        f.write(f"\n{status}: {len(names)}\n")
+        f.write("-" * 120 + "\n")
+        for i in range(0, len(names), 8):
+            f.write("  " + "  ".join(f"{n:<12}" for n in names[i:i + 8]) + "\n")
+
+
 def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
     """Write the comprehensive PENDF isomer mapping log."""
     isomer_mappings = stats['isomer_mappings']
@@ -861,6 +1175,9 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                          Products not in chain: {stats['products_not_in_chain']:5d}\n")
         f.write(f"                       Reactions added to chain: {stats['reactions_added']:5d}\n")
         f.write(f"                     Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
+        f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
+        f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
+        f.write(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}\n")
         f.write("\n")
 
         # Column definitions
@@ -937,6 +1254,12 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
 
         _write_proximity_check(f, isomer_mappings, rtol)
         _write_duplicate_section(f, duplicate_errors)
+        _write_consistency_audit_section(
+            f, stats.get('audit_offenders_list', []),
+            stats.get('audit_clean', 0))
+        _write_rejected_section(
+            f, stats.get('rejected', []), stats.get('reject_rtol'))
+        _write_absent_decay_section(f, stats.get('absent_by_status', {}))
 
     print(f"Isomer mapping log written to: {log_file}")
 
@@ -947,7 +1270,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
 
 def main(base_chain_file, pendf_path, decay_file, output_chain_file,
          log_file=None, mapping_mode='elis', elis_rtol=ELIS_RTOL,
-         elis_atol=ELIS_ATOL, verbose=True, library=None):
+         elis_atol=ELIS_ATOL, verbose=True, library=None, reject_rtol=None):
     """Patch a chain with PENDF MF=10 isomeric branching. Returns the Chain."""
     if decay_file is None:
         raise ValueError("decay_file is required for isomeric branching.")
@@ -981,9 +1304,14 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     print("\nStep 4: Mapping MF=10 isomeric branching...")
     print(f"  ELIS tolerance: rtol={elis_rtol} ({elis_rtol*100:.0f}%), "
           f"atol={elis_atol} eV")
+    if reject_rtol is not None:
+        print(f"  MF=10 audit rejection: worst rel dev > {reject_rtol:.3e} "
+              f"-> reaction left stock")
+    else:
+        print("  MF=10 audit: detection + logging only (no rejection)")
     branching, stats = map_library(
         source, chain, decay_lookup, mapping_mode, elis_rtol, elis_atol,
-        verbose=verbose)
+        verbose=verbose, reject_rtol=reject_rtol)
 
     print("\nStep 5: Decorating chain...")
     reactions_added = decorate_chain(chain, branching)
@@ -1061,6 +1389,10 @@ if __name__ == '__main__':
               f"{LIBRARY_CONFIGS[args.library]['description']}")
     print(f"Mapping mode: {args.map}")
     print(f"Tolerances:   rtol={args.rtol}, atol={args.atol}")
+    if args.mf10_reject_rtol is not None:
+        print(f"MF=10 reject: worst rel dev > {args.mf10_reject_rtol}")
+    else:
+        print("MF=10 reject: off (audit only)")
     print(f"\nInput chain:  {base_chain}")
     print(f"PENDF source: {pendf}")
     print(f"Decay lib:    {decay_file}")
@@ -1072,7 +1404,8 @@ if __name__ == '__main__':
          decay_file=str(decay_file), output_chain_file=str(output_chain),
          log_file=str(log_file) if log_file else None,
          mapping_mode=args.map, elis_rtol=args.rtol, elis_atol=args.atol,
-         verbose=verbose, library=args.library)
+         verbose=verbose, library=args.library,
+         reject_rtol=args.mf10_reject_rtol)
 
     print("\n" + "=" * 70)
     print("Done. Chain saved to:", output_chain)
