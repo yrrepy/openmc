@@ -96,18 +96,20 @@ def build_parser():
     epilog = "\n".join(lib_help_lines)
 
     parser = argparse.ArgumentParser(description='PENDF Isomeric Branching Chain Patcher v1 -- adds MF=10 isomeric branching from a PENDF library to an OpenMC chain.', epilog=epilog, formatter_class=CustomFormatter)
-    parser.add_argument('-l', '--library',      choices=list(LIBRARY_CONFIGS), metavar='LIB', default=None,     help='Library preset (see list below); provides defaults for the paths')
-    parser.add_argument('--base-chain',         type=Path,                                    default=None,     help='Base OpenMC chain XML (overrides preset)')
-    parser.add_argument('--pendf',              type=Path,                                    default=None,     help='PENDF source: an .h5 library file OR a directory of ASC .pendf/.asc tapes (overrides preset)')
-    parser.add_argument('--decay-file',         type=Path,                                    default=None,     help='ENDF decay library file or directory (overrides preset)')
-    parser.add_argument('--output-chain',       type=Path,                                    default=None,     help='Output chain XML (overrides preset-derived name)')
-    parser.add_argument('--log-file',           type=Path,                                    default=None,     help='Isomer mapping log file (overrides preset-derived name)')
-    parser.add_argument('-m', '--map',          choices=['elis', 'lfs_order'],                default='elis',   help="Mapping mode: 'elis' (production, default) or 'lfs_order' (FISPACT validation)")
-    parser.add_argument('-r', '--rtol',         type=float,                                   default=0.50,     help='Relative tolerance for ELIS matching (default: 0.50 = 50%%)')
-    parser.add_argument('-a', '--atol',         type=float,                                   default=0.0,      help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
-    parser.add_argument('--mf10-reject-rtol',   type=float,                                   default=None,     help='Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (default: None = audit only, reject nothing)')
-    parser.add_argument('-v', '--verbose',      action='store_true',                          default=True,     help='Enable verbose output (default: True)')
-    parser.add_argument('-q', '--quiet',        action='store_true',                          default=False,    help='Disable verbose output')
+    parser.add_argument('-l', '--library',          choices=list(LIBRARY_CONFIGS), metavar='LIB', default=None,   help='Library preset (see list below); provides defaults for the paths')
+    parser.add_argument('--base-chain',             type=Path,                                    default=None,   help='Base OpenMC chain XML (overrides preset)')
+    parser.add_argument('--pendf',                  type=Path,                                    default=None,   help='PENDF source: an .h5 library file OR a directory of ASC .pendf/.asc tapes (overrides preset)')
+    parser.add_argument('--decay-file',             type=Path,                                    default=None,   help='ENDF decay library file or directory (overrides preset)')
+    parser.add_argument('--output-chain',           type=Path,                                    default=None,   help='Output chain XML (overrides preset-derived name)')
+    parser.add_argument('--log-file',               type=Path,                                    default=None,   help='Isomer mapping log file (overrides preset-derived name)')
+    parser.add_argument('-m', '--map',              choices=['elis', 'lfs_order'],                default='elis', help="Mapping mode: 'elis' (production, default) or 'lfs_order' (FISPACT validation)")
+    parser.add_argument('-r', '--rtol',             type=float,                                   default=0.50,   help='Relative tolerance for ELIS matching (default: 0.50 = 50%%)')
+    parser.add_argument('-a', '--atol',             type=float,                                   default=0.0,    help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
+    parser.add_argument('--audit-emax',             type=float,                                   default=2.0e7,  help='Cap the MF=10-vs-MF=3 audit at E <= this many eV (default: 2.0e7 = application group cap; MF=10 partials legitimately stop near 30 MeV while MF=3 runs to 200 MeV)')
+    parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help='Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (default: None = audit only, reject nothing)')
+    parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has |ratio-1| > X (default: None = off; None-ratio bands never trigger)')
+    parser.add_argument('-v', '--verbose',          action='store_true',                          default=True,   help='Enable verbose output (default: True)')
+    parser.add_argument('-q', '--quiet',            action='store_true',                          default=False,  help='Disable verbose output')
     return parser
 
 
@@ -330,7 +332,46 @@ def open_pendf_source(path, library=None):
 # Pointwise MF=10-vs-MF=3 consistency audit
 # =============================================================================
 
-def _audit_reaction(source, parent, mt, partials):
+# Lethargy band edges (eV): thermal [grid_min, 1), resonance [1, 1e5),
+# fast [1e5, emax]. The three ratios diagnose WHERE the MF=10 partials
+# depart from the MF=3 total, which the single full-range number hides.
+_BAND_THERMAL_HI = 1.0
+_BAND_RESONANCE_HI = 1.0e5
+
+
+def _lethargy_integral(e, xs):
+    """Trapezoidal integral of the lethargy-weighted cross section (int sigma/E dE).
+
+    ``sigma/E`` is evaluated with a guarded divide so a non-positive grid edge
+    (never expected for a physical energy grid) contributes zero rather than a
+    NaN/inf.
+    """
+    leth = np.divide(xs, e, out=np.zeros_like(xs, dtype=float), where=e > 0.0)
+    return float(_TRAPEZOID(leth, e))
+
+
+def _band_ratio(e, total, part, lo, hi, inclusive_hi):
+    """Lethargy-weighted ``int part/E dE`` / ``int total/E dE`` over one band.
+
+    Selects the grid points falling in ``[lo, hi)`` (or ``[lo, hi]`` when
+    ``inclusive_hi``). Returns ``(ratio, part_nonzero_but_total_zero)``:
+    ``ratio`` is ``None`` when the band holds fewer than 2 grid points or its
+    total integral is zero; the second flag is ``True`` only in the degenerate
+    case where the partials integrate to something while the total is zero
+    (a genuine inconsistency the caller surfaces in the row notes).
+    """
+    sel = (e >= lo) & (e <= hi) if inclusive_hi else (e >= lo) & (e < hi)
+    if int(np.count_nonzero(sel)) < 2:
+        return None, False
+    eb, tb, pb = e[sel], total[sel], part[sel]
+    int_total = _lethargy_integral(eb, tb)
+    if int_total == 0.0:
+        int_part = _lethargy_integral(eb, pb)
+        return None, (int_part != 0.0)
+    return _lethargy_integral(eb, pb) / int_total, False
+
+
+def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
     """Pointwise consistency of a reaction's MF=10 partials against its MF=3 total.
 
     Every MF=10 partial (ground + metastable) is interpolated lin-lin onto the
@@ -341,11 +382,24 @@ def _audit_reaction(source, parent, mt, partials):
     the runtime warning share one definition of "consistent" (including the
     ``CONSISTENCY_ABS_FLOOR`` both-sides floor-dust exemption).
 
+    The MF=3 grid is truncated to ``E <= emax`` BEFORE everything (worst-dev
+    scan, E-at-max, values, and all integrals). This suppresses the known
+    policy artifact where MF=10 partials legitimately end near 30 MeV (TENDL
+    lumping into MT=5) while the MF=3 total runs to 200 MeV: over the full tape
+    range nearly every reaction shows ``dev=1.0`` somewhere and a plain
+    ``int sigma dE`` ratio is dominated by the >30 MeV tail. ``emax`` defaults
+    to the 20 MeV application group-structure cap.
+
     Returns ``None`` when the MF=3 total is unavailable (nothing to compare
-    against), else a dict with ``worst_dev`` (max relative deviation),
-    ``energy`` (eV at that group; ``None`` when only floor dust qualified),
-    ``sum_partials``/``total`` (barn there), and ``integral_ratio``
-    (``int Sum(partials) / int total`` over the MF=3 grid).
+    against) or fewer than 2 grid points survive the cap, else a dict with
+    ``worst_dev`` (max relative deviation), ``energy`` (eV at that group;
+    ``None`` when only floor dust qualified), ``sum_partials``/``total`` (barn
+    there), ``integral_ratio`` (full-range, capped, LETHARGY-weighted
+    ``int Sum(partials)/E dE`` / ``int total/E dE`` -- in v1 this was an
+    unweighted ``dE`` ratio), the three per-band lethargy ratios
+    ``ratio_thermal``/``ratio_resonance``/``ratio_fast`` (``None`` for a band
+    with <2 grid points or zero total integral), and ``notes`` (a string
+    flagging any band whose partials integrate nonzero against a zero total).
     """
     try:
         mf3_e, mf3_xs = source.total_xs(parent, mt)
@@ -354,6 +408,13 @@ def _audit_reaction(source, parent, mt, partials):
     mf3_e = np.asarray(mf3_e, dtype=float)
     mf3_xs = np.asarray(mf3_xs, dtype=float)
     if mf3_e.size == 0:
+        return None
+
+    # Cap the grid at emax before anything else.
+    keep = mf3_e <= emax
+    mf3_e = mf3_e[keep]
+    mf3_xs = mf3_xs[keep]
+    if mf3_e.size < 2:
         return None
 
     part_sum = np.zeros_like(mf3_xs)
@@ -368,16 +429,33 @@ def _audit_reaction(source, parent, mt, partials):
 
     worst, idx = _partials_total_max_deviation(mf3_xs, part_sum)
 
-    int_total = float(_TRAPEZOID(mf3_xs, mf3_e))
-    int_part = float(_TRAPEZOID(part_sum, mf3_e))
+    int_total = _lethargy_integral(mf3_e, mf3_xs)
+    int_part = _lethargy_integral(mf3_e, part_sum)
     ratio = (int_part / int_total) if int_total != 0.0 else float('inf')
+
+    ratio_thermal, flag_th = _band_ratio(
+        mf3_e, mf3_xs, part_sum, 0.0, _BAND_THERMAL_HI, False)
+    ratio_resonance, flag_re = _band_ratio(
+        mf3_e, mf3_xs, part_sum, _BAND_THERMAL_HI, _BAND_RESONANCE_HI, False)
+    ratio_fast, flag_fa = _band_ratio(
+        mf3_e, mf3_xs, part_sum, _BAND_RESONANCE_HI, emax, True)
+
+    flagged = [name for name, flag in
+               (('thermal', flag_th), ('resonance', flag_re), ('fast', flag_fa))
+               if flag]
+    notes = (f"partials nonzero vs zero total in {', '.join(flagged)}"
+             if flagged else '')
 
     return dict(
         worst_dev=worst,
         energy=(float(mf3_e[idx]) if idx >= 0 else None),
         sum_partials=(float(part_sum[idx]) if idx >= 0 else None),
         total=(float(mf3_xs[idx]) if idx >= 0 else None),
-        integral_ratio=ratio)
+        integral_ratio=ratio,
+        ratio_thermal=ratio_thermal,
+        ratio_resonance=ratio_resonance,
+        ratio_fast=ratio_fast,
+        notes=notes)
 
 
 # =============================================================================
@@ -474,7 +552,7 @@ def _classify_lfs_order(parent, mt, r_name, metastables, decay_lookup,
 
 
 def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
-                reject_rtol=None):
+                reject_rtol=None, audit_emax=2.0e7, reject_band_ratio=None):
     """Map every PENDF nuclide's MF=10 metastable partials against the chain.
 
     Returns ``(branching, stats)`` where ``branching`` is
@@ -483,10 +561,14 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     per-parent log records.
 
     Every reaction carrying >=1 metastable pathway is run through the pointwise
-    MF=10-vs-MF=3 consistency audit (:func:`_audit_reaction`) regardless of
-    ``reject_rtol``. When ``reject_rtol`` is not ``None``, a reaction whose audit
-    max relative deviation exceeds it is left stock -- no ``<isomeric_branching>``
-    is created -- and recorded in ``stats['rejected']``.
+    MF=10-vs-MF=3 consistency audit (:func:`_audit_reaction`, capped at
+    ``audit_emax`` eV) regardless of the rejection gates. A reaction is left
+    stock -- no ``<isomeric_branching>`` is created, and it is recorded in
+    ``stats['rejected']`` with a ``criterion`` -- when EITHER gate fires:
+
+    * ``reject_rtol`` is set and the audit max relative deviation exceeds it, OR
+    * ``reject_band_ratio`` is set and any DEFINED lethargy band ratio has
+      ``|ratio - 1| > reject_band_ratio`` (``None`` band ratios never trigger).
     """
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
@@ -534,7 +616,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
             # Pointwise MF=10-vs-MF=3 consistency audit. Always runs (the
             # decoration candidates are exactly the reactions with >=1
             # metastable pathway); rejection is a separate, opt-in gate below.
-            audit = _audit_reaction(source, parent, mt, partials)
+            audit = _audit_reaction(source, parent, mt, partials,
+                                    emax=audit_emax)
             reject_this = False
             if audit is not None:
                 if audit['worst_dev'] > CONSISTENCY_RTOL:
@@ -542,11 +625,23 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                         parent=parent, mt=mt, reaction=r_name, **audit))
                 else:
                     audit_clean += 1
+                # Rejection gates: worst-dev rtol OR any defined band ratio.
+                fired = []
                 if reject_rtol is not None and audit['worst_dev'] > reject_rtol:
+                    fired.append('worst_dev')
+                if reject_band_ratio is not None:
+                    for key, band in (('ratio_thermal', 'thermal'),
+                                      ('ratio_resonance', 'resonance'),
+                                      ('ratio_fast', 'fast')):
+                        r = audit.get(key)
+                        if r is not None and abs(r - 1.0) > reject_band_ratio:
+                            fired.append(f'band_ratio:{band}')
+                if fired:
                     reject_this = True
                     rejected.append(dict(
                         parent=parent, mt=mt, reaction=r_name,
-                        threshold=reject_rtol, **audit))
+                        threshold=reject_rtol, band_threshold=reject_band_ratio,
+                        criterion=', '.join(fired), **audit))
 
             records = _classify_metastables(
                 parent, mt, r_name, metastables, decay_lookup,
@@ -670,6 +765,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         lfs_order_dropped_list=lfs_order_dropped,
         # MF=10 consistency audit + threshold-gated rejection + decay-gap log.
         reject_rtol=reject_rtol,
+        reject_band_ratio=reject_band_ratio,
+        audit_emax=audit_emax,
         audit_offenders=len(audit_offenders),
         audit_clean=audit_clean,
         audit_offenders_list=audit_offenders,
@@ -985,17 +1082,34 @@ def _write_duplicate_section(f, duplicate_errors):
         f.write("\n")
 
 
-def _write_consistency_audit_section(f, offenders, audit_clean):
+def _fmt_ratio(ratio):
+    """Render a band/full ratio: 'n/a' for None, 'inf' for inf, else 4dp."""
+    if ratio is None:
+        return "n/a"
+    if ratio == float('inf'):
+        return "inf"
+    return f"{ratio:.4f}"
+
+
+def _write_consistency_audit_section(f, offenders, audit_clean, emax=2.0e7):
     """MF=10 CONSISTENCY AUDIT section: offenders (worst_dev > rtol) worst-first."""
     f.write("\n\n" + "=" * 220 + "\n")
     f.write("MF=10 CONSISTENCY AUDIT\n")
     f.write("=" * 220 + "\n\n")
     f.write("Pointwise Sum(MF=10 partials) interpolated onto the MF=3 energy "
-            "grid, compared against the MF=3 total, for every reaction carrying "
-            ">=1 metastable pathway.\n")
+            f"grid (capped at E <= {emax:.3e} eV), compared against the MF=3 "
+            "total, for every reaction carrying >=1 metastable pathway.\n")
+    f.write("The cap suppresses the >30 MeV MT=5 lumping artifact (MF=10 "
+            "partials stop near 30 MeV while the MF=3 total runs to 200 MeV).\n")
     f.write(f"Groups where BOTH sides sit below {CONSISTENCY_ABS_FLOOR:.0e} b "
             "(evaluator floor dust) are exempt -- their relative deviation is "
             "meaningless.\n")
+    f.write("IntRatio and the Thermal/Resonance/Fast ratios are LETHARGY-"
+            "weighted (int sigma/E dE) partials/total; bands are thermal "
+            f"[grid_min, {_BAND_THERMAL_HI:.0e} eV), resonance "
+            f"[{_BAND_THERMAL_HI:.0e} eV, {_BAND_RESONANCE_HI:.0e} eV), fast "
+            f"[{_BAND_RESONANCE_HI:.0e} eV, {emax:.3e} eV]. "
+            "'n/a' = band has <2 grid points or zero total integral.\n")
     f.write(f"Offenders (max rel dev > {CONSISTENCY_RTOL:.0e}) are listed "
             f"worst-first; {audit_clean} audited reaction(s) are clean.\n\n")
     if not offenders:
@@ -1005,46 +1119,56 @@ def _write_consistency_audit_section(f, offenders, audit_clean):
     f.write(f"Total offenders: {len(offenders)}\n\n")
     header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
               f"{'E[eV]@max':>14}  {'Sum-part[b]':>14}  {'Total[b]':>14}  "
-              f"{'IntRatio':>12}")
-    sep = "-" * 120
+              f"{'IntRatio':>12}  {'Thermal':>10}  {'Resonance':>10}  "
+              f"{'Fast':>10}  {'Notes':<40}")
+    sep = "-" * 180
     f.write(header + "\n" + sep + "\n")
     for o in sorted(offenders, key=lambda x: x['worst_dev'], reverse=True):
         e = o.get('energy')
         sp = o.get('sum_partials')
         tot = o.get('total')
-        ratio = o.get('integral_ratio')
         e_str = f"{e:.4e}" if e is not None else "-"
         sp_str = f"{sp:.4e}" if sp is not None else "-"
         tot_str = f"{tot:.4e}" if tot is not None else "-"
-        ratio_str = f"{ratio:.4f}" if ratio not in (None, float('inf')) else "inf"
         f.write(f"{o['parent']:<12}  {o['mt']:>5}  {o['reaction']:<12}  "
                 f"{o['worst_dev']:>12.4e}  {e_str:>14}  {sp_str:>14}  "
-                f"{tot_str:>14}  {ratio_str:>12}\n")
+                f"{tot_str:>14}  {_fmt_ratio(o.get('integral_ratio')):>12}  "
+                f"{_fmt_ratio(o.get('ratio_thermal')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_resonance')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_fast')):>10}  "
+                f"{o.get('notes', ''):<40}\n")
 
 
-def _write_rejected_section(f, rejected, reject_rtol):
+def _write_rejected_section(f, rejected, reject_rtol, reject_band_ratio=None):
     """MF=10 REJECTED REACTIONS section: audit-gated reactions left stock."""
     f.write("\n\n" + "=" * 220 + "\n")
     f.write("MF=10 REJECTED REACTIONS\n")
     f.write("=" * 220 + "\n\n")
-    if reject_rtol is None:
-        f.write("rejection disabled (audit only): --mf10-reject-rtol was not "
-                "set, so no reaction was rejected on audit grounds.\n")
+    if reject_rtol is None and reject_band_ratio is None:
+        f.write("rejection disabled (audit only): neither --mf10-reject-rtol "
+                "nor --mf10-reject-band-ratio was set, so no reaction was "
+                "rejected on audit grounds.\n")
         return
-    f.write(f"Threshold: --mf10-reject-rtol = {reject_rtol:.3e}\n")
-    f.write("Criterion: a reaction whose MF=10-vs-MF=3 audit max relative "
-            f"deviation exceeds {reject_rtol:.3e} is left stock (no "
-            "<isomeric_branching> child).\n")
+    rtol_str = (f"{reject_rtol:.3e}" if reject_rtol is not None
+                else "off")
+    band_str = (f"{reject_band_ratio:.3e}" if reject_band_ratio is not None
+                else "off")
+    f.write(f"Thresholds: --mf10-reject-rtol = {rtol_str}; "
+            f"--mf10-reject-band-ratio = {band_str}\n")
+    f.write("Criterion: a reaction is left stock (no <isomeric_branching> "
+            "child) when its MF=10-vs-MF=3 audit max relative deviation exceeds "
+            "the rtol threshold, OR any DEFINED lethargy band ratio has "
+            "|ratio-1| exceeding the band threshold.\n")
     f.write("Consequence: MF=3 total routes to the ground target; isomeric "
             "branching discarded.\n\n")
     if not rejected:
-        f.write(f"No reactions exceeded the threshold {reject_rtol:.3e}.\n")
+        f.write("No reactions exceeded the active threshold(s).\n")
         return
     f.write(f"Total rejected: {len(rejected)}\n\n")
     header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
-              f"{'Threshold':>12}  {'E[eV]@max':>14}  {'Sum-part[b]':>14}  "
-              f"{'Total[b]':>14}  {'Consequence':<52}")
-    sep = "-" * 160
+              f"{'E[eV]@max':>14}  {'Sum-part[b]':>14}  {'Total[b]':>14}  "
+              f"{'Criterion':<28}  {'Consequence':<52}")
+    sep = "-" * 190
     f.write(header + "\n" + sep + "\n")
     consequence = "left stock: MF=3 total -> ground target; branching discarded"
     for o in sorted(rejected, key=lambda x: x['worst_dev'], reverse=True):
@@ -1054,9 +1178,10 @@ def _write_rejected_section(f, rejected, reject_rtol):
         e_str = f"{e:.4e}" if e is not None else "-"
         sp_str = f"{sp:.4e}" if sp is not None else "-"
         tot_str = f"{tot:.4e}" if tot is not None else "-"
+        crit = o.get('criterion', '-')
         f.write(f"{o['parent']:<12}  {o['mt']:>5}  {o['reaction']:<12}  "
-                f"{o['worst_dev']:>12.4e}  {o['threshold']:>12.3e}  "
-                f"{e_str:>14}  {sp_str:>14}  {tot_str:>14}  {consequence:<52}\n")
+                f"{o['worst_dev']:>12.4e}  {e_str:>14}  {sp_str:>14}  "
+                f"{tot_str:>14}  {crit:<28}  {consequence:<52}\n")
 
 
 _ABSENT_STATUS_LABELS = (
@@ -1256,9 +1381,10 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         _write_duplicate_section(f, duplicate_errors)
         _write_consistency_audit_section(
             f, stats.get('audit_offenders_list', []),
-            stats.get('audit_clean', 0))
+            stats.get('audit_clean', 0), stats.get('audit_emax', 2.0e7))
         _write_rejected_section(
-            f, stats.get('rejected', []), stats.get('reject_rtol'))
+            f, stats.get('rejected', []), stats.get('reject_rtol'),
+            stats.get('reject_band_ratio'))
         _write_absent_decay_section(f, stats.get('absent_by_status', {}))
 
     print(f"Isomer mapping log written to: {log_file}")
@@ -1270,7 +1396,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
 
 def main(base_chain_file, pendf_path, decay_file, output_chain_file,
          log_file=None, mapping_mode='elis', elis_rtol=ELIS_RTOL,
-         elis_atol=ELIS_ATOL, verbose=True, library=None, reject_rtol=None):
+         elis_atol=ELIS_ATOL, verbose=True, library=None, reject_rtol=None,
+         audit_emax=2.0e7, reject_band_ratio=None):
     """Patch a chain with PENDF MF=10 isomeric branching. Returns the Chain."""
     if decay_file is None:
         raise ValueError("decay_file is required for isomeric branching.")
@@ -1304,14 +1431,20 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     print("\nStep 4: Mapping MF=10 isomeric branching...")
     print(f"  ELIS tolerance: rtol={elis_rtol} ({elis_rtol*100:.0f}%), "
           f"atol={elis_atol} eV")
-    if reject_rtol is not None:
-        print(f"  MF=10 audit rejection: worst rel dev > {reject_rtol:.3e} "
-              f"-> reaction left stock")
-    else:
+    print(f"  MF=10 audit cap: E <= {audit_emax:.3e} eV")
+    if reject_rtol is None and reject_band_ratio is None:
         print("  MF=10 audit: detection + logging only (no rejection)")
+    else:
+        rtol_msg = (f"worst rel dev > {reject_rtol:.3e}"
+                    if reject_rtol is not None else "off")
+        band_msg = (f"|band ratio - 1| > {reject_band_ratio:.3e}"
+                    if reject_band_ratio is not None else "off")
+        print(f"  MF=10 audit rejection: rtol {rtol_msg}; band {band_msg} "
+              f"-> reaction left stock")
     branching, stats = map_library(
         source, chain, decay_lookup, mapping_mode, elis_rtol, elis_atol,
-        verbose=verbose, reject_rtol=reject_rtol)
+        verbose=verbose, reject_rtol=reject_rtol, audit_emax=audit_emax,
+        reject_band_ratio=reject_band_ratio)
 
     print("\nStep 5: Decorating chain...")
     reactions_added = decorate_chain(chain, branching)
@@ -1389,10 +1522,15 @@ if __name__ == '__main__':
               f"{LIBRARY_CONFIGS[args.library]['description']}")
     print(f"Mapping mode: {args.map}")
     print(f"Tolerances:   rtol={args.rtol}, atol={args.atol}")
-    if args.mf10_reject_rtol is not None:
-        print(f"MF=10 reject: worst rel dev > {args.mf10_reject_rtol}")
-    else:
+    print(f"Audit emax:   {args.audit_emax:.3e} eV")
+    if args.mf10_reject_rtol is None and args.mf10_reject_band_ratio is None:
         print("MF=10 reject: off (audit only)")
+    else:
+        rtol_msg = (f"worst rel dev > {args.mf10_reject_rtol}"
+                    if args.mf10_reject_rtol is not None else "off")
+        band_msg = (f"|band ratio - 1| > {args.mf10_reject_band_ratio}"
+                    if args.mf10_reject_band_ratio is not None else "off")
+        print(f"MF=10 reject: rtol {rtol_msg}; band {band_msg}")
     print(f"\nInput chain:  {base_chain}")
     print(f"PENDF source: {pendf}")
     print(f"Decay lib:    {decay_file}")
@@ -1405,7 +1543,8 @@ if __name__ == '__main__':
          log_file=str(log_file) if log_file else None,
          mapping_mode=args.map, elis_rtol=args.rtol, elis_atol=args.atol,
          verbose=verbose, library=args.library,
-         reject_rtol=args.mf10_reject_rtol)
+         reject_rtol=args.mf10_reject_rtol, audit_emax=args.audit_emax,
+         reject_band_ratio=args.mf10_reject_band_ratio)
 
     print("\n" + "=" * 70)
     print("Done. Chain saved to:", output_chain)

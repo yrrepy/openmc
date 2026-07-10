@@ -252,9 +252,11 @@ def _decay_lookup_with_in114():
 def _in115_ng_offender():
     """In115 (n,gamma): ground+m1+m4 partials whose sum trails the MF=3 total.
 
-    On grid E=[1,2,3] the MF=3 total is [10,20,30] b; the partials sum to
-    [10,20,27] b, so the worst relative deviation is 3/30 = 0.10 at E=3 eV, and
-    the integral ratio is 38.5/40 = 0.9625.
+    On grid E=[1,2,3] eV the MF=3 total is [10,20,30] b; the partials sum to
+    [10,20,27] b, so the worst relative deviation is 3/30 = 0.10 at E=3 eV. The
+    v2 lethargy-weighted (int sigma/E dE) integral ratio is 19.5/20 = 0.975
+    (all three grid points fall in the resonance band, so ratio_resonance is
+    the same 0.975 while thermal/fast have no points -> None).
     """
     grid = [1.0, 2.0, 3.0]
     return dict(qm=6784720.0, qi=6784720.0, energy=grid, xs=[10.0, 20.0, 30.0],
@@ -279,7 +281,9 @@ def _in113_ng_clean():
 
 
 def test_audit_worst_dev_and_integral_ratio():
-    # Directly exercise the pointwise audit on a constructed mismatch.
+    # Directly exercise the pointwise audit on a constructed mismatch. In v2 the
+    # integral_ratio is LETHARGY-weighted (int sigma/E dE), so 19.5/20 = 0.975
+    # here, not the v1 unweighted-dE 38.5/40 = 0.9625.
     source = _FakeSource({"In115": {102: _in115_ng_offender()}})
     audit = _audit_reaction(source, "In115", 102,
                             source.reactions("In115")[102]["partials"])
@@ -288,7 +292,12 @@ def test_audit_worst_dev_and_integral_ratio():
     assert audit["energy"] == pytest.approx(3.0)
     assert audit["total"] == pytest.approx(30.0)
     assert audit["sum_partials"] == pytest.approx(27.0)
-    assert audit["integral_ratio"] == pytest.approx(0.9625)
+    assert audit["integral_ratio"] == pytest.approx(0.975)
+    # All three grid points sit in the resonance band -> thermal/fast are None.
+    assert audit["ratio_thermal"] is None
+    assert audit["ratio_resonance"] == pytest.approx(0.975)
+    assert audit["ratio_fast"] is None
+    assert audit["notes"] == ""
 
 
 def test_audit_floor_dust_not_offender():
@@ -397,6 +406,136 @@ def test_rejected_section_disabled_message(tmp_path):
     write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
     text = log.read_text()
     assert "rejection disabled (audit only)" in text
+
+
+# ---------------------------------------------------------------------------
+# Metric v2: emax cap + lethargy-weighted band ratios + band-ratio rejection
+# ---------------------------------------------------------------------------
+
+def test_audit_mismatch_above_emax_invisible():
+    # A mismatch that exists ONLY above emax is truncated away: with the default
+    # 2e7 cap the summed partials match the total on every surviving point, so
+    # the reaction audits clean. Lifting the cap past the offending point makes
+    # the same reaction a worst_dev=1.0 offender -- proving the cap is the cause.
+    grid = [1.0, 1.0e3, 1.0e6, 1.0e7, 5.0e7]
+    total = [10.0, 10.0, 10.0, 10.0, 10.0]
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        # Ground matches the total up to 1e7, then collapses to 0 at 5e7.
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=[10.0, 10.0, 10.0, 10.0, 0.0]),
+        # A (zero-valued) metastable so the reaction carries a pathway.
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[0.0, 0.0, 0.0, 0.0, 0.0])])
+    source = _FakeSource({"In115": {102: rxn}})
+
+    capped = _audit_reaction(source, "In115", 102, rxn["partials"])
+    assert capped["worst_dev"] == pytest.approx(0.0)
+
+    uncapped = _audit_reaction(source, "In115", 102, rxn["partials"], emax=1.0e8)
+    assert uncapped["worst_dev"] == pytest.approx(1.0)
+    assert uncapped["energy"] == pytest.approx(5.0e7)
+
+    # map_library uses the default cap -> the reaction is NOT an offender.
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 0.0)]})
+    _, stats = map_library(source, chain, _decay_lookup(), "elis", 0.50, 0.0)
+    assert stats["audit_offenders"] == 0
+
+
+def test_audit_band_ratios_thermal_only():
+    # partials = 0.5x total in the thermal band [<1 eV) and = total elsewhere
+    # -> ratio_thermal ~ 0.5, ratio_resonance ~ 1.0, ratio_fast ~ 1.0.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [10.0] * 8
+    ground = [5.0, 5.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=ground)])
+    source = _FakeSource({"In115": {102: rxn}})
+    audit = _audit_reaction(source, "In115", 102, rxn["partials"])
+    assert audit["ratio_thermal"] == pytest.approx(0.5)
+    assert audit["ratio_resonance"] == pytest.approx(1.0)
+    assert audit["ratio_fast"] == pytest.approx(1.0)
+    assert audit["notes"] == ""
+
+
+def test_reject_band_ratio_leaves_offender_stock(tmp_path):
+    # reject_band_ratio set (reject_rtol unset): a reaction broken only in the
+    # thermal band is rejected on the band criterion and left stock in the XML.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [10.0] * 8
+    ground = [5.0, 5.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]   # 0.5x in thermal
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=ground),
+        # metastable maps to In116_m1 (would decorate absent rejection)
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[0.0] * 8)])
+    source = _FakeSource({"In115": {102: rxn}})
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 0.0)]})
+
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0,
+                                   reject_rtol=None, reject_band_ratio=0.1)
+    assert stats["rejected_count"] == 1
+    rej = stats["rejected"][0]
+    assert rej["parent"] == "In115"
+    assert "band_ratio" in rej["criterion"]
+    assert "thermal" in rej["criterion"]
+    assert rej["threshold"] is None                  # reject_rtol was unset
+    assert "In115" not in branching                  # rejected -> not decorated
+
+    reactions_added = decorate_chain(chain, branching)
+    stats["reactions_added"] = reactions_added
+    out = tmp_path / "chain.xml"
+    chain.export_to_xml(out)
+    import xml.etree.ElementTree as ET
+    root = ET.parse(out).getroot()
+    nuc = next(n for n in root.findall("nuclide") if n.get("name") == "In115")
+    assert nuc.find(".//isomeric_branching") is None
+
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain=str(out), chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "band_ratio:thermal" in text
+
+
+def test_band_ratio_none_when_grid_misses_band(tmp_path):
+    # A grid that never enters the thermal or fast band leaves those ratios None
+    # ('n/a' in the log) and they can NEVER trigger band rejection.
+    grid = [10.0, 100.0, 1000.0]                     # all in the resonance band
+    total = [10.0, 20.0, 30.0]
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=[7.0, 14.0, 20.9]),      # sum trails total at 1000
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[3.0, 6.0, 9.0])])
+    source = _FakeSource({"In115": {102: rxn}})
+    audit = _audit_reaction(source, "In115", 102, rxn["partials"])
+    assert audit["ratio_thermal"] is None
+    assert audit["ratio_fast"] is None
+    assert audit["ratio_resonance"] is not None
+    assert audit["worst_dev"] > 1e-5                 # an offender -> logged
+
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 0.0)]})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0, reject_band_ratio=0.1)
+    assert stats["rejected_count"] == 0              # None bands never trigger
+    assert "In115" in branching
+
+    stats["reactions_added"] = 0
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    audit_section = log.read_text().split("MF=10 CONSISTENCY AUDIT", 1)[1]
+    assert "n/a" in audit_section
 
 
 def test_absent_from_decay_section_unique_and_grouped(tmp_path):
