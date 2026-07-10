@@ -573,3 +573,97 @@ def test_absent_from_decay_section_unique_and_grouped(tmp_path):
     assert "Zn66" in section
     assert "no_decay_data" in section
     assert "no_metastables" in section
+
+
+# ---------------------------------------------------------------------------
+# Criterion refinements: band significance floor + self-loop-ground exemption
+# ---------------------------------------------------------------------------
+
+def test_band_dust_floor_thermal_none_no_reject():
+    # The thermal band [<1 eV) total sits entirely below CONSISTENCY_ABS_FLOOR
+    # (1e-15 b) -- evaluator dust -- so ratio_thermal is None and can NEVER
+    # trigger band rejection, even at a tiny threshold, despite the ground
+    # partial reading 0 there (a spurious ~0 ratio absent the floor). The real
+    # resonance/fast bands stay consistent, so nothing is rejected.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [1e-20, 1e-20, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    ground = [0.0, 0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]   # 0 in thermal dust
+    rxn = dict(qm=6784720.0, qi=6784720.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=6784720.0, qm=6784720.0, elfs=0.0,
+             energy=grid, xs=ground),
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[0.0] * 8)])
+    source = _FakeSource({"In115": {102: rxn}})
+    audit = _audit_reaction(source, "In115", 102, rxn["partials"])
+    assert audit["ratio_thermal"] is None
+    assert audit["ratio_resonance"] == pytest.approx(1.0)
+    assert audit["ratio_fast"] == pytest.approx(1.0)
+
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 6784720.0)]})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0, reject_band_ratio=1e-6)
+    assert stats["rejected_count"] == 0              # dust thermal never fires
+    assert "In115" in branching
+
+
+def test_self_loop_ground_band_reject_exempt():
+    # In113 (n,n') is a ground-state self-loop: its LFS=0 partial (izap 49113)
+    # produces In113 itself, so the ground pathway is a transmutation-matrix
+    # no-op. The fast band is badly broken (partials sum ~0.13x total -- MF=10
+    # enumerates only ~13% of the inelastic), but only the m1 partial carries
+    # real isomer production, so the band-reject gate is exempted.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]
+    ground = [0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0]
+    meta = [0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 1.5, 1.8]        # sum = 0.13x (fast)
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49113, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=ground),
+        dict(lfs=1, izap=49113, qi=-391700.0, qm=0.0, elfs=391700.0,
+             energy=grid, xs=meta)])
+    source = _FakeSource({"In113": {4: rxn}})
+    decay = {(49, 113): [
+        DecayState(49, 113, 0.0, 0, half_life=None),
+        DecayState(49, 113, 391700.0, 1, half_life=6000.0)]}
+    chain = _chain_with(["In113", "In113_m1"],
+                        reactions={"In113": [("(n,n')", "In113", 0.0)]})
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0,
+                                   reject_rtol=None, reject_band_ratio=0.3)
+    assert stats["rejected_count"] == 0              # exempted -> not rejected
+    assert stats["band_reject_exempt"] == 1
+    assert "In113" in branching                      # decorated, not stock
+
+    off = stats["audit_offenders_list"][0]
+    assert off["parent"] == "In113"
+    assert "self-loop ground" in off["notes"]        # marker for transparency
+
+    decorate_chain(chain, branching)
+    assert "(n,n')_m1" in {rx.type for rx in chain["In113"].reactions}
+
+
+def test_metastable_parent_ground_not_exempt():
+    # In115_m1 (n,n') -> In115 (ground) is isomer BURNUP, a real transition, not
+    # a self-loop: gnds_name(49,115,0)='In115' != parent 'In115_m1'. A broken
+    # fast band must therefore STILL trigger band rejection (no exemption).
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]
+    ground = [0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0]         # 0.1x total (fast)
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49115, qi=0.0, qm=0.0, elfs=0.0,
+             energy=grid, xs=ground),
+        dict(lfs=1, izap=49115, qi=-336000.0, qm=0.0, elfs=336000.0,
+             energy=grid, xs=[0.0] * 8)])
+    source = _FakeSource({"In115_m1": {4: rxn}})
+    decay = {(49, 115): [
+        DecayState(49, 115, 0.0, 0, half_life=None),
+        DecayState(49, 115, 336000.0, 1, half_life=1.6e14)]}
+    chain = _chain_with(["In115", "In115_m1"],
+                        reactions={"In115_m1": [("(n,n')", "In115", 0.0)]})
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0,
+                                   reject_rtol=None, reject_band_ratio=0.3)
+    assert stats["rejected_count"] == 1              # no exemption -> rejected
+    assert stats["band_reject_exempt"] == 0
+    assert stats["rejected"][0]["parent"] == "In115_m1"
+    assert "band_ratio" in stats["rejected"][0]["criterion"]
+    assert "In115_m1" not in branching               # rejected -> not decorated

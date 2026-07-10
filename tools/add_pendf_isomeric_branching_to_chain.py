@@ -138,6 +138,42 @@ def _ground_product(z, a, r_name):
     return gnds_name(zp, a + delta_a, 0)
 
 
+def _self_loop_ground(parent, r_name, partials, chain):
+    """True when reaction ``r_name``'s GROUND pathway returns to ``parent``.
+
+    Such a ground route -- e.g. ``(n,n')`` on a ground-state parent, whose
+    LFS=0 partial produces the parent itself -- is a transmutation-matrix
+    self-loop no-op (loss and gain both land on the diagonal and cancel), so
+    the partial-sum-vs-total completeness the band audit measures cannot affect
+    the chain: only the metastable partials carry real isomer production.
+    Reactions flagged here are therefore exempt from the band-ratio rejection
+    gate (rejecting would destroy valid isomer production -- e.g. JEFF In113
+    ``(n,n')`` has Fast=0.13 because MF=10 enumerates only ~13% of inelastic,
+    yet its m1 partial is the physically wanted cross section).
+
+    The ground product name is taken from the LFS=0 partial's IZAP
+    (``gnds_name(z, a, 0)``); when the reaction carries no LFS=0 partial, it
+    falls back to the base chain's existing target for this reaction on
+    ``parent``. The match must be EXACT: for a metastable parent (e.g.
+    ``In115_m1 (n,n') -> In115`` ground) the ground route is a real
+    isomer-burnup transition, NOT a self-loop, so ``parent`` never equals the
+    ground name and the reaction stays rejectable.
+    """
+    ground = next((p for p in partials if p['lfs'] == 0), None)
+    if ground is not None:
+        z, a = ground['izap'] // 1000, ground['izap'] % 1000
+        if z not in ATOMIC_SYMBOL:
+            return False
+        return gnds_name(z, a, 0) == parent
+    # No LFS=0 partial: fall back to the base chain's existing target.
+    if parent in chain.nuclide_dict:
+        existing = next((rx for rx in chain[parent].reactions
+                         if rx.type == r_name), None)
+        if existing is not None:
+            return existing.target == parent
+    return False
+
+
 # =============================================================================
 # PENDF source adapters (h5 and ASC), one interface
 # =============================================================================
@@ -355,15 +391,27 @@ def _band_ratio(e, total, part, lo, hi, inclusive_hi):
 
     Selects the grid points falling in ``[lo, hi)`` (or ``[lo, hi]`` when
     ``inclusive_hi``). Returns ``(ratio, part_nonzero_but_total_zero)``:
-    ``ratio`` is ``None`` when the band holds fewer than 2 grid points or its
-    total integral is zero; the second flag is ``True`` only in the degenerate
-    case where the partials integrate to something while the total is zero
-    (a genuine inconsistency the caller surfaces in the row notes).
+    ``ratio`` is ``None`` when the band holds fewer than 2 grid points, its
+    total integral is zero, or the band fails the significance floor below; the
+    second flag is ``True`` only in the degenerate case where the partials
+    integrate to something while the total is zero (a genuine inconsistency the
+    caller surfaces in the row notes).
+
+    Significance floor: a band whose MF=3 total never rises above
+    ``CONSISTENCY_ABS_FLOOR`` (``max(total_in_band) < CONSISTENCY_ABS_FLOOR``)
+    is treated as undefined (``None``, no flag), same as the <2-points /
+    zero-integral cases. Such a band is all below-threshold evaluator dust of a
+    threshold reaction; its sparse points yield spurious ratios (~2.0 from a
+    two-point trapezoid over near-zero values), which accounted for ~2/3 of a
+    full-library JEFF band-reject set as false positives on sigma < 1e-9 b
+    reactions.
     """
     sel = (e >= lo) & (e <= hi) if inclusive_hi else (e >= lo) & (e < hi)
     if int(np.count_nonzero(sel)) < 2:
         return None, False
     eb, tb, pb = e[sel], total[sel], part[sel]
+    if float(np.max(tb)) < CONSISTENCY_ABS_FLOOR:
+        return None, False
     int_total = _lethargy_integral(eb, tb)
     if int_total == 0.0:
         int_part = _lethargy_integral(eb, pb)
@@ -398,8 +446,10 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
     ``int Sum(partials)/E dE`` / ``int total/E dE`` -- in v1 this was an
     unweighted ``dE`` ratio), the three per-band lethargy ratios
     ``ratio_thermal``/``ratio_resonance``/``ratio_fast`` (``None`` for a band
-    with <2 grid points or zero total integral), and ``notes`` (a string
-    flagging any band whose partials integrate nonzero against a zero total).
+    with <2 grid points, zero total integral, or a below-threshold total whose
+    ``max < CONSISTENCY_ABS_FLOOR`` -- see :func:`_band_ratio`), and ``notes``
+    (a string flagging any band whose partials integrate nonzero against a zero
+    total).
     """
     try:
         mf3_e, mf3_xs = source.total_xs(parent, mt)
@@ -569,6 +619,16 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     * ``reject_rtol`` is set and the audit max relative deviation exceeds it, OR
     * ``reject_band_ratio`` is set and any DEFINED lethargy band ratio has
       ``|ratio - 1| > reject_band_ratio`` (``None`` band ratios never trigger).
+
+    Self-loop-ground exemption: a reaction whose GROUND product is the parent
+    itself (see :func:`_self_loop_ground`) is EXEMPT from the band-ratio gate --
+    its ground pathway is a transmutation-matrix self-loop no-op, so partial-sum
+    incompleteness cannot affect the chain and rejecting would only destroy
+    valid metastable isomer production. The ``worst_dev`` rtol gate still
+    applies. When the exemption suppresses a rejection that would otherwise have
+    fired on the band criterion alone, the audit row's ``notes`` gains a
+    ``self-loop ground: band-reject exempt`` marker and ``stats`` counts it in
+    ``band_reject_exempt``.
     """
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
@@ -582,6 +642,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     audit_offenders = []          # reactions with worst_dev > CONSISTENCY_RTOL
     audit_clean = 0               # auditable reactions within CONSISTENCY_RTOL
     rejected = []                 # audit-rejected (left stock) when flag set
+    band_reject_exempt = 0        # self-loop-ground reactions spared band reject
     absent_status = {}            # base GNDS name -> lookup_liso status (no_dk)
 
     nuclides_with_branching = set()
@@ -620,22 +681,47 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                                     emax=audit_emax)
             reject_this = False
             if audit is not None:
-                if audit['worst_dev'] > CONSISTENCY_RTOL:
-                    audit_offenders.append(dict(
-                        parent=parent, mt=mt, reaction=r_name, **audit))
-                else:
-                    audit_clean += 1
                 # Rejection gates: worst-dev rtol OR any defined band ratio.
                 fired = []
                 if reject_rtol is not None and audit['worst_dev'] > reject_rtol:
                     fired.append('worst_dev')
+                band_fired = []
                 if reject_band_ratio is not None:
                     for key, band in (('ratio_thermal', 'thermal'),
                                       ('ratio_resonance', 'resonance'),
                                       ('ratio_fast', 'fast')):
                         r = audit.get(key)
                         if r is not None and abs(r - 1.0) > reject_band_ratio:
-                            fired.append(f'band_ratio:{band}')
+                            band_fired.append(f'band_ratio:{band}')
+
+                # Self-loop-ground exemption: when the reaction's ground pathway
+                # returns to the parent itself, its ground route is a
+                # transmutation-matrix no-op, so band-ratio incompleteness
+                # cannot affect the chain -- only the metastable partials carry
+                # real isomer production. Suppress the band gate (the worst_dev
+                # gate is unaffected). A metastable parent's ground route
+                # (e.g. In115_m1 -> In115) is a real transition, NOT a
+                # self-loop, and stays rejectable (see _self_loop_ground).
+                if band_fired and _self_loop_ground(parent, r_name, partials,
+                                                    chain):
+                    if not fired:
+                        # The exemption actually spares a rejection that the
+                        # band criterion would otherwise have fired: mark the
+                        # audit row and count it. (If worst_dev also fired the
+                        # reaction is rejected anyway, so nothing is spared.)
+                        band_reject_exempt += 1
+                        marker = 'self-loop ground: band-reject exempt'
+                        audit['notes'] = (f"{audit['notes']}; {marker}"
+                                          if audit['notes'] else marker)
+                else:
+                    fired.extend(band_fired)
+
+                if audit['worst_dev'] > CONSISTENCY_RTOL:
+                    audit_offenders.append(dict(
+                        parent=parent, mt=mt, reaction=r_name, **audit))
+                else:
+                    audit_clean += 1
+
                 if fired:
                     reject_this = True
                     rejected.append(dict(
@@ -772,6 +858,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         audit_offenders_list=audit_offenders,
         rejected_count=len(rejected),
         rejected=rejected,
+        band_reject_exempt=band_reject_exempt,
         absent_by_status=absent_by_status,
         absent_unique_count=len(absent_status),
     )
@@ -892,6 +979,7 @@ def print_stats(stats, mode):
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
     print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
+    print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
     print(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}")
 
 
@@ -1109,7 +1197,9 @@ def _write_consistency_audit_section(f, offenders, audit_clean, emax=2.0e7):
             f"[grid_min, {_BAND_THERMAL_HI:.0e} eV), resonance "
             f"[{_BAND_THERMAL_HI:.0e} eV, {_BAND_RESONANCE_HI:.0e} eV), fast "
             f"[{_BAND_RESONANCE_HI:.0e} eV, {emax:.3e} eV]. "
-            "'n/a' = band has <2 grid points or zero total integral.\n")
+            "'n/a' = band has <2 grid points, a zero total integral, or a "
+            f"below-threshold total (max < {CONSISTENCY_ABS_FLOOR:.0e} b, "
+            "evaluator dust -- spurious ratios suppressed).\n")
     f.write(f"Offenders (max rel dev > {CONSISTENCY_RTOL:.0e}) are listed "
             f"worst-first; {audit_clean} audited reaction(s) are clean.\n\n")
     if not offenders:
@@ -1302,6 +1392,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                     Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
+        f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
         f.write(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}\n")
         f.write("\n")
 
