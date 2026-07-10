@@ -31,7 +31,7 @@ _FOLDED = (
     '<nuclide name="In115" reactions="2">'
     '<reaction type="(n,gamma)">'
     '<isomeric_branching targets="In116 In116_m1" pendf_lfs="0 1"'
-    ' q_values="6784720.0 6657450.0"/>'
+    ' Q="6784720.0 6657450.0"/>'
     '</reaction>'
     '</nuclide>'
 )
@@ -55,6 +55,10 @@ def test_fold_unfold_fold_idempotent():
     assert '<isomeric_branching' in first
     assert 'targets="In116 In116_m1"' in first
     assert 'pendf_lfs="0 1"' in first
+    # The per-pathway Q list is emitted under the canonical ``Q`` name, never
+    # the legacy ``q_values`` alias.
+    assert 'Q="6784720.0 6657450.0"' in first
+    assert 'q_values' not in first
 
 
 def test_legacy_and_folded_same_tuples():
@@ -90,7 +94,7 @@ def test_metastable_only_child_roundtrips():
         '<nuclide name="In115" reactions="2">'
         '<reaction type="(n,gamma)">'
         '<isomeric_branching targets="In116_m1 In116_m2" pendf_lfs="1 4"'
-        ' q_values="6657450.0 6495070.0"/>'
+        ' Q="6657450.0 6495070.0"/>'
         '</reaction>'
         '</nuclide>'
     )
@@ -112,7 +116,7 @@ def test_missing_pendf_lfs_tolerated():
         '<nuclide name="In115" reactions="2">'
         '<reaction type="(n,gamma)">'
         '<isomeric_branching targets="In116 In116_m1"'
-        ' q_values="6784720.0 6657450.0"/>'
+        ' Q="6784720.0 6657450.0"/>'
         '</reaction>'
         '</nuclide>'
     )
@@ -122,8 +126,9 @@ def test_missing_pendf_lfs_tolerated():
     }
 
 
-def test_missing_q_values_tolerated():
-    """§5.5 no q_values -> the element Q applies to every entry, else 0.0."""
+def test_missing_per_pathway_Q_tolerated():
+    """§5.5 no per-pathway Q list -> the element Q applies to every entry,
+    else 0.0."""
     with_q = (
         '<nuclide name="In115" reactions="2">'
         '<reaction type="(n,gamma)" Q="6784720.0">'
@@ -167,7 +172,7 @@ _CHAIN = (
     '<nuclide name="In115" reactions="3">'
     '<reaction type="(n,gamma)">'
     '<isomeric_branching targets="In116 In116_m1 In116_m2" pendf_lfs="0 1 4"'
-    ' q_values="6784720.0 6657450.0 6495070.0"/>'
+    ' Q="6784720.0 6657450.0 6495070.0"/>'
     '</reaction>'
     '</nuclide>'
     '<nuclide name="In116" half_life="14.1" decay_modes="1" decay_energy="0.0"'
@@ -309,7 +314,7 @@ def test_reduce_preserves_pendf_lfs_on_dropped_target():
          '<nuclide name="In115" reactions="1">'
          '<reaction type="(n,gamma)">'
          '<isomeric_branching targets="In116 In116_m1" pendf_lfs="0 1"'
-         ' q_values="6784720.0 6657450.0"/>'
+         ' Q="6784720.0 6657450.0"/>'
          '</reaction></nuclide>'),
         ('In116', '<nuclide name="In116" half_life="14.1" decay_modes="0" reactions="0"/>'),
         ('In116_m1', '<nuclide name="In116_m1" half_life="3257.0" decay_modes="0" reactions="0"/>'),

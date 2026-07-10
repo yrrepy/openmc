@@ -29,7 +29,7 @@ def _folded_chain():
         '<nuclide name="In115" reactions="1">'
         '<reaction type="(n,gamma)">'
         '<isomeric_branching targets="In116 In116_m1" pendf_lfs="0 1"'
-        ' q_values="6784720.0 6657450.0"/>'
+        ' Q="6784720.0 6657450.0"/>'
         '</reaction></nuclide>',
         '<nuclide name="In116" half_life="14.1" decay_modes="1"'
         ' decay_energy="0.0" reactions="0">'

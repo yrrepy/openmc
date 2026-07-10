@@ -111,7 +111,7 @@ def _unfold_isomeric_branching(base_type, iso_elem, elem_Q):
         The ``<isomeric_branching>`` child.
     elem_Q : float
         Q value on the parent element, used as the per-entry fallback when the
-        child omits ``q_values``.
+        child omits ``Q`` (and its ``q_values`` legacy alias).
     """
     targets = get_text(iso_elem, "targets", "").split()
 
@@ -126,10 +126,13 @@ def _unfold_isomeric_branching(base_type, iso_elem, elem_Q):
         lfs_vals = None
 
     # Per-entry Q values, else the element Q (or 0.0) applies to every entry.
-    q_text = iso_elem.get("q_values")
+    # Canonical attribute is 'Q'; 'q_values' is the legacy alias (dual-read).
+    q_text = iso_elem.get("Q")
+    if q_text is None:
+        q_text = iso_elem.get("q_values")
     q_vals = [float(v) for v in q_text.split()] if q_text is not None else None
     if q_vals is not None and len(q_vals) != len(targets):
-        warn(f"isomeric_branching q_values count ({len(q_vals)}) != target "
+        warn(f"isomeric_branching Q count ({len(q_vals)}) != target "
              f"count ({len(targets)}) for reaction '{base_type}'; using element Q")
         q_vals = None
 
@@ -466,7 +469,7 @@ class Nuclide:
                              ' '.join(r.target for r in ordered))
                 iso_elem.set('pendf_lfs',
                              ' '.join(str(r.pendf_lfs) for r in ordered))
-                iso_elem.set('q_values',
+                iso_elem.set('Q',
                              ' '.join(str(r.Q) for r in ordered))
             else:
                 rx_elem = ET.SubElement(elem, 'reaction')

@@ -233,7 +233,7 @@ def test_pendf_lfs_xml_roundtrip(run_in_tmpdir):
     assert 'type="(n,gamma)"' in xml_text
     assert 'targets="In116 In116_m1"' in xml_text
     assert 'pendf_lfs="0 1"' in xml_text
-    assert 'q_values="6784730.0 6657460.0"' in xml_text
+    assert 'Q="6784730.0 6657460.0"' in xml_text
     # The fallback reaction has no isomeric pathway -> stock element.
     assert '<reaction type="(n,p)" Q="0.0" target="Cd115"/>' in xml_text
 
