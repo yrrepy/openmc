@@ -240,9 +240,12 @@ def test_reaction_without_mf10_single_row():
     np.testing.assert_allclose(table.xs_matrix[0], [2.0])
 
 
-def test_unbound_partials_fall_back_and_warn():
-    """MF=10 partials with no matching chain reaction -> MF=3 total + one
-    summary warning directing the user at the chain patcher tool."""
+def test_fully_stock_chain_ignores_library_pathways_silently(recwarn):
+    """A chain left fully STOCK for a reaction (no ``pendf_lfs`` pathway) emits the
+    MF=3 total SILENTLY, regardless of the MF=10 partials the library carries --
+    the chain is the demand side, so a by-design stock reaction never warns even
+    when the library has isomeric partials (here both products are unmappable, so
+    ``_chain_from_fake`` builds a stock chain)."""
     fake = _FakePendf(
         mf3={"Am241": {102: _const(5.0)}},
         mf10={"Am241": {102: {
@@ -250,33 +253,34 @@ def test_unbound_partials_fall_back_and_warn():
             2: (None, _const(1.0)),
         }}})
     edges = np.array([0.0, 2.0e7])
-    # Both products unmappable -> the chain carries no reaction for either LFS.
+    # Both products unmappable -> the chain carries no reaction for either LFS
+    # (fully stock for (n,gamma)).
     chain = _chain_from_fake(fake, {102: "(n,gamma)"})
 
-    with pytest.warns(UserWarning,
-                      match="add_pendf_isomeric_branching_to_chain"):
-        table = _build_xs_table_pendf(
-            ["Am241"], ["(n,gamma)"], edges, fake, chain)
+    table = _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
 
-    # Fell back to the single MF=3-total row (no qualified names)
+    # Fell back to the single MF=3-total row, with no warning of any kind.
     assert table.reactions == ["(n,gamma)"]
     assert table.rxn_indices.tolist() == [0]
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
+    assert len(recwarn) == 0
 
 
-def test_partially_unbound_partials_fall_back():
-    """If ANY partial is unbound, the whole reaction falls back to the MF=3
-    total (mirrors the historical partially-mapped behavior)."""
+def test_chain_ground_qualified_library_extra_lfs_warns():
+    """Chain qualified for the ground LFS only while the library carries an extra
+    (metastable) LFS -> set mismatch -> the whole reaction falls back to the MF=3
+    total and one summary warning fires (chain and library disagree). Value is the
+    MF=3 total -- identical to the old partially-unbound fallback."""
     fake = _FakePendf(
         mf3={"Ir193": {102: _const(5.0)}},
         mf10={"Ir193": {102: {
-            0: ("Ir194", _const(4.0)),   # ground: bound
-            38: (None, _const(1.0)),     # metastable: unbound (ELIS-unmapped)
+            0: ("Ir194", _const(4.0)),   # ground: chain binds LFS 0
+            38: (None, _const(1.0)),     # metastable LFS: library extra, unmapped
         }}})
     edges = np.array([0.0, 2.0e7])
-    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # demands {0} only
 
-    with pytest.warns(UserWarning, match="depletion-chain reaction"):
+    with pytest.warns(UserWarning, match="does not match"):
         table = _build_xs_table_pendf(
             ["Ir193"], ["(n,gamma)"], edges, fake, chain)
 
@@ -286,12 +290,11 @@ def test_partially_unbound_partials_fall_back():
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
 
 
-def test_ground_only_unbound_falls_back_silently(recwarn):
-    """A ground-only MF=10 reaction (pathway LFS set == {0}) whose ground pathway
-    is unbound falls back to the MF=3 total WITHOUT warning: the patcher leaves
-    such a reaction stock in the chain by design, and the MF=3 total equals the
-    LFS=0 partial, so the fallback warning would be pure noise (e.g. H2 (n,gamma)
-    -> H3)."""
+def test_ground_only_stock_falls_back_silently(recwarn):
+    """A reaction left STOCK in the chain (the patcher rejected its sole ground
+    pathway, so no ``pendf_lfs`` is recorded) falls back to the MF=3 total WITHOUT
+    warning: the chain is the demand side, and a stock reaction never warns
+    regardless of the library's MF=10 partials (e.g. H2 (n,gamma) -> H3)."""
     fake = _FakePendf(
         mf3={"H2": {102: _const(5.5e-4)}},
         mf10={"H2": {102: {
@@ -310,23 +313,25 @@ def test_ground_only_unbound_falls_back_silently(recwarn):
     assert len(recwarn) == 0
 
 
-def test_unbound_metastable_lfs_still_warns():
-    """A reaction whose pathway LFS set contains a nonzero (metastable) LFS keeps
-    the loud fallback warning even when the ground pathway is bound -- only the
-    ground-only ({LFS=0}) class is silenced."""
+def test_chain_library_lfs_mismatch_warning_names_both_sets():
+    """The chain <-> library mismatch summary warning names BOTH LFS sets so the
+    user sees exactly where they diverge (chain LFS {0} vs library LFS {0, 38})."""
     fake = _FakePendf(
         mf3={"Ir193": {102: _const(5.0)}},
         mf10={"Ir193": {102: {
-            0: ("Ir194", _const(4.0)),   # ground: bound
-            38: (None, _const(1.0)),     # metastable LFS: unbound -> loud warning
+            0: ("Ir194", _const(4.0)),   # ground: chain binds LFS 0
+            38: (None, _const(1.0)),     # metastable LFS: library extra
         }}})
     edges = np.array([0.0, 2.0e7])
     chain = _chain_from_fake(fake, {102: "(n,gamma)"})
 
-    with pytest.warns(UserWarning, match="depletion-chain reaction"):
+    with pytest.warns(UserWarning, match="chain and library disagree") as record:
         table = _build_xs_table_pendf(
             ["Ir193"], ["(n,gamma)"], edges, fake, chain)
 
+    msg = str(record[0].message)
+    assert "chain LFS {0}" in msg
+    assert "library LFS {0, 38}" in msg
     assert table.reactions == ["(n,gamma)"]
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
 
@@ -424,6 +429,110 @@ def test_matching_partials_do_not_warn(recwarn):
     chain = _chain_from_fake(fake, {102: "(n,gamma)"})
 
     _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
+    assert len(recwarn) == 0
+
+
+# ---------------------------------------------------------------------------
+# Chain-demand-side pathway binding: exact set match vs mismatch
+# (the chain is the demand side -- only an exact LFS-set match emits partials)
+# ---------------------------------------------------------------------------
+
+def test_chain_qualified_exact_match_emits_partials(recwarn):
+    """(a) Chain qualified {0, 1} and library {0, 1} -> exact set match -> per-
+    product pathway rows, no warning."""
+    fake = _FakePendf(
+        mf3={"In115": {102: _const(5.0)}},
+        mf10={"In115": {102: {
+            0: ("In116", _const(4.0)),
+            1: ("In116_m1", _const(1.0)),
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # demands {0, 1}
+
+    table = _build_xs_table_pendf(["In115"], ["(n,gamma)"], edges, fake, chain)
+
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
+    np.testing.assert_allclose(table.xs_matrix[0], [4.0])   # ground partial
+    np.testing.assert_allclose(table.xs_matrix[1], [1.0])   # m1 partial
+    assert len(recwarn) == 0
+
+
+def test_chain_qualified_library_has_extra_lfs_warns():
+    """(b) Chain qualified {0, 1} but library {0, 1, 4} -> mismatch -> MF=3 total
+    row + one summary warning naming both LFS sets."""
+    fake = _FakePendf(
+        mf3={"In115": {102: _const(5.0)}},
+        mf10={"In115": {102: {
+            0: ("In116", _const(3.0)),
+            1: ("In116_m1", _const(1.0)),
+            4: (None, _const(1.0)),      # library extra LFS, unmapped in chain
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # demands {0, 1}
+
+    with pytest.warns(UserWarning, match="does not match") as record:
+        table = _build_xs_table_pendf(
+            ["In115"], ["(n,gamma)"], edges, fake, chain)
+
+    msg = str(record[0].message)
+    assert "chain LFS {0, 1}" in msg
+    assert "library LFS {0, 1, 4}" in msg
+    # Values fall back to the MF=3 total -- no qualified rows.
+    assert table.reactions == ["(n,gamma)"]
+    assert table.rxn_indices.tolist() == [0]
+    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
+
+
+def test_chain_qualified_library_has_no_mf10_warns():
+    """(c) Chain qualified {0, 1} but the library has NO MF=10 for the MT ->
+    mismatch -> MF=3 total row + summary warning (library LFS set empty). The value
+    is the MF=3 total -- identical to the old silent fallback; only the warning is
+    new."""
+    fake = _FakePendf(mf3={"In115": {102: _const(5.0)}})   # MF=3 only, no MF=10
+
+    edges = np.array([0.0, 2.0e7])
+    # Chain demands {0, 1} with no library MF=10 to source it.
+    chain = Chain()
+    nuc = Nuclide("In115")
+    nuc.add_reaction("(n,gamma)", "In116", 0.0, 1.0, pendf_lfs=0)
+    nuc.add_reaction("(n,gamma)_m1", "In116_m1", 0.0, 1.0, pendf_lfs=1)
+    chain.add_nuclide(nuc)
+
+    with pytest.warns(UserWarning, match="does not match") as record:
+        table = _build_xs_table_pendf(
+            ["In115"], ["(n,gamma)"], edges, fake, chain)
+
+    msg = str(record[0].message)
+    assert "chain LFS {0, 1}" in msg
+    assert "library LFS {}" in msg
+    assert table.reactions == ["(n,gamma)"]
+    assert table.rxn_indices.tolist() == [0]
+    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
+
+
+def test_fully_stock_chain_with_library_metastable_silent(recwarn):
+    """(d) The big new behavior: a fully STOCK chain (no ``pendf_lfs`` pathway)
+    with a library that DOES carry metastable MF=10 partials emits the MF=3 total
+    row and NO warning -- the chain is the demand side, so a by-design stock
+    reaction is silent even when the library has isomeric data."""
+    fake = _FakePendf(
+        mf3={"In115": {102: _const(5.0)}},
+        mf10={"In115": {102: {
+            0: ("In116", _const(4.0)),
+            1: ("In116_m1", _const(1.0)),   # library carries a metastable pathway
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    # Stock chain: plain (n,gamma) with no pendf_lfs -> _chain_lfs_reactions {}.
+    chain = Chain()
+    nuc = Nuclide("In115")
+    nuc.add_reaction("(n,gamma)", "In116", 0.0, 1.0)   # no pendf_lfs -> stock
+    chain.add_nuclide(nuc)
+
+    table = _build_xs_table_pendf(["In115"], ["(n,gamma)"], edges, fake, chain)
+
+    assert table.reactions == ["(n,gamma)"]
+    assert table.rxn_indices.tolist() == [0]
+    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
     assert len(recwarn) == 0
 
 

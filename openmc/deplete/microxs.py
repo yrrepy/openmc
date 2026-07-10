@@ -1031,13 +1031,17 @@ def _build_xs_table_pendf(
     ``R_m{n}``). Rows come exclusively from the MF=10 partials -- never from
     static branching ratios.
 
-    A partial whose ``lfs`` is absent from the chain cannot be named. Mirroring
-    the historical partially-mapped fallback, if *any* partial of a reaction is
-    unbound the single MF=3 total row is emitted instead of pathway rows, and the
-    unbound ``(nuclide, R, lfs)`` triples are collected into one summary warning
-    per build (directing the user to the chain patcher tool). A chain whose
-    *qualified* reactions carry ``pendf_lfs=None`` (built without LFS recording)
-    is a hard error (see :func:`_chain_lfs_reactions`).
+    **The chain is the demand side.** For each ``(nuclide, R)`` the chain is
+    consulted first: a reaction left *stock* (no ``pendf_lfs`` pathway) emits the
+    single MF=3 total row silently, regardless of any MF=10 partials the library
+    carries. A *qualified* reaction's demanded ``LFS`` set is compared against the
+    library's; only an **exact set match** emits pathway rows (one per product),
+    while any disagreement (chain expects ``LFS`` the library lacks, the library
+    carries extra ``LFS``, or the library has no MF=10 for the MT) falls back to
+    the MF=3 total and is collected into one summary warning per build (directing
+    the user to regenerate the chain from the library). A chain whose *qualified*
+    reactions carry ``pendf_lfs=None`` (built without LFS recording) is a hard
+    error (see :func:`_chain_lfs_reactions`).
 
     The result's ``reactions`` axis is the expanded list: for each base reaction
     in input order, the base name first then its ``_m{n}`` variants in ascending
@@ -1103,10 +1107,11 @@ def _build_xs_table_pendf(
         pendf_library, 'pathway_xs_g' if grouped else 'pathway_xs', None)
     have_pathways = None not in (pathways_fn, pathway_xs_fn)
 
-    # Unbound (nuclide, base reaction, LFS) triples: a library MF=10 partial with
-    # no matching chain reaction. Collected across the whole build so the fallback
-    # to the MF=3 total is reported once, not once per reaction.
-    unbound: list[tuple[str, str, int]] = []
+    # (nuclide, base reaction, demanded-LFS set, library-LFS set) tuples where the
+    # chain demands qualified MF=10 pathways the library does not exactly match, so
+    # the MF=3 total was staged instead of pathway rows. Collected across the whole
+    # build so the disagreement is reported once, not once per reaction.
+    mismatched: list[tuple[str, str, set[int], set[int]]] = []
 
     # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
     # ordinals seen per base reaction are collected to build the expanded axis.
@@ -1159,33 +1164,43 @@ def _build_xs_table_pendf(
                 energy, xs = pendf_library.xs(nuc, mt)
                 total_g = _group_average(energy, xs, energies)
 
-            # Each MF=10 partial is keyed by (LFS, IZAP): an LFS is a level
-            # index, and a single LFS may be shared by several product nuclides
-            # (a lumped channel), so IZAP disambiguates the product.
-            pathway_list = list(pathways_fn(nuc, mt)) if have_pathways else []
-            if not pathway_list:
-                # No MF=10 partials -> single canonical (ground) row
+            # The depletion CHAIN is the demand side: consult it first for the
+            # qualified pathways it expects for this (nuclide, base reaction).
+            # ``_chain_lfs_reactions`` returns {pendf_lfs: ReactionTuple} and
+            # raises on a legacy qualified-but-lfs-less chain (unbindable).
+            lfs_reactions = _chain_lfs_reactions(chain, nuc, name)
+
+            # Chain stock (no qualified pathway for this reaction): emit the single
+            # MF=3 total row, SILENTLY -- regardless of any MF=10 partials the
+            # library carries. The chain patcher deliberately leaves such reactions
+            # stock (rejected / no-decay-data / ELIS-tolerance), and the MF=3 total
+            # equals the LFS=0 partial for a ground-only reaction, so a fallback
+            # warning here would be pure by-design noise.
+            if not lfs_reactions:
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
-            # Bind each library LFS partial to the chain reaction carrying that
-            # ``pendf_lfs``: the chain is the row-naming authority (raises on an
-            # lfs-less chain). ``None`` marks a partial the chain cannot name.
-            lfs_reactions = _chain_lfs_reactions(chain, nuc, name)
-            bound = [lfs_reactions.get(lfs) for lfs, _izap in pathway_list]
-            if any(rx is None for rx in bound):
-                # Mirror the historical partially-mapped fallback: if ANY partial
-                # is unnamed, emit the single MF=3 total row instead of pathway
-                # rows. A ground-only pathway set ({LFS=0}) is deliberately left
-                # stock in the chain (its MF=3 total equals the LFS=0 partial), so
-                # that fallback is silent; only an unbound metastable LFS (a
-                # nonzero LFS present) collects the triples for the summary warning.
-                if {lfs for lfs, _izap in pathway_list} != {0}:
-                    for (lfs, _izap), rx in zip(pathway_list, bound):
-                        if rx is None:
-                            unbound.append((nuc, name, lfs))
+            # Chain qualified: compare the LFS set the chain demands against the
+            # LFS set the library provides for this MT. Each MF=10 partial is keyed
+            # by (LFS, IZAP): an LFS is a level index, and a single LFS may be
+            # shared by several product nuclides (a lumped channel), so IZAP
+            # disambiguates the product.
+            pathway_list = list(pathways_fn(nuc, mt)) if have_pathways else []
+            demanded_lfs = set(lfs_reactions)
+            library_lfs = {lfs for lfs, _izap in pathway_list}
+            if demanded_lfs != library_lfs:
+                # The chain and library disagree on this reaction's pathways: the
+                # chain expects LFS the library does not match, the library carries
+                # extra LFS, or the library has no MF=10 for this MT. Emit the MF=3
+                # total (identical value to the old stock/unbound fallback) and
+                # collect for one honest summary warning naming both LFS sets.
+                mismatched.append((nuc, name, demanded_lfs, library_lfs))
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
+
+            # Exact set match: every library partial binds to a chain reaction
+            # (``demanded_lfs == library_lfs`` guarantees no ``None``).
+            bound = [lfs_reactions[lfs] for lfs, _izap in pathway_list]
 
             # A lumped reaction (e.g. MT=5 (n,misc)) can carry MF=10 partials for
             # several distinct daughter nuclides that share an LFS and therefore
@@ -1230,16 +1245,21 @@ def _build_xs_table_pendf(
                     key=lambda t: _liso_from_gnds(t[0].type)):
                 stage(nuc_idx, base_idx, rx.type, xs_g, keep_zero=True)
 
-    # One summary warning for every MF=10 partial that fell back to the MF=3
-    # total because the chain had no reaction carrying its LFS (emitted once per
-    # build, not per reaction/group).
-    if unbound:
-        summary = ', '.join(f'{n} {r} LFS={lfs}' for n, r, lfs in unbound)
-        warn('PENDF library has MF=10 isomeric partials with no matching '
-             'depletion-chain reaction, so the MF=3 total was emitted instead '
-             f'of pathway rows for: {summary}. Add these isomeric branches to '
-             'the chain with tools/add_pendf_isomeric_branching_to_chain.py to '
-             'resolve them.')
+    # One summary warning when the chain demanded MF=10 pathways the library did
+    # not exactly match (emitted once per build, not per reaction/group). The
+    # staged values are unaffected (the MF=3 total was used); only the chain <->
+    # library disagreement is surfaced.
+    if mismatched:
+        summary = ', '.join(
+            f'{n} {r} (chain LFS '
+            f'{{{", ".join(map(str, sorted(dem)))}}} vs library LFS '
+            f'{{{", ".join(map(str, sorted(lib)))}}})'
+            for n, r, dem, lib in mismatched)
+        warn('The depletion chain expects MF=10 pathways the PENDF library does '
+             f'not match for: {summary}. The MF=3 total was used for these '
+             'reactions. The chain and library disagree -- regenerate the chain '
+             'from this library with '
+             'tools/add_pendf_isomeric_branching_to_chain.py.')
 
     # Build the expanded reaction axis: every base name (always present, so the
     # dense result keeps a column for each requested reaction) followed by its
