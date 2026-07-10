@@ -51,7 +51,8 @@ import numpy as np
 import openmc
 from openmc.checkvalue import PathLike
 from .data import gnds_name
-from .endf import Evaluation, get_head_record, get_list_record, get_tab1_record
+from .endf import (Evaluation, get_cont_record, get_head_record,
+                   get_list_record, get_tab1_record)
 from .urr import ProbabilityTables
 
 __all__ = ['PendfLibrary', 'GroupedPendfLibrary', 'PendfTapeLibrary',
@@ -409,6 +410,84 @@ def _write_mf10_partials(mtg, ev, mt, name, path):
         lg.attrs['LFS'] = lfs
         lg.attrs['ELFS'] = pqm - pqi
         _write_xy(lg, ptab.x, ptab.y)
+
+
+def _mf9_backed_mts(ev):
+    """Return ``{mt: n_subsections}`` for MF=8 sections that declare LMF=9.
+
+    Scans each MF=8 section of ``ev`` for product subsections whose LMF pointer
+    (the subsection header's ``L1`` field) is 9 -- i.e. the isomeric-production
+    data for that channel lives in MF=9 (branching *multiplicities*) rather than
+    MF=10 (partial cross sections). This module folds isomeric branching from
+    MF=10 only, so an LMF=9 channel's partials would be silently absent.
+
+    The MF=8 HEAD carries ``NS`` (subsection count) and ``NO``: ``NO=0`` -> each
+    subsection is a LIST with inline decay data, ``NO=1`` -> each is a single
+    CONT record (decay chain deferred to MT=457). Both layouts put LMF in the
+    subsection header's ``L1`` field, so the header is read with
+    :func:`get_list_record` (which also consumes the LIST body) or
+    :func:`get_cont_record` accordingly -- the same walk-by-section idiom used to
+    read MF=10 in :func:`_iter_mf10_partials`. The special MF=8 fission-yield /
+    decay sections (MT 454/457/459) use a different record layout and carry no
+    LMF pointer, so they are skipped. Any parse hiccup on a section is swallowed:
+    this scan is advisory and must never perturb ingestion.
+
+    Returns an empty dict when no MF=8 section declares LMF=9 (the expected
+    result for producer-folded PENDF tapes, whose MF=8 carries LMF=10 only) and
+    when ``ev`` has no MF=8 section at all.
+    """
+    mf9_mts = {}
+    for (mf, mt) in ev.section:
+        if mf != 8 or mt in (454, 457, 459):
+            continue
+        count = 0
+        try:
+            fo = io.StringIO(ev.section[8, mt])
+            _za, _awr, _lis, _liso, ns, no = get_head_record(fo)
+            for _ in range(ns):
+                if no == 0:
+                    (_zap, _elfs, lmf, _lfs, _npl, _n2), _vals = \
+                        get_list_record(fo)
+                else:
+                    _zap, _elfs, lmf, _lfs, _npl, _n2 = get_cont_record(fo)
+                if lmf == 9:
+                    count += 1
+        except Exception:
+            # Advisory-only: a malformed / unexpected MF=8 section must never
+            # break tape ingestion, so a parse failure just skips this section.
+            continue
+        if count:
+            mf9_mts[mt] = count
+    return mf9_mts
+
+
+def _warn_if_mf9_backed(ev, name, source_name):
+    """Warn once per tape if it declares MF=9-backed isomeric production.
+
+    Our PENDF ASC tapes are producer-folded: a channel that originally stored
+    isomeric branching as MF=9 multiplicities arrives with its MF=8 LMF pointer
+    rewritten 9 -> 10 and a synthesized MF=10 partial cross section, which this
+    reader consumes. A tape that *still* declares ``LMF=9`` in MF=8 carries MF=9
+    content this MF=10-only reader does not fold, so those channels' isomeric
+    partials would be silently missing. A correctly folded tape has zero LMF=9
+    (and a tape with no MF=8 section trivially so), for which this is silent.
+
+    Advisory only: it never changes what is parsed, stored, or returned -- it
+    just surfaces one diagnostic per tape when the never-expected condition is
+    met. Shared by the HDF5 build (:meth:`PendfLibrary.from_endf_directory`) and
+    the tape-direct collapse (:meth:`PendfTapeLibrary._load`).
+    """
+    mf9_mts = _mf9_backed_mts(ev)
+    if not mf9_mts:
+        return
+    detail = ', '.join(
+        f"MT={mt} ({n} subsection{'s' if n != 1 else ''})"
+        for mt, n in sorted(mf9_mts.items()))
+    warn(f"{source_name}: {name} declares MF=9-backed isomeric production "
+         f"(MF=8 LMF=9) for {detail}, which this reader does not fold; "
+         f"MF=10-only reads will silently miss these channels' partials. "
+         f"Expected zero for producer-folded PENDF tapes; check the tape's "
+         f"processing chain.")
 
 
 # MF=2 MT=153 (NJOY PURR) probability-table layout: each URR energy carries a
@@ -905,6 +984,12 @@ class PendfLibrary:
                             warn(f"{path.name}: {name} MF=10 MT={mt} has no "
                                  f"MF=3 section; isomeric partials dropped.")
 
+                        # Advisory guard: warn if this tape declares MF=9-backed
+                        # isomeric production (MF=8 LMF=9) that this MF=10-only
+                        # reader does not fold. Silent for producer-folded tapes
+                        # (zero LMF=9); changes nothing written to the h5.
+                        _warn_if_mf9_backed(ev, name, path.name)
+
                         # MF=2 MT=153 probability tables (URR). Ingested
                         # unconditionally (independent of keep_extra_mts, which
                         # only gates the MF=3 loop) so a rebuilt library always
@@ -1349,6 +1434,10 @@ class PendfTapeLibrary:
         name = gnds_name(ev.target['atomic_number'],
                          ev.target['mass_number'],
                          ev.target['isomeric_state'])
+        # Advisory guard (shared with from_endf_directory): warn once per tape
+        # if it declares MF=9-backed isomeric production the MF=10-only read
+        # silently misses. Silent for producer-folded tapes; parses unchanged.
+        _warn_if_mf9_backed(ev, name, path.name)
         reactions: dict = {}
         for (mf, mt), text in sorted(ev.section.items()):
             if mf != 3:
