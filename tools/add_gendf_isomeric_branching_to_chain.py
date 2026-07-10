@@ -36,6 +36,23 @@ from openmc.deplete.gendf import (
 
 
 # =============================================================================
+# LFS sentinel values ("unspecified isomer" conventions) -- report-only guard
+# =============================================================================
+
+# Some evaluations tag a reaction product whose final-state LEVEL could not be
+# resolved with a SENTINEL LFS instead of a true level index. These sentinels
+# are NOT level ordinals and must NEVER be interpreted as isomer ordinals -- a
+# sentinel must never become ``_m99`` / ``_m40``. ELIS mapping is unaffected
+# (it matches the real GENDF-ELFS excitation energy, QM - QI); only a
+# positional ``lfs_order`` consumer would mis-name them. Detection below is
+# REPORT-ONLY: no mapping decision and no byte of the output chain depends on it.
+SENTINEL_LFS = {
+    99: 'ENDF/JEFF convention: isomer of unspecified level',
+    40: 'TENDL convention: isomer of unspecified level',
+}
+
+
+# =============================================================================
 # Single-target reason codes
 # =============================================================================
 
@@ -72,6 +89,15 @@ LIBRARY_CONFIGS = {
         'output_dir': '/home/perry/NukeData/Activation/OMC/Perry-made/Isomeric-Chains/',
         'output_prefix': 'chain_endfCENDL32_dkENDF80_isoCENDL32gendf.mt4.',
         'log_prefix': 'CENDL32_isomer_mapping',
+    },
+    'endfb71_decay2012': {
+        'description': 'ENDF/B-7.1 + decay2012 - CCFE-709',
+        'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/ENDFB71data/endfb71-n/gxs-709/',
+        'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
+        'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB71_decay2012/Chain_ENDFB71_decay2012.xml',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB71_decay2012/',
+        'output_prefix': 'Chain_ENDFB71_decay2012-IsoFlag',
+        'log_prefix': 'ENDFB71-dk2012_isomer_mapping',
     },
     'endfb80': {
         'description': 'ENDF/B-8.0 (Native pairing) - CCFE-709',
@@ -316,6 +342,199 @@ def _parse_no_metastable_decay_data_error(error_str):
         result['product'] = f"{elem}{mass}_m{lfs}" if lfs else f"{elem}{mass}_m?"
 
     return result
+
+
+def _collect_lfs_sentinels(branching_data, elis_errors, duplicate_mapping_errors,
+                           lfs_order_dropped, mapping_mode):
+    """Report-only scan for LFS SENTINEL values (see :data:`SENTINEL_LFS`).
+
+    Returns a list of occurrence records drawn from BOTH the successfully mapped
+    products (``branching_data`` -> ``IsomericBranching.lfs_mapping``) and the
+    unmapped/skipped error channels (``lib.processing_errors``). No mapping
+    decision depends on this; it exists so a sentinel LFS -- which the
+    flags-only writer would otherwise emit verbatim in ``gendf_lfs`` -- is never
+    silently consumed as an isomer ordinal (``_m99`` / ``_m40``).
+    """
+    sentinels = []
+    method = 'lfs_order' if mapping_mode == 'lfs_order' else 'elis'
+
+    def _base(product, z, a):
+        if product and '_m' in str(product):
+            return str(product).split('_m')[0]
+        if z and a:
+            return f"{_z_to_element(z)}{a}"
+        return '?'
+
+    # 1) Mapped products (these are what the flags-only writer emits to the
+    #    chain's gendf_lfs attribute -- the primary ordinal-misuse risk).
+    for parent, reactions in (branching_data or {}).items():
+        for reaction_type, branching in (reactions or {}).items():
+            lfs_map = getattr(branching, 'lfs_mapping', None) or {}
+            elis_map = getattr(branching, 'elis_mapping', None) or {}
+            mt = getattr(branching, 'mt', None)
+            for product, lfs in lfs_map.items():
+                if lfs not in SENTINEL_LFS:
+                    continue
+                info = elis_map.get(product, {}) if isinstance(elis_map, dict) else {}
+                z, a = info.get('target_z'), info.get('target_a')
+                sentinels.append(dict(
+                    parent=parent, mt=mt, reaction=reaction_type, lfs=lfs,
+                    description=SENTINEL_LFS[lfs], target_z=z, target_a=a,
+                    base_nuclide=_base(product, z, a), elis=info.get('elis'),
+                    product=product, method=info.get('method', method),
+                    outcome=f"mapped -> {product}"))
+
+    # 2) Unmapped / skipped channels (completeness -- these are NOT written to
+    #    the chain, but are reported so every sentinel occurrence is visible).
+    for err in (elis_errors or []):
+        lfs = err.get('lfs')
+        parent = err.get('parent')
+        reaction = err.get('reaction')
+        if lfs is None and err.get('error'):
+            parsed = _parse_no_metastable_decay_data_error(err.get('error', ''))
+            lfs = parsed.get('lfs')
+            parent = parent or parsed.get('parent')
+            reaction = reaction or parsed.get('reaction')
+            err = {**parsed, **{k: v for k, v in err.items() if v is not None}}
+        if lfs not in SENTINEL_LFS:
+            continue
+        etype = err.get('type', '')
+        outcome = {
+            'elis_tol_exceeded':        'ELIS rtol exceeded (unmapped)',
+            'no_metastable_decay_data': 'no DK-Lib data (unmapped)',
+            'zero_elis_metastables':    'DK-Lib ELIS=0 (unmapped)',
+        }.get(etype, (etype or 'unmapped'))
+        z, a = err.get('target_z'), err.get('target_a')
+        sentinels.append(dict(
+            parent=parent, mt=err.get('mt'), reaction=reaction, lfs=lfs,
+            description=SENTINEL_LFS[lfs], target_z=z, target_a=a,
+            base_nuclide=err.get('base_nuclide') or _base(None, z, a),
+            elis=err.get('elis'), product=None, method=method, outcome=outcome))
+
+    for err in (duplicate_mapping_errors or []):
+        z, a = err.get('target_z'), err.get('target_a')
+        base = err.get('base_nuclide') or _base(None, z, a)
+        for d in err.get('discarded', []):
+            if d.get('lfs') not in SENTINEL_LFS:
+                continue
+            sentinels.append(dict(
+                parent=err.get('nuclide'), mt=err.get('mt'),
+                reaction=err.get('reaction'), lfs=d.get('lfs'),
+                description=SENTINEL_LFS[d.get('lfs')], target_z=z, target_a=a,
+                base_nuclide=base, elis=d.get('elis'), product=None,
+                method=method,
+                outcome=f"duplicate LFS discarded (kept LFS={err.get('kept_lfs')})"))
+        if err.get('kept_lfs') in SENTINEL_LFS:
+            sentinels.append(dict(
+                parent=err.get('nuclide'), mt=err.get('mt'),
+                reaction=err.get('reaction'), lfs=err.get('kept_lfs'),
+                description=SENTINEL_LFS[err.get('kept_lfs')], target_z=z,
+                target_a=a, base_nuclide=base, elis=err.get('kept_elis'),
+                product=None, method=method,
+                outcome=f"duplicate resolved: kept -> _m{err.get('liso')}"))
+
+    for err in (lfs_order_dropped or []):
+        lfs = err.get('lfs')
+        if lfs not in SENTINEL_LFS:
+            continue
+        z, a = err.get('target_z'), err.get('target_a')
+        sentinels.append(dict(
+            parent=err.get('parent'), mt=err.get('mt'),
+            reaction=err.get('reaction'), lfs=lfs,
+            description=SENTINEL_LFS[lfs], target_z=z, target_a=a,
+            base_nuclide=err.get('base_nuclide') or _base(None, z, a),
+            elis=err.get('gendf_elis'), product=None, method='lfs_order',
+            outcome='lfs_order dropped (unmapped)'))
+
+    return sentinels
+
+
+def _print_lfs_sentinel_warning(sentinels, mode):
+    """Loud console warning + per-value breakdown when LFS sentinels were seen.
+
+    Report-only: no mapping decision or chain output depends on this. Under
+    'elis' mapping the sentinel rows are matched on their real GENDF-ELFS
+    excitation energy and are SAFE; the risk is only a downstream POSITIONAL
+    consumer (FISPACT-parity lfs_order tooling) that would mis-name them
+    ``_m99`` / ``_m40``. Under 'lfs_order' the tool IS doing positional naming,
+    so the warning is emphatic.
+    """
+    if not sentinels:
+        return
+    by_val = Counter(s['lfs'] for s in sentinels)
+    bar = "!" * 70
+    print("\n" + bar)
+    print(f"WARNING: {len(sentinels)} LFS SENTINEL occurrence(s) detected "
+          "(unspecified-level isomer tags)")
+    print(bar)
+    for val in sorted(by_val):
+        print(f"  LFS={val:<3d} x{by_val[val]:<4d} {SENTINEL_LFS[val]}")
+    print("  Sentinel LFS values are NOT level ordinals; they must never be")
+    print("  interpreted as isomer ordinals (e.g. _m99 / _m40).")
+    if mode == 'lfs_order':
+        print("  MODE=lfs_order is ACTIVE: positional product naming is "
+              "UNRELIABLE for these")
+        print("  rows -- use ELIS mapping for production calculations.")
+    else:
+        print("  ELIS mapping is active, so these rows are matched on real "
+              "excitation energy")
+        print("  and are SAFE here; the risk is only if the chain is later "
+              "consumed ORDINALLY")
+        print("  (e.g. FISPACT-parity lfs_order tooling).")
+    print("  See the 'LFS SENTINEL VALUES' section of the mapping log for "
+          "every occurrence.")
+    print(bar)
+
+
+def _write_lfs_sentinel_section(f, sentinels):
+    """LFS SENTINEL VALUES section: every GENDF partial carrying a sentinel LFS.
+
+    Report-only. Lists all occurrences (mapped + unmapped, all nuclides/targets)
+    so a sentinel LFS is never silently consumed as an isomer ordinal. Printed
+    unconditionally (mirrors the other log sections), with a 'none found' line
+    when empty.
+    """
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write('LFS SENTINEL VALUES ("unspecified isomer" conventions)\n')
+    f.write("=" * 220 + "\n\n")
+    f.write("Some evaluations tag a product whose final-state LEVEL could not "
+            "be resolved with a SENTINEL LFS instead of a true level index:\n")
+    for val, desc in sorted(SENTINEL_LFS.items()):
+        f.write(f"    LFS={val:<3d} = {desc}\n")
+    f.write("These sentinels are NOT level ordinals. ELIS mapping (this tool's "
+            "default) is unaffected -- it matches the real GENDF-ELFS "
+            "excitation energy (QM - QI), so the\n")
+    f.write("CHAIN-Product carries the correct _m<liso>. A positional/lfs_order "
+            "consumer, however, would mis-name these rows _m99 / _m40. They are "
+            "reported here so such misuse is\n")
+    f.write("caught; mapping decisions and the output chain XML are "
+            "UNCHANGED.\n\n")
+    if not sentinels:
+        f.write("No LFS sentinel values found.\n")
+        return
+    by_val = Counter(s['lfs'] for s in sentinels)
+    breakdown = ", ".join(f"LFS={v}: {by_val[v]}" for v in sorted(by_val))
+    f.write(f"Total sentinel occurrences: {len(sentinels)}  ({breakdown})\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+              f"{'Convention':<22}  {'Target':<12}  {'GENDF-ELFS[eV]':>14}  "
+              f"{'Method':<10}  {'Outcome':<46}")
+    sep = "-" * len(header)
+    f.write(header + "\n" + sep + "\n")
+
+    def _k(x):
+        return (str(x.get('parent') or ''), x.get('mt') or 0, x.get('lfs') or 0)
+
+    for s in sorted(sentinels, key=_k):
+        elis = s.get('elis')
+        elis_str = f"{elis:.1f}" if isinstance(elis, (int, float)) else "N/A"
+        conv = (s.get('description') or '').split(':')[0]
+        mt = s.get('mt')
+        mt_str = str(mt) if mt is not None else "?"
+        f.write(f"{str(s.get('parent') or '?'):<12}  {mt_str:>5}  "
+                f"{str(s.get('reaction') or '?'):<12}  {s['lfs']:>4}  "
+                f"{conv:<22}  {str(s.get('base_nuclide') or '?'):<12}  "
+                f"{elis_str:>14}  {str(s.get('method') or ''):<10}  "
+                f"{str(s.get('outcome') or ''):<46}\n")
 
 
 def _check_isomeric_state_proximity(isomer_mappings, rtol):
@@ -887,10 +1106,13 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 
 def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=None,
                              duplicate_mapping_errors=None, lfs_order_dropped=None,
-                             lfs_order_orphan_dk=None, single_target_cases=None):
+                             lfs_order_orphan_dk=None, single_target_cases=None,
+                             lfs_sentinels=None):
     """Write comprehensive isomer mapping log."""
     if elis_errors is None:
         elis_errors = []
+    if lfs_sentinels is None:
+        lfs_sentinels = []
     if duplicate_mapping_errors is None:
         duplicate_mapping_errors = []
     if lfs_order_dropped is None:
@@ -1004,6 +1226,8 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
             f.write(f"                     Orphan DK states (no LFS): {orphan_count:5d}\n")
         if dup_mapping_count:
             f.write(f"                    Duplicate mappings resolved: {dup_mapping_count:5d} ({dup_discarded_count} LFS discarded)\n")
+        if lfs_sentinels:
+            f.write(f"                       LFS sentinel occurrences: {len(lfs_sentinels):5d}\n")
         f.write("\n")
 
         # Column descriptions
@@ -1388,6 +1612,9 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         conflicts = _detect_mapping_conflicts(isomer_mappings)
         _write_conflicts_table(f, conflicts, isomer_mappings, header, sep)
 
+        # LFS SENTINEL VALUES section (report-only safeguard)
+        _write_lfs_sentinel_section(f, lfs_sentinels)
+
     print(f"Isomer mapping log written to: {log_file}")
 
 
@@ -1723,6 +1950,18 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     if dup_mappings:
         print(f"                    Duplicate mappings resolved: {dup_mappings:5d} ({dup_discarded} LFS discarded)")
 
+    # Report-only LFS sentinel scan (see SENTINEL_LFS): flag products/partials
+    # whose GENDF MF=10 LFS is a library "unspecified level" sentinel (99 / 40)
+    # so it is never silently consumed as an isomer ordinal. The flags-only
+    # writer would otherwise emit the sentinel verbatim in gendf_lfs. This
+    # changes no mapping decision and no byte of the output chain XML.
+    lfs_sentinels = _collect_lfs_sentinels(
+        branching_data, elis_errors, duplicate_mapping_errors,
+        lfs_order_dropped, mapping_mode)
+    if lfs_sentinels:
+        print(f"                       LFS sentinel occurrences: {len(lfs_sentinels):5d}")
+    _print_lfs_sentinel_warning(lfs_sentinels, mapping_mode)
+
     # Step 5: Add to XML
     print("\nStep 5: Adding branching to chain XML...")
     if prune_nn_prime_self_loops:
@@ -1781,7 +2020,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
                                 duplicate_mapping_errors=duplicate_mapping_errors,
                                 lfs_order_dropped=lfs_order_dropped,
                                 lfs_order_orphan_dk=lfs_order_orphan_dk,
-                                single_target_cases=summary.get('single_target_cases', []))
+                                single_target_cases=summary.get('single_target_cases', []),
+                                lfs_sentinels=lfs_sentinels)
 
     return chain
 
