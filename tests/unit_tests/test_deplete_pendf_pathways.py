@@ -752,3 +752,118 @@ def test_zero_metastable_partial_stages_and_passes():
     consistency_chain = _chain({"In115": [("(n,gamma)", "In116"),
                                           ("(n,gamma)_m1", "In116_m1")]})
     _check_pathway_consistency(consistency_chain, micro)  # no raise
+
+
+# ---------------------------------------------------------------------------
+# Chain provenance stamp verification at collapse (§chain-provenance stamp)
+# ---------------------------------------------------------------------------
+
+class _IdentifiedPendf(_FakePendf):
+    """A ``_FakePendf`` that also carries a ``library`` identity string.
+
+    ``_FakePendf`` deliberately exposes no ``library`` attr, so the provenance
+    stamp check skips it (duck-typed libraries without identity are unverifiable).
+    This subclass adds the identity so the mismatch path can be exercised;
+    ``nuclides`` (the collapse interface) already supplies the count.
+    """
+
+    def __init__(self, mf3, mf10=None, library="TENDL-2017"):
+        super().__init__(mf3, mf10)
+        self.library = library
+
+
+def _stamped_am241_setup(library="TENDL-2017"):
+    """Return (fake, chain, edges, flux) for a 1-nuclide (Am241) collapse.
+
+    The chain binds LFS {0, 2} exactly to the library's partials (no LFS-set
+    mismatch, no consistency warning), so any warning captured is the provenance
+    stamp's. The chain is stamped by the caller.
+    """
+    fake = _IdentifiedPendf(
+        mf3={"Am241": {102: _const(5.0)}},
+        mf10={"Am241": {102: {
+            0: ("Am242", _const(4.0)),
+            2: ("Am242_m1", _const(1.0)),
+        }}}, library=library)
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+    return fake, chain, [0.0, 1.0e7, 2.0e7], [1.0, 1.0]
+
+
+def _collapse(fake, chain, edges, flux):
+    return MicroXS.from_multigroup_flux(
+        energies=edges, multigroup_flux=flux, chain_file=chain,
+        nuclides=["Am241"], reactions=["(n,gamma)"], pendf_library=fake)
+
+
+def _provenance_warnings(record):
+    return [w for w in record if "provenance mismatch" in str(w.message)]
+
+
+def test_stamp_matching_library_silent(recwarn):
+    """A stamp matching the library on both string and count -> no warning."""
+    fake, chain, edges, flux = _stamped_am241_setup()
+    chain.root_attrs = {'pendf_source': 'tendl2017.h5',
+                        'pendf_library': 'TENDL-2017', 'pendf_nuclides': '1'}
+    _collapse(fake, chain, edges, flux)
+    assert _provenance_warnings(recwarn) == []
+
+
+def test_stamp_library_string_mismatch_warns():
+    """A stamp naming a different library string -> one warning naming both."""
+    fake, chain, edges, flux = _stamped_am241_setup(library="TENDL-2017")
+    chain.root_attrs = {'pendf_source': 'jeff40.h5',
+                        'pendf_library': 'JEFF-4.0',   # != library in use
+                        'pendf_nuclides': '1'}          # count matches
+    with pytest.warns(UserWarning, match="provenance mismatch") as record:
+        _collapse(fake, chain, edges, flux)
+    msg = str(_provenance_warnings(record)[0].message)
+    assert "JEFF-4.0" in msg                     # stamp's library
+    assert "TENDL-2017" in msg                   # library in use
+    assert "jeff40.h5" in msg                    # source basename included
+    assert "add_pendf_isomeric_branching_to_chain" in msg
+
+
+def test_stamp_nuclide_count_mismatch_warns():
+    """A stamp whose nuclide count differs -> warns even when the string matches."""
+    fake, chain, edges, flux = _stamped_am241_setup()
+    chain.root_attrs = {'pendf_source': 'tendl2017.h5',
+                        'pendf_library': 'TENDL-2017',  # matches
+                        'pendf_nuclides': '593'}         # != 1 in use
+    with pytest.warns(UserWarning, match="provenance mismatch") as record:
+        _collapse(fake, chain, edges, flux)
+    msg = str(_provenance_warnings(record)[0].message)
+    assert "593 nuclides" in msg
+    assert "1 nuclides" in msg
+
+
+def test_stamp_source_rename_only_silent(recwarn):
+    """A differing pendf_source alone (a file rename) is never a trigger."""
+    fake, chain, edges, flux = _stamped_am241_setup()
+    chain.root_attrs = {'pendf_source': 'renamed-copy.h5',   # only this differs
+                        'pendf_library': 'TENDL-2017', 'pendf_nuclides': '1'}
+    _collapse(fake, chain, edges, flux)
+    assert _provenance_warnings(recwarn) == []
+
+
+def test_stamp_duck_typed_library_without_identity_skips(recwarn):
+    """A stamped chain collapsed against a library with no ``library`` attr
+    (plain _FakePendf) skips the check -- even a wildly wrong stamp is silent."""
+    fake = _FakePendf(
+        mf3={"Am241": {102: _const(5.0)}},
+        mf10={"Am241": {102: {
+            0: ("Am242", _const(4.0)),
+            2: ("Am242_m1", _const(1.0)),
+        }}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+    chain.root_attrs = {'pendf_source': 'anything.h5',
+                        'pendf_library': 'SOME-OTHER-LIB', 'pendf_nuclides': '999'}
+    _collapse(fake, chain, [0.0, 1.0e7, 2.0e7], [1.0, 1.0])
+    assert _provenance_warnings(recwarn) == []
+
+
+def test_unstamped_chain_silent(recwarn):
+    """An unstamped chain (the pre-stamp default) never warns."""
+    fake, chain, edges, flux = _stamped_am241_setup()
+    assert chain.root_attrs == {}          # _chain_from_fake leaves it unstamped
+    _collapse(fake, chain, edges, flux)
+    assert _provenance_warnings(recwarn) == []

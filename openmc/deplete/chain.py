@@ -286,6 +286,11 @@ class Chain:
         self.nuclide_dict = {}
         self._fission_yields = None
         self._decay_matrix = None
+        # Unknown attributes on the <depletion_chain> root element, preserved
+        # verbatim across from_xml -> export_to_xml (e.g. the PENDF provenance
+        # stamp the chain patcher writes). Empty for a vanilla chain, so nothing
+        # extra is emitted and the output stays byte-identical.
+        self.root_attrs: dict = {}
 
     def __contains__(self, nuclide):
         return nuclide in self.nuclide_dict
@@ -573,6 +578,10 @@ class Chain:
         # Load XML tree
         root = ET.parse(str(filename))
 
+        # Preserve any attributes on the <depletion_chain> root element (e.g.
+        # the PENDF provenance stamp) so export_to_xml can re-emit them.
+        chain.root_attrs = dict(root.getroot().attrib)
+
         for i, nuclide_elem in enumerate(root.findall('nuclide')):
             this_q = fission_q.get(get_text(nuclide_elem, "name"))
 
@@ -595,6 +604,10 @@ class Chain:
         """
 
         root_elem = ET.Element('depletion_chain')
+        # Re-emit any preserved root attributes (e.g. the PENDF provenance
+        # stamp). A vanilla chain carries none, so nothing is emitted here.
+        for key, value in getattr(self, 'root_attrs', {}).items():
+            root_elem.set(key, str(value))
         for nuclide in self.nuclides:
             root_elem.append(nuclide.to_xml_element())
 
@@ -1340,6 +1353,10 @@ class Chain:
         # Doesn't appear that the ordering matters for the reactions,
         # just the contents
         new_chain.reactions = sorted(new_chain.reactions)
+
+        # Carry the root attributes (e.g. the PENDF provenance stamp) through
+        # reduce so a reduced-then-exported chain stays self-identifying.
+        new_chain.root_attrs = dict(getattr(self, 'root_attrs', {}))
 
         return new_chain
 

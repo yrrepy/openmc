@@ -836,6 +836,8 @@ class GroupedPendfLibrary:
         Ascending energy group boundaries in [eV], length ``n_groups + 1``.
     nuclides : list of str
         GNDS nuclide names present in the library.
+    library : str or None
+        Name of the source data library (root ``library`` attr), or ``None``.
     """
 
     def __init__(self, path: PathLike):
@@ -889,6 +891,18 @@ class GroupedPendfLibrary:
     @property
     def nuclides(self) -> list[str]:
         return self._nuclides
+
+    @property
+    def library(self) -> str | None:
+        """Source data library name (root ``library`` attr), or ``None``.
+
+        Copied from the pointwise source at bin time (``tools/pendf_group_bin.py``)
+        so a grouped library carries the same provenance identity as a
+        :class:`PendfLibrary`; the chain-provenance stamp check reads it.
+        """
+        if 'library' in self._file.attrs:
+            return _attr_str(self._file.attrs, 'library')
+        return None
 
     def reactions(self, nuclide: str) -> list[int]:
         """Return the MT numbers with grouped MF=3 data for ``nuclide``."""

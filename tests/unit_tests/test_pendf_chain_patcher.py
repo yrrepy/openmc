@@ -224,6 +224,47 @@ def test_full_fold_roundtrip(tmp_path):
     assert rxns["(n,gamma)_m2"] == ("In116_m2", 6495060.0, 4)
 
 
+def test_main_stamps_chain_provenance(tmp_path, monkeypatch):
+    # main() writes the PENDF source identity onto the exported chain root:
+    # pendf_library (source string), pendf_nuclides (count), pendf_source
+    # (basename). Uses the module fixtures with open_pendf_source /
+    # parse_decay_isomeric_levels monkeypatched so no real data files are needed.
+    import add_pendf_isomeric_branching_to_chain as patcher
+
+    base = _chain_with(["In115", "In116", "In116_m1", "In116_m2"],
+                       reactions={"In115": [("(n,gamma)", "In116", 6784720.0)]})
+    base_xml = tmp_path / "base.xml"
+    base.export_to_xml(str(base_xml))
+
+    fake_source = _FakeSource({"In115": {
+        102: dict(qm=6784720.0, qi=6784720.0,
+                  partials=_in115_ng_metastables())}})
+    monkeypatch.setattr(patcher, "open_pendf_source",
+                        lambda path, library=None: fake_source)
+    monkeypatch.setattr(patcher, "parse_decay_isomeric_levels",
+                        lambda decay_file: _decay_lookup())
+
+    pendf_path = tmp_path / "TENDL2017-IST.293K.PENDF.h5"
+    out = tmp_path / "chain_out.xml"
+    patcher.main(base_chain_file=str(base_xml), pendf_path=str(pendf_path),
+                 decay_file="ignored", output_chain_file=str(out),
+                 mapping_mode="elis", verbose=False)
+
+    import lxml.etree as ET
+    root = ET.parse(str(out)).getroot()
+    assert root.get("pendf_library") == "synthetic"     # _FakeSource.library
+    assert root.get("pendf_nuclides") == "1"            # one nuclide (In115)
+    assert root.get("pendf_source") == "TENDL2017-IST.293K.PENDF.h5"
+
+    # And the stamp round-trips back through Chain.from_xml.
+    reread = Chain.from_xml(str(out))
+    assert reread.root_attrs == {
+        "pendf_library": "synthetic",
+        "pendf_nuclides": "1",
+        "pendf_source": "TENDL2017-IST.293K.PENDF.h5",
+    }
+
+
 def test_elis_matched_stat_counts():
     chain = _chain_with(["In115", "In116", "In116_m1", "In116_m2"],
                         reactions={"In115": [("(n,gamma)", "In116", 6784720.0)]})

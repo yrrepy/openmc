@@ -1557,8 +1557,20 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     print_stats(stats, mapping_mode)
 
     print("\nStep 6: Exporting folded chain XML...")
+    # Stamp the exported chain's root element with the PENDF source's identity so
+    # a wrong/stale chain paired with a library is self-detecting at collapse time
+    # (openmc.deplete.microxs._verify_pendf_chain_stamp). The library string and
+    # nuclide count are the mismatch triggers; pendf_source (the h5/dir basename)
+    # is informational only -- a file rename must not false-alarm.
+    chain.root_attrs = {
+        'pendf_source': Path(pendf_path).name,
+        'pendf_library': source.library,
+        'pendf_nuclides': str(len(source.nuclides)),
+    }
     chain.export_to_xml(output_chain_file)
     print(f"  Chain written to: {output_chain_file}")
+    print(f"  Provenance stamp: library={source.library!r}, "
+          f"nuclides={len(source.nuclides)}, source={Path(pendf_path).name!r}")
 
     if log_file:
         source_stats = dict(

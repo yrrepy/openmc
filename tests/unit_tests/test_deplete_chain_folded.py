@@ -242,6 +242,61 @@ def test_duplicate_lfs_group_exports_stock():
     assert reparsed.reactions == nuc.reactions
 
 
+# ---------------------------------------------------------------------------
+# Root-attribute (PENDF provenance stamp) round-trip
+# ---------------------------------------------------------------------------
+
+def test_root_attrs_survive_roundtrip_and_reduce(run_in_tmpdir):
+    """A stamped <depletion_chain> root survives from_xml -> export -> from_xml,
+    and rides through reduce() (§ chain-provenance stamp round-trip)."""
+    stamped = _CHAIN.replace(
+        '<depletion_chain>',
+        '<depletion_chain pendf_source="JEFF40-IST.293K.PENDF.h5"'
+        ' pendf_library="JEFF-4.0" pendf_nuclides="593">')
+    src = Path('chain_stamped.xml')
+    src.write_text(stamped)
+
+    chain = Chain.from_xml(str(src))
+    assert chain.root_attrs == {
+        'pendf_source': 'JEFF40-IST.293K.PENDF.h5',
+        'pendf_library': 'JEFF-4.0',
+        'pendf_nuclides': '593',
+    }
+
+    out = Path('exported.xml')
+    chain.export_to_xml(str(out))
+    root = ET.parse(str(out)).getroot()
+    assert root.get('pendf_library') == 'JEFF-4.0'
+    assert root.get('pendf_nuclides') == '593'
+    assert root.get('pendf_source') == 'JEFF40-IST.293K.PENDF.h5'
+    # Reload preserves the stamp.
+    assert Chain.from_xml(str(out)).root_attrs == chain.root_attrs
+
+    # reduce() -> export -> reload keeps the stamp.
+    reduced = chain.reduce(
+        ["In115", "In116", "In116_m1", "In116_m2", "Sn116"])
+    assert reduced.root_attrs == chain.root_attrs
+    rout = Path('reduced_stamped.xml')
+    reduced.export_to_xml(str(rout))
+    assert Chain.from_xml(str(rout)).root_attrs == chain.root_attrs
+
+
+def test_vanilla_chain_exports_without_root_attrs(run_in_tmpdir):
+    """A chain with no stamp emits a bare <depletion_chain> (no spurious attrs,
+    output stays byte-identical to the pre-stamp behavior)."""
+    src = Path('chain_vanilla.xml')
+    src.write_text(_CHAIN)
+
+    chain = Chain.from_xml(str(src))
+    assert chain.root_attrs == {}
+
+    out = Path('vanilla_out.xml')
+    chain.export_to_xml(str(out))
+    assert dict(ET.parse(str(out)).getroot().attrib) == {}
+    # A freshly constructed (never-parsed) chain is likewise attribute-free.
+    assert Chain().root_attrs == {}
+
+
 def test_reduce_preserves_pendf_lfs_on_dropped_target():
     """reduce() keeps pendf_lfs when a pathway's target is not retained --
     the PENDF collapse still needs the LFS to bind the MF=10 partial

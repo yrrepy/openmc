@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 import re
 import shutil
 from tempfile import TemporaryDirectory
@@ -973,6 +974,86 @@ def _get_pendf_chain(chain_file: PathLike | Chain | None) -> Chain:
     return _get_chain(chain_file)
 
 
+def _pendf_library_basename(pendf_library) -> str | None:
+    """Best-effort basename of a PENDF library's backing HDF5 file, or ``None``.
+
+    :class:`~openmc.data.PendfLibrary` holds its open ``h5py.File`` handles in
+    ``_files``; :class:`~openmc.data.GroupedPendfLibrary` records its ``_path``.
+    Neither is part of the duck-typed collapse interface, so a library exposing
+    neither (a test fake, or a directory-mode :class:`PendfLibrary` spanning
+    several files) yields ``None`` and the basename is dropped from the mismatch
+    message.
+    """
+    path = getattr(pendf_library, '_path', None)
+    if path is not None:
+        return Path(path).name
+    files = getattr(pendf_library, '_files', None)
+    if files:
+        try:
+            names = {Path(f.filename).name for f in files}
+        except Exception:
+            return None
+        if len(names) == 1:
+            return next(iter(names))
+    return None
+
+
+def _verify_pendf_chain_stamp(chain, pendf_library) -> None:
+    """Warn when a stamped chain's PENDF provenance disagrees with the library.
+
+    The chain patcher (``tools/add_pendf_isomeric_branching_to_chain.py``) stamps
+    the exported chain's root element with the identity of the PENDF source it was
+    built from: ``pendf_library`` (the source library string), ``pendf_nuclides``
+    (the nuclide count) and an informational ``pendf_source`` (the h5/dir
+    basename). The PENDF collapse is chain-driven -- a stock reaction silently
+    takes the MF=3 total -- so a wrong/stale chain paired with a library produces
+    silently degraded physics that no pathway-set comparison can catch. This makes
+    such a pairing self-detecting.
+
+    Behavior:
+
+    * Unstamped chain (no ``pendf_*`` root attrs) -> silent (backward compatible
+      with chains built before stamping, and with vanilla chains).
+    * Library exposing no ``library`` identity string (e.g. a duck-typed test
+      fake) -> silent; there is nothing to verify against.
+    * Stamp present and EITHER the library string OR the nuclide count disagrees
+      -> one :class:`UserWarning` naming both identities in full. A differing
+      ``pendf_source`` alone (a file rename) is never a trigger.
+    """
+    root_attrs = getattr(chain, 'root_attrs', None) or {}
+    stamped_lib = root_attrs.get('pendf_library')
+    stamped_n = root_attrs.get('pendf_nuclides')
+    if stamped_lib is None and stamped_n is None:
+        return  # unstamped chain -- nothing to verify
+
+    # The library string is the identity marker; a library that carries none
+    # (test fakes) cannot be verified against, so the check skips entirely.
+    lib_name = getattr(pendf_library, 'library', None)
+    if lib_name is None:
+        return
+    lib_nuclides = getattr(pendf_library, 'nuclides', None)
+    lib_n = len(lib_nuclides) if lib_nuclides is not None else None
+
+    # Trigger on the library string OR the nuclide count (compared as strings so
+    # the XML-sourced stamp and the int count agree). The source basename is
+    # never a trigger.
+    lib_mismatch = stamped_lib is not None and stamped_lib != lib_name
+    n_mismatch = (stamped_n is not None and lib_n is not None
+                  and str(stamped_n) != str(lib_n))
+    if not (lib_mismatch or n_mismatch):
+        return
+
+    source = root_attrs.get('pendf_source', 'unknown source')
+    basename = _pendf_library_basename(pendf_library)
+    against = f'{basename} ' if basename else ''
+    warn(
+        f'PENDF provenance mismatch: chain built from {source} (library '
+        f'{stamped_lib!r}, {stamped_n} nuclides) but collapsing against '
+        f'{against}(library {lib_name!r}, {lib_n} nuclides) -- regenerate the '
+        f'chain from this library with '
+        f'tools/add_pendf_isomeric_branching_to_chain.py')
+
+
 def _chain_lfs_reactions(chain: Chain, nuc: str, base_reaction: str) -> dict:
     """Map MF=10 ``LFS`` levels to the chain reactions that consume them.
 
@@ -1691,6 +1772,10 @@ class MicroXS:
         # Load it once here and share it with both defaulting and the table build.
         if pendf_library is not None:
             chain = _get_pendf_chain(chain_file)
+            # Verify the chain's PENDF provenance stamp against the library
+            # actually in use (no-op for unstamped chains / identity-less
+            # libraries); a wrong chain<->library pairing warns once here.
+            _verify_pendf_chain_stamp(chain, pendf_library)
         elif not nuclides or reactions is None:
             chain = _get_chain(chain_file)
         else:
