@@ -22,7 +22,8 @@ from openmc.deplete.microxs import (
 
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
 PENDF_DIR = Path(os.environ.get(
-    "OPENMC_PENDF_TEST_DATA", "/home/perry/NukeData/Activation/PENDF/Point_TENDL2017"))
+    "OPENMC_PENDF_TEST_DATA",
+    "/home/perry/NukeData/Activation/PENDF/Point_TENDL2017/pendf"))
 
 
 class _FakePendf:
@@ -242,14 +243,13 @@ def test_collapse_group_length_guard():
 # Real-data spot check vs Tabulated1D.integral() (skipped if data absent)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not PENDF_DIR.exists(),
-                    reason="TENDL-2017 PENDF data not available")
+@pytest.mark.skipif(not (PENDF_DIR / "n-Fe056.pendf").exists(),
+                    reason="TENDL-2017 PENDF Fe56 tape not available")
 def test_group_average_vs_tabulated_integral():
     from openmc.data import Tabulated1D
     from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
     path = PENDF_DIR / "n-Fe056.pendf"
-    assert path.exists()
     ev = Evaluation(str(path))
     f = io.StringIO(ev.section[3, 102])
     get_head_record(f)                 # MF=3 HEAD record
