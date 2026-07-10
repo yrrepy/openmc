@@ -761,11 +761,11 @@ extern "C" int openmc_statepoint_load(const char* filename)
       hid_t tallies_group = open_group(file_id, "tallies");
 
       for (auto& tally : model::tallies) {
-        // rma tally moments are block-distributed; the master scatters their
-        // row chunks to the owners in a separate all-ranks pass
-        // (scatter_rma_tally_results, below) so no rank temp-allocates the full
-        // moments. Skip them here -- consistently on every rank, keeping the
-        // Parallel HDF5 collective group/dataset calls below in lock-step.
+        // rma tally moments are block-distributed; each rank reads its owned
+        // rows in a separate all-ranks pass (read_distributed_rma_tally_results,
+        // called below) so no rank temp-allocates the full moments. Skip them
+        // here -- consistently on every rank, keeping the Parallel HDF5
+        // collective group/dataset calls below in lock-step.
         if (tally->storage_ == TallyStorage::RMA && mpi::n_procs > 1) {
           continue;
         }
