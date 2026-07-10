@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
 import shutil
 from tempfile import TemporaryDirectory
@@ -22,7 +23,7 @@ import numpy as np
 from openmc.checkvalue import check_type, check_value, check_iterable_type, PathLike
 from openmc import StatePoint
 from openmc.mgxs import GROUP_STRUCTURES
-from openmc.data import REACTION_MT
+from openmc.data import REACTION_MT, open_pendf_library
 import openmc
 from .chain import Chain, REACTIONS, _get_chain
 from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
@@ -440,11 +441,18 @@ def get_pendf_microxs_and_flux(
         composition -- an :class:`openmc.Material`, or an :class:`openmc.Cell`
         filled with a single Material (mixed Material/Cell sequences allowed);
         see that argument.
-    pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary
+    pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary or openmc.data.PendfTapeLibrary or path-like
         PENDF cross section library object (duck-typed with ``nuclides``,
         ``reactions(nuclide)`` and ``xs(nuclide, mt)``; a grouped library is
-        detected via ``group_edges``/``xs_g``). Required. Group cross sections are
-        taken from this library rather than from continuous-energy data.
+        detected via ``group_edges``/``xs_g``). May also be a path, opened via
+        :func:`openmc.data.open_pendf_library`: a grouped or pointwise ``.h5``
+        file, a directory of ``.h5`` files, or a directory of raw ASC PENDF tapes
+        (routed to the cross-validation
+        :class:`~openmc.data.PendfTapeLibrary`, which requires ``energies`` and
+        does not support ``urr_material_dilution``). A path is opened once and
+        closed here; a passed object is left to the caller. Required. Group cross
+        sections are taken from this library rather than from continuous-energy
+        data.
     nuclides : list of str, optional
         Nuclides to get cross sections for. If not specified, all burnable
         nuclides from the depletion chain file are used.
@@ -526,6 +534,30 @@ def get_pendf_microxs_and_flux(
             "composition automatically. To supply an explicit composition "
             "(openmc.Material or {nuclide: density} mapping), call "
             "MicroXS.from_multigroup_flux directly.")
+
+    # ``pendf_library`` may be an already-opened reader or a path: a
+    # grouped/pointwise .h5 file, a directory of .h5 files, or a directory of
+    # raw ASC PENDF tapes (the cross-validation tape adapter). Resolve a path to
+    # a reader once here and share the object across every domain's collapse
+    # (from_multigroup_flux then receives the object, not the path). Only a
+    # grouped .h5 is self-describing; the pointwise .h5 and the tape adapter both
+    # require the caller's ``energies``.
+    _owned_pendf = None
+    if isinstance(pendf_library, (str, os.PathLike)):
+        pendf_library = open_pendf_library(pendf_library)
+        _owned_pendf = pendf_library
+
+    # The URR self-shielding fold reads probability tables the raw ASC tape
+    # adapter does not serve; reject the combination loudly rather than silently
+    # skipping the correction (build a pointwise .h5 for URR work).
+    if urr_material_dilution and getattr(pendf_library, 'is_tape_source', False):
+        if _owned_pendf is not None:
+            _owned_pendf.close()
+        raise ValueError(
+            'urr_material_dilution is not supported on the raw ASC PENDF tape '
+            'adapter (a deterministic-collapse cross-validation path); build a '
+            'pointwise .h5 with PendfLibrary.from_endf_directory for URR '
+            'self-shielding')
 
     # Resolve the group structure. Explicit ``energies`` win; otherwise fall back
     # to a grouped PENDF library's own ``group_edges`` (duck-detected exactly as
@@ -658,6 +690,12 @@ def get_pendf_microxs_and_flux(
 
     # Reset tallies
     model.tallies = original_tallies
+
+    # Close a library we opened from a path (a caller-passed object is left to
+    # the caller). The tape adapter's close is a no-op; an h5 reader closes its
+    # file handles.
+    if _owned_pendf is not None:
+        _owned_pendf.close()
 
     return fluxes, micros
 
@@ -1647,9 +1685,17 @@ class MicroXS:
         cross_sections : PathLike, optional
             Cross section library used to resolve nuclide data availability and
             evaluate cross sections. Defaults to ``openmc.config['cross_sections']``.
-        pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary, optional
+        pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary or openmc.data.PendfTapeLibrary or path-like, optional
             PENDF cross section library, duck-typed with ``nuclides``,
-            ``reactions(nuclide)`` and ``xs(nuclide, mt)``. When given, group
+            ``reactions(nuclide)`` and ``xs(nuclide, mt)``. May also be a path,
+            opened via :func:`openmc.data.open_pendf_library`: a grouped or
+            pointwise ``.h5`` file, a directory of ``.h5`` files, or a directory
+            of raw ASC PENDF tapes -- the last routed to the cross-validation
+            :class:`~openmc.data.PendfTapeLibrary`, which collapses
+            bit-identically to a pointwise ``.h5`` built from the same tapes but
+            (like a pointwise library) still requires the caller's ``energies``
+            and does not support ``urr_material_dilution``. A path is opened and
+            closed here; a passed object is left to the caller. When given, group
             cross sections are taken from this library rather than from
             continuous-energy data; the continuous-energy session arguments
             (``cross_sections`` and any :func:`openmc.lib.init` keyword
@@ -1716,6 +1762,18 @@ class MicroXS:
         if multigroup_flux is None:
             raise ValueError('multigroup_flux is a required argument')
 
+        # ``pendf_library`` may be an already-opened reader or a path: a
+        # grouped/pointwise .h5 file, a directory of .h5 files, or a directory
+        # of raw ASC PENDF tapes (routed to the cross-validation tape adapter).
+        # A path is opened here and closed after the collapse; a passed object
+        # is left to the caller. Only a grouped .h5 is self-describing (carries
+        # its own group_edges); the pointwise .h5 and the tape adapter both
+        # require the caller's ``energies``.
+        _owned_pendf = None
+        if isinstance(pendf_library, (str, os.PathLike)):
+            pendf_library = open_pendf_library(pendf_library)
+            _owned_pendf = pendf_library
+
         # Fuse the URR dilution toggle with its composition: normalize
         # ``urr_material_dilution`` to a local ``densities`` mapping (or None
         # when off) here, before any collapse work, so the impossible "on but no
@@ -1751,6 +1809,18 @@ class MicroXS:
                 'urr_material_dilution requires a pendf_library; the URR '
                 'self-shielding correction is built from its probability '
                 'tables and is not available on the continuous-energy path')
+
+        # The raw ASC tape adapter serves no probability tables; reject URR on it
+        # loudly rather than silently skipping the correction.
+        if densities is not None and getattr(pendf_library, 'is_tape_source',
+                                             False):
+            if _owned_pendf is not None:
+                _owned_pendf.close()
+            raise ValueError(
+                'urr_material_dilution is not supported on the raw ASC PENDF '
+                'tape adapter (a deterministic-collapse cross-validation path); '
+                'build a pointwise .h5 with PendfLibrary.from_endf_directory for '
+                'URR self-shielding')
 
         # Default the group structure to a grouped PENDF library's own edges
         # when the caller omits ``energies``. A grouped library is duck-detected
@@ -1837,6 +1907,10 @@ class MicroXS:
                 from .mat_ssf import _apply_mat_ssf
                 _apply_mat_ssf(table, pendf_library, energies, densities,
                                mat_ssf_nuclides)
+            # Close a library we opened from a path; a caller-passed object is
+            # left to the caller. The library is no longer used below.
+            if _owned_pendf is not None:
+                _owned_pendf.close()
         else:
             # None selects the continuous-energy default (293.6 K); resolve it
             # here, the sole place temperature is consumed (passed to group_xs).

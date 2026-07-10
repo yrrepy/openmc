@@ -11,10 +11,13 @@ import pytest
 
 import openmc.data
 from openmc.data import Tabulated1D
-from openmc.data.pendf import (PendfLibrary, _check_lin_lin,
+from openmc.data.pendf import (PendfLibrary, PendfTapeLibrary,
+                               open_pendf_library, _check_lin_lin,
                                _discover_pendf_files, _write_mf10_partials,
                                _identity_from_evaluation, tape_identity,
                                _TENDL_RE)
+
+_CHAIN_SIMPLE = Path(__file__).parents[1] / "chain_simple.xml"
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
 _PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017/pendf")
@@ -775,3 +778,285 @@ def test_discover_negatives_and_near_misses(tmp_path):
         "ZA000001",                    # ENDF/B free-neutron placeholder (skipped)
     ])
     assert got == {}
+
+
+# ---------------------------------------------------------------------------
+# PendfTapeLibrary -- raw ASC-tape collapse adapter (cross-validation)
+#
+# The pointwise HDF5 is the production format; this adapter reads the source
+# tapes directly so a collapse against a tape directory can be validated against
+# a collapse against a pointwise HDF5 built from the same tapes (must be
+# bit-identical). The tests below exercise the duck-typed interface, the lazy
+# one-nuclide cache, provenance, path dispatch, and the equivalence.
+# ---------------------------------------------------------------------------
+
+def _tape_dir(tmp_path, names):
+    """Symlink the named fixtures into an isolated tape directory."""
+    src = tmp_path / "tapes"
+    src.mkdir()
+    for name in names:
+        fn = _FIXTURES[name]
+        (src / fn).symlink_to(_PENDF_DIR / fn)
+    return src
+
+
+def test_tape_adapter_interface(tmp_path, evaluations):
+    # nuclides / reactions / xs / pathways / pathway_xs against known content.
+    src = _tape_dir(tmp_path, ("Fe56", "In115"))
+    with PendfTapeLibrary(src) as lib:
+        assert sorted(lib.nuclides) == ["Fe56", "In115"]
+
+        # MF=3 arrays exactly equal the direct parse (float64, no round-trip).
+        _qm, _qi, tab = _mf3(evaluations["In115"], 102)
+        energy, xs = lib.xs("In115", 102)
+        np.testing.assert_array_equal(energy, tab.x)
+        np.testing.assert_array_equal(xs, tab.y)
+
+        # MF=10 pathways and partial arrays match the tape (In115(n,gamma) has
+        # LFS {0,1,4}, all IZAP 49116).
+        assert lib.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
+        _ns, subs = _mf10(evaluations["In115"], 102)
+        for pqm, pqi, izap, lfs, ptab in subs:
+            penergy, pxs = lib.pathway_xs("In115", 102, lfs)
+            np.testing.assert_array_equal(penergy, ptab.x)
+            np.testing.assert_array_equal(pxs, ptab.y)
+
+        # Extra (non-activation) MTs excluded by default, exactly as the h5 build.
+        assert not (set(lib.reactions("In115")) &
+                    {251, 252, 253, 301, 444})
+
+        # Reader parity fields for the collapse / stamp check.
+        assert lib.mapping is None
+        assert lib.is_tape_source is True
+        assert lib.has_ptables("In115") is False
+
+
+def test_tape_adapter_matches_h5_data(tmp_path):
+    # Every reaction, pathway, and cross section array is identical to the
+    # pointwise HDF5 built from the same tapes -- the raw-data guarantee the
+    # bit-identical collapse rests on.
+    src = _tape_dir(tmp_path, ("Fe56", "In115"))
+    out = tmp_path / "tendl.h5"
+    h5lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+    tapelib = PendfTapeLibrary(src)
+    try:
+        assert sorted(tapelib.nuclides) == sorted(h5lib.nuclides)
+        for nuc in h5lib.nuclides:
+            assert tapelib.reactions(nuc) == h5lib.reactions(nuc)
+            for mt in h5lib.reactions(nuc):
+                he, hx = h5lib.xs(nuc, mt)
+                te, tx = tapelib.xs(nuc, mt)
+                np.testing.assert_array_equal(he, te)
+                np.testing.assert_array_equal(hx, tx)
+                assert tapelib.pathways(nuc, mt) == h5lib.pathways(nuc, mt)
+                for lfs, izap in h5lib.pathways(nuc, mt):
+                    hpe, hpx = h5lib.pathway_xs(nuc, mt, lfs, izap)
+                    tpe, tpx = tapelib.pathway_xs(nuc, mt, lfs, izap)
+                    np.testing.assert_array_equal(hpe, tpe)
+                    np.testing.assert_array_equal(hpx, tpx)
+    finally:
+        h5lib.close()
+
+
+def test_tape_adapter_lazy_one_nuclide_cache(tmp_path, monkeypatch):
+    # The constructor scans headers; pointwise arrays are parsed lazily and
+    # cached one nuclide at a time. A parse counter on Evaluation (installed
+    # after construction) proves the second access to a nuclide does not
+    # re-parse, and that touching another nuclide evicts the cache.
+    import openmc.data.pendf as pmod
+
+    src = _tape_dir(tmp_path, ("Fe56", "In115"))
+    lib = PendfTapeLibrary(src)          # header scan happens here (uncounted)
+
+    calls = {"n": 0}
+    real_eval = pmod.Evaluation
+
+    def counting_eval(path, *args, **kwargs):
+        calls["n"] += 1
+        return real_eval(path, *args, **kwargs)
+
+    monkeypatch.setattr(pmod, "Evaluation", counting_eval)
+
+    lib.xs("In115", 102)                 # first access -> 1 parse
+    assert calls["n"] == 1
+    lib.pathways("In115", 102)           # same nuclide -> cache hit
+    lib.reactions("In115")               # same nuclide -> cache hit
+    assert calls["n"] == 1
+    lib.xs("Fe56", 102)                  # different nuclide -> evict + 1 parse
+    assert calls["n"] == 2
+    lib.xs("In115", 102)                 # back to In115 -> re-parse
+    assert calls["n"] == 3
+
+
+def test_tape_adapter_source_identity(tmp_path):
+    # Provenance: the adapter's source_identity equals a direct tape_identity()
+    # of the directory (the value an h5 built from these tapes also stamps).
+    src = _tape_dir(tmp_path, ("Fe56", "In115"))
+    with PendfTapeLibrary(src) as lib:
+        assert lib.source_identity == tape_identity(src)
+
+
+def test_tape_adapter_chain_stamp_verifies_silently(tmp_path):
+    # A chain stamped from these tapes (pendf_library == tape_identity, matching
+    # nuclide count) verifies silently against the adapter -- the stamp compares
+    # against the adapter's tape-derived source_identity.
+    from openmc.deplete.chain import Chain
+    from openmc.deplete.microxs import _verify_pendf_chain_stamp
+
+    src = _tape_dir(tmp_path, ("Fe56", "In115"))
+    with PendfTapeLibrary(src) as lib:
+        stamp = tape_identity(src)       # computed outside the no-warn block
+        chain = Chain()
+        chain.root_attrs = {'pendf_library': stamp,
+                            'pendf_nuclides': len(lib.nuclides)}
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")     # any warning fails the test
+            _verify_pendf_chain_stamp(chain, lib)
+
+
+def test_tape_adapter_bogus_and_empty_paths(tmp_path):
+    # Helpful errors: a nonexistent path and an empty directory.
+    with pytest.raises(FileNotFoundError):
+        PendfTapeLibrary(tmp_path / "does_not_exist")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="No recognizable PENDF tapes"):
+        PendfTapeLibrary(empty)
+
+
+def test_open_pendf_library_routes_tape_directory(tmp_path):
+    # Dispatch: a directory of ASC tapes routes to the tape adapter.
+    src = _tape_dir(tmp_path, ("Fe56",))
+    lib = open_pendf_library(src)
+    try:
+        assert isinstance(lib, PendfTapeLibrary)
+        assert lib.nuclides == ["Fe56"]
+    finally:
+        lib.close()
+
+
+def test_open_pendf_library_routes_pointwise_h5(tmp_path):
+    # Dispatch: a pointwise .h5 file routes to PendfLibrary (not the tape adapter).
+    src = _tape_dir(tmp_path, ("Fe56",))
+    out = tmp_path / "tendl.h5"
+    PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16).close()
+    lib = open_pendf_library(out)
+    try:
+        assert isinstance(lib, PendfLibrary)
+    finally:
+        lib.close()
+
+
+def test_open_pendf_library_helpful_errors(tmp_path):
+    # Dispatch: nonexistent path, empty directory, and a non-HDF5 single file.
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        open_pendf_library(tmp_path / "nope")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError, match="no .h5 libraries and no"):
+        open_pendf_library(empty)
+    junk = tmp_path / "junk.h5"
+    junk.write_text("not hdf5")
+    with pytest.raises(ValueError, match="not an HDF5 PENDF library"):
+        open_pendf_library(junk)
+
+
+def _chain_from_library_pathways(lib, base_names):
+    """Chain demanding exactly the library's MF=10 pathways, one distinct product
+    per (mt, lfs) so no reaction falls back to the MF=3 total. The SAME chain
+    drives both the h5 and the tape collapse, so any expansion difference would
+    come from the library data alone.
+    """
+    from openmc.deplete.chain import Chain
+    from openmc.deplete.nuclide import Nuclide
+    from openmc.data import gnds_name, ATOMIC_SYMBOL
+
+    chain = Chain()
+    for nuc in lib.nuclides:
+        nuclide = Nuclide(nuc)
+        for mt, base in base_names.items():
+            if mt not in lib.reactions(nuc):
+                continue
+            metas = 0
+            for lfs, izap in lib.pathways(nuc, mt):
+                z, a = izap // 1000, izap % 1000
+                if z not in ATOMIC_SYMBOL:
+                    continue
+                if lfs == 0:
+                    liso = 0
+                else:
+                    metas += 1
+                    liso = metas
+                rtype = base if liso == 0 else f"{base}_m{liso}"
+                nuclide.add_reaction(rtype, gnds_name(z, a, liso), 0.0, 1.0,
+                                     pendf_lfs=lfs)
+        chain.add_nuclide(nuclide)
+    return chain
+
+
+def test_tape_vs_h5_collapse_bit_identical(tmp_path):
+    # THE cross-validation: collapsing from the ASC tape directory gives a
+    # bit-identical MicroXS to collapsing from a pointwise h5 built from the same
+    # tapes, driven by the same chain (In115 carries MF=10 metastable pathways).
+    from openmc.deplete.microxs import _build_xs_table_pendf
+
+    src = _tape_dir(tmp_path, ("Fe56", "In115"))
+    out = tmp_path / "tendl.h5"
+    h5lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+    tapelib = PendfTapeLibrary(src)
+
+    # Non-lumped activation reactions; In115(n,gamma) expands into ground + m1/m2.
+    base_names = {102: "(n,gamma)", 16: "(n,2n)", 17: "(n,3n)"}
+    chain = _chain_from_library_pathways(tapelib, base_names)
+
+    edges = np.array([1e-5, 1e-3, 1e-1, 1e1, 1e3, 1e5, 1e6, 5e6, 1e7,
+                      1.5e7, 2e7])
+    nuclides = sorted(tapelib.nuclides)
+    reactions = list(dict.fromkeys(base_names.values()))
+
+    try:
+        t_h5 = _build_xs_table_pendf(nuclides, reactions, edges, h5lib, chain)
+        t_tp = _build_xs_table_pendf(nuclides, reactions, edges, tapelib, chain)
+
+        assert t_h5.reactions == t_tp.reactions
+        assert t_h5.nuc_indices.tolist() == t_tp.nuc_indices.tolist()
+        assert t_h5.rxn_indices.tolist() == t_tp.rxn_indices.tolist()
+        assert t_h5.xs_matrix.shape == t_tp.xs_matrix.shape
+        # EXACTLY equal, not merely close.
+        np.testing.assert_array_equal(t_h5.xs_matrix, t_tp.xs_matrix)
+        # Isomeric expansion did happen (guards against a trivial all-total pass).
+        assert "(n,gamma)_m1" in t_tp.reactions
+    finally:
+        h5lib.close()
+
+
+def test_from_multigroup_flux_tape_path_equals_object(tmp_path):
+    # Dispatch through the collapse entry point: passing the tape DIRECTORY path
+    # as pendf_library routes to the adapter and gives the same MicroXS as
+    # passing a constructed adapter object.
+    from openmc.deplete.microxs import MicroXS
+
+    src = _tape_dir(tmp_path, ("Fe56",))
+    kw = dict(energies=[0.0, 1.0e3, 1.0e5, 1.0e7, 2.0e7],
+              multigroup_flux=[1.0, 2.0, 3.0, 4.0], chain_file=_CHAIN_SIMPLE,
+              nuclides=["Fe56"], reactions=["(n,gamma)"])
+    m_obj = MicroXS.from_multigroup_flux(pendf_library=PendfTapeLibrary(src), **kw)
+    m_path = MicroXS.from_multigroup_flux(pendf_library=str(src), **kw)
+    np.testing.assert_array_equal(m_obj.data, m_path.data)
+
+
+def test_from_multigroup_flux_rejects_urr_on_tape_adapter(tmp_path):
+    # URR self-shielding needs probability tables the tape adapter does not
+    # serve; the combination is rejected loudly, not silently skipped.
+    from openmc.deplete.microxs import MicroXS
+
+    src = _tape_dir(tmp_path, ("Fe56",))
+    with pytest.raises(ValueError, match="tape adapter"):
+        MicroXS.from_multigroup_flux(
+            energies=[0.0, 2.0e7], multigroup_flux=[1.0], chain_file=_CHAIN_SIMPLE,
+            nuclides=["Fe56"], reactions=["(n,gamma)"],
+            pendf_library=PendfTapeLibrary(src),
+            urr_material_dilution={"Fe56": 1.0})

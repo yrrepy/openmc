@@ -21,6 +21,16 @@ all length ``n_groups`` on a shared ``/group_edges`` grid) and exposes the same
 duck-typed accessors so the collapse can source rows from either reader without
 rebinning.
 
+For cross-validation this module also provides :class:`PendfTapeLibrary`, a
+testing adapter that presents a directory of raw ASC PENDF tapes through the
+same collapse-facing accessors as :class:`PendfLibrary`, reading MF=3 totals and
+MF=10 partials straight from the tapes. It applies the identical structural rules
+as the HDF5 build, so a collapse against the tape directory is bit-identical to a
+collapse against a pointwise HDF5 built from the same tapes -- the HDF5 remains
+the production format; the adapter validates the build/collapse against source.
+:func:`open_pendf_library` sniffs a path (grouped ``.h5``, pointwise ``.h5``, or
+ASC tape directory) and returns the matching reader.
+
 .. versionadded:: 0.15.4
 """
 
@@ -44,7 +54,8 @@ from .data import gnds_name
 from .endf import Evaluation, get_head_record, get_list_record, get_tab1_record
 from .urr import ProbabilityTables
 
-__all__ = ['PendfLibrary', 'GroupedPendfLibrary']
+__all__ = ['PendfLibrary', 'GroupedPendfLibrary', 'PendfTapeLibrary',
+           'open_pendf_library']
 
 # Version of the PENDF HDF5 format written/read by this module.
 #   1 -- MF=10 subgroups are always named ``LFS{lfs}``.
@@ -337,6 +348,31 @@ def _iter_mf10_partials(ev, mt, name):
         yield pqm, pqi, izap, lfs, ptab
 
 
+def _dedupe_mf10_partials(partials, source_name, name, mt):
+    """Drop true ``(IZAP, LFS)`` duplicate MF=10 partials, keeping the first.
+
+    Shared by :func:`_write_mf10_partials` (the HDF5 build) and
+    :class:`PendfTapeLibrary` (the ASC-tape collapse adapter) so both surface an
+    identical set of partials for a reaction -- the single-source-of-truth
+    behind the ASC-vs-h5 bit-identical collapse. ``partials`` is the raw
+    ``(QM, QI, IZAP, LFS, tab)`` sequence from :func:`_iter_mf10_partials`;
+    ``source_name`` names the offending tape in the skip warning. Uniqueness of
+    an LFS is decided from the surviving distinct ``(IZAP, LFS)`` pairs, so a
+    duplicate never makes the retained partial's LFS look shared.
+    """
+    seen = set()
+    unique = []
+    for pqm, pqi, izap, lfs, ptab in partials:
+        if (izap, lfs) in seen:
+            warn(f"{source_name}: duplicate MF=10 "
+                 f"partial (IZAP={izap}, LFS={lfs}) in {name} "
+                 f"MT={mt}; skipping.")
+            continue
+        seen.add((izap, lfs))
+        unique.append((pqm, pqi, izap, lfs, ptab))
+    return unique
+
+
 def _write_mf10_partials(mtg, ev, mt, name, path):
     """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
 
@@ -353,19 +389,9 @@ def _write_mf10_partials(mtg, ev, mt, name, path):
     if not partials:
         return
 
-    # Drop true (IZAP, LFS) duplicates, keeping the first occurrence. Uniqueness
-    # of an LFS is decided from the distinct (IZAP, LFS) pairs below, so a
-    # duplicate never makes the surviving partial's LFS look shared.
-    seen = set()
-    unique = []
-    for pqm, pqi, izap, lfs, ptab in partials:
-        if (izap, lfs) in seen:
-            warn(f"{path.name}: duplicate MF=10 "
-                 f"partial (IZAP={izap}, LFS={lfs}) in {name} "
-                 f"MT={mt}; skipping.")
-            continue
-        seen.add((izap, lfs))
-        unique.append((pqm, pqi, izap, lfs, ptab))
+    # Drop true (IZAP, LFS) duplicates, keeping the first occurrence (shared with
+    # the ASC tape adapter so the two see identical partials).
+    unique = _dedupe_mf10_partials(partials, path.name, name, mt)
 
     # An LFS carried by more than one product nuclide must be disambiguated by
     # IZAP in the subgroup name; a unique LFS keeps the plain ``LFS{lfs}`` name.
@@ -1144,3 +1170,342 @@ class GroupedPendfLibrary:
         """
         return np.asarray(
             self._partial(nuclide, mt, lfs, izap)['xs_g'][()], dtype=np.float64)
+
+
+class PendfTapeLibrary:
+    """Raw ASC PENDF tape directory presented through the collapse interface.
+
+    .. versionadded:: 0.15.4
+
+    A **cross-validation / testing adapter**. It exposes a directory of raw
+    ENDF-6 PENDF tapes (the ``.pendf``/``.asc`` files recognized by
+    :func:`_discover_pendf_files`) through the same duck-typed, collapse-facing
+    interface as :class:`PendfLibrary` -- ``nuclides``, ``reactions(nuclide)``,
+    ``xs(nuclide, mt)``, ``pathways(nuclide, mt)`` and
+    ``pathway_xs(nuclide, mt, lfs, izap=None)`` -- reading MF=3 totals and MF=10
+    isomeric-production partials straight from the tapes instead of from a
+    preprocessed HDF5 file. Collapsing a domain against this adapter yields a
+    **bit-identical** :class:`~openmc.deplete.MicroXS` to collapsing against a
+    pointwise :class:`PendfLibrary` built from the same tapes by
+    :meth:`PendfLibrary.from_endf_directory` with default options: it applies the
+    identical MF=3 extra-MT filtering, ``lin-lin`` check, MF=10 duplicate-partial
+    drop and MF=10-without-MF=3 exclusion, and returns the same float64 arrays
+    (the source tapes are parsed the same way, so the group averages match to the
+    bit).
+
+    The pointwise HDF5 (:class:`PendfLibrary`) remains the production format;
+    this adapter exists to validate the HDF5 build/collapse against the source
+    tapes (and to collapse directly from tapes without a build step). Like a
+    pointwise :class:`PendfLibrary`, and unlike a :class:`GroupedPendfLibrary`,
+    it carries no group structure of its own, so the collapse ``energies`` must
+    be supplied by the caller. URR self-shielding probability tables are **not**
+    served (:meth:`has_ptables` is always ``False``); the collapse entry points
+    reject ``urr_material_dilution`` on a tape adapter -- build a pointwise HDF5
+    for URR work.
+
+    Tapes are parsed **lazily**: the constructor reads each tape's MF=1/451
+    header once to resolve its GNDS identity (validated against the isomeric
+    state implied by the filename, exactly as
+    :meth:`PendfLibrary.from_endf_directory`), but a nuclide's pointwise cross
+    section arrays are parsed only on first access and cached one nuclide at a
+    time -- the collapse consumes a nuclide's reactions back-to-back, so only the
+    tape under collapse is held in memory (the ``_AscSource`` pattern from
+    ``tools/add_pendf_isomeric_branching_to_chain.py``).
+
+    Parameters
+    ----------
+    path : str or path-like
+        Directory of raw ASC PENDF tapes.
+    library : str, optional
+        Name of the source data library recorded as ``library``. Defaults to
+        ``'unknown'``; the tape-derived ``source_identity`` carries the
+        provenance the chain-stamp check verifies against.
+    temperature : float, optional
+        Library temperature in kelvin. If given, every tape's own temperature
+        must agree to within 0.1 K; if omitted, the first tape's temperature is
+        adopted and enforced on the rest (mirrors
+        :meth:`PendfLibrary.from_endf_directory`).
+    keep_extra_mts : bool
+        Retain non-activation MF=3 reactions (particle production, HEATR
+        heating/damage, average secondary quantities, resonance parameters).
+        The default ``False`` matches the default HDF5 build, so the two collapse
+        bit-identically.
+
+    Attributes
+    ----------
+    nuclides : list of str
+        GNDS names of the nuclides discovered in the directory.
+    temperature : float or None
+        Library temperature in kelvin.
+    library : str
+        Source data library label (user-supplied or ``'unknown'``).
+    mapping : None
+        Always ``None`` (source-faithful; the isomer<->LFS mapping lives on the
+        chain). Present for :class:`PendfLibrary` parity.
+    source_identity : str or None
+        Tape-derived provenance identity of the directory
+        (:func:`tape_identity`), or ``None`` if none could be read.
+
+    """
+
+    #: Duck marker: the collapse entry points reject URR self-shielding on a tape
+    #: adapter (no probability tables are served) by testing this attribute.
+    is_tape_source = True
+
+    def __init__(self, path, library=None, temperature=None,
+                 keep_extra_mts=False):
+        self._path = Path(path)
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"PENDF tape directory does not exist: {self._path}")
+        if not self._path.is_dir():
+            raise NotADirectoryError(
+                f"PENDF tape source is not a directory: {self._path}")
+        entries = _discover_pendf_files(self._path)
+        if not entries:
+            raise ValueError(
+                f"No recognizable PENDF tapes found in {self._path}.")
+
+        self._keep_extra_mts = bool(keep_extra_mts)
+        self._tapes: dict[str, Path] = {}
+        # One-nuclide (energy, xs) cache; see _load.
+        self._cache_name = None
+        self._cache = None
+
+        # Eager header scan: resolve each tape's GNDS identity once (the ASC
+        # source pattern). Only the name->path map and metadata are retained --
+        # never the pointwise arrays, which _load parses lazily.
+        lib_temperature = temperature
+        for tape_path, implied_liso in entries:
+            try:
+                ev = Evaluation(tape_path)
+                Z = ev.target['atomic_number']
+                A = ev.target['mass_number']
+                liso = ev.target['isomeric_state']
+                name = gnds_name(Z, A, liso)
+                T = ev.target['temperature']
+            except Exception as exc:
+                warn(f"skipping {tape_path}: {exc}")
+                continue
+            if implied_liso != liso:
+                warn(f"{tape_path.name}: filename implies isomeric state "
+                     f"{implied_liso} but MF=1/451 header gives {liso}; "
+                     f"trusting header ({name}).")
+            if lib_temperature is None:
+                lib_temperature = T
+            elif abs(T - lib_temperature) > 0.1:
+                raise _TemperatureMismatchError(
+                    f"{tape_path.name}: temperature {T} K disagrees with "
+                    f"library temperature {lib_temperature} K by more than "
+                    "0.1 K.")
+            if name in self._tapes:
+                warn(f"{tape_path.name}: duplicate nuclide {name}; skipping.")
+                continue
+            self._tapes[name] = tape_path
+
+        if not self._tapes:
+            raise ValueError(f"No PENDF tapes in {self._path} could be read.")
+
+        self.nuclides = sorted(self._tapes)
+        self.temperature = (None if lib_temperature is None
+                            else float(lib_temperature))
+        self.library = 'unknown' if library is None else str(library)
+        self.mapping = None
+        # Tape-derived provenance identity (matches what the chain-stamp check
+        # and an h5 built from these tapes report).
+        self.source_identity = tape_identity(self._path)
+
+    def __repr__(self):
+        return (f"<PendfTapeLibrary: {len(self.nuclides)} nuclides, "
+                f"{self.library}, {self.temperature} K>")
+
+    def _load(self, nuclide):
+        """Parse one tape into the collapse-shaped reaction map (cached).
+
+        Returns ``{mt: {'xs': (energy, xs), 'partials': {(lfs, izap): (energy,
+        xs)}}}`` for the requested nuclide, cached one nuclide at a time (a
+        second access to the same nuclide never re-parses; touching a different
+        nuclide evicts the previous one).
+
+        Applies the identical structural rules as
+        :meth:`PendfLibrary.from_endf_directory`, in the identical
+        ``sorted(ev.section)`` order: an MF=3 reaction in :data:`_EXTRA_MTS` is
+        dropped unless ``keep_extra_mts``; every retained MF=3 TAB1 is lin-lin
+        checked; MF=10 partials are attached only to their MF=3 sibling (an MF=10
+        MT with no MF=3 section is dropped, exactly as the h5 build stores none),
+        with true ``(IZAP, LFS)`` duplicates removed via
+        :func:`_dedupe_mf10_partials`. Arrays are returned as float64, matching
+        the ``_write_xy`` dtype the h5 round-trips, so the two collapse to the
+        bit.
+        """
+        if self._cache_name == nuclide:
+            return self._cache
+        try:
+            path = self._tapes[nuclide]
+        except KeyError:
+            raise KeyError(f"Nuclide {nuclide!r} not in library.")
+
+        ev = Evaluation(path)
+        name = gnds_name(ev.target['atomic_number'],
+                         ev.target['mass_number'],
+                         ev.target['isomeric_state'])
+        reactions: dict = {}
+        for (mf, mt), text in sorted(ev.section.items()):
+            if mf != 3:
+                continue
+            if mt in _EXTRA_MTS and not self._keep_extra_mts:
+                continue
+            fo = io.StringIO(text)
+            get_head_record(fo)                 # MF=3 HEAD (discarded)
+            (_qm, _qi, _l1, _lr), tab = get_tab1_record(fo)
+            _check_lin_lin(name, 3, mt, tab)
+            xs = (np.asarray(tab.x, dtype=np.float64),
+                  np.asarray(tab.y, dtype=np.float64))
+            partials: dict = {}
+            raw = list(_iter_mf10_partials(ev, mt, name))
+            for _pqm, _pqi, izap, lfs, ptab in _dedupe_mf10_partials(
+                    raw, path.name, name, mt):
+                partials[(int(lfs), int(izap))] = (
+                    np.asarray(ptab.x, dtype=np.float64),
+                    np.asarray(ptab.y, dtype=np.float64))
+            reactions[mt] = dict(xs=xs, partials=partials)
+
+        self._cache_name = nuclide
+        self._cache = reactions
+        return reactions
+
+    def reactions(self, nuclide):
+        """Return the sorted MTs with MF=3 cross sections for a nuclide."""
+        return sorted(self._load(nuclide))
+
+    def xs(self, nuclide, mt):
+        """Return ``(energy, xs)`` of the MF=3 cross section (eV, barn)."""
+        rx = self._load(nuclide).get(mt)
+        if rx is None:
+            raise KeyError(f"Nuclide {nuclide!r} has no MF=3 reaction MT={mt}.")
+        return rx['xs']
+
+    def pathways(self, nuclide, mt):
+        """Return the sorted ``(lfs, izap)`` MF=10 partials of a reaction.
+
+        Empty if the reaction has no MF=10 partials; a lumped reaction (a shared
+        LFS produced by several nuclides) repeats an ``lfs`` with different
+        ``izap`` values, exactly as :meth:`PendfLibrary.pathways`.
+        """
+        rx = self._load(nuclide).get(mt)
+        if rx is None:
+            raise KeyError(f"Nuclide {nuclide!r} has no MF=3 reaction MT={mt}.")
+        return sorted(rx['partials'])
+
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
+        """Return ``(energy, xs)`` of one MF=10 isomeric-production partial.
+
+        ``izap`` selects one product of a shared/lumped LFS; omit it for a
+        unique LFS.
+        """
+        rx = self._load(nuclide).get(mt)
+        if rx is None:
+            raise KeyError(f"Nuclide {nuclide!r} MT={mt} has no MF=10 partials.")
+        parts = rx['partials']
+        if izap is not None:
+            try:
+                return parts[(lfs, izap)]
+            except KeyError:
+                raise KeyError(
+                    f"Nuclide {nuclide!r} MT={mt} has no MF=10 partial "
+                    f"LFS={lfs}, IZAP={izap}.")
+        matches = [v for (level, _z), v in parts.items() if level == lfs]
+        if not matches:
+            raise KeyError(
+                f"Nuclide {nuclide!r} MT={mt} has no MF=10 partial LFS={lfs}.")
+        if len(matches) > 1:
+            izaps = sorted(z for (level, z) in parts if level == lfs)
+            raise ValueError(
+                f"Nuclide {nuclide!r} MT={mt} LFS={lfs} is shared by IZAP "
+                f"values {izaps}; pass izap= to disambiguate.")
+        return matches[0]
+
+    def has_ptables(self, nuclide):
+        """Return ``False`` -- the tape adapter serves no URR probability tables.
+
+        URR self-shielding is a production feature of the pointwise
+        :class:`PendfLibrary`; the tape adapter targets the deterministic
+        collapse cross-validation, and the collapse entry points reject
+        ``urr_material_dilution`` on it (see
+        :meth:`openmc.deplete.MicroXS.from_multigroup_flux`).
+        """
+        return False
+
+    def ptables(self, nuclide, temperature=None):
+        """Return ``None`` -- no URR probability tables served (see
+        :meth:`has_ptables`)."""
+        return None
+
+    def close(self):
+        """Release the one-nuclide cache (tapes hold no persistent handle)."""
+        self._cache_name = None
+        self._cache = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def open_pendf_library(path: PathLike, library=None):
+    """Open a PENDF source path as the reader the depletion collapse expects.
+
+    Sniffs ``path`` and returns the matching duck-typed reader:
+
+    * a single ``.h5`` file -> :class:`GroupedPendfLibrary` when its root
+      ``format`` attribute is ``'pendf-grouped'``, else :class:`PendfLibrary`;
+    * a directory containing ``.h5`` files -> :class:`PendfLibrary`
+      (directory mode);
+    * a directory of raw ASC PENDF tapes -> :class:`PendfTapeLibrary`.
+
+    Only a grouped ``.h5`` carries its own group structure; the pointwise
+    :class:`PendfLibrary` and the :class:`PendfTapeLibrary` both require the
+    collapse ``energies`` to be supplied by the caller. This is the collapse-side
+    counterpart of ``open_pendf_source`` in
+    ``tools/add_pendf_isomeric_branching_to_chain.py`` (which maps the same
+    source kinds to the chain patcher's adapters).
+
+    Parameters
+    ----------
+    path : str or path-like
+        A ``.h5`` PENDF library file, a directory of such files, or a directory
+        of raw ASC PENDF tapes.
+    library : str, optional
+        Source library label, forwarded to :class:`PendfTapeLibrary` for the ASC
+        directory case (ignored for the HDF5 readers, which read it from file).
+
+    Returns
+    -------
+    PendfLibrary or GroupedPendfLibrary or PendfTapeLibrary
+        A reader exposing the duck-typed collapse interface.
+
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"PENDF source path does not exist: {path}")
+    if path.is_file():
+        try:
+            with h5py.File(path, 'r') as f:
+                fmt = _decode(f.attrs.get('format'))
+        except OSError as exc:
+            raise ValueError(
+                f"{path} is not an HDF5 PENDF library; a raw PENDF tape source "
+                f"must be a directory of ASC tapes, not a single file") from exc
+        if fmt == GROUPED_FORMAT:
+            return GroupedPendfLibrary(path)
+        return PendfLibrary(path)
+    # Directory: prefer a preprocessed .h5 library (pointwise directory mode)
+    # over raw ASC tapes, mirroring open_pendf_source's precedence.
+    if any(path.glob('*.h5')):
+        return PendfLibrary(path)
+    if not _discover_pendf_files(path):
+        raise ValueError(
+            f"PENDF source directory {path} contains no .h5 libraries and no "
+            f"recognizable ASC PENDF tapes")
+    return PendfTapeLibrary(path, library=library)
