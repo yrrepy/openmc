@@ -139,6 +139,7 @@ def build_parser():
     parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has |ratio-1| > X (default: None = off; None-ratio bands never trigger)')
     parser.add_argument('-v', '--verbose',          action='store_true',                          default=True,   help='Enable verbose output (default: True)')
     parser.add_argument('-q', '--quiet',            action='store_true',                          default=False,  help='Disable verbose output')
+    parser.add_argument('--prune-nn-prime-self-loops', action='store_true',                       default=False,  help="Remove (n,n') reactions with no isomeric branching whose target is EXACTLY the parent -- ground-parent self-loops that are an exact no-op in the depletion matrix. A metastable parent's (n,n') to ground is real isomer burnup and is KEPT. Default: keep all (n,n') reactions.")
     return parser
 
 
@@ -1035,6 +1036,55 @@ def decorate_chain(chain, branching):
     return reactions_added
 
 
+def _prune_nn_prime_self_loops(chain):
+    """Remove stock ``(n,n')`` ground self-loops (target == parent) in place.
+
+    A stock ``(n,n')`` whose target is EXACTLY the parent nuclide is a
+    transmutation-matrix no-op (loss and gain both land on the diagonal and
+    cancel), so dropping it changes no depletion result while trimming the
+    matrix. The match is EXACT on three conditions, all required:
+
+    * ``rx.type == "(n,n')"`` (never a qualified ``(n,n')_m<n>`` variant), AND
+    * ``rx.pendf_lfs is None`` -- the reaction carries no isomeric branching. A
+      branched ``(n,n')``'s ground member has ``pendf_lfs == 0`` (part of a
+      folded ``<isomeric_branching>`` set) and is NEVER removed; removing it
+      would break the fold precondition and flip the collapse to MF=3 fallback,
+      AND
+    * ``rx.target == nuc.name`` EXACTLY (no base-name stripping). A metastable
+      parent's ground route (e.g. ``In115_m1 (n,n') -> In115``) is real isomer
+      burnup, an off-diagonal transition, and stays -- its target never equals
+      the metastable parent name.
+
+    Returns a list of pruned records ``{'nuclide', 'reaction', 'target'}``. The
+    per-nuclide ``reactions=`` XML count is recomputed from ``len(reactions)``
+    at export time, so no manual count fix-up is needed here.
+    """
+    pruned = []
+    for nuc in chain.nuclides:
+        kept = []
+        removed_any = False
+        for rx in nuc.reactions:
+            if (rx.type == "(n,n')" and rx.pendf_lfs is None
+                    and rx.target == nuc.name):
+                pruned.append(dict(nuclide=nuc.name, reaction=rx.type,
+                                   target=rx.target))
+                removed_any = True
+            else:
+                kept.append(rx)
+        if removed_any:
+            nuc.reactions = kept
+
+    # Rebuild the top-level reaction-type list (first-appearance order) so the
+    # in-memory chain stays consistent, mirroring decorate_chain's final step.
+    if pruned:
+        chain.reactions = []
+        for nuc in chain.nuclides:
+            for rx in nuc.reactions:
+                if rx.type not in chain.reactions:
+                    chain.reactions.append(rx.type)
+    return pruned
+
+
 # =============================================================================
 # Console statistics block
 # =============================================================================
@@ -1565,6 +1615,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
+        if stats.get('nn_prime_prune_enabled'):
+            f.write(f"                       Pruned (n,n') self-loops: {stats.get('nn_prime_pruned_count', 0):5d}\n")
         f.write(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}\n")
         f.write(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}\n")
         f.write("\n")
@@ -1662,7 +1714,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
 def main(base_chain_file, pendf_path, decay_file, output_chain_file,
          log_file=None, mapping_mode='elis', elis_rtol=ELIS_RTOL,
          elis_atol=ELIS_ATOL, verbose=True, library=None, reject_rtol=None,
-         audit_emax=2.0e7, reject_band_ratio=None):
+         audit_emax=2.0e7, reject_band_ratio=None,
+         prune_nn_prime_self_loops=False):
     """Patch a chain with PENDF MF=10 isomeric branching. Returns the Chain."""
     if decay_file is None:
         raise ValueError("decay_file is required for isomeric branching.")
@@ -1715,8 +1768,22 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     reactions_added = decorate_chain(chain, branching)
     stats['reactions_added'] = reactions_added
 
+    # Optionally prune stock (n,n') ground self-loops (target == parent). Runs
+    # AFTER decoration -- branched (n,n') groups already carry their pendf_lfs=0
+    # ground member and are exempt -- and BEFORE the export/stamp step.
+    if prune_nn_prime_self_loops:
+        print("  Pruning (n,n') self-loops without isomeric branching...")
+        nn_prime_pruned = _prune_nn_prime_self_loops(chain)
+    else:
+        nn_prime_pruned = []
+    stats['nn_prime_prune_enabled'] = prune_nn_prime_self_loops
+    stats['nn_prime_pruned'] = nn_prime_pruned
+    stats['nn_prime_pruned_count'] = len(nn_prime_pruned)
+
     print_stats(stats, mapping_mode)
     _print_lfs_sentinel_warning(stats.get('lfs_sentinels', []), mapping_mode)
+    if nn_prime_pruned:
+        print(f"\nPruned (n,n') self-loops: {len(nn_prime_pruned)}")
 
     print("\nStep 6: Exporting folded chain XML...")
     # Stamp the exported chain's root element with the PENDF source's identity so
@@ -1810,6 +1877,8 @@ if __name__ == '__main__':
               f"{LIBRARY_CONFIGS[args.library]['description']}")
     print(f"Mapping mode: {args.map}")
     print(f"Tolerances:   rtol={args.rtol}, atol={args.atol}")
+    if args.prune_nn_prime_self_loops:
+        print("Prune (n,n') self-loops: ENABLED")
     print(f"Audit emax:   {args.audit_emax:.3e} eV")
     if args.mf10_reject_rtol is None and args.mf10_reject_band_ratio is None:
         print("MF=10 reject: off (audit only)")
@@ -1832,7 +1901,8 @@ if __name__ == '__main__':
          mapping_mode=args.map, elis_rtol=args.rtol, elis_atol=args.atol,
          verbose=verbose, library=args.library,
          reject_rtol=args.mf10_reject_rtol, audit_emax=args.audit_emax,
-         reject_band_ratio=args.mf10_reject_band_ratio)
+         reject_band_ratio=args.mf10_reject_band_ratio,
+         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops)
 
     print("\n" + "=" * 70)
     print("Done. Chain saved to:", output_chain)
