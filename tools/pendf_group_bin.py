@@ -8,7 +8,8 @@ onto a fixed energy group structure with
 output schema is ``format='pendf-grouped'`` version 2:
 
 * root attrs: ``format``, ``version``, ``source`` (abs path of the pointwise
-  file), ``dtype``, plus the source's ``library``/``temperature`` attrs;
+  file), ``dtype``, plus the source's ``library``/``temperature``/
+  ``source_identity`` attrs;
 * ``/group_edges`` float64[G+1] ascending eV;
 * ``/<Nuclide>/`` copies the source nuclide attrs verbatim;
 * ``/<Nuclide>/MT<mt>/xs_g`` the MF=3 group cross section (MT attrs copied);
@@ -107,7 +108,7 @@ def bin_pendf_library(
         dst.attrs['version'] = GROUPED_VERSION
         dst.attrs['source'] = str(Path(pendf_in).resolve())
         dst.attrs['dtype'] = dtype
-        for key in ('library', 'temperature'):
+        for key in ('library', 'temperature', 'source_identity'):
             if key in src.attrs:
                 dst.attrs[key] = src.attrs[key]
         dst.create_dataset('group_edges', data=edges)

@@ -1003,10 +1003,12 @@ def _verify_pendf_chain_stamp(chain, pendf_library) -> None:
 
     The chain patcher (``tools/add_pendf_isomeric_branching_to_chain.py``) stamps
     the exported chain's root element with the identity of the PENDF source it was
-    built from: ``pendf_library`` (the source library string), ``pendf_nuclides``
-    (the nuclide count) and an informational ``pendf_source`` (the h5/dir
-    basename). The PENDF collapse is chain-driven -- a stock reaction silently
-    takes the MF=3 total -- so a wrong/stale chain paired with a library produces
+    built from: ``pendf_library`` (the tape-derived source identity),
+    ``pendf_nuclides`` (the nuclide count), an informational ``pendf_source`` (the
+    h5 basename / dir last-two components) and the provenance-only ``decay_source``
+    / ``decay_library``. The PENDF collapse is chain-driven -- a stock reaction
+    silently takes the MF=3 total -- so a wrong/stale chain paired with a library
+    produces
     silently degraded physics that no pathway-set comparison can catch. This makes
     such a pairing self-detecting.
 
@@ -1014,11 +1016,16 @@ def _verify_pendf_chain_stamp(chain, pendf_library) -> None:
 
     * Unstamped chain (no ``pendf_*`` root attrs) -> silent (backward compatible
       with chains built before stamping, and with vanilla chains).
-    * Library exposing no ``library`` identity string (e.g. a duck-typed test
+    * Library exposing no identity string at all -- neither a tape-derived
+      ``source_identity`` nor a user ``library`` label (e.g. a duck-typed test
       fake) -> silent; there is nothing to verify against.
-    * Stamp present and EITHER the library string OR the nuclide count disagrees
-      -> one :class:`UserWarning` naming both identities in full. A differing
-      ``pendf_source`` alone (a file rename) is never a trigger.
+    * The stamp is a tape-derived identity, so the stamped ``pendf_library`` is
+      compared against BOTH the library's ``source_identity`` and its ``library``
+      label; a mismatch fires only when it matches NEITHER. The nuclide-count
+      trigger is unchanged. Either triggering yields one :class:`UserWarning`
+      naming the identities compared. A differing ``pendf_source`` alone (a file
+      rename) is never a trigger; the ``decay_*`` provenance attrs are never
+      verified.
     """
     root_attrs = getattr(chain, 'root_attrs', None) or {}
     stamped_lib = root_attrs.get('pendf_library')
@@ -1026,18 +1033,22 @@ def _verify_pendf_chain_stamp(chain, pendf_library) -> None:
     if stamped_lib is None and stamped_n is None:
         return  # unstamped chain -- nothing to verify
 
-    # The library string is the identity marker; a library that carries none
-    # (test fakes) cannot be verified against, so the check skips entirely.
+    # The stamp is a tape-derived identity; a library belongs to the chain if the
+    # stamp matches EITHER its tape-derived source_identity OR its user library
+    # label. A library carrying neither (test fakes) cannot be verified against,
+    # so the check skips entirely.
+    source_identity = getattr(pendf_library, 'source_identity', None)
     lib_name = getattr(pendf_library, 'library', None)
-    if lib_name is None:
+    identities = [x for x in (source_identity, lib_name) if x is not None]
+    if not identities:
         return
     lib_nuclides = getattr(pendf_library, 'nuclides', None)
     lib_n = len(lib_nuclides) if lib_nuclides is not None else None
 
-    # Trigger on the library string OR the nuclide count (compared as strings so
-    # the XML-sourced stamp and the int count agree). The source basename is
-    # never a trigger.
-    lib_mismatch = stamped_lib is not None and stamped_lib != lib_name
+    # Trigger on the library string (matches NEITHER identity) OR the nuclide
+    # count (compared as strings so the XML-sourced stamp and the int count
+    # agree). The source basename is never a trigger.
+    lib_mismatch = stamped_lib is not None and stamped_lib not in identities
     n_mismatch = (stamped_n is not None and lib_n is not None
                   and str(stamped_n) != str(lib_n))
     if not (lib_mismatch or n_mismatch):
@@ -1046,10 +1057,11 @@ def _verify_pendf_chain_stamp(chain, pendf_library) -> None:
     source = root_attrs.get('pendf_source', 'unknown source')
     basename = _pendf_library_basename(pendf_library)
     against = f'{basename} ' if basename else ''
+    compared = ' / '.join(repr(x) for x in identities)
     warn(
         f'PENDF provenance mismatch: chain built from {source} (library '
         f'{stamped_lib!r}, {stamped_n} nuclides) but collapsing against '
-        f'{against}(library {lib_name!r}, {lib_n} nuclides) -- regenerate the '
+        f'{against}(identity {compared}, {lib_n} nuclides) -- regenerate the '
         f'chain from this library with '
         f'tools/add_pendf_isomeric_branching_to_chain.py')
 
@@ -1115,14 +1127,18 @@ def _build_xs_table_pendf(
     **The chain is the demand side.** For each ``(nuclide, R)`` the chain is
     consulted first: a reaction left *stock* (no ``pendf_lfs`` pathway) emits the
     single MF=3 total row silently, regardless of any MF=10 partials the library
-    carries. A *qualified* reaction's demanded ``LFS`` set is compared against the
-    library's; only an **exact set match** emits pathway rows (one per product),
-    while any disagreement (chain expects ``LFS`` the library lacks, the library
-    carries extra ``LFS``, or the library has no MF=10 for the MT) falls back to
-    the MF=3 total and is collected into one summary warning per build (directing
-    the user to regenerate the chain from the library). A chain whose *qualified*
-    reactions carry ``pendf_lfs=None`` (built without LFS recording) is a hard
-    error (see :func:`_chain_lfs_reactions`).
+    carries. A *qualified* reaction emits one pathway row per **demanded** ``LFS``,
+    bound to its library partial; ``LFS`` the library carries but the chain does
+    not demand are ignored silently (the chain is the source of truth). When a
+    demanded ``LFS`` is *missing* from the library the reaction falls back to the
+    MF=3 total and is collected into one summary warning per build -- except the
+    **self-loop ground waiver**: if the only missing demanded ``LFS`` is the ground
+    and that ground reaction is a self-loop (target == parent, e.g. In115
+    ``(n,n')``), the base row is staged from the MF=3 total and the demanded
+    metastable rows from their partials with no warning, since such tapes define no
+    LFS=0 partial and the self-loop base is a transmutation-matrix no-op. A chain
+    whose *qualified* reactions carry ``pendf_lfs=None`` (built without LFS
+    recording) is a hard error (see :func:`_chain_lfs_reactions`).
 
     The result's ``reactions`` axis is the expanded list: for each base reaction
     in input order, the base name first then its ``_m{n}`` variants in ascending
@@ -1261,27 +1277,48 @@ def _build_xs_table_pendf(
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
-            # Chain qualified: compare the LFS set the chain demands against the
-            # LFS set the library provides for this MT. Each MF=10 partial is keyed
-            # by (LFS, IZAP): an LFS is a level index, and a single LFS may be
-            # shared by several product nuclides (a lumped channel), so IZAP
-            # disambiguates the product.
+            # Chain qualified: the chain (demand side) lists the LFS levels it
+            # expects for this reaction; bind each to the library partial carrying
+            # that LFS. Each MF=10 partial is keyed by (LFS, IZAP): an LFS is a
+            # level index, and a single LFS may be shared by several product
+            # nuclides (a lumped channel), so IZAP disambiguates the product.
+            # Extra library LFS the chain does not demand are IGNORED silently --
+            # the chain is the source of truth for which pathways to emit.
             pathway_list = list(pathways_fn(nuc, mt)) if have_pathways else []
             demanded_lfs = set(lfs_reactions)
             library_lfs = {lfs for lfs, _izap in pathway_list}
-            if demanded_lfs != library_lfs:
-                # The chain and library disagree on this reaction's pathways: the
-                # chain expects LFS the library does not match, the library carries
-                # extra LFS, or the library has no MF=10 for this MT. Emit the MF=3
-                # total (identical value to the old stock/unbound fallback) and
-                # collect for one honest summary warning naming both LFS sets.
+            missing = demanded_lfs - library_lfs
+
+            # Self-loop ground waiver: JEFF In113/In115-style (n,n') tapes carry no
+            # LFS=0 MF=10 partial (only the metastable), yet the folded chain always
+            # lists a ground member. When the ONLY demanded LFS the library lacks is
+            # the ground AND that ground reaction is a self-loop (target == parent),
+            # waive it: the self-loop base row is a transmutation-matrix no-op (loss
+            # and gain both land on the diagonal), and the tape defines no ground
+            # partial, so stage the base row from the MF=3 total and the demanded
+            # metastable rows from their partials. This restores In113m/In115m
+            # (n,n') production that a blanket fallback-to-total would kill.
+            ground_rx = lfs_reactions.get(0)
+            self_loop_waiver = (missing == {0} and ground_rx is not None
+                                and ground_rx.target == nuc)
+
+            if missing and not self_loop_waiver:
+                # A demanded LFS is missing from the library and this is not the
+                # self-loop ground case (a metastable is missing, or a non-self-loop
+                # ground is missing): fall back to the MF=3 total and collect one
+                # honest summary warning naming both LFS sets.
                 mismatched.append((nuc, name, demanded_lfs, library_lfs))
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
-            # Exact set match: every library partial binds to a chain reaction
-            # (``demanded_lfs == library_lfs`` guarantees no ``None``).
-            bound = [lfs_reactions[lfs] for lfs, _izap in pathway_list]
+            # Emit exactly the demanded pathways: select the library partials whose
+            # LFS the chain demands (extras dropped), skipping the ground when the
+            # self-loop waiver is in effect (its base row comes from the MF=3 total
+            # below, since the library has no LFS=0 partial).
+            emit_pairs = [(lfs, izap) for lfs, izap in pathway_list
+                          if lfs in demanded_lfs
+                          and not (self_loop_waiver and lfs == 0)]
+            bound = [lfs_reactions[lfs] for lfs, _izap in emit_pairs]
 
             # A lumped reaction (e.g. MT=5 (n,misc)) can carry MF=10 partials for
             # several distinct daughter nuclides that share an LFS and therefore
@@ -1292,7 +1329,7 @@ def _build_xs_table_pendf(
             # reaction) claimed by more than one daughter, identified by IZAP
             # (= 1000*Z + A, the product nuclide ignoring its isomeric state).
             row_izap: dict[str, int] = {}
-            for (_lfs, izap), rx in zip(pathway_list, bound):
+            for (_lfs, izap), rx in zip(emit_pairs, bound):
                 claimed = row_izap.setdefault(rx.type, izap)
                 if claimed != izap:
                     raise ValueError(
@@ -1302,23 +1339,21 @@ def _build_xs_table_pendf(
                         f'multi-product lumped channels (e.g. MT=5 (n,misc)) are '
                         f'not supported as collapse rows.')
 
-            # All partials bound: one row per product, valued from its MF=10
-            # partial (never a branching ratio). Consistency-check the partials
-            # against the MF=3 total before staging.
+            if self_loop_waiver:
+                # Self-loop base row from the MF=3 total (the tape has no LFS=0
+                # partial for it).
+                stage(nuc_idx, base_idx, name, total_g)
+
+            # One row per demanded product, valued from its MF=10 partial (never a
+            # branching ratio). The build-time patcher audit is the authoritative
+            # partials-vs-total consistency diagnosis, so no runtime check here.
             partial_g = []
-            for lfs, izap in pathway_list:
+            for lfs, izap in emit_pairs:
                 if grouped:
                     partial_g.append(pathway_xs_fn(nuc, mt, lfs, izap))
                 else:
                     pe, pxs = pathway_xs_fn(nuc, mt, lfs, izap)
                     partial_g.append(_group_average(pe, pxs, energies))
-            part_sum = np.sum(partial_g, axis=0)
-            worst, g = _partials_total_max_deviation(total_g, part_sum)
-            if worst > CONSISTENCY_RTOL:
-                warn(f'PENDF MF=10 partials for {nuc} MT={mt} sum to '
-                     f'{part_sum[g]:.6e} b but the MF=3 total is '
-                     f'{total_g[g]:.6e} b in group {g} (max relative '
-                     f'deviation {worst:.3e} > {CONSISTENCY_RTOL:.0e}).')
             # Emit ground first, then ascending isomer order; the row name is the
             # bound chain reaction's type (ground keeps the base name R).
             for rx, xs_g in sorted(

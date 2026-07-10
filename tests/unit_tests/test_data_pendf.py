@@ -13,10 +13,11 @@ import openmc.data
 from openmc.data import Tabulated1D
 from openmc.data.pendf import (PendfLibrary, _check_lin_lin,
                                _discover_pendf_files, _write_mf10_partials,
+                               _identity_from_evaluation, tape_identity,
                                _TENDL_RE)
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
 
-_PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017")
+_PENDF_DIR = Path("/home/perry/NukeData/Activation/PENDF/Point_TENDL2017/pendf")
 
 _FIXTURES = {
     "Fe56": "n-Fe056.pendf",
@@ -229,6 +230,97 @@ def test_roundtrip(tmp_path, evaluations):
                     {251, 252, 253, 301, 444})
     finally:
         reader.close()
+
+
+def test_source_identity_stored_and_read(tmp_path):
+    # from_endf_directory stamps the source directory's tape identity; reopening
+    # reads it back, and it equals a direct tape_identity() of the source dir.
+    src = tmp_path / "pendf"
+    src.mkdir()
+    for name in ("Fe56", "In115"):
+        fn = _FIXTURES[name]
+        (src / fn).symlink_to(_PENDF_DIR / fn)
+
+    out = tmp_path / "tendl.h5"
+    lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+    try:
+        expected = tape_identity(src)
+        assert expected is not None
+        assert lib.source_identity == expected
+    finally:
+        lib.close()
+
+    reader = PendfLibrary(out)
+    try:
+        assert reader.source_identity == expected
+    finally:
+        reader.close()
+
+
+def test_source_identity_none_on_old_file(tmp_path):
+    # A file built without the source_identity attr reads back None.
+    out = _mf10_library(tmp_path, "Xx100", _LUMPED_MT, _LUMPED_SUBS)
+    with PendfLibrary(out) as lib:
+        assert lib.source_identity is None
+
+
+# ---------------------------------------------------------------------------
+# tape_identity
+# ---------------------------------------------------------------------------
+
+def _write_tpid_tape(path, tpid_text):
+    """Write a minimal tape whose first line is a TPID record (cols 0:66)."""
+    path.write_text(f"{tpid_text:<66}   1 0  0    0\n 1.001000+3\n")
+    return path
+
+
+def test_identity_from_evaluation_format():
+    ev = types.SimpleNamespace(
+        info={"library": ("JEFF", 40, 0), "sublibrary": "Radioactive decay data"})
+    assert _identity_from_evaluation(ev) == "JEFF-40 Radioactive decay data"
+    # No sublibrary -> bare '<library>-<version>' identity.
+    ev2 = types.SimpleNamespace(info={"library": ("ENDF/B", 8, 1)})
+    assert _identity_from_evaluation(ev2) == "ENDF/B-8"
+    # No library info at all -> None.
+    assert _identity_from_evaluation(types.SimpleNamespace(info={})) is None
+
+
+def test_tape_identity_tpid_text(tmp_path):
+    tape = _write_tpid_tape(tmp_path / "tape", "JEFF-4.0 Incident Neutron File")
+    assert tape_identity(tape) == "JEFF-4.0 Incident Neutron File"
+
+
+def test_tape_identity_blank_tpid_falls_back_to_451(tmp_path, monkeypatch):
+    tape = _write_tpid_tape(tmp_path / "decay_tape", "")   # blank TPID
+    fake_ev = types.SimpleNamespace(
+        info={"library": ("JEFF", 40, 0), "sublibrary": "Radioactive decay data"})
+    monkeypatch.setattr("openmc.data.pendf.Evaluation", lambda p: fake_ev)
+    assert tape_identity(tape) == "JEFF-40 Radioactive decay data"
+
+
+def test_tape_identity_unreadable_returns_none(tmp_path):
+    # A path that does not exist -> None (never raises).
+    assert tape_identity(tmp_path / "does_not_exist") is None
+
+
+def test_tape_identity_directory_samples_first(tmp_path, recwarn):
+    d = tmp_path / "tapes"
+    d.mkdir()
+    for i in range(4):
+        _write_tpid_tape(d / f"t{i}", "SAME-LIBRARY Neutron File")
+    assert tape_identity(d) == "SAME-LIBRARY Neutron File"
+    assert len(recwarn) == 0
+
+
+def test_tape_identity_directory_disagreement_warns(tmp_path):
+    d = tmp_path / "tapes"
+    d.mkdir()
+    _write_tpid_tape(d / "a", "LIB-A Neutron File")
+    _write_tpid_tape(d / "b", "LIB-B Neutron File")
+    with pytest.warns(UserWarning, match="different identities"):
+        ident = tape_identity(d)
+    assert ident == "LIB-A Neutron File"   # first sorted file
 
 
 def test_raw_mf10_attrs_not_baked(tmp_path):

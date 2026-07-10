@@ -32,6 +32,7 @@ import numpy as np
 
 import openmc.data
 from openmc.data import gnds_name, zam, ATOMIC_SYMBOL, DADZ
+from openmc.data.pendf import tape_identity
 from openmc.deplete import Chain
 from openmc.deplete.nuclide import ReactionTuple
 from openmc.deplete.chain import REACTIONS
@@ -192,7 +193,11 @@ class _H5Source:
     def __init__(self, path):
         self._lib = openmc.data.PendfLibrary(path)
         self.nuclides = list(self._lib.nuclides)
-        self.library = self._lib.library or 'unknown'
+        # For provenance stamping prefer the h5's tape-derived source_identity
+        # (matches what the collapse verifies against), falling back to the
+        # user-supplied ``library`` label on files that predate it.
+        self.library = (self._lib.source_identity or self._lib.library
+                        or 'unknown')
         self.mapping = self._lib.mapping
 
     def reactions(self, nuclide):
@@ -244,7 +249,10 @@ class _AscSource:
                                        get_tab1_record)
         import io
 
-        self.library = library or 'unknown'
+        # Provenance identity from the tapes themselves (TPID / MF=1/451), so the
+        # stamp matches what the collapse verifies against; 'unknown' only when
+        # no tape identity can be read.
+        self.library = tape_identity(Path(path)) or 'unknown'
         self.mapping = None
         self._data = {}
         self._tapes = {}                 # GNDS name -> tape path
@@ -362,6 +370,20 @@ def open_pendf_source(path, library=None):
     if path.is_file():
         return _H5Source(path)
     raise FileNotFoundError(str(path))
+
+
+def _pendf_source_label(path) -> str:
+    """Short human-readable label of the PENDF source for the chain stamp.
+
+    A directory uses its last two path components (e.g. ``'jeff40-n/pendf'``) so
+    the label distinguishes sibling projection dirs; a single file uses its bare
+    basename. Informational only -- never a mismatch trigger.
+    """
+    p = Path(path)
+    if p.is_dir():
+        parts = p.parts
+        return '/'.join(parts[-2:]) if len(parts) >= 2 else p.name
+    return p.name
 
 
 # =============================================================================
@@ -1559,18 +1581,28 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     print("\nStep 6: Exporting folded chain XML...")
     # Stamp the exported chain's root element with the PENDF source's identity so
     # a wrong/stale chain paired with a library is self-detecting at collapse time
-    # (openmc.deplete.microxs._verify_pendf_chain_stamp). The library string and
-    # nuclide count are the mismatch triggers; pendf_source (the h5/dir basename)
-    # is informational only -- a file rename must not false-alarm.
+    # (openmc.deplete.microxs._verify_pendf_chain_stamp). The tape-derived
+    # ``pendf_library`` string and the nuclide count are the mismatch triggers;
+    # ``pendf_source`` (dir last-two-components / file basename) is informational
+    # only -- a rename must not false-alarm. The ``decay_*`` attrs are pure
+    # provenance (never verified at collapse), recording the decay library the
+    # isomer mapping was resolved against.
+    pendf_source = _pendf_source_label(pendf_path)
+    decay_source = Path(decay_file).name
+    decay_library = tape_identity(Path(decay_file)) or 'unknown'
     chain.root_attrs = {
-        'pendf_source': Path(pendf_path).name,
+        'pendf_source': pendf_source,
         'pendf_library': source.library,
         'pendf_nuclides': str(len(source.nuclides)),
+        'decay_source': decay_source,
+        'decay_library': decay_library,
     }
     chain.export_to_xml(output_chain_file)
     print(f"  Chain written to: {output_chain_file}")
     print(f"  Provenance stamp: library={source.library!r}, "
-          f"nuclides={len(source.nuclides)}, source={Path(pendf_path).name!r}")
+          f"nuclides={len(source.nuclides)}, source={pendf_source!r}")
+    print(f"  Decay provenance: source={decay_source!r}, "
+          f"library={decay_library!r}")
 
     if log_file:
         source_stats = dict(

@@ -203,6 +203,118 @@ def _discover_pendf_files(pendf_dir):
     return files
 
 
+def _identity_from_evaluation(ev) -> str | None:
+    """Derive a source identity from an ENDF MF=1/451 evaluation.
+
+    Formats the NLIB library tuple as ``'<LIBRARY>-<NVER>'`` and appends the
+    sublibrary description when available, e.g. ``('JEFF', 40, 0)`` +
+    ``'Radioactive decay data'`` -> ``'JEFF-40 Radioactive decay data'``. Returns
+    ``None`` when the evaluation carries no library information.
+    """
+    lib = ev.info.get('library')
+    if lib is None:
+        return None
+    name, version, _release = lib
+    identity = f"{name}-{version}"
+    sublibrary = ev.info.get('sublibrary')
+    if sublibrary:
+        identity = f"{identity} {sublibrary}"
+    return identity
+
+
+def _tape_file_identity(path) -> str | None:
+    """Identity of a single ENDF/PENDF tape file, or ``None`` if unreadable.
+
+    Reads the TPID record (the first line's columns 0:66); if its stripped text
+    is non-empty it is returned verbatim. A blank TPID (common on decay tapes)
+    falls back to the MF=1/451-derived identity (see
+    :func:`_identity_from_evaluation`).
+    """
+    try:
+        with open(path) as fh:
+            first_line = fh.readline()
+    except OSError:
+        return None
+    tpid = first_line[:66].strip()
+    if tpid:
+        return tpid
+    try:
+        ev = Evaluation(str(path))
+    except Exception:
+        return None
+    return _identity_from_evaluation(ev)
+
+
+def tape_identity(path: PathLike) -> str | None:
+    """Return a human-readable identity string for a PENDF/decay tape source.
+
+    The identity stamps the provenance of an HDF5 PENDF library (root
+    ``source_identity`` attr) and of a patched depletion chain, so a chain and a
+    library built from the same tapes are recognizable as belonging together even
+    when their user-supplied ``library`` labels differ.
+
+    Parameters
+    ----------
+    path : str or path-like
+        A single ENDF/PENDF tape file, or a directory of them.
+
+    Returns
+    -------
+    str or None
+        For a single tape: the TPID text (first line, columns 0:66) when
+        non-empty, else the MF=1/451-derived ``'<LIBRARY>-<NVER> <sublibrary>'``
+        identity. For a directory: the identity of the first of up to three
+        sampled tapes (PENDF tapes discovered by :func:`_discover_pendf_files`,
+        or the directory's sorted files otherwise). Divergent sampled TPIDs are
+        per-material processing strings, not a library identity, so the
+        MF=1/451-derived identity is used instead (with a warning); only if no
+        451 identity can be derived is the first divergent string returned.
+        ``None`` when no identity can be read (unreadable / non-ENDF / missing
+        source).
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return _tape_file_identity(path)
+
+    entries = _discover_pendf_files(path)
+    if entries:
+        tapes = sorted(p for p, _liso in entries)
+    else:
+        tapes = sorted(p for p in path.iterdir() if p.is_file())
+
+    identities: list[str] = []
+    for tape in tapes:
+        identity = _tape_file_identity(tape)
+        if identity is not None:
+            identities.append(identity)
+        if len(identities) >= 3:
+            break
+    if not identities:
+        return None
+    first = identities[0]
+    distinct = list(dict.fromkeys(identities))
+    if len(distinct) > 1:
+        # Divergent TPIDs are per-material processing strings (e.g. NJOY's
+        # 'pendf for material 1125'), useless as a library identity. Fall back
+        # to the MF=1/451-derived identity, which is per-library and stable
+        # across the tape set.
+        for tape in tapes:
+            try:
+                ev = Evaluation(str(tape))
+            except Exception:
+                continue
+            derived = _identity_from_evaluation(ev)
+            if derived is not None:
+                warn(f"tape_identity: sampled tapes in {path} report "
+                     f"per-material TPIDs ({', '.join(repr(i) for i in distinct)}); "
+                     f"using the MF=1/451-derived identity {derived!r}.")
+                return derived
+        warn(f"tape_identity: sampled tapes in {path} report different "
+             f"identities ({', '.join(repr(i) for i in distinct)}) and no "
+             f"MF=1/451 identity could be derived; using {first!r}.")
+    return first
+
+
 def _iter_mf10_partials(ev, mt, name):
     """Yield the MF=10 isomeric-production partials of reaction ``mt``.
 
@@ -370,7 +482,11 @@ class PendfLibrary:
         (source-faithful) file. Informational only -- the isomer<->LFS product
         mapping is now carried on the depletion chain, not the library.
     library : str
-        Name of the source data library.
+        Name of the source data library (user-supplied label).
+    source_identity : str or None
+        Tape-derived provenance identity of the source directory (root
+        ``source_identity`` attr), or ``None`` for a file written before this
+        attr was added. Used by the chain provenance-stamp check.
 
     """
 
@@ -390,6 +506,7 @@ class PendfLibrary:
         self.library = None
         self.temperature = None
         self.mapping = None
+        self.source_identity = None
         for p in paths:
             f = h5py.File(p, 'r')
             self._files.append(f)
@@ -416,6 +533,9 @@ class PendfLibrary:
                 self.library = library
                 self.temperature = temperature
                 self.mapping = mapping
+                self.source_identity = (
+                    _attr_str(f.attrs, 'source_identity')
+                    if 'source_identity' in f.attrs else None)
             else:
                 # Directory mode: every file must share the first file's
                 # library identity and temperature, or data would be served
@@ -791,6 +911,12 @@ class PendfLibrary:
                 h5.attrs['source_path'] = np.bytes_(str(pendf_dir))
                 h5.attrs['created'] = np.bytes_(date.today().isoformat())
                 h5.attrs['openmc_version'] = np.bytes_(openmc.__version__)
+                # Tape-derived provenance identity (distinct from the
+                # user-supplied ``library`` label): the source directory's TPID /
+                # MF=1/451 identity, used by the chain provenance-stamp check.
+                source_identity = tape_identity(pendf_dir)
+                if source_identity is not None:
+                    h5.attrs['source_identity'] = np.bytes_(source_identity)
 
             os.replace(tmp, out)
         except BaseException:
@@ -838,6 +964,9 @@ class GroupedPendfLibrary:
         GNDS nuclide names present in the library.
     library : str or None
         Name of the source data library (root ``library`` attr), or ``None``.
+    source_identity : str or None
+        Tape-derived provenance identity carried from the pointwise source (root
+        ``source_identity`` attr), or ``None``.
     """
 
     def __init__(self, path: PathLike):
@@ -902,6 +1031,18 @@ class GroupedPendfLibrary:
         """
         if 'library' in self._file.attrs:
             return _attr_str(self._file.attrs, 'library')
+        return None
+
+    @property
+    def source_identity(self) -> str | None:
+        """Tape-derived source identity (root ``source_identity`` attr), or None.
+
+        Copied from the pointwise source at bin time (``tools/pendf_group_bin.py``)
+        so a grouped library carries the same tape-derived provenance as a
+        :class:`PendfLibrary`; the chain provenance-stamp check reads it.
+        """
+        if 'source_identity' in self._file.attrs:
+            return _attr_str(self._file.attrs, 'source_identity')
         return None
 
     def reactions(self, nuclide: str) -> list[int]:

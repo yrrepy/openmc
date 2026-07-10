@@ -4,9 +4,10 @@ Covers the ORIGEN-style "Option A" per-product rows built by
 ``_build_xs_table_pendf`` (ground row keeps the canonical reaction name,
 metastable products get an ``_m{n}`` suffix), the **chain-sourced** row naming
 (each MF=10 ``LFS`` partial is bound to the depletion-chain reaction carrying
-that ``pendf_lfs``), the unbound-partial MF=3-total fallback, the
-Sigma(partials) vs MF=3-total consistency check, and the always-on expansion
-through :meth:`MicroXS.from_multigroup_flux`. Pathway rows come exclusively from
+that ``pendf_lfs``), the demand-side chain semantics (extra library LFS ignored,
+demanded-missing LFS falling back to the MF=3 total, the self-loop ground waiver),
+and the always-on expansion through
+:meth:`MicroXS.from_multigroup_flux`. Pathway rows come exclusively from
 MF=10 partial cross sections -- never from static branching ratios; the product
 *names* come from the chain, never from the library.
 """
@@ -266,11 +267,11 @@ def test_fully_stock_chain_ignores_library_pathways_silently(recwarn):
     assert len(recwarn) == 0
 
 
-def test_chain_ground_qualified_library_extra_lfs_warns():
+def test_chain_ground_qualified_library_extra_lfs_ignored(recwarn):
     """Chain qualified for the ground LFS only while the library carries an extra
-    (metastable) LFS -> set mismatch -> the whole reaction falls back to the MF=3
-    total and one summary warning fires (chain and library disagree). Value is the
-    MF=3 total -- identical to the old partially-unbound fallback."""
+    (metastable) LFS -> the extra is ignored silently and the ground pathway row is
+    emitted from its partial (no fallback, no warning: the chain is the source of
+    truth for which pathways to emit)."""
     fake = _FakePendf(
         mf3={"Ir193": {102: _const(5.0)}},
         mf10={"Ir193": {102: {
@@ -280,14 +281,14 @@ def test_chain_ground_qualified_library_extra_lfs_warns():
     edges = np.array([0.0, 2.0e7])
     chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # demands {0} only
 
-    with pytest.warns(UserWarning, match="does not match"):
-        table = _build_xs_table_pendf(
-            ["Ir193"], ["(n,gamma)"], edges, fake, chain)
+    table = _build_xs_table_pendf(["Ir193"], ["(n,gamma)"], edges, fake, chain)
 
-    # Single MF=3-total row -- not the bound ground partial alone.
+    # The demanded ground partial is emitted (4.0), not the MF=3 total (5.0);
+    # the undemanded LFS 38 is dropped.
     assert table.reactions == ["(n,gamma)"]
     assert table.rxn_indices.tolist() == [0]
-    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
+    np.testing.assert_allclose(table.xs_matrix[0], [4.0])
+    assert len(recwarn) == 0
 
 
 def test_ground_only_stock_falls_back_silently(recwarn):
@@ -314,24 +315,30 @@ def test_ground_only_stock_falls_back_silently(recwarn):
 
 
 def test_chain_library_lfs_mismatch_warning_names_both_sets():
-    """The chain <-> library mismatch summary warning names BOTH LFS sets so the
-    user sees exactly where they diverge (chain LFS {0} vs library LFS {0, 38})."""
+    """A demanded LFS missing from the library (here the metastable LFS 1, which is
+    NOT the self-loop ground case) falls back to the MF=3 total, and the summary
+    warning names BOTH LFS sets so the user sees exactly where they diverge (chain
+    LFS {0, 1} vs library LFS {0})."""
     fake = _FakePendf(
         mf3={"Ir193": {102: _const(5.0)}},
         mf10={"Ir193": {102: {
-            0: ("Ir194", _const(4.0)),   # ground: chain binds LFS 0
-            38: (None, _const(1.0)),     # metastable LFS: library extra
+            0: ("Ir194", _const(4.0)),   # only the ground partial is present
         }}})
     edges = np.array([0.0, 2.0e7])
-    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+    # Chain demands {0, 1} but the library lacks the metastable LFS 1.
+    chain = Chain()
+    nuc = Nuclide("Ir193")
+    nuc.add_reaction("(n,gamma)", "Ir194", 0.0, 1.0, pendf_lfs=0)
+    nuc.add_reaction("(n,gamma)_m1", "Ir194_m1", 0.0, 1.0, pendf_lfs=1)
+    chain.add_nuclide(nuc)
 
     with pytest.warns(UserWarning, match="chain and library disagree") as record:
         table = _build_xs_table_pendf(
             ["Ir193"], ["(n,gamma)"], edges, fake, chain)
 
     msg = str(record[0].message)
-    assert "chain LFS {0}" in msg
-    assert "library LFS {0, 38}" in msg
+    assert "chain LFS {0, 1}" in msg
+    assert "library LFS {0}" in msg
     assert table.reactions == ["(n,gamma)"]
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
 
@@ -359,77 +366,10 @@ def test_lfs_less_chain_raises():
         _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
 
 
-def test_consistency_check_warns_on_mismatch():
-    """Sigma(partials) that disagree with the MF=3 total raise a warning."""
-    fake = _FakePendf(
-        mf3={"Am241": {102: _const(5.0)}},
-        mf10={"Am241": {102: {
-            0: ("Am242", _const(4.0)),
-            2: ("Am242_m1", _const(0.5)),   # 4.0 + 0.5 = 4.5 != 5.0
-        }}})
-    edges = np.array([0.0, 2.0e7])
-    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
-
-    with pytest.warns(UserWarning, match="partials"):
-        table = _build_xs_table_pendf(
-            ["Am241"], ["(n,gamma)"], edges, fake, chain)
-
-    # Rows are still emitted from the partials despite the warning
-    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
-    np.testing.assert_allclose(table.xs_matrix[0], [4.0])
-    np.testing.assert_allclose(table.xs_matrix[1], [0.5])
-
-
-def test_floor_dust_mismatch_does_not_warn(recwarn):
-    """Groups where BOTH the total and the summed partials sit below the
-    absolute floor are evaluator placeholder dust (e.g. JEFF-4.0's 1e-20 b
-    "effective zero" floored independently per section, giving exact 2:1
-    ratios): their relative deviation is meaningless and must not warn."""
-    fake = _FakePendf(
-        mf3={"Am241": {102: _const(1.0e-20)}},
-        mf10={"Am241": {102: {
-            0: ("Am242", _const(1.0e-20)),
-            2: ("Am242_m1", _const(1.0e-20)),   # sum 2e-20 vs total 1e-20
-        }}})
-    edges = np.array([0.0, 2.0e7])
-    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
-
-    table = _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
-
-    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
-    assert len(recwarn) == 0
-
-
-def test_meaningful_partials_vs_dust_total_still_warns():
-    """A meaningful partial against a floor-dust total is a genuine
-    inconsistency, not placeholder noise -- the floor exemption requires
-    BOTH sides to be dust."""
-    fake = _FakePendf(
-        mf3={"Am241": {102: _const(1.0e-20)}},
-        mf10={"Am241": {102: {
-            0: ("Am242", _const(2.0)),          # 2 b vs dust total
-            2: ("Am242_m1", _const(0.5)),
-        }}})
-    edges = np.array([0.0, 2.0e7])
-    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
-
-    with pytest.warns(UserWarning, match="partials"):
-        _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
-
-
-def test_matching_partials_do_not_warn(recwarn):
-    """Partials that sum to the total within tolerance emit no warning."""
-    fake = _FakePendf(
-        mf3={"Am241": {102: _const(5.0)}},
-        mf10={"Am241": {102: {
-            0: ("Am242", _const(4.0)),
-            2: ("Am242_m1", _const(1.0)),
-        }}})
-    edges = np.array([0.0, 2.0e7])
-    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
-
-    _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
-    assert len(recwarn) == 0
+# NOTE: the runtime Sigma(partials)-vs-MF=3-total consistency warning was removed
+# from ``_build_xs_table_pendf`` (Change 2); the build-time patcher audit is the
+# authoritative diagnosis. The floor/deviation helpers (``_partials_total_max_
+# deviation``, ``CONSISTENCY_*``) remain and are exercised via the patcher tests.
 
 
 # ---------------------------------------------------------------------------
@@ -457,9 +397,10 @@ def test_chain_qualified_exact_match_emits_partials(recwarn):
     assert len(recwarn) == 0
 
 
-def test_chain_qualified_library_has_extra_lfs_warns():
-    """(b) Chain qualified {0, 1} but library {0, 1, 4} -> mismatch -> MF=3 total
-    row + one summary warning naming both LFS sets."""
+def test_chain_qualified_library_has_extra_lfs_ignored(recwarn):
+    """(b) Chain qualified {0, 1} but library {0, 1, 4} -> the extra LFS 4 is
+    ignored silently and the two demanded pathway rows are emitted from their
+    partials (no fallback, no warning)."""
     fake = _FakePendf(
         mf3={"In115": {102: _const(5.0)}},
         mf10={"In115": {102: {
@@ -470,17 +411,13 @@ def test_chain_qualified_library_has_extra_lfs_warns():
     edges = np.array([0.0, 2.0e7])
     chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # demands {0, 1}
 
-    with pytest.warns(UserWarning, match="does not match") as record:
-        table = _build_xs_table_pendf(
-            ["In115"], ["(n,gamma)"], edges, fake, chain)
+    table = _build_xs_table_pendf(["In115"], ["(n,gamma)"], edges, fake, chain)
 
-    msg = str(record[0].message)
-    assert "chain LFS {0, 1}" in msg
-    assert "library LFS {0, 1, 4}" in msg
-    # Values fall back to the MF=3 total -- no qualified rows.
-    assert table.reactions == ["(n,gamma)"]
-    assert table.rxn_indices.tolist() == [0]
-    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
+    # Only the demanded LFS {0, 1} produce rows; the extra LFS 4 is dropped.
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
+    np.testing.assert_allclose(table.xs_matrix[0], [3.0])   # ground partial
+    np.testing.assert_allclose(table.xs_matrix[1], [1.0])   # m1 partial
+    assert len(recwarn) == 0
 
 
 def test_chain_qualified_library_has_no_mf10_warns():
@@ -534,6 +471,84 @@ def test_fully_stock_chain_with_library_metastable_silent(recwarn):
     assert table.rxn_indices.tolist() == [0]
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
     assert len(recwarn) == 0
+
+
+def test_chain_subset_demand_extra_lfs_ignored(recwarn):
+    """Subset demand (Sn122 (n,p)-style): the chain demands LFS {0, 5} while the
+    library carries {0, 1, 5}; the undemanded LFS 1 is ignored and rows come from
+    the LFS 0 and LFS 5 partials, no warning."""
+    fake = _FakePendf(
+        mf3={"Sn122": {103: _const(6.0)}},
+        mf10={"Sn122": {103: {
+            0: ("In122", _const(4.0)),      # demanded ground product
+            1: (None, _const(1.0)),         # undemanded extra LFS
+            5: ("In122_m1", _const(1.0)),   # demanded metastable product
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    chain = _chain_from_fake(fake, {103: "(n,p)"})   # demands {0, 5}
+
+    table = _build_xs_table_pendf(["Sn122"], ["(n,p)"], edges, fake, chain)
+
+    assert table.reactions == ["(n,p)", "(n,p)_m1"]
+    np.testing.assert_allclose(table.xs_matrix[0], [4.0])   # LFS 0 partial
+    np.testing.assert_allclose(table.xs_matrix[1], [1.0])   # LFS 5 partial
+    assert len(recwarn) == 0
+
+
+def test_self_loop_ground_waiver_stages_base_from_total(recwarn):
+    """Self-loop ground waiver: In115 (n,n') chain demands {0, 1} with the ground a
+    self-loop (target == parent) but the tape carries only the metastable LFS 1
+    (JEFF In113/In115 behavior). The base row is staged from the MF=3 total and the
+    m1 row from its partial -- no fallback, no warning (restores In115m (n,n')
+    production)."""
+    fake = _FakePendf(
+        mf3={"In115": {4: _const(2.0)}},
+        mf10={"In115": {4: {
+            1: ("In115_m1", _const(0.8)),   # only the metastable partial exists
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    # Chain: ground self-loop (target == parent) + metastable.
+    chain = Chain()
+    nuc = Nuclide("In115")
+    nuc.add_reaction("(n,n')", "In115", 0.0, 1.0, pendf_lfs=0)         # self-loop
+    nuc.add_reaction("(n,n')_m1", "In115_m1", 0.0, 1.0, pendf_lfs=1)
+    chain.add_nuclide(nuc)
+
+    table = _build_xs_table_pendf(["In115"], ["(n,n')"], edges, fake, chain)
+
+    assert table.reactions == ["(n,n')", "(n,n')_m1"]
+    rows = {r: table.xs_matrix[i] for i, r in enumerate(table.rxn_indices)}
+    np.testing.assert_allclose(rows[0], [2.0])   # base row == MF=3 total
+    np.testing.assert_allclose(rows[1], [0.8])   # m1 row == LFS 1 partial
+    assert len(recwarn) == 0
+
+
+def test_non_self_loop_ground_missing_falls_back_and_warns():
+    """A demanded ground LFS missing from the library whose chain target is NOT the
+    parent (not a self-loop) falls back to the MF=3 total with the mismatch warning
+    -- the waiver is self-loop-only."""
+    fake = _FakePendf(
+        mf3={"In115": {102: _const(5.0)}},
+        mf10={"In115": {102: {
+            1: ("In116_m1", _const(1.0)),   # only the metastable; ground missing
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    # Chain demands {0, 1}; ground target In116 != parent In115 -> not a self-loop.
+    chain = Chain()
+    nuc = Nuclide("In115")
+    nuc.add_reaction("(n,gamma)", "In116", 0.0, 1.0, pendf_lfs=0)
+    nuc.add_reaction("(n,gamma)_m1", "In116_m1", 0.0, 1.0, pendf_lfs=1)
+    chain.add_nuclide(nuc)
+
+    with pytest.warns(UserWarning, match="does not match") as record:
+        table = _build_xs_table_pendf(
+            ["In115"], ["(n,gamma)"], edges, fake, chain)
+
+    msg = str(record[0].message)
+    assert "chain LFS {0, 1}" in msg
+    assert "library LFS {1}" in msg
+    assert table.reactions == ["(n,gamma)"]
+    np.testing.assert_allclose(table.xs_matrix[0], [5.0])
 
 
 # ---------------------------------------------------------------------------
@@ -767,9 +782,12 @@ class _IdentifiedPendf(_FakePendf):
     ``nuclides`` (the collapse interface) already supplies the count.
     """
 
-    def __init__(self, mf3, mf10=None, library="TENDL-2017"):
+    def __init__(self, mf3, mf10=None, library="TENDL-2017", source_identity=None):
         super().__init__(mf3, mf10)
         self.library = library
+        # Tape-derived provenance identity (Change 3e); ``None`` mimics an old h5
+        # that carries only the user ``library`` label.
+        self.source_identity = source_identity
 
 
 def _stamped_am241_setup(library="TENDL-2017"):
@@ -867,3 +885,42 @@ def test_unstamped_chain_silent(recwarn):
     assert chain.root_attrs == {}          # _chain_from_fake leaves it unstamped
     _collapse(fake, chain, edges, flux)
     assert _provenance_warnings(recwarn) == []
+
+
+def test_stamp_matches_source_identity_silent(recwarn):
+    """Change 3e: the stamp is a tape-derived identity; a library exposing a
+    matching ``source_identity`` verifies silently even when its user ``library``
+    label differs (the stamp need match only ONE of the two)."""
+    fake, chain, edges, flux = _stamped_am241_setup(library="jeff40-user-label")
+    fake.source_identity = "JEFF-4.0 Incident Neutron File"
+    chain.root_attrs = {'pendf_source': 'jeff40-n/pendf',
+                        'pendf_library': 'JEFF-4.0 Incident Neutron File',
+                        'pendf_nuclides': '1'}
+    _collapse(fake, chain, edges, flux)
+    assert _provenance_warnings(recwarn) == []
+
+
+def test_stamp_matches_library_label_when_no_source_identity_silent(recwarn):
+    """An old h5 with no ``source_identity`` still verifies silently when the stamp
+    matches its user ``library`` label (backward compatible)."""
+    fake, chain, edges, flux = _stamped_am241_setup(library="TENDL-2017")
+    assert getattr(fake, 'source_identity', None) is None
+    chain.root_attrs = {'pendf_source': 'tendl2017.h5',
+                        'pendf_library': 'TENDL-2017', 'pendf_nuclides': '1'}
+    _collapse(fake, chain, edges, flux)
+    assert _provenance_warnings(recwarn) == []
+
+
+def test_stamp_matches_neither_identity_warns():
+    """When the stamp matches NEITHER ``source_identity`` NOR the library label the
+    mismatch fires, and the message shows the identities compared."""
+    fake, chain, edges, flux = _stamped_am241_setup(library="TENDL-2017")
+    fake.source_identity = "TENDL-2017 pointwise"
+    chain.root_attrs = {'pendf_source': 'jeff40-n/pendf',
+                        'pendf_library': 'JEFF-4.0 Incident Neutron File',
+                        'pendf_nuclides': '1'}
+    with pytest.warns(UserWarning, match="provenance mismatch") as record:
+        _collapse(fake, chain, edges, flux)
+    msg = str(_provenance_warnings(record)[0].message)
+    assert "JEFF-4.0 Incident Neutron File" in msg          # stamped identity
+    assert "TENDL-2017" in msg                              # a compared identity

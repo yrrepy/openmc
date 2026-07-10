@@ -227,8 +227,10 @@ def test_full_fold_roundtrip(tmp_path):
 def test_main_stamps_chain_provenance(tmp_path, monkeypatch):
     # main() writes the PENDF source identity onto the exported chain root:
     # pendf_library (source string), pendf_nuclides (count), pendf_source
-    # (basename). Uses the module fixtures with open_pendf_source /
-    # parse_decay_isomeric_levels monkeypatched so no real data files are needed.
+    # (file basename / dir last-two), plus provenance-only decay_source (basename)
+    # and decay_library (tape identity, 'unknown' when unreadable). Uses the module
+    # fixtures with open_pendf_source / parse_decay_isomeric_levels monkeypatched so
+    # no real data files are needed.
     import add_pendf_isomeric_branching_to_chain as patcher
 
     base = _chain_with(["In115", "In116", "In116_m1", "In116_m2"],
@@ -255,6 +257,9 @@ def test_main_stamps_chain_provenance(tmp_path, monkeypatch):
     assert root.get("pendf_library") == "synthetic"     # _FakeSource.library
     assert root.get("pendf_nuclides") == "1"            # one nuclide (In115)
     assert root.get("pendf_source") == "TENDL2017-IST.293K.PENDF.h5"
+    assert root.get("decay_source") == "ignored"        # basename of decay_file
+    # "ignored" is unreadable as a tape -> tape_identity None -> 'unknown'.
+    assert root.get("decay_library") == "unknown"
 
     # And the stamp round-trips back through Chain.from_xml.
     reread = Chain.from_xml(str(out))
@@ -262,6 +267,8 @@ def test_main_stamps_chain_provenance(tmp_path, monkeypatch):
         "pendf_library": "synthetic",
         "pendf_nuclides": "1",
         "pendf_source": "TENDL2017-IST.293K.PENDF.h5",
+        "decay_source": "ignored",
+        "decay_library": "unknown",
     }
 
 

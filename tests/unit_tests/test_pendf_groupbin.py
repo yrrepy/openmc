@@ -58,6 +58,7 @@ def _make_pointwise_h5(path):
     with h5py.File(path, "w") as f:
         f.attrs["format_version"] = 2
         f.attrs["library"] = np.bytes_("TEST")
+        f.attrs["source_identity"] = np.bytes_("TEST tape identity")
         f.attrs["temperature"] = np.float64(293.16)
 
         # In115: MT102 (n,gamma) with three MF=10 partials on a grid holding a
@@ -216,6 +217,27 @@ def test_reader_api(libs):
     # A unique LFS resolves its partial with a bare-LFS call (no izap needed).
     assert grouped.pathway_xs_g("In115", 102, 1).shape == (len(EDGES) - 1,)
     assert grouped.xs_g("In115", 102).shape == (len(EDGES) - 1,)
+
+
+def test_source_identity_copied_to_grouped(libs):
+    """The bin step copies the pointwise ``source_identity`` root attr through, and
+    the grouped reader exposes it (mirrors the ``library`` provenance copy)."""
+    _, grouped, grouped_path = libs
+    assert grouped.source_identity == "TEST tape identity"
+    with h5py.File(grouped_path, "r") as f:
+        assert f.attrs["source_identity"].decode() == "TEST tape identity"
+
+
+def test_source_identity_none_when_source_lacks_it(tmp_path):
+    """A pointwise source without ``source_identity`` yields a grouped library whose
+    ``source_identity`` is None (old-file backward compatibility)."""
+    src = tmp_path / "pointwise.h5"
+    grouped = tmp_path / "grouped.h5"
+    _make_pointwise_h5(src)
+    with h5py.File(src, "r+") as f:
+        del f.attrs["source_identity"]
+    pgb.bin_pendf_library(src, grouped, EDGES)
+    assert GroupedPendfLibrary(grouped).source_identity is None
 
 
 def test_reader_lumped_pathways(libs):
