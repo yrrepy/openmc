@@ -29,6 +29,8 @@ from collections import defaultdict, Counter
 from enum import Enum
 from xml.dom import minidom
 
+import numpy as np
+
 from openmc.deplete import Chain
 from openmc.deplete.gendf import (
     GENDFLibrary, REACTION_TO_MT
@@ -155,7 +157,7 @@ LIBRARY_CONFIGS = {
     },
     'jeff40': {
         'description':   'JEFF-4.0 (Native pairing) - UKAEA-1102',
-        'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/JEFF4data/jeff4-n/gxs-1102/',
+        'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/JEFF40data/jeff40-n/gxs-1102/',
         'decay_file':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/jeff-4.0-endf/decay/Radioactive_Decay_Data_JEFF-40.txt',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/Chain_JEFF40.xml',
         'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/',
@@ -274,6 +276,9 @@ def build_parser():
              "energy-dependent ratios as <isomeric_yields> (legacy/informational)."
     )
 
+    parser.add_argument('--audit-emax',             type=float, default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
+    parser.add_argument('--mf10-reject-band-ratio', type=float, default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band ratio has |ratio-1| > X (default: None = audit only, reject nothing). GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
+
     return parser
 
 
@@ -296,6 +301,332 @@ def _z_to_element(z):
         'Mt', 'Ds', 'Rg', 'Cn', 'Nh', 'Fl', 'Mc', 'Lv', 'Ts', 'Og'
     ]
     return elements[z] if 0 <= z < len(elements) else f'Z{z}'
+
+
+# =============================================================================
+# MF=10-vs-MF=3 consistency audit  (GROUP-SPACE port of the PENDF patcher)
+# =============================================================================
+#
+# This is the multigroup cousin of the pointwise audit in
+# ``add_pendf_isomeric_branching_to_chain.py``. For every decorated-candidate
+# reaction it compares the summed MF=10 isomeric-production partials against the
+# MF=3 total, group by group, and reports a per-band lethargy-weighted ratio so
+# it is clear WHERE (thermal / epithermal / intermediate / fast) any departure
+# lives. Column names, section titles, the ``--mf10-reject-band-ratio`` knob and
+# the console phrasing mirror the PENDF tool so downstream tooling reads both.
+#
+# DELIBERATE GENDF/PENDF SEMANTIC DIFFERENCE -- read before using rejection:
+# the GENDF depletion runtime consumes branching as partial/Sum(partials)
+# RATIOS applied to an MF=3-total reaction rate. A COMMON-MODE inflation of all
+# partials (the same factor in every group -- e.g. the known JEFF-4.0 sub-thermal
+# lin-lin chord class) therefore CANCELS in the ratio and is HARMLESS on this
+# path; only DIFFERENTIAL defects (partials disagreeing with each other by
+# energy) bias results. Consequently rejection stays OFF by default, and the
+# audit adds a GENDF-specific ``BR-spread`` column that separates the two:
+# near-constant branching fractions (small spread) + large band ratios => benign
+# common-mode; a large spread => genuine differential suspicion.
+
+# Constants mirror ``openmc.deplete.microxs`` in the PENDF fork (this GENDF
+# fork's microxs.py does not define them). RTOL is the "offender" threshold for
+# the always-on table; ABS_FLOOR is the both-sides evaluator floor-dust exempt.
+CONSISTENCY_RTOL = 1e-5
+CONSISTENCY_ABS_FLOOR = 1e-15
+
+# Lethargy band edges (eV): thermal [grid_min, 0.625), epithermal [0.625, 1e5),
+# intermediate [1e5, 1e6), fast [1e6, emax]. 0.625 eV is the cadmium cutoff.
+_BAND_THERMAL_HI = 0.625
+_BAND_EPITHERMAL_HI = 1.0e5
+_BAND_INTERMEDIATE_HI = 1.0e6
+
+
+def _partials_total_max_deviation(total_g, part_sum):
+    """Max relative deviation of summed MF=10 partials from the MF=3 total.
+
+    Group-space definition, ported verbatim from the PENDF fork's
+    ``openmc.deplete.microxs``: returns ``(worst, group_idx)`` over groups with
+    nonzero total, skipping groups where BOTH sides are below
+    ``CONSISTENCY_ABS_FLOOR`` (evaluator floor dust). ``(0.0, -1)`` when no group
+    qualifies.
+    """
+    nz = (total_g != 0.0) & (
+        (np.abs(total_g) >= CONSISTENCY_ABS_FLOOR)
+        | (np.abs(part_sum) >= CONSISTENCY_ABS_FLOOR))
+    if not nz.any():
+        return 0.0, -1
+    dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
+    worst = float(dev.max())
+    return worst, int(np.nonzero(nz)[0][dev.argmax()])
+
+
+def _band_lethargy_weights(bounds, lo, hi):
+    """Per-group lethargy overlap Delta-u_g of each group with band ``[lo, hi]``.
+
+    ``bounds`` is the ascending energy-boundary array (length n_groups+1); group
+    g spans ``[bounds[g], bounds[g+1]]``. Returns a length-n_groups array of
+    ``ln(min(bounds[g+1], hi) / max(bounds[g], lo))`` clipped at 0 -- the portion
+    of the group's lethargy that falls inside the band. A group straddling a band
+    edge is thereby apportioned by its lethargy overlap (exact for multigroup
+    data, where the group cross section is constant so
+    ``int sigma/E dE = sigma * Delta-u``).
+    """
+    elo = np.asarray(bounds[:-1], dtype=float)
+    ehi = np.asarray(bounds[1:], dtype=float)
+    top = np.minimum(ehi, hi)
+    bot = np.maximum(elo, lo)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        du = np.where((top > bot) & (bot > 0.0), np.log(top / bot), 0.0)
+    return du
+
+
+def _band_ratio_gendf(bounds, total_pg, part_pg, lo, hi):
+    """Lethargy-weighted band ratio ``Sum part_g du_g / Sum tot_g du_g``.
+
+    ``du_g`` is each group's lethargy overlap with ``[lo, hi]`` (band-edge groups
+    apportioned by overlap). Returns ``(ratio, part_nonzero_vs_zero_total)``.
+    ``ratio`` is ``None`` when the band has no contributing group, a zero total
+    integral, or fails the significance floor -- a band whose contributing MF=3
+    totals never rise above ``CONSISTENCY_ABS_FLOOR`` is below-threshold
+    evaluator dust and cannot produce a meaningful ratio (mirrors the PENDF
+    tool). The second flag is ``True`` only in the degenerate case of nonzero
+    partials against a zero total.
+    """
+    du = _band_lethargy_weights(bounds, lo, hi)
+    sel = du > 0.0
+    if not sel.any():
+        return None, False
+    if float(np.max(total_pg[sel])) < CONSISTENCY_ABS_FLOOR:
+        return None, False
+    int_total = float(np.sum(total_pg * du))
+    if int_total == 0.0:
+        int_part = float(np.sum(part_pg * du))
+        return None, (int_part != 0.0)
+    return float(np.sum(part_pg * du)) / int_total, False
+
+
+def _branching_spread(bounds, meta_partials, part_sum, band_lo, band_hi, emax):
+    """GENDF-specific BR-spread: branching-fraction spread WITHIN one band.
+
+    For each non-ground partial ``m`` compute the per-group branching fraction
+    ``r_m,g = part_m,g / Sum(parts)_g`` over the SIGNIFICANT groups that overlap
+    the band ``[band_lo, band_hi]`` (lethargy overlap > 0, ``Sum(parts)_g >
+    CONSISTENCY_ABS_FLOOR``, ``E < emax``), then take ``max_g r - min_g r``.
+    BR-spread is the max of that over the non-ground partials -- one number.
+
+    The band is deliberately the WORST-deviating band (largest ``|ratio - 1|``;
+    chosen by the caller), i.e. where the MF10-vs-MF3 anomaly lives. Measuring
+    the spread THERE -- not over the full range -- is what separates the two
+    failure modes: a sub-thermal common-mode chord scales all partials together
+    so the branching fraction is CONSTANT across the anomalous band (spread ~ 0),
+    whereas a differential defect makes the partials disagree by energy WITHIN
+    the anomalous band (large spread). Full-range spread would instead be
+    dominated by the reaction's legitimate fast-region branching variation and
+    could not tell a benign chord from a real defect (verified empirically:
+    JEFF-4.0 chord class -> full-range median ~0.4 but worst-band ~0.000).
+    Returns ``None`` when no non-ground partial or no qualifying group.
+    """
+    if not meta_partials:
+        return None
+    du = _band_lethargy_weights(bounds, band_lo, band_hi)
+    elo = np.asarray(bounds[:-1], dtype=float)
+    sig = (du > 0.0) & (part_sum > CONSISTENCY_ABS_FLOOR) & (elo < emax)
+    if not sig.any():
+        return None
+    denom = part_sum[sig]
+    max_spread = 0.0
+    for _lfs, pg in meta_partials:
+        r = pg[sig] / denom
+        spread = float(r.max() - r.min())
+        if spread > max_spread:
+            max_spread = spread
+    return max_spread
+
+
+def _self_loop_ground_gendf(parent, branching):
+    """True when the reaction's GROUND product is the parent itself.
+
+    Group-space analog of the PENDF self-loop-ground exemption: an
+    ``(n,n')``-type ground route back to the parent is a transmutation-matrix
+    no-op (loss and gain both land on the diagonal and cancel), so partial-sum
+    band incompleteness cannot affect the chain -- only the metastable partials
+    carry real isomer production, and rejecting would destroy it. The ground
+    product is the branching's first product (``products[0]`` -- the LFS=0 entry
+    the flags-only writer emits as ground). A metastable parent's ground route
+    (e.g. In115_m1 -> In115) is a real transition, NOT a self-loop, and stays
+    rejectable because ``products[0]`` then differs from ``parent``.
+    """
+    products = list(getattr(branching, 'products', None) or [])
+    return bool(products) and products[0] == parent
+
+
+def _audit_reaction_gendf(lib, parent, mt, emax=2.0e7):
+    """Group-space MF=10-vs-MF=3 consistency for one reaction.
+
+    Reads the MF=3 total (per-group) and every MF=10 production partial
+    (``IZAP != 0``, ground + metastable), each aligned to the library group grid
+    via the reader's ``_extract_xs`` -- which handles a threshold partial's group
+    offset. (``_get_production_xs`` is NOT used: its front-trim assumes coverage
+    starts at group 0 and would misplace threshold partials.) Groups whose low
+    edge is at or above ``emax`` are dropped from the worst-deviation scan; band
+    ratios cap via the fast band's lethargy overlap at ``emax``.
+
+    Returns ``None`` when MF=3 or MF=10 is unavailable, else a dict with
+    ``worst_dev`` and the worst group's energy band / values, the capped
+    lethargy-weighted ``integral_ratio``, the four per-band ratios, the
+    GENDF-specific ``br_spread``, and ``notes``.
+    """
+    try:
+        mf3 = np.asarray(lib.get_xs(parent, mt), dtype=float)
+    except Exception:
+        return None
+    try:
+        mf10 = lib._load_mf10_data(parent, mt)
+    except Exception:
+        return None
+    if mf10 is None:
+        return None
+    mf10_data, _ = mf10
+
+    bounds = np.asarray(lib.energy_bounds, dtype=float)
+    n_groups = int(lib.n_groups)
+    if mf3.size != n_groups or bounds.size != n_groups + 1:
+        return None
+
+    part_sum = np.zeros(n_groups)
+    meta_partials = []              # (lfs, per-group array) for non-ground
+    for level in mf10_data.get('levels', []):
+        if int(level.get('IZAP', 0)) == 0:
+            continue
+        try:
+            pg = np.asarray(lib._extract_xs({'sigma': level['sigma']}, parent,
+                                            mt, False), dtype=float)
+        except Exception:
+            continue
+        if pg.size != n_groups:
+            continue
+        part_sum = part_sum + pg
+        if int(level.get('LFS', 0)) != 0:
+            meta_partials.append((int(level['LFS']), pg))
+
+    # emax cap: keep groups whose LOW edge is below emax for the worst-dev scan.
+    keep = bounds[:-1] < emax
+    if not keep.any():
+        return None
+    mf3_k = np.where(keep, mf3, 0.0)
+    part_k = np.where(keep, part_sum, 0.0)
+
+    worst, gidx = _partials_total_max_deviation(mf3_k, part_k)
+    if gidx >= 0:
+        energy_lo = float(bounds[gidx])
+        energy_hi = float(bounds[gidx + 1])
+        sum_at = float(part_sum[gidx])
+        total_at = float(mf3[gidx])
+    else:
+        energy_lo = energy_hi = sum_at = total_at = None
+
+    # Full-range (capped) lethargy-weighted integral ratio.
+    du_full = _band_lethargy_weights(bounds, 0.0, emax)
+    int_total = float(np.sum(mf3 * du_full))
+    int_part = float(np.sum(part_sum * du_full))
+    ratio = (int_part / int_total) if int_total != 0.0 else float('inf')
+
+    r_th, f_th = _band_ratio_gendf(bounds, mf3, part_sum, 0.0, _BAND_THERMAL_HI)
+    r_ep, f_ep = _band_ratio_gendf(bounds, mf3, part_sum, _BAND_THERMAL_HI,
+                                   _BAND_EPITHERMAL_HI)
+    r_in, f_in = _band_ratio_gendf(bounds, mf3, part_sum, _BAND_EPITHERMAL_HI,
+                                   _BAND_INTERMEDIATE_HI)
+    r_fa, f_fa = _band_ratio_gendf(bounds, mf3, part_sum, _BAND_INTERMEDIATE_HI,
+                                   emax)
+
+    flagged = [name for name, flag in (('thermal', f_th), ('epithermal', f_ep),
+               ('intermediate', f_in), ('fast', f_fa)) if flag]
+    notes = (f"partials nonzero vs zero total in {', '.join(flagged)}"
+             if flagged else '')
+
+    # BR-spread is measured WITHIN the worst-deviating defined band (max
+    # |ratio - 1|) -- where the MF10-vs-MF3 anomaly lives -- so it reports
+    # whether THAT anomaly is common-mode (constant branching -> small) or
+    # differential (varying -> large). See _branching_spread.
+    bands = [('thermal', 0.0, _BAND_THERMAL_HI, r_th),
+             ('epithermal', _BAND_THERMAL_HI, _BAND_EPITHERMAL_HI, r_ep),
+             ('intermediate', _BAND_EPITHERMAL_HI, _BAND_INTERMEDIATE_HI, r_in),
+             ('fast', _BAND_INTERMEDIATE_HI, emax, r_fa)]
+    defined = [b for b in bands if b[3] is not None]
+    if defined:
+        wname, wlo, whi, _wr = max(defined, key=lambda b: abs(b[3] - 1.0))
+        br_spread = _branching_spread(bounds, meta_partials, part_sum, wlo, whi,
+                                      emax)
+        br_spread_band = wname
+    else:
+        br_spread = None
+        br_spread_band = None
+
+    return dict(
+        worst_dev=worst, group_index=gidx,
+        energy_lo=energy_lo, energy_hi=energy_hi,
+        sum_partials=sum_at, total=total_at,
+        integral_ratio=ratio, ratio_thermal=r_th, ratio_epithermal=r_ep,
+        ratio_intermediate=r_in, ratio_fast=r_fa, br_spread=br_spread,
+        br_spread_band=br_spread_band, notes=notes)
+
+
+def run_mf10_consistency_audit(lib, branching_data, emax=2.0e7,
+                               reject_band_ratio=None):
+    """Audit every decorated-candidate reaction and (optionally) gate rejection.
+
+    ``branching_data`` is ``{parent: {reaction_name: IsomericBranching}}`` -- the
+    exact set that would receive an ``<isomeric_branching>`` child. Every one is
+    run through :func:`_audit_reaction_gendf` (always -- the table is
+    always-on). When ``reject_band_ratio`` is set, a reaction whose
+    ``|band ratio - 1|`` exceeds it on ANY defined band is REJECTED (returned so
+    the caller can leave it stock), UNLESS it is a self-loop-ground reaction
+    (exempt -- see :func:`_self_loop_ground_gendf`). Rejection is OFF by default;
+    band-ratio deviations are harmless if common-mode on the GENDF ratio path
+    (see the module note and the ``BR-spread`` column).
+
+    Returns ``(audit_rows, offender_count, clean_count, rejected_rows,
+    exempt_count)``.
+    """
+    audit_rows = []
+    rejected_rows = []
+    offenders = clean = exempt = 0
+
+    for parent in sorted(branching_data):
+        for r_name, branching in branching_data[parent].items():
+            mt = getattr(branching, 'mt', None)
+            if mt is None:
+                continue
+            audit = _audit_reaction_gendf(lib, parent, mt, emax=emax)
+            if audit is None:
+                continue
+            row = dict(parent=parent, mt=mt, reaction=r_name, **audit)
+            audit_rows.append(row)
+            if audit['worst_dev'] > CONSISTENCY_RTOL:
+                offenders += 1
+            else:
+                clean += 1
+
+            if reject_band_ratio is None:
+                continue
+            band_fired = []
+            for key, band in (('ratio_thermal', 'thermal'),
+                              ('ratio_epithermal', 'epithermal'),
+                              ('ratio_intermediate', 'intermediate'),
+                              ('ratio_fast', 'fast')):
+                r = audit.get(key)
+                if r is not None and abs(r - 1.0) > reject_band_ratio:
+                    band_fired.append(f'band_ratio:{band}')
+            if not band_fired:
+                continue
+            if _self_loop_ground_gendf(parent, branching):
+                exempt += 1
+                marker = 'self-loop ground: band-reject exempt'
+                row['notes'] = (f"{row['notes']}; {marker}"
+                                if row['notes'] else marker)
+                continue
+            rejected_rows.append(dict(parent=parent, mt=mt, reaction=r_name,
+                                      criterion=', '.join(band_fired), **audit))
+
+    return audit_rows, offenders, clean, rejected_rows, exempt
 
 
 def _parse_no_metastable_decay_data_error(error_str):
@@ -840,6 +1171,18 @@ def _determine_single_target_reason(branching, valid_products, missing_products,
 # XML manipulation
 # =============================================================================
 
+def _q_str(value):
+    """Format a Q value (eV) for the chain XML, killing float-subtraction noise.
+
+    Q_meta is computed as ``Q_ground - ELFS`` (a float subtraction), which can
+    leave e.g. ``-13286354.999999998``; rounding to 4 dp restores the clean
+    ``-13286355.0`` while preserving genuine sub-eV level energies. Q is a
+    heating quantity (never enters the transmutation matrix), so this precision
+    is ample.
+    """
+    return str(round(float(value), 4))
+
+
 def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                          chain, verbose=True, prune_nn_prime_self_loops=False,
                          suppress_single_target_yields=False,
@@ -886,6 +1229,8 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'nn_prime_self_loops_pruned': [],  # Track pruned (n,n') self-loops
         'single_target_cases': [],  # Track all single-target cases
         'single_target_suppressed': 0,  # Count of suppressed single-target cases
+        'q_from_elfs': 0,   # metastable Q values derived as Q_ground - ELFS
+        'q_replicated': 0,  # metastable Q values replicated (no ELFS available)
     }
 
     nuclide_map = {nuc.get('name'): nuc for nuc in root.findall('nuclide')}
@@ -1017,7 +1362,13 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
             energies = sorted(energy_yields.keys())
 
             if mode == 'flags_only':
-                # Write <isomeric_branching targets="A B C" gendf_lfs="0 3 15"/>
+                # Folded new form:
+                #   <reaction type="(n,2n)">
+                #     <isomeric_branching targets="A B" gendf_lfs="0 1"
+                #                         Q="q_ground q_meta"/>
+                #   </reaction>
+                # The per-pathway target/LFS/Q live ONLY on the child; the scalar
+                # target/Q are dropped from the <reaction> element (below).
                 iso_elem = ET.SubElement(rx_elem, 'isomeric_branching')
                 iso_elem.set('targets', ' '.join(products))
                 # Write LFS values from branching.lfs_mapping
@@ -1030,6 +1381,34 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                             f"{nuclide_name} {reaction_type}")
                     lfs_values.append(lfs)
                 iso_elem.set('gendf_lfs', ' '.join(str(v) for v in lfs_values))
+
+                # Per-pathway Q parallel-list (WORK ITEM 2). The ground
+                # (products[0], LFS=0) keeps the base reaction's scalar Q (= QM);
+                # each metastable costs its excitation energy, so
+                #   Q_meta = Q_ground - ELFS,  ELFS = QM - QI,
+                # taken from the SAME MF=10 the branching was derived from
+                # (branching.elis_mapping[p]['elis']) -- no Q value is invented.
+                # A metastable with no ELFS available (e.g. lfs_order mode)
+                # replicates the ground Q and is counted for the report.
+                scalar_q = rx_elem.get('Q')
+                gq = float(scalar_q) if scalar_q is not None else 0.0
+                q_values = [scalar_q if scalar_q is not None else '0.0']
+                elis_map = getattr(branching, 'elis_mapping', None) or {}
+                for p in products[1:]:
+                    info = elis_map.get(p) if isinstance(elis_map, dict) else None
+                    elfs = info.get('elis') if isinstance(info, dict) else None
+                    if elfs is not None:
+                        q_values.append(_q_str(gq - float(elfs)))
+                        summary['q_from_elfs'] += 1
+                    else:
+                        q_values.append(scalar_q if scalar_q is not None else '0.0')
+                        summary['q_replicated'] += 1
+                iso_elem.set('Q', ' '.join(q_values))
+
+                # Fold: drop the scalar target/Q now that the child carries the
+                # full per-pathway lists. Unbranched reactions are untouched.
+                rx_elem.attrib.pop('target', None)
+                rx_elem.attrib.pop('Q', None)
             else:
                 # Write full <isomeric_yields> (embedded/informational)
                 yields_elem = ET.SubElement(rx_elem, 'isomeric_yields')
@@ -1104,10 +1483,159 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 # Logging functions
 # =============================================================================
 
+def _fmt_ratio(ratio):
+    """Render a band/full ratio: 'n/a' for None, 'inf' for inf, else 4dp."""
+    if ratio is None:
+        return "n/a"
+    if ratio == float('inf'):
+        return "inf"
+    return f"{ratio:.4f}"
+
+
+def _fmt_erange(o):
+    """Worst-deviation group's energy band as a compact 'elo-ehi' range (eV).
+
+    This is the group-space analog of the PENDF pointwise 'E@max': a multigroup
+    reaction's worst deviation lives in a GROUP, which spans an energy range.
+    """
+    lo = o.get('energy_lo')
+    hi = o.get('energy_hi')
+    if lo is None or hi is None:
+        return "-"
+    return f"{lo:.3e}-{hi:.3e}"
+
+
+def _fmt_spread(v):
+    """Render the BR-spread column: compact 4dp, or 'n/a' when undefined."""
+    return f"{v:.4f}" if v is not None else "n/a"
+
+
+def _write_consistency_audit_section(f, offenders, audit_clean, emax=2.0e7):
+    """MF=10 CONSISTENCY AUDIT section (group-space): offenders worst-first.
+
+    Mirrors the PENDF tool's section (title, columns, phrasing) with two
+    group-space adaptations: E[eV]@max carries the worst group's energy RANGE,
+    and a GENDF-specific BR-spread column separates common-mode (benign) from
+    differential (suspect) band-ratio departures.
+    """
+    f.write("\n\n" + "=" * 240 + "\n")
+    f.write("MF=10 CONSISTENCY AUDIT\n")
+    f.write("=" * 240 + "\n\n")
+    f.write("Group-by-group Sum(MF=10 partials) vs the MF=3 total (each MF=10 "
+            "partial aligned to the library group grid; capped at "
+            f"E <= {emax:.3e} eV), for every reaction carrying >=1 metastable "
+            "pathway.\n")
+    f.write("The cap suppresses the >30 MeV MT=5 lumping artifact (MF=10 "
+            "partials stop near 30 MeV while the MF=3 total runs higher).\n")
+    f.write(f"Groups where BOTH sides sit below {CONSISTENCY_ABS_FLOOR:.0e} b "
+            "(evaluator floor dust) are exempt from the deviation scan.\n")
+    f.write("IntRatio and the Thermal/Epithermal/Intermed/Fast ratios are "
+            "LETHARGY-weighted (Sum sigma_g*du_g) partials/total; bands are "
+            f"thermal [grid_min, {_BAND_THERMAL_HI:g} eV) "
+            f"({_BAND_THERMAL_HI:g} eV = Cd cutoff), epithermal "
+            f"[{_BAND_THERMAL_HI:g}, {_BAND_EPITHERMAL_HI:.0e} eV), intermediate "
+            f"[{_BAND_EPITHERMAL_HI:.0e}, {_BAND_INTERMEDIATE_HI:.0e} eV), fast "
+            f"[{_BAND_INTERMEDIATE_HI:.0e} eV, {emax:.3e} eV]; a band-edge group "
+            "is apportioned by lethargy overlap. 'n/a' = no contributing group, "
+            f"zero total, or below-threshold dust (max < "
+            f"{CONSISTENCY_ABS_FLOOR:.0e} b).\n")
+    f.write("E[eV]@max = ENERGY RANGE of the worst-deviation group (group-space "
+            "analog of the pointwise E@max).\n")
+    f.write("BR-spread [GENDF-specific] = max over non-ground partials of "
+            "(max_g - min_g) of the per-group branching fraction "
+            "part_m,g / Sum(parts)_g, measured over the significant groups "
+            "WITHIN the worst-deviating band (max |ratio-1|, where the anomaly "
+            "lives). It separates the two failure modes on the GENDF RATIO "
+            "path:\n")
+    f.write("  * SMALL BR-spread + large band ratios => COMMON-MODE (all "
+            "partials scaled together, branching fraction constant across the "
+            "anomalous band): HARMLESS here -- the runtime applies "
+            "partial/Sum(partials) ratios to an MF=3 rate, so the uniform factor "
+            "cancels.\n")
+    f.write("  * LARGE BR-spread => DIFFERENTIAL defect (partials disagree by "
+            "energy within the anomalous band): genuinely biases the "
+            "branching.\n")
+    f.write("  (Measuring the spread over the FULL range instead would be "
+            "dominated by the reaction's legitimate fast-region branching "
+            "variation and could not tell a benign chord from a real defect.)\n")
+    f.write(f"Offenders (max rel dev > {CONSISTENCY_RTOL:.0e}) are listed "
+            f"worst-first; {audit_clean} audited reaction(s) are clean.\n\n")
+    if not offenders:
+        f.write("No offenders: all audited reactions agree within "
+                f"{CONSISTENCY_RTOL:.0e}.\n")
+        return
+    f.write(f"Total offenders: {len(offenders)}\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
+              f"{'E[eV]@max':>21}  {'Sum-part[b]':>14}  {'Total[b]':>14}  "
+              f"{'IntRatio':>12}  {'Thermal':>10}  {'Epithermal':>10}  "
+              f"{'Intermed':>10}  {'Fast':>10}  {'BR-spread':>10}  {'Notes':<40}")
+    sep = "-" * len(header)
+    f.write(header + "\n" + sep + "\n")
+    for o in sorted(offenders, key=lambda x: x['worst_dev'], reverse=True):
+        sp = o.get('sum_partials')
+        tot = o.get('total')
+        sp_str = f"{sp:.4e}" if sp is not None else "-"
+        tot_str = f"{tot:.4e}" if tot is not None else "-"
+        f.write(f"{o['parent']:<12}  {o['mt']:>5}  {o['reaction']:<12}  "
+                f"{o['worst_dev']:>12.4e}  {_fmt_erange(o):>21}  {sp_str:>14}  "
+                f"{tot_str:>14}  {_fmt_ratio(o.get('integral_ratio')):>12}  "
+                f"{_fmt_ratio(o.get('ratio_thermal')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_epithermal')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_intermediate')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_fast')):>10}  "
+                f"{_fmt_spread(o.get('br_spread')):>10}  "
+                f"{o.get('notes', ''):<40}\n")
+
+
+def _write_rejected_section(f, rejected, reject_band_ratio):
+    """MF=10 REJECTED REACTIONS section: band-ratio-gated reactions left stock."""
+    f.write("\n\n" + "=" * 240 + "\n")
+    f.write("MF=10 REJECTED REACTIONS\n")
+    f.write("=" * 240 + "\n\n")
+    if reject_band_ratio is None:
+        f.write("rejection disabled (audit only): --mf10-reject-band-ratio was "
+                "not set, so no reaction was left stock on audit grounds.\n")
+        f.write("NOTE: on the GENDF ratio path a band-ratio deviation is "
+                "harmless when it is COMMON-MODE (small BR-spread), so rejection "
+                "is OFF by default.\n")
+        return
+    f.write(f"Threshold: --mf10-reject-band-ratio = {reject_band_ratio:.3e}\n")
+    f.write("Criterion: a reaction is left stock (no <isomeric_branching> child) "
+            "when any DEFINED lethargy band ratio has |ratio-1| exceeding the "
+            "threshold, EXCEPT self-loop-ground reactions (exempt).\n")
+    f.write("Consequence: the base reaction keeps its scalar target/Q; the MF=3 "
+            "total routes to the ground target and isomeric branching is "
+            "discarded.\n")
+    f.write("CAUTION: a common-mode band-ratio deviation (small BR-spread) is "
+            "HARMLESS on the GENDF path -- inspect BR-spread before trusting a "
+            "rejection.\n\n")
+    if not rejected:
+        f.write("No reactions exceeded the active threshold.\n")
+        return
+    f.write(f"Total rejected: {len(rejected)}\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'MaxRelDev':>12}  "
+              f"{'E[eV]@max':>21}  {'Thermal':>10}  {'Epithermal':>10}  "
+              f"{'Intermed':>10}  {'Fast':>10}  {'BR-spread':>10}  "
+              f"{'Criterion':<28}  {'Consequence':<40}")
+    sep = "-" * len(header)
+    f.write(header + "\n" + sep + "\n")
+    consequence = "left stock: MF=3 total -> ground target"
+    for o in sorted(rejected, key=lambda x: x['worst_dev'], reverse=True):
+        f.write(f"{o['parent']:<12}  {o['mt']:>5}  {o['reaction']:<12}  "
+                f"{o['worst_dev']:>12.4e}  {_fmt_erange(o):>21}  "
+                f"{_fmt_ratio(o.get('ratio_thermal')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_epithermal')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_intermediate')):>10}  "
+                f"{_fmt_ratio(o.get('ratio_fast')):>10}  "
+                f"{_fmt_spread(o.get('br_spread')):>10}  "
+                f"{o.get('criterion', '-'):<28}  {consequence:<40}\n")
+
+
 def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=None,
                              duplicate_mapping_errors=None, lfs_order_dropped=None,
                              lfs_order_orphan_dk=None, single_target_cases=None,
-                             lfs_sentinels=None):
+                             lfs_sentinels=None, audit_rows=None,
+                             rejected_rows=None):
     """Write comprehensive isomer mapping log."""
     if elis_errors is None:
         elis_errors = []
@@ -1228,6 +1756,10 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
             f.write(f"                    Duplicate mappings resolved: {dup_mapping_count:5d} ({dup_discarded_count} LFS discarded)\n")
         if lfs_sentinels:
             f.write(f"                       LFS sentinel occurrences: {len(lfs_sentinels):5d}\n")
+        if audit_rows is not None and stats is not None:
+            f.write(f"                          MF=10 audit offenders: {stats.get('audit_offenders', 0):5d}\n")
+            f.write(f"                                 MF=10 rejected: {stats.get('mf10_rejected', 0):5d}\n")
+            f.write(f"                 Band-reject exempt (self-loop): {stats.get('band_reject_exempt', 0):5d}\n")
         f.write("\n")
 
         # Column descriptions
@@ -1612,6 +2144,16 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         conflicts = _detect_mapping_conflicts(isomer_mappings)
         _write_conflicts_table(f, conflicts, isomer_mappings, header, sep)
 
+        # MF=10 CONSISTENCY AUDIT + REJECTED sections (group-space band audit)
+        audit_emax = stats.get('audit_emax', 2.0e7) if stats else 2.0e7
+        reject_band_ratio = (stats.get('mf10_reject_band_ratio')
+                             if stats else None)
+        audit_clean = stats.get('audit_clean', 0) if stats else 0
+        offenders = [r for r in (audit_rows or [])
+                     if r.get('worst_dev', 0.0) > CONSISTENCY_RTOL]
+        _write_consistency_audit_section(f, offenders, audit_clean, audit_emax)
+        _write_rejected_section(f, rejected_rows or [], reject_band_ratio)
+
         # LFS SENTINEL VALUES section (report-only safeguard)
         _write_lfs_sentinel_section(f, lfs_sentinels)
 
@@ -1818,7 +2360,9 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
          renormalization_log_file=None,
          prune_nn_prime_self_loops=False,
          suppress_single_target_yields=False,
-         mode='flags_only'):
+         mode='flags_only',
+         audit_emax=2.0e7,
+         mf10_reject_band_ratio=None):
     """
     Main workflow: GENDF MF=10 → OpenMC chain with isomeric branching.
 
@@ -1908,6 +2452,31 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         elif err_type == 'lfs_order_orphan_dk':
             lfs_order_orphan_dk.append(err)
 
+    # Step 4b: MF=10-vs-MF=3 consistency audit (group-space). Always builds the
+    # audit table; --mf10-reject-band-ratio (OFF by default) additionally leaves
+    # a band-inconsistent reaction stock. Rejection is applied by dropping the
+    # reaction from branching_data BEFORE decoration, so every downstream count,
+    # the mapping log, and the output XML all see the reduced (post-reject) set.
+    print("\nStep 4b: MF=10-vs-MF=3 consistency audit "
+          f"(cap E <= {audit_emax:.3e} eV)...")
+    if mf10_reject_band_ratio is None:
+        print("  Audit: detection + logging only (no rejection)")
+    else:
+        print(f"  Audit rejection: |band ratio - 1| > "
+              f"{mf10_reject_band_ratio:.3e} -> reaction left stock "
+              "(self-loop-ground exempt)")
+    (audit_rows, audit_offenders, audit_clean, rejected_rows,
+     band_reject_exempt) = run_mf10_consistency_audit(
+        lib, branching_data, emax=audit_emax,
+        reject_band_ratio=mf10_reject_band_ratio)
+    for row in rejected_rows:
+        branching_data.get(row['parent'], {}).pop(row['reaction'], None)
+    branching_data = {p: rxns for p, rxns in branching_data.items() if rxns}
+    print(f"  Audited: {len(audit_rows)} reaction(s); "
+          f"offenders (dev > {CONSISTENCY_RTOL:.0e}): {audit_offenders}; "
+          f"rejected: {len(rejected_rows)}; self-loop exempt: "
+          f"{band_reject_exempt}")
+
     # Calculate counts for summary
     # branching_data structure: {nuclide: {reaction_name: IsomericBranching}}
     mapped_count = sum(
@@ -1949,6 +2518,9 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         print(f"                     Orphan DK states (no LFS): {orphan_count:5d}")
     if dup_mappings:
         print(f"                    Duplicate mappings resolved: {dup_mappings:5d} ({dup_discarded} LFS discarded)")
+    print(f"                          MF=10 audit offenders: {audit_offenders:5d}")
+    print(f"                                 MF=10 rejected: {len(rejected_rows):5d}")
+    print(f"                 Band-reject exempt (self-loop): {band_reject_exempt:5d}")
 
     # Report-only LFS sentinel scan (see SENTINEL_LFS): flag products/partials
     # whose GENDF MF=10 LFS is a library "unspecified level" sentinel (99 / 40)
@@ -2014,6 +2586,12 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             'elis_atol': elis_atol,
             'gendf_nuclides_total': len(lib.available_nuclides()),
             'chain_nuclides_total': len(chain.nuclides),
+            'audit_emax': audit_emax,
+            'mf10_reject_band_ratio': mf10_reject_band_ratio,
+            'audit_clean': audit_clean,
+            'audit_offenders': audit_offenders,
+            'mf10_rejected': len(rejected_rows),
+            'band_reject_exempt': band_reject_exempt,
         }
         write_isomer_mapping_log(summary['elis_mappings'], isomer_mapping_log_file,
                                 stats=stats, elis_errors=elis_errors,
@@ -2021,7 +2599,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
                                 lfs_order_dropped=lfs_order_dropped,
                                 lfs_order_orphan_dk=lfs_order_orphan_dk,
                                 single_target_cases=summary.get('single_target_cases', []),
-                                lfs_sentinels=lfs_sentinels)
+                                lfs_sentinels=lfs_sentinels,
+                                audit_rows=audit_rows, rejected_rows=rejected_rows)
 
     return chain
 
@@ -2056,6 +2635,11 @@ if __name__ == '__main__':
     if args.suppress_single_target_yields:
         print("Suppress single-target yields: ENABLED")
     print(f"Output mode:  {args.mode}")
+    print(f"Audit emax:   {args.audit_emax:.3e} eV")
+    if args.mf10_reject_band_ratio is None:
+        print("MF=10 reject: off (audit only)")
+    else:
+        print(f"MF=10 reject: |band ratio - 1| > {args.mf10_reject_band_ratio}")
     print(f"\nInput chain:  {config['base_chain']}")
     print(f"Output chain: {output_chain}")
     print(f"Mapping log:  {log_file}")
@@ -2074,7 +2658,9 @@ if __name__ == '__main__':
         isomer_mapping_log_file=log_file,
         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
         suppress_single_target_yields=args.suppress_single_target_yields,
-        mode=args.mode
+        mode=args.mode,
+        audit_emax=args.audit_emax,
+        mf10_reject_band_ratio=args.mf10_reject_band_ratio
     )
 
     print("\n" + "=" * 70)

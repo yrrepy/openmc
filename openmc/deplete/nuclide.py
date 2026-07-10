@@ -252,8 +252,20 @@ class Nuclide:
         # Check for reaction paths
         for reaction_elem in element.iter('reaction'):
             r_type = get_text(reaction_elem, "type")
-            Q = float(get_text(reaction_elem, "Q", 0.0))
             branching_ratio = float(get_text(reaction_elem, "branching_ratio", 1.0))
+
+            # Read the scalar Q as raw text so an absent attribute can be told
+            # apart from an explicit "0.0". In the folded isomeric-branching
+            # form a BRANCHED reaction carries neither ``target`` nor ``Q`` on
+            # the <reaction> element -- both live on the <isomeric_branching>
+            # child's ground (first) entry -- so fall back to that child to keep
+            # the in-memory ReactionTuple's legacy fields populated. This is
+            # behaviour-preserving: form_rxn_matrix uses ``.target`` as the
+            # single-target fallback (and _build_isomeric_families_cache treats
+            # ``.target`` as the ground pathway), while ``.Q`` feeds heating; in
+            # both the value must equal the ground pathway's, exactly as the old
+            # top-level attributes did.
+            Q_text = get_text(reaction_elem, "Q")
 
             # If the type is not fission, get target and Q value, otherwise
             # just set null values
@@ -261,7 +273,22 @@ class Nuclide:
                 target = get_text(reaction_elem, "target")
                 if target is not None and target.lower() == "nothing":
                     target = None
+                if target is None or Q_text is None:
+                    iso_elem = reaction_elem.find('isomeric_branching')
+                    if iso_elem is not None:
+                        iso_targets = iso_elem.get('targets', '').split()
+                        # Accept the GENDF-fork ``Q`` attribute and the
+                        # PENDF-style ``q_values`` (forward-compat).
+                        q_attr = iso_elem.get('Q')
+                        if q_attr is None:
+                            q_attr = iso_elem.get('q_values')
+                        if target is None and iso_targets:
+                            target = iso_targets[0]
+                        if Q_text is None and q_attr:
+                            Q_text = q_attr.split()[0]
+                Q = float(Q_text) if Q_text is not None else 0.0
             else:
+                Q = float(Q_text) if Q_text is not None else 0.0
                 target = None
                 if fission_q is not None:
                     Q = fission_q

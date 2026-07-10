@@ -154,14 +154,27 @@ def _parse_isomeric_state(nuclide: str) -> tuple:
 
 
 def _load_isomeric_branching_targets(root):
-    """Load isomeric branching targets, LFS values, and embedded ratios from XML.
+    """Load isomeric branching targets, LFS values, Q values, and embedded ratios.
 
-    Returns (targets_data, lfs_data, embedded_data), each dict or None.
+    Returns (targets_data, lfs_data, q_data, embedded_data), each dict or None.
+
+    Both chain-XML shapes are accepted for a branched ``<reaction>``:
+
+    * legacy: scalar ``target``/``Q`` on the ``<reaction>`` element and an
+      ``<isomeric_branching targets=... gendf_lfs=.../>`` child with no Q;
+    * folded: the ``<reaction>`` carries only ``type`` and the child carries the
+      per-pathway ``Q`` (or forward-compatible ``q_values``) parallel-list
+      alongside ``targets``/``gendf_lfs``.
+
+    The per-pathway Q list is retained in ``q_data`` purely so the writer can
+    re-emit it losslessly (round-trip fidelity); it is not consumed at runtime
+    (Q does not enter :meth:`form_rxn_matrix`).
     """
     from openmc._xml import get_text
 
     targets_data = {}
     lfs_data = {}
+    q_data = {}
     embedded_data = {}
 
     for nuclide_elem in root.findall('nuclide'):
@@ -171,6 +184,7 @@ def _load_isomeric_branching_targets(root):
 
         nuc_reactions = {}
         nuc_lfs = {}
+        nuc_q = {}
 
         for reaction_elem in nuclide_elem.findall('reaction'):
             rx_type = reaction_elem.get('type')
@@ -193,6 +207,22 @@ def _load_isomeric_branching_targets(root):
                                 f"gendf_lfs count ({len(lfs_vals)}) != "
                                 f"target count ({len(targets)}) for "
                                 f"{nuc_name}/{rx_type}, ignoring LFS")
+                    # Per-pathway Q parallel-list (folded form). Accept both the
+                    # GENDF-fork ``Q`` attribute and the PENDF-style
+                    # ``q_values``. A legacy child has neither -- the scalar Q on
+                    # the <reaction> is used by the writer's replicate fallback.
+                    q_attr = iso_elem.get('Q')
+                    if q_attr is None:
+                        q_attr = iso_elem.get('q_values')
+                    if q_attr:
+                        q_vals = q_attr.split()
+                        if len(q_vals) == len(targets):
+                            nuc_q[rx_type] = q_vals
+                        else:
+                            warn(
+                                f"isomeric_branching Q count ({len(q_vals)}) != "
+                                f"target count ({len(targets)}) for "
+                                f"{nuc_name}/{rx_type}, ignoring Q")
                 continue
 
             # Legacy <isomeric_yields> with embedded ratios
@@ -241,15 +271,32 @@ def _load_isomeric_branching_targets(root):
             targets_data[nuc_name] = nuc_reactions
         if nuc_lfs:
             lfs_data[nuc_name] = nuc_lfs
+        if nuc_q:
+            q_data[nuc_name] = nuc_q
 
     targets_out = targets_data if targets_data else None
     lfs_out = lfs_data if lfs_data else None
+    q_out = q_data if q_data else None
     embedded_out = embedded_data if embedded_data else None
-    return targets_out, lfs_out, embedded_out
+    return targets_out, lfs_out, q_out, embedded_out
 
 
-def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
-    """Write isomeric branching targets and LFS values to chain XML."""
+def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
+                                      q_data=None):
+    """Write isomeric branching targets, LFS values, and per-pathway Q to XML.
+
+    Emits the folded form: for every BRANCHED reaction the scalar ``target`` and
+    ``Q`` are stripped from the ``<reaction>`` element and instead carried on the
+    ``<isomeric_branching>`` child as parallel ``targets``/``gendf_lfs``/``Q``
+    lists (one entry per pathway, ground first). Unbranched reactions are left
+    untouched (they keep their scalar ``target``/``Q``).
+
+    The child's ``Q`` list is the stored per-pathway Q (``q_data``) when known;
+    for a chain loaded from the legacy shape -- which carried only a single
+    reaction-level Q -- that scalar Q is REPLICATED across every target (the code
+    already assumes "Q value is independent of target state", see
+    :meth:`set_branch_ratios`), so no per-pathway Q is invented.
+    """
     if targets_data is None:
         return
 
@@ -265,8 +312,17 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
             if not rx_type or rx_type not in nuc_targets:
                 continue
 
+            targets = nuc_targets[rx_type]
+
+            # Fold: the branched reaction's per-pathway data lives ONLY on the
+            # child. Capture the scalar Q (for the replicate fallback) then drop
+            # the scalar target/Q from the <reaction> element.
+            scalar_q = reaction_elem.get('Q')
+            reaction_elem.attrib.pop('target', None)
+            reaction_elem.attrib.pop('Q', None)
+
             iso_elem = ET.SubElement(reaction_elem, 'isomeric_branching')
-            iso_elem.set('targets', ' '.join(nuc_targets[rx_type]))
+            iso_elem.set('targets', ' '.join(targets))
             # Write gendf_lfs
             if (lfs_data is not None
                     and nuc_name in lfs_data
@@ -274,6 +330,20 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None):
                 lfs_vals = lfs_data[nuc_name][rx_type]
                 iso_elem.set('gendf_lfs',
                              ' '.join(str(v) for v in lfs_vals))
+
+            # Write the per-pathway Q parallel-list. Prefer stored per-pathway Q;
+            # otherwise replicate the reaction's scalar Q across all targets.
+            q_vals = None
+            if (q_data is not None
+                    and nuc_name in q_data
+                    and rx_type in q_data[nuc_name]):
+                stored = q_data[nuc_name][rx_type]
+                if len(stored) == len(targets):
+                    q_vals = [str(v) for v in stored]
+            if q_vals is None and scalar_q is not None:
+                q_vals = [scalar_q] * len(targets)
+            if q_vals is not None:
+                iso_elem.set('Q', ' '.join(q_vals))
 
 
 def replace_missing(product, decay_data):
@@ -428,6 +498,7 @@ class Chain:
         self._decay_matrix = None
         self.isomeric_branching_targets = None
         self.isomeric_branching_lfs = None
+        self.isomeric_branching_q = None
         self.isomeric_branching_embedded = None
         self.reduce_pruned_targets = None
 
@@ -726,7 +797,7 @@ class Chain:
 
         # Load isomeric branching data if present
         chain.isomeric_branching_targets, chain.isomeric_branching_lfs, \
-            chain.isomeric_branching_embedded = \
+            chain.isomeric_branching_q, chain.isomeric_branching_embedded = \
             _load_isomeric_branching_targets(root)
 
         # Pre-compute isomeric families cache for faster reduction operations
@@ -760,7 +831,8 @@ class Chain:
         if self.isomeric_branching_targets is not None:
             _write_isomeric_branching_targets(root_elem,
                                               self.isomeric_branching_targets,
-                                              self.isomeric_branching_lfs)
+                                              self.isomeric_branching_lfs,
+                                              self.isomeric_branching_q)
 
         tree = ET.ElementTree(root_elem)
         tree.write(str(filename), encoding='utf-8', pretty_print=True)
@@ -1686,12 +1758,14 @@ class Chain:
         if self.isomeric_branching_targets:
             new_targets = {}
             new_lfs = {}
+            new_q = {}
             pruned = {}
             for parent, reactions in self.isomeric_branching_targets.items():
                 if parent not in all_isotopes:
                     continue
                 new_reactions = {}
                 new_lfs_reactions = {}
+                new_q_reactions = {}
                 pruned_reactions = {}
                 for rx_type, target_list in reactions.items():
                     retained_indices = [i for i, t in enumerate(target_list)
@@ -1707,20 +1781,31 @@ class Chain:
                             lfs_list = self.isomeric_branching_lfs[parent][rx_type]
                             new_lfs_reactions[rx_type] = [lfs_list[i]
                                                           for i in retained_indices]
+                        # Keep per-pathway Q in sync (parallel to targets/LFS)
+                        if (self.isomeric_branching_q
+                                and parent in self.isomeric_branching_q
+                                and rx_type in self.isomeric_branching_q[parent]):
+                            q_list = self.isomeric_branching_q[parent][rx_type]
+                            new_q_reactions[rx_type] = [q_list[i]
+                                                        for i in retained_indices]
                     if removed:
                         pruned_reactions[rx_type] = removed
                 if new_reactions:
                     new_targets[parent] = new_reactions
                 if new_lfs_reactions:
                     new_lfs[parent] = new_lfs_reactions
+                if new_q_reactions:
+                    new_q[parent] = new_q_reactions
                 if pruned_reactions:
                     pruned[parent] = pruned_reactions
             new_chain.isomeric_branching_targets = new_targets or None
             new_chain.isomeric_branching_lfs = new_lfs or None
+            new_chain.isomeric_branching_q = new_q or None
             new_chain.reduce_pruned_targets = pruned or None
         else:
             new_chain.isomeric_branching_targets = None
             new_chain.isomeric_branching_lfs = None
+            new_chain.isomeric_branching_q = None
             new_chain.reduce_pruned_targets = None
 
         # Filter embedded branching ratios for reduced chain
