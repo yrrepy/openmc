@@ -375,6 +375,43 @@ def test_consistency_check_warns_on_mismatch():
     np.testing.assert_allclose(table.xs_matrix[1], [0.5])
 
 
+def test_floor_dust_mismatch_does_not_warn(recwarn):
+    """Groups where BOTH the total and the summed partials sit below the
+    absolute floor are evaluator placeholder dust (e.g. JEFF-4.0's 1e-20 b
+    "effective zero" floored independently per section, giving exact 2:1
+    ratios): their relative deviation is meaningless and must not warn."""
+    fake = _FakePendf(
+        mf3={"Am241": {102: _const(1.0e-20)}},
+        mf10={"Am241": {102: {
+            0: ("Am242", _const(1.0e-20)),
+            2: ("Am242_m1", _const(1.0e-20)),   # sum 2e-20 vs total 1e-20
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+
+    table = _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
+
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]
+    assert len(recwarn) == 0
+
+
+def test_meaningful_partials_vs_dust_total_still_warns():
+    """A meaningful partial against a floor-dust total is a genuine
+    inconsistency, not placeholder noise -- the floor exemption requires
+    BOTH sides to be dust."""
+    fake = _FakePendf(
+        mf3={"Am241": {102: _const(1.0e-20)}},
+        mf10={"Am241": {102: {
+            0: ("Am242", _const(2.0)),          # 2 b vs dust total
+            2: ("Am242_m1", _const(0.5)),
+        }}})
+    edges = np.array([0.0, 2.0e7])
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})
+
+    with pytest.warns(UserWarning, match="partials"):
+        _build_xs_table_pendf(["Am241"], ["(n,gamma)"], edges, fake, chain)
+
+
 def test_matching_partials_do_not_warn(recwarn):
     """Partials that sum to the total within tolerance emit no warning."""
     fake = _FakePendf(

@@ -891,6 +891,14 @@ def _liso_from_gnds(name: str) -> int:
 # isomeric nuclide at full-library scale.
 CONSISTENCY_RTOL = 1e-5
 
+# Groups where BOTH the MF=3 total and the summed partials sit below this
+# (barns) are evaluator floor placeholders (e.g. the ubiquitous 1e-20 b
+# "effective zero" in JEFF-4.0, floored independently per section), not
+# physics -- their relative deviation is meaningless. A group is only
+# exempt when both sides are dust: a meaningful partial against a dust
+# total (or vice versa) is a genuine inconsistency and still warns.
+CONSISTENCY_ABS_FLOOR = 1e-15
+
 # Trailing metastable qualifier ('_m1') on nuclide names / qualified
 # reaction types.
 _ISOMER_SUFFIX = re.compile(r'_m\d+$')
@@ -899,10 +907,13 @@ _ISOMER_SUFFIX = re.compile(r'_m\d+$')
 def _partials_total_max_deviation(total_g, part_sum):
     """Max relative deviation of summed MF=10 partials from the MF=3 total.
 
-    Returns (worst, group_idx) over groups with nonzero total, or
-    (0.0, -1) when every group's total is zero.
+    Returns (worst, group_idx) over groups with nonzero total, skipping
+    groups where both sides are below ``CONSISTENCY_ABS_FLOOR`` (evaluator
+    floor dust). Returns (0.0, -1) when no group qualifies.
     """
-    nz = total_g != 0.0
+    nz = (total_g != 0.0) & (
+        (np.abs(total_g) >= CONSISTENCY_ABS_FLOOR)
+        | (np.abs(part_sum) >= CONSISTENCY_ABS_FLOOR))
     if not nz.any():
         return 0.0, -1
     dev = np.abs(part_sum[nz] - total_g[nz]) / np.abs(total_g[nz])
