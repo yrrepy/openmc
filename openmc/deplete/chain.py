@@ -281,8 +281,33 @@ def _load_isomeric_branching_targets(root):
     return targets_out, lfs_out, q_out, embedded_out
 
 
+def _write_embedded_yields(reaction_elem, data):
+    """Re-emit stored energy-dependent ratios as an ``<isomeric_yields>`` child."""
+    yields_elem = ET.SubElement(reaction_elem, 'isomeric_yields')
+    yields_elem.set('type', 'energy_dependent')
+
+    energies = data['energies']
+    targets = data['targets']
+    ratios = data['branching_ratios']
+
+    energies_elem = ET.SubElement(yields_elem, 'energies')
+    energies_elem.text = ' '.join(f'{e:.6e}' for e in energies)
+
+    targets_elem = ET.SubElement(yields_elem, 'targets')
+    targets_elem.text = ' '.join(targets)
+
+    ratios_elem = ET.SubElement(yields_elem, 'branching_ratios')
+    lines = []
+    for target in targets:
+        vals = ratios.get(target)
+        if vals is None:
+            vals = [0.0] * len(energies)
+        lines.append('          ' + ' '.join(f'{r:.6e}' for r in vals))
+    ratios_elem.text = '\n' + '\n'.join(lines) + '\n        '
+
+
 def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
-                                      q_data=None):
+                                      q_data=None, embedded_data=None):
     """Write isomeric branching targets, LFS values, and per-pathway Q to XML.
 
     Emits the folded form: for every BRANCHED reaction the scalar ``target`` and
@@ -303,16 +328,24 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
     reaction-level Q -- that scalar Q is REPLICATED across every target (the code
     already assumes "Q value is independent of target state", see
     :meth:`set_branch_ratios`), so no per-pathway Q is invented.
+
+    Reactions carrying embedded energy-dependent ratios (``embedded_data``) are
+    re-emitted as the legacy ``<isomeric_yields>`` child instead of the flags
+    form, keeping their scalar ``target``/``Q`` so the ratios round-trip.
     """
-    if targets_data is None:
+    targets_data = targets_data or {}
+    embedded_data = embedded_data or {}
+    if not targets_data and not embedded_data:
         return
+
+    nuc_names = set(targets_data) | {parent for parent, _rx in embedded_data}
 
     for nuclide_elem in root_elem.findall('nuclide'):
         nuc_name = nuclide_elem.get('name')
-        if not nuc_name or nuc_name not in targets_data:
+        if not nuc_name or nuc_name not in nuc_names:
             continue
 
-        nuc_targets = targets_data[nuc_name]
+        nuc_targets = targets_data.get(nuc_name, {})
 
         # Count same-type elements so multi-entry branched reactions are
         # emitted once and never folded
@@ -324,11 +357,21 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
 
         for reaction_elem in reaction_elems:
             rx_type = reaction_elem.get('type')
-            if not rx_type or rx_type not in nuc_targets:
+            if not rx_type:
+                continue
+            has_embedded = (nuc_name, rx_type) in embedded_data
+            if rx_type not in nuc_targets and not has_embedded:
                 continue
             if rx_type in emitted:
                 continue
             emitted.add(rx_type)
+
+            # Embedded ratios take precedence: emit the lossless legacy form and
+            # leave the reaction's scalar target/Q untouched.
+            if has_embedded:
+                _write_embedded_yields(reaction_elem,
+                                       embedded_data[(nuc_name, rx_type)])
+                continue
 
             targets = nuc_targets[rx_type]
 
@@ -834,8 +877,8 @@ class Chain:
 
         .. versionadded:: 0.15.3
             Isomeric branching data is now included in exported XML files.
-            The exported chain can be reloaded with full fidelity, including
-            any renormalized branching ratios from chain reduction operations.
+            Both flag-only branching (targets, ``gendf_lfs``, per-pathway Q)
+            and embedded energy-dependent ratios round-trip losslessly.
 
         Parameters
         ----------
@@ -847,12 +890,15 @@ class Chain:
         for nuclide in self.nuclides:
             root_elem.append(nuclide.to_xml_element())
 
-        # Write isomeric branching targets if present
-        if self.isomeric_branching_targets is not None:
+        # Write isomeric branching data if present. Flags (targets + gendf_lfs)
+        # and embedded energy-dependent ratios both round-trip losslessly.
+        if (self.isomeric_branching_targets is not None
+                or self.isomeric_branching_embedded is not None):
             _write_isomeric_branching_targets(root_elem,
                                               self.isomeric_branching_targets,
                                               self.isomeric_branching_lfs,
-                                              self.isomeric_branching_q)
+                                              self.isomeric_branching_q,
+                                              self.isomeric_branching_embedded)
 
         tree = ET.ElementTree(root_elem)
         tree.write(str(filename), encoding='utf-8', pretty_print=True)
