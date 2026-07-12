@@ -179,7 +179,9 @@ class CoupledOperator(OpenMCOperator):
         .. versionadded:: 0.12
     keep_isomeric_siblings : bool, optional
         Whether to keep all isomeric state siblings together during chain
-        reduction:
+        reduction. Only takes effect when the chain carries isomeric-branching
+        metadata; with an official chain that has none, this flag is a no-op and
+        reduction matches upstream.
 
         - True (default): Always keep all isomeric siblings (ground +
           metastables) when any state is reachable. Required for correct

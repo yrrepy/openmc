@@ -73,7 +73,9 @@ class IndependentOperator(OpenMCOperator):
         value of ``None`` implies no limit on the depth.
     keep_isomeric_siblings : bool, optional
         Whether to keep all isomeric state siblings together during chain
-        reduction:
+        reduction. Only takes effect when the chain carries
+        isomeric-branching metadata; chains without any (e.g. official
+        chains) are unaffected by this flag:
 
         - True (default): Always keep all isomeric siblings (ground +
           metastables) when any state is reachable. Required for correct
@@ -281,7 +283,9 @@ class IndependentOperator(OpenMCOperator):
             value of ``None`` implies no limit on the depth.
         keep_isomeric_siblings : bool, optional
             Whether to keep all isomeric state siblings together during chain
-            reduction:
+            reduction. Only takes effect when the chain carries
+            isomeric-branching metadata; chains without any (e.g. official
+            chains) are unaffected by this flag:
 
             - True (default): Always keep all isomeric siblings (ground +
               metastables) when any state is reachable. Required for correct
@@ -361,7 +365,8 @@ class IndependentOperator(OpenMCOperator):
         reduce_chain_level : int, optional
             Depth of the search when reducing the depletion chain.
         keep_isomeric_siblings : bool, optional
-            Whether to keep isomeric siblings. Defaults to True.
+            Whether to keep isomeric siblings. Defaults to True. No-op
+            without isomeric-branching metadata.
         fission_yield_opts : dict, optional
             Arguments for the FissionYieldHelper.
         gendf_library : GENDFLibrary, optional

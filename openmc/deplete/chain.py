@@ -1664,9 +1664,10 @@ class Chain:
 
         .. versionadded:: 0.15.3
             Isomeric branching data is now filtered and preserved in reduced
-            chains. When isomeric targets are partially excluded, branching
-            ratios are automatically renormalized to sum to 1.0, preserving
-            mass conservation.
+            chains. When isomeric targets are partially excluded the surviving
+            targets are retained (and pruned ones recorded); the ratios
+            themselves are renormalized to sum to 1.0 later -- at runtime for
+            flag-only chains and at patch time for embedded ratios -- not here.
 
         Parameters
         ----------
@@ -1680,7 +1681,10 @@ class Chain:
             of the initial isotopes and their progeny should be
             explored
         keep_isomeric_siblings : bool, optional
-            Whether to keep all isomeric state siblings together:
+            Whether to keep all isomeric state siblings together. Only takes
+            effect for chains that carry isomeric-branching metadata; for a
+            vanilla/official chain without it this flag is a no-op and
+            ``reduce()`` matches the upstream (sibling-independent) result.
 
             - True (default): Always keep all isomeric siblings (ground +
               metastables) when any state is reachable. Required for correct
@@ -1698,9 +1702,9 @@ class Chain:
             Depletion chain containing isotopes that would appear
             after following up to ``level`` reactions and decay paths.
             If the original chain contains isomeric branching data,
-            the reduced chain will include filtered and renormalized
-            isomeric branching for reactions where at least one target
-            is retained.
+            the reduced chain will include the filtered isomeric branching
+            (targets/LFS/Q and embedded ratios) for reactions where at least
+            one target is retained.
 
         Notes
         -----
@@ -1709,14 +1713,12 @@ class Chain:
         Energy-dependent isomeric branching data is filtered based on which
         isotopes are included in the reduced chain:
 
-        - **All targets retained**: Original branching ratios preserved
-        - **All targets excluded**: Isomeric branching entry dropped for that reaction
-        - **Partial exclusion**: Branching ratios renormalized to sum to 1.0
-
-        The renormalization ensures mass conservation. For example, if a reaction
-        produces 95% ground state and 5% metastable state, and the metastable
-        state is excluded from the reduced chain, the ground state branching
-        ratio is renormalized to 100%.
+        - **All targets retained**: branching data preserved unchanged
+        - **All targets excluded**: isomeric branching entry dropped for that reaction
+        - **Partial exclusion**: surviving targets kept, pruned ones recorded in
+          ``reduce_pruned_targets``; the remaining ratios are renormalized to sum
+          to 1.0 downstream (at runtime for flag-only chains, at patch time for
+          embedded ratios), preserving mass conservation
 
         This behavior is consistent with fission yield handling, where products
         are filtered and yields are implicitly renormalized.
@@ -1736,14 +1738,19 @@ class Chain:
                 f"{type(keep_isomeric_siblings).__name__}"
             )
 
+        # Sibling expansion only matters for chains that actually carry
+        # isomeric-branching metadata; gating on it keeps reduce() byte-identical
+        # to upstream for vanilla/official chains (no spurious 10-30% growth).
+        has_iso_metadata = self.isomeric_branching_targets is not None
+        expand_siblings = keep_isomeric_siblings and has_iso_metadata
+
         # First pass: Follow reactions, including isomeric branching targets
-        # if keep_isomeric_siblings is True
-        include_iso_targets = keep_isomeric_siblings
+        # when expansion is active
         all_isotopes = self._follow(set(initial_isotopes), level,
-                                   include_isomeric_targets=include_iso_targets)
+                                   include_isomeric_targets=expand_siblings)
 
         # Expand to include isomeric siblings if requested
-        if keep_isomeric_siblings:
+        if expand_siblings:
             self._expand_with_isomeric_siblings(all_isotopes)
 
         # Avoid re-sorting for fission yields

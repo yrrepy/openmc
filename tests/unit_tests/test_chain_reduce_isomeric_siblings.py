@@ -125,7 +125,7 @@ def test_reduce_siblings_policy_true():
 
 
 def test_reduce_siblings_true_no_branching():
-    """Test policy=True includes siblings even without isomeric branching data."""
+    """policy=True is a no-op without isomeric branching metadata (vanilla parity)."""
     chain = openmc.deplete.Chain()
 
     # Create a chain without isomeric branching
@@ -143,12 +143,12 @@ def test_reduce_siblings_true_no_branching():
     # No isomeric branching data
     chain.isomeric_branching_targets = None
 
-    # Reduce with policy=True
+    # Reduce with policy=True; the flag is gated on isomeric metadata, so an
+    # unbranched sibling (Cd112_m1) is NOT pulled in -- matches upstream/False.
     reduced = chain.reduce(['Cd111'], level=1, keep_isomeric_siblings=True)
-
-    # Should include Cd112_m1 even without isomeric branching
     nuclide_names = {n.name for n in reduced.nuclides}
-    assert nuclide_names == {'Cd111', 'Cd112', 'Cd112_m1'}
+    assert nuclide_names == {'Cd111', 'Cd112'}
+    assert 'Cd112_m1' not in nuclide_names
 
 
 # ==================== Tests for Type Validation ====================
