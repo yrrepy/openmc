@@ -185,16 +185,21 @@ class IndependentOperator(OpenMCOperator):
             fluxes = [fluxes[i] for i in index_sort]
             micros = [micros[i] for i in index_sort]
 
-        # Store energy bins if present in flux tuples
+        # Store energy bins if present. Accept (flux, energy_bounds) tuples, a
+        # Flux ndarray subclass (carries .energy_bounds), or a bare array.
         self._energy_bins = None
         self._flux_with_energy = []
         for flux_item in fluxes:
             if isinstance(flux_item, tuple) and len(flux_item) == 2:
-                self._flux_with_energy.append(flux_item)
-                if self._energy_bins is None:
-                    self._energy_bins = flux_item[1]
+                flux_arr, energy_bounds = flux_item
+            elif getattr(flux_item, 'energy_bounds', None) is not None:
+                flux_arr = np.asarray(flux_item)
+                energy_bounds = flux_item.energy_bounds
             else:
-                self._flux_with_energy.append((flux_item, None))
+                flux_arr, energy_bounds = flux_item, None
+            self._flux_with_energy.append((flux_arr, energy_bounds))
+            if energy_bounds is not None and self._energy_bins is None:
+                self._energy_bins = energy_bounds
         super().__init__(
             materials=materials,
             cross_sections=micros,

@@ -48,6 +48,53 @@ DomainTypes: TypeAlias = Union[
 ]
 
 
+class Flux(np.ndarray):
+    """Multigroup flux array carrying its energy-group boundaries.
+
+    A thin :class:`numpy.ndarray` subclass returned by
+    :func:`get_microxs_and_flux`. It behaves exactly like a 1D flux array
+    (indexing, arithmetic, ``.sum()``, ...) while also transporting the energy
+    group boundaries in the :attr:`energy_bounds` attribute so downstream
+    isomeric-branching logic can recover the group structure. Because it *is*
+    an ndarray, code that previously expected a plain array keeps working.
+
+    .. versionadded:: 0.15.4
+
+    Parameters
+    ----------
+    input_array : array_like
+        Flux values in each energy group in [n-cm/src].
+    energy_bounds : iterable of float, optional
+        Energy group boundaries in [eV]; length ``len(input_array) + 1``.
+
+    Attributes
+    ----------
+    energy_bounds : numpy.ndarray or None
+        Energy group boundaries in [eV], or ``None`` if not provided.
+
+    """
+
+    def __new__(cls, input_array, energy_bounds=None):
+        obj = np.asarray(input_array).view(cls)
+        obj.energy_bounds = (None if energy_bounds is None
+                             else np.asarray(energy_bounds))
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.energy_bounds = getattr(obj, 'energy_bounds', None)
+
+    def __reduce__(self):
+        # Append energy_bounds to ndarray's pickle state
+        reconstruct, args, state = super().__reduce__()
+        return reconstruct, args, state + (self.energy_bounds,)
+
+    def __setstate__(self, state):
+        self.energy_bounds = state[-1]
+        super().__setstate__(state[:-1])
+
+
 def get_microxs_and_flux(
     model: openmc.Model,
     domains: DomainTypes,
@@ -62,7 +109,7 @@ def get_microxs_and_flux(
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary' | None = None,
     reaction_rate_opts: dict | None = None,
     gendf_mt4_fallback: bool = False,
-) -> tuple[list[np.ndarray], list[MicroXS]]:
+) -> tuple[list[Flux], list[MicroXS]]:
     """Generate microscopic cross sections and fluxes for multiple domains.
 
     This function runs a neutron transport solve to obtain the flux and reaction
@@ -135,8 +182,11 @@ def get_microxs_and_flux(
 
     Returns
     -------
-    list of numpy.ndarray
-        Flux in each group in [n-cm/src] for each domain
+    list of openmc.deplete.Flux
+        Flux in each group in [n-cm/src] for each domain. Each :class:`Flux`
+        is a :class:`numpy.ndarray` subclass that also carries the energy group
+        boundaries in its ``energy_bounds`` attribute (backward compatible with
+        plain-array expectations).
     list of MicroXS
         Cross section data in [b] for each domain
 
@@ -339,10 +389,10 @@ def get_microxs_and_flux(
     # Reset tallies
     model.tallies = original_tallies
 
-    # Package flux with energy information for isomeric branching
-    fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
+    # Return Flux arrays carrying the energy grid for isomeric branching
+    fluxes = [Flux(f, energy_bounds=energy_filter.values) for f in fluxes]
 
-    return fluxes_with_energy, micros
+    return fluxes, micros
 
 
 def get_gendfxs_and_flux(
@@ -355,7 +405,7 @@ def get_gendfxs_and_flux(
     path_statepoint: PathLike | None = None,
     path_input: PathLike | None = None,
     run_kwargs=None
-) -> tuple[list[tuple[np.ndarray, Sequence[float]]], list[MicroXS]]:
+) -> tuple[list[Flux], list[MicroXS]]:
     """Generate microscopic cross sections and fluxes for multiple domains using GENDF library.
 
     This function runs a neutron transport solve to obtain the flux in the
@@ -398,10 +448,10 @@ def get_gendfxs_and_flux(
 
     Returns
     -------
-    list of tuple of (numpy.ndarray, energies)
-        For each domain, a tuple containing:
-        - Flux in each group in [n-cm/src]
-        - Energy boundaries used for the flux
+    list of openmc.deplete.Flux
+        Flux in each group in [n-cm/src] for each domain. Each :class:`Flux`
+        is a :class:`numpy.ndarray` subclass that also carries the energy group
+        boundaries in its ``energy_bounds`` attribute.
     list of MicroXS
         Cross section data in [b] for each domain, retrieved from GENDF library
 
@@ -526,9 +576,9 @@ def get_gendfxs_and_flux(
     # Reset tallies
     model.tallies = original_tallies
 
-    # Package flux with energy information for isomeric branching
-    fluxes_with_energy = [(f, energy_filter.values) for f in fluxes]
-    return fluxes_with_energy, micros
+    # Return Flux arrays carrying the energy grid for isomeric branching
+    fluxes = [Flux(f, energy_bounds=energy_filter.values) for f in fluxes]
+    return fluxes, micros
 
 
 def _apply_gendf_mt4_fallback(micros, fluxes, gendf_library,
