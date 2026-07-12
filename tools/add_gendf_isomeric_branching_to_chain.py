@@ -464,8 +464,9 @@ def _audit_reaction_gendf(lib, parent, mt, emax=2.0e7):
     Reads the MF=3 total (per-group) and every MF=10 production partial
     (``IZAP != 0``, ground + metastable), each aligned to the library group grid
     via the reader's ``_extract_xs`` -- which handles a threshold partial's group
-    offset. (``_get_production_xs`` is NOT used: its front-trim assumes coverage
-    starts at group 0 and would misplace threshold partials.) Groups whose low
+    offset. (``_get_production_xs`` now performs the same energy-aware alignment
+    of partial-range MF=10 bands; ``_extract_xs`` is kept here simply because the
+    audit already holds each raw level from ``_load_mf10_data``.) Groups whose low
     edge is at or above ``emax`` are dropped from the worst-deviation scan; band
     ratios cap via the fast band's lethargy overlap at ``emax``.
 
@@ -1242,7 +1243,11 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
             continue
 
         nuc_elem = nuclide_map[nuclide_name]
-        reaction_map = {rx.get('type'): rx for rx in nuc_elem.findall('reaction')}
+        # Multimap: official chains represent a branched reaction as multiple
+        # same-type elements (one per static pathway)
+        reaction_map = {}
+        for rx in nuc_elem.findall('reaction'):
+            reaction_map.setdefault(rx.get('type'), []).append(rx)
 
         for reaction_type, branching in nuclide_reactions.items():
             if reaction_type not in reaction_map:
@@ -1305,7 +1310,11 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     })
 
             # Detect single-target cases - ALWAYS log regardless of suppress flag
-            rx_elem = reaction_map[reaction_type]
+            # For multi-entry reactions keep the ground-target element as the
+            # survivor (duplicates are folded away at the write step below)
+            rx_elems = reaction_map[reaction_type]
+            rx_elem = next((e for e in rx_elems
+                            if e.get('target') == valid_products[0]), rx_elems[0])
             original_target = rx_elem.get('target')
 
             if len(valid_products) == 1:
@@ -1351,6 +1360,16 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     summary['single_target_suppressed'] += 1
                     summary['skipped'] += 1
                     continue
+
+            # Fold duplicate same-type elements into the survivor so exactly
+            # one isomeric element is emitted per (nuclide, reaction type).
+            # The child carries the complete distribution, so the static split
+            # (including the survivor's branching_ratio) no longer applies.
+            if len(rx_elems) > 1:
+                for extra in rx_elems:
+                    if extra is not rx_elem:
+                        nuc_elem.remove(extra)
+                rx_elem.attrib.pop('branching_ratio', None)
 
             # Remove any existing isomeric elements
             for tag in ('isomeric_yields', 'isomeric_branching'):

@@ -291,6 +291,13 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
     lists (one entry per pathway, ground first). Unbranched reactions are left
     untouched (they keep their scalar ``target``/``Q``).
 
+    Exactly ONE ``<isomeric_branching>`` child is emitted per (nuclide, reaction
+    type). A reaction represented by MULTIPLE same-type elements (official-chain
+    style, one element per static pathway) gets the child on its first element
+    and is NOT folded -- every entry keeps its scalar
+    ``target``/``Q``/``branching_ratio`` (the legacy shape the reader accepts)
+    so the static split round-trips.
+
     The child's ``Q`` list is the stored per-pathway Q (``q_data``) when known;
     for a chain loaded from the legacy shape -- which carried only a single
     reaction-level Q -- that scalar Q is REPLICATED across every target (the code
@@ -307,19 +314,32 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
 
         nuc_targets = targets_data[nuc_name]
 
-        for reaction_elem in nuclide_elem.findall('reaction'):
+        # Count same-type elements so multi-entry branched reactions are
+        # emitted once and never folded
+        reaction_elems = nuclide_elem.findall('reaction')
+        type_counts = defaultdict(int)
+        for elem in reaction_elems:
+            type_counts[elem.get('type')] += 1
+        emitted = set()
+
+        for reaction_elem in reaction_elems:
             rx_type = reaction_elem.get('type')
             if not rx_type or rx_type not in nuc_targets:
                 continue
+            if rx_type in emitted:
+                continue
+            emitted.add(rx_type)
 
             targets = nuc_targets[rx_type]
 
             # Fold: the branched reaction's per-pathway data lives ONLY on the
             # child. Capture the scalar Q (for the replicate fallback) then drop
-            # the scalar target/Q from the <reaction> element.
+            # the scalar target/Q from the <reaction> element. Multi-entry
+            # reactions keep their scalars (legacy shape) -- see docstring.
             scalar_q = reaction_elem.get('Q')
-            reaction_elem.attrib.pop('target', None)
-            reaction_elem.attrib.pop('Q', None)
+            if type_counts[rx_type] == 1:
+                reaction_elem.attrib.pop('target', None)
+                reaction_elem.attrib.pop('Q', None)
 
             iso_elem = ET.SubElement(reaction_elem, 'isomeric_branching')
             iso_elem.set('targets', ' '.join(targets))
