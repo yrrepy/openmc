@@ -386,6 +386,177 @@ The values of the microscopic cross sections passed to
 simulation. This implicit assumption may produce inaccurate results for certain
 scenarios.
 
+.. _gendf_depletion:
+
+GENDF Multigroup Cross Sections and Isomeric Branching
+======================================================
+
+OpenMC can obtain transmutation reaction rates from a GENDF library, a set of
+multigroup cross sections produced with NJOY's GROUPR module. GENDF data is
+useful for two things that continuous-energy (CE) HDF5 libraries handle poorly:
+lumped reactions such as :math:`(n,n')` (MT=4) that most CE libraries do not
+store, and isomeric branching, where a single reaction populates more than one
+isomeric state of the product nuclide. The group structure is detected
+automatically from the files; the fusion/activation structures ``CCFE-709`` and
+``UKAEA-1102`` are recognized by name for isomeric-branching workflows.
+
+Creating a GENDF cross-section library
+--------------------------------------
+
+A GENDF library is created with the :func:`~openmc.deplete.GENDFLibrary`
+factory, which is given the path to a directory of GENDF ``.asc`` files::
+
+    lib = openmc.deplete.GENDFLibrary('/path/to/JEFF40-GENDF/')
+
+The factory selects a backend automatically. A compiled C++ backend is used
+when it is available and no ``decay_file`` is given; otherwise a pure-Python
+backend is used. The ``decay_file`` argument (a directory of ENDF decay files or
+a single concatenated file) enables ELIS-based mapping of GENDF ``MF=10``
+metastable products to OpenMC ``_m{n}`` names based on excitation-energy
+matching::
+
+    lib = openmc.deplete.GENDFLibrary(
+        '/path/to/JEFF40-GENDF/',
+        decay_file='/path/to/JEFF40-decay/')
+
+A decay file is only needed to *resolve* which isomeric state each product
+corresponds to. When the depletion chain already carries the resolved
+final-state indices as ``gendf_lfs`` flags (see
+:ref:`io_chain_isomeric_branching`), the branching split is computed at run time
+directly from those flags and no decay file is required. Excitation-energy
+matching uses a relative tolerance of 50% by default; when a second level also
+falls within tolerance, an ambiguity warning is issued so the assignment can be
+checked.
+
+Transport-independent depletion with GENDF
+------------------------------------------
+
+Passing ``gendf_library`` to :func:`~openmc.deplete.get_microxs_and_flux` builds
+the microscopic cross sections from the multigroup GENDF data. When
+``gendf_library`` is given and ``energies`` is left as ``None``, the energy group
+structure is taken from the library automatically::
+
+    fluxes, micros = openmc.deplete.get_microxs_and_flux(
+        model, materials, gendf_library=lib)
+
+The returned ``fluxes`` are :class:`~openmc.deplete.Flux` objects. Each behaves
+like a plain 1D flux array but also carries the energy group boundaries in its
+``energy_bounds`` attribute, which the isomeric-branching logic uses to recover
+the group structure. The ``fluxes`` and ``micros`` are then passed to
+:class:`~openmc.deplete.IndependentOperator` as usual.
+
+For workflows that already hold collapsed (single-group) ``MicroXS`` but still
+need correct isomeric branching, the GENDF library can be given directly to the
+operator, which then looks up the multigroup cross sections on the fly::
+
+    op = openmc.deplete.IndependentOperator(
+        materials, fluxes, micros, chain_file, gendf_library=lib)
+
+Transport-coupled reaction rates with GENDF
+-------------------------------------------
+
+:class:`~openmc.deplete.CoupledOperator` accepts a ``reaction_rate_mode`` that
+selects how one-group reaction rates are formed. Two modes use GENDF data:
+
+``"gendf-flux"``
+    Tallies a multigroup flux spectrum in the GENDF group structure and
+    collapses it with the GENDF group-wise cross sections (fission is
+    direct-tallied by default). This provides reaction rates for lumped
+    reactions such as :math:`(n,n')` that are absent from most CE HDF5
+    libraries, and supports isomeric branching. The ``gendf_library`` argument
+    is required.
+
+``"direct_with_flux"``
+    Combines direct reaction-rate tallies with a flux-spectrum tally for
+    automatic isomeric branching. The energy structure is auto-detected from the
+    chain's isomeric-branching metadata (``CCFE-709`` or ``UKAEA-1102``).
+    Supplying ``gendf_library`` enables the flux-spectrum-weighted branching
+    split.
+
+For example, to collapse reaction rates from GENDF cross sections::
+
+    op = openmc.deplete.CoupledOperator(
+        model, chain_file,
+        reaction_rate_mode='gendf-flux',
+        gendf_library=lib)
+
+.. _gendf_mt4:
+
+Inelastic scattering (n,n') from GENDF
+--------------------------------------
+
+Most CE HDF5 libraries carry only the partial inelastic levels (MT=51-91) and
+not the lumped MT=4 :math:`(n,n')` reaction, so a direct :math:`(n,n')` tally is
+silently zero. Setting ``gendf_mt4_fallback=True`` fills the :math:`(n,n')`
+cross section from GENDF MT=4 data for nuclides present in both the CE and GENDF
+libraries. It requires ``gendf_library`` and a matching group structure, and is
+available on :func:`~openmc.deplete.get_microxs_and_flux` and on
+:class:`~openmc.deplete.CoupledOperator` in the ``"direct_with_flux"`` and
+``"flux"`` modes. It has no effect in ``"gendf-flux"`` mode, which computes
+:math:`(n,n')` natively::
+
+    fluxes, micros = openmc.deplete.get_microxs_and_flux(
+        model, materials, gendf_library=lib, gendf_mt4_fallback=True)
+
+Isomeric branching
+------------------
+
+When a reaction populates more than one isomeric state of the product nuclide
+(for example :math:`(n,\gamma)` producing both the ground state and a metastable
+state), the depletion chain records the possible targets as
+``<isomeric_branching>`` flags rather than fixed ratios (see
+:ref:`io_chain_isomeric_branching`). At run time the split between states is
+computed from the GENDF cross sections weighted by the local flux spectrum
+(:math:`\sigma \cdot \phi` weighting), so a single chain remains valid across
+different spectra. This requires a GENDF library, provided through
+``gendf_library`` as shown above.
+
+The ``keep_isomeric_siblings`` argument (default ``True``) keeps ground and
+metastable siblings together when the chain is reduced, which is required for
+correct branching. It only takes effect when the chain carries isomeric-branching
+metadata; for chains without it, the flag is a no-op and reduction matches the
+upstream behavior.
+
+The flags themselves are added to an existing chain with the
+``tools/add_gendf_isomeric_branching_to_chain.py`` script, which reads the GENDF
+``MF=10`` sections and a decay file to resolve each final state to an OpenMC
+isomer name.
+
+Caveats and limitations
+-----------------------
+
+GENDF-based depletion inherits the assumptions of multigroup collapse. The
+following are worth checking for a given problem:
+
+- **Evaluation consistency.** The GENDF collapse cross sections should come from
+  the same nuclear data evaluation as the CE transport library. OpenMC matches
+  the *coverage* of the CE and GENDF libraries (only nuclides present in both
+  are treated), but it does not verify that they share an evaluation.
+  Unresolved-resonance probability-table self-shielding present in the CE
+  transport data is not reproduced by a binned multigroup spectrum.
+
+- **Group-structure adequacy.** The multigroup grid must resolve the flux
+  spectrum wherever the branching cross sections vary. Resonance capture,
+  :math:`(n,\gamma)`, is the stress case: the ``CCFE-709`` and ``UKAEA-1102``
+  structures are designed for fusion/activation spectra, so for
+  thermal/epithermal-heavy problems a one-time comparison of the collapsed rate
+  against a direct reaction-rate tally is recommended.
+
+- **MF=9 vs MF=10 provenance.** In ENDF evaluations, the isomer split for a
+  resonance reaction such as :math:`(n,\gamma)` is often stored in ``MF=9``
+  (multiplicities) rather than ``MF=10``. GROUPR folds ``MF=9`` with ``MF=3``
+  into group-wise ``MF=10``-style sections when the GENDF is produced, so
+  whether a given (nuclide, reaction) pair carries a usable branching section
+  depends on how that particular library was generated. When a flagged reaction
+  has no ``MF=10`` section in the GENDF, the calculation falls back to the
+  chain's static branching ratio.
+
+- **Flux-spectrum weighting.** Branching ratios are reaction-rate
+  (:math:`\sigma \cdot \phi`) weighted, not plain-flux weighted, so they depend
+  on the local spectrum. Spectra that maximize the sensitivity of a branching
+  ratio (fast/fusion spectra for many capture reactions) are exactly where
+  library-to-library differences matter most.
+
 Transfer Rates
 ==============
 

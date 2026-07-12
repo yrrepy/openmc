@@ -67,6 +67,29 @@ cross sections. The following function can be used to generate this information:
 
    get_microxs_and_flux
 
+The multigroup fluxes returned by :func:`get_microxs_and_flux` are instances of
+the :class:`Flux` class, a :class:`numpy.ndarray` subclass that also carries the
+energy group boundaries:
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+   :template: myclass.rst
+
+   Flux
+
+Multigroup GENDF cross sections -- used for transport-independent depletion,
+GENDF-based reaction rates, and isomeric branching -- are obtained through the
+:func:`GENDFLibrary` factory. See :ref:`gendf_depletion` in the user's guide
+for usage.
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+   :template: myfunction.rst
+
+   GENDFLibrary
+
 Minimal Example
 ---------------
 
