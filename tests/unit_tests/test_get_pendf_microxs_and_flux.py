@@ -34,6 +34,15 @@ N_GROUPS = len(EDGES) - 1  # 3
 # satisfies the requirement.
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
 
+# The canonical redirect wording for a non-bool wrapper-level dilution toggle.
+_REDIRECT_MSG = (
+    "urr_material_dilution must be a bool for "
+    "get_pendf_microxs_and_flux(); True uses each domain's own "
+    "composition automatically. To supply an explicit composition "
+    "(openmc.Material or {nuclide: density} mapping), call "
+    "MicroXS.from_multigroup_flux directly."
+)
+
 
 # ---------------------------------------------------------------------------
 # Test doubles for the transport solve / statepoint read
@@ -104,186 +113,43 @@ def _uo2_material(o16_density):
     return mat
 
 
-# ---------------------------------------------------------------------------
-# Tally set-up (StopIteration pattern) -- flux-only, no reaction-rate tally
-# ---------------------------------------------------------------------------
+def _capture_tallies(model, lib, **kwargs):
+    """Drive the wrapper until the tallies are built, capture them, abort the run.
 
-def test_tally_setup_flux_only_explicit_energies():
-    """One flux tally on the given edges; no reaction-rate tally is built."""
-    model = _bare_model()
-    mat = _uo2_material(12.5)
-    lib = _fake_library()
-
+    Returns the list of tallies present on ``model`` at the moment ``model.run``
+    would fire -- proving what the wrapper set up without a real transport solve.
+    """
     captured = {}
 
-    def capture_run(**kwargs):
+    def capture_run(**_):
         captured['tallies'] = list(model.tallies)
         raise StopIteration
 
     with patch.object(model, 'run', side_effect=capture_run):
         with pytest.raises(StopIteration):
             get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib, chain_file=CHAIN_FILE,
-                nuclides=["U238"], reactions=["(n,gamma)"],
-                energies=EDGES,
-            )
-
-    tallies = captured['tallies']
-    names = [t.name for t in tallies]
-    assert 'MicroXS flux 0' in names
-    # Flux-only: no reaction-rate tally exists.
-    assert not any(n.startswith('MicroXS RR') for n in names)
-    assert len(tallies) == 1
-
-    flux_tally = tallies[0]
-    assert flux_tally.scores == ['flux']
-    assert flux_tally.nuclides == []
-    ef = next(f for f in flux_tally.filters if isinstance(f, openmc.EnergyFilter))
-    np.testing.assert_allclose(ef.values, EDGES)
+                model, [_uo2_material(12.5)], pendf_library=lib,
+                chain_file=CHAIN_FILE, nuclides=["U238"],
+                reactions=["(n,gamma)"], **kwargs)
+    return captured['tallies']
 
 
-def test_tally_setup_energies_default_from_grouped_group_edges():
-    """energies=None defaults the tally edges to a grouped library's group_edges."""
+def _assert_raises_before_run(domains, lib, match, **kwargs):
+    """The wrapper raises ``ValueError(match)`` BEFORE ``model.run`` is called.
+
+    A ``run`` spy proves the failure is pre-run; the raised exception is returned
+    so the caller can additionally check its verbatim text.
+    """
     model = _bare_model()
-    mat = _uo2_material(12.5)
-    lib = _GroupedDuck(EDGES)
-
-    captured = {}
-
-    def capture_run(**kwargs):
-        captured['tallies'] = list(model.tallies)
-        raise StopIteration
-
-    with patch.object(model, 'run', side_effect=capture_run):
-        with pytest.raises(StopIteration):
-            get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib, chain_file=CHAIN_FILE,
-                nuclides=["U238"], reactions=["(n,gamma)"],
-                energies=None,
-            )
-
-    flux_tally = captured['tallies'][0]
-    ef = next(f for f in flux_tally.filters if isinstance(f, openmc.EnergyFilter))
-    np.testing.assert_allclose(ef.values, EDGES)
-
-
-# ---------------------------------------------------------------------------
-# Pre-run validation (all raise BEFORE model.run -- proven by a run spy)
-# ---------------------------------------------------------------------------
-
-def test_dilution_true_with_void_cell_raises_before_run():
-    """dilution=True with a void (fill-less) Cell has no composition -> raise
-    pre-run (a material-filled Cell is accepted; see the passing test below)."""
-    model = _bare_model()
-    cell = openmc.Cell()  # no fill -> void, no single composition
-    lib = _fake_library()
     run_spy = Mock()
-
     with patch.object(model, 'run', run_spy):
-        with pytest.raises(ValueError,
-                           match="filled with a single openmc.Material"):
+        with pytest.raises(ValueError, match=match) as excinfo:
             get_pendf_microxs_and_flux(
-                model, [cell], pendf_library=lib, chain_file=CHAIN_FILE,
-                nuclides=["U238"], reactions=["(n,gamma)"],
-                energies=EDGES, urr_material_dilution=True,
-            )
-
+                model, domains, pendf_library=lib,
+                nuclides=["U238"], reactions=["(n,gamma)"], **kwargs)
     run_spy.assert_not_called()
+    return excinfo
 
-
-def test_dilution_true_cell_with_material_fill_resolves_composition():
-    """A Cell filled with a single Material passes the dilution domain check and
-    shields with that fill's composition (the tally domain stays the Cell)."""
-    from openmc.deplete.microxs import _pendf_dilution_material
-
-    mat = _uo2_material(12.5)
-    cell = openmc.Cell(fill=mat)
-
-    # The composition resolver returns the cell's fill Material.
-    assert _pendf_dilution_material(cell) is mat
-    # A bare Material still resolves to itself; a mixed sequence is allowed.
-    assert _pendf_dilution_material(mat) is mat
-
-    # End to end: a material-filled Cell domain drives the collapse without
-    # raising, and its MicroXS equals the direct dilution call with the fill.
-    lib = _fake_library()
-    flux0 = [1.0, 2.0, 3.0]
-    canned = np.array([flux0]).reshape(1, N_GROUPS, 1, 1)
-    model = _bare_model()
-    _, micros = _run_wrapper_with_canned_flux(
-        model, [cell], lib, canned, urr_material_dilution=True)
-
-    direct = MicroXS.from_multigroup_flux(
-        energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
-        nuclides=["U238"], reactions=["(n,gamma)"],
-        pendf_library=_fake_library(), urr_material_dilution=mat)
-    np.testing.assert_array_equal(micros[0].data, direct.data)
-
-
-def test_non_bool_dilution_raises_redirect_before_run():
-    """A Material passed as the wrapper-level toggle gets the redirect message."""
-    model = _bare_model()
-    mat = _uo2_material(12.5)
-    lib = _fake_library()
-    run_spy = Mock()
-
-    with patch.object(model, 'run', run_spy):
-        with pytest.raises(
-                ValueError,
-                match=r"must be a bool for get_pendf_microxs_and_flux"):
-            get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib,
-                nuclides=["U238"], reactions=["(n,gamma)"],
-                energies=EDGES, urr_material_dilution=mat,
-            )
-
-    run_spy.assert_not_called()
-
-
-def test_non_bool_dilution_redirect_message_verbatim():
-    """The redirect message is the canonical wording, verbatim."""
-    model = _bare_model()
-    mat = _uo2_material(12.5)
-    lib = _fake_library()
-
-    expected = (
-        "urr_material_dilution must be a bool for "
-        "get_pendf_microxs_and_flux(); True uses each domain's own "
-        "composition automatically. To supply an explicit composition "
-        "(openmc.Material or {nuclide: density} mapping), call "
-        "MicroXS.from_multigroup_flux directly."
-    )
-    with patch.object(model, 'run', Mock()):
-        with pytest.raises(ValueError) as excinfo:
-            get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib,
-                nuclides=["U238"], reactions=["(n,gamma)"],
-                energies=EDGES, urr_material_dilution=mat,
-            )
-    assert str(excinfo.value) == expected
-
-
-def test_pointwise_library_energies_none_raises_before_run():
-    """A pointwise library has no group_edges; energies=None must raise pre-run."""
-    model = _bare_model()
-    mat = _uo2_material(12.5)
-    lib = _fake_library()  # pointwise: no group_edges
-    run_spy = Mock()
-
-    with patch.object(model, 'run', run_spy):
-        with pytest.raises(ValueError, match="energies must be provided"):
-            get_pendf_microxs_and_flux(
-                model, [mat], pendf_library=lib,
-                nuclides=["U238"], reactions=["(n,gamma)"],
-                energies=None,
-            )
-
-    run_spy.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# G-EQ / G-OFF: transport-coupled == flux-supplied (exact array equality)
-# ---------------------------------------------------------------------------
 
 def _run_wrapper_with_canned_flux(model, domains, lib, canned, **kwargs):
     """Drive the wrapper with a canned per-domain flux (no real transport)."""
@@ -297,8 +163,95 @@ def _run_wrapper_with_canned_flux(model, domains, lib, canned, **kwargs):
             energies=EDGES, **kwargs)
 
 
-def test_geq_dilution_on_equals_direct_per_domain():
-    """Each domain's MicroXS equals the direct dilution call with that material."""
+# ---------------------------------------------------------------------------
+# Tally set-up (StopIteration pattern) -- flux-only, no reaction-rate tally
+# ---------------------------------------------------------------------------
+
+def test_tally_setup_flux_only_and_energies_default():
+    """One flux-only tally is built (no reaction-rate tally), and ``energies=None``
+    defaults the tally edges to a grouped library's ``group_edges``."""
+    # Explicit energies, pointwise library: exactly one flux tally, no RR tally.
+    tallies = _capture_tallies(_bare_model(), _fake_library(), energies=EDGES)
+    names = [t.name for t in tallies]
+    assert 'MicroXS flux 0' in names
+    assert not any(n.startswith('MicroXS RR') for n in names)
+    assert len(tallies) == 1
+
+    flux_tally = tallies[0]
+    assert flux_tally.scores == ['flux']
+    assert flux_tally.nuclides == []
+    ef = next(f for f in flux_tally.filters if isinstance(f, openmc.EnergyFilter))
+    np.testing.assert_allclose(ef.values, EDGES)
+
+    # energies=None + grouped library: tally edges default to group_edges.
+    tallies = _capture_tallies(_bare_model(), _GroupedDuck(EDGES), energies=None)
+    ef = next(f for f in tallies[0].filters if isinstance(f, openmc.EnergyFilter))
+    np.testing.assert_allclose(ef.values, EDGES)
+
+
+# ---------------------------------------------------------------------------
+# Pre-run validation (all raise BEFORE model.run -- proven by a run spy)
+# ---------------------------------------------------------------------------
+
+def test_pre_run_validation_raises_before_run():
+    """Every wrapper-level input error raises before any transport: a void
+    dilution domain, a non-bool dilution toggle (with the verbatim redirect
+    message), and ``energies=None`` for a pointwise library."""
+    lib = _fake_library()
+    mat = _uo2_material(12.5)
+
+    # dilution=True on a void (fill-less) Cell has no single composition.
+    _assert_raises_before_run(
+        [openmc.Cell()], lib, "filled with a single openmc.Material",
+        chain_file=CHAIN_FILE, energies=EDGES, urr_material_dilution=True)
+
+    # A Material passed as the bool toggle gets the redirect message, verbatim.
+    excinfo = _assert_raises_before_run(
+        [mat], lib, r"must be a bool for get_pendf_microxs_and_flux",
+        energies=EDGES, urr_material_dilution=mat)
+    assert str(excinfo.value) == _REDIRECT_MSG
+
+    # A pointwise library has no group_edges, so energies=None cannot default.
+    _assert_raises_before_run(
+        [mat], lib, "energies must be provided", energies=None)
+
+
+def test_dilution_material_resolution_and_cell_fill_domain():
+    """``_pendf_dilution_material`` resolves a domain's shielding composition, and
+    a Cell filled with a single Material drives the collapse -- its MicroXS equals
+    the direct dilution call with that fill (the tally domain stays the Cell)."""
+    from openmc.deplete.microxs import _pendf_dilution_material
+
+    mat = _uo2_material(12.5)
+    cell = openmc.Cell(fill=mat)
+
+    # The resolver returns a Cell's fill Material, and a bare Material itself.
+    assert _pendf_dilution_material(cell) is mat
+    assert _pendf_dilution_material(mat) is mat
+
+    # End to end: a material-filled Cell domain collapses without raising and
+    # equals the direct dilution call with that fill.
+    lib = _fake_library()
+    flux0 = [1.0, 2.0, 3.0]
+    canned = np.array([flux0]).reshape(1, N_GROUPS, 1, 1)
+    _, micros = _run_wrapper_with_canned_flux(
+        _bare_model(), [cell], lib, canned, urr_material_dilution=True)
+
+    direct = MicroXS.from_multigroup_flux(
+        energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
+        nuclides=["U238"], reactions=["(n,gamma)"],
+        pendf_library=_fake_library(), urr_material_dilution=mat)
+    np.testing.assert_array_equal(micros[0].data, direct.data)
+
+
+# ---------------------------------------------------------------------------
+# G-EQ / G-OFF: transport-coupled == flux-supplied (exact array equality)
+# ---------------------------------------------------------------------------
+
+def test_geq_goff_equal_direct_per_domain():
+    """Transport-coupled MicroXS equals the direct ``from_multigroup_flux`` call
+    for each domain with dilution ON (gate G-EQ) and OFF (gate G-OFF); the two
+    disagree for the shielded domain, proving the per-domain correction fires."""
     lib = _fake_library()
     mat0 = _uo2_material(12.5)   # sigma_0 = 50 b
     mat1 = _uo2_material(50.0)   # sigma_0 = 200 b (less shielding)
@@ -306,9 +259,9 @@ def test_geq_dilution_on_equals_direct_per_domain():
     flux1 = [4.0, 5.0, 6.0]
     canned = np.array([flux0, flux1]).reshape(2, N_GROUPS, 1, 1)
 
-    model = _bare_model()
-    fluxes, micros = _run_wrapper_with_canned_flux(
-        model, [mat0, mat1], lib, canned, urr_material_dilution=True)
+    # G-EQ: each domain's MicroXS equals the direct dilution call with its material.
+    fluxes, micros_on = _run_wrapper_with_canned_flux(
+        _bare_model(), [mat0, mat1], lib, canned, urr_material_dilution=True)
 
     # Raw tallied flux magnitudes are returned unmodified, one per domain.
     assert len(fluxes) == 2
@@ -323,43 +276,27 @@ def test_geq_dilution_on_equals_direct_per_domain():
         energies=EDGES, multigroup_flux=flux1, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=mat1)
+    np.testing.assert_array_equal(micros_on[0].data, direct0.data)
+    np.testing.assert_array_equal(micros_on[1].data, direct1.data)
+    assert micros_on[0].nuclides == direct0.nuclides == ["U238"]
+    assert micros_on[0].reactions == direct0.reactions == ["(n,gamma)"]
 
-    np.testing.assert_array_equal(micros[0].data, direct0.data)
-    np.testing.assert_array_equal(micros[1].data, direct1.data)
-    assert micros[0].nuclides == direct0.nuclides == ["U238"]
-    assert micros[0].reactions == direct0.reactions == ["(n,gamma)"]
+    # Different compositions give different self-shielding (per-domain, not shared).
+    assert not np.array_equal(micros_on[0].data, micros_on[1].data)
 
-    # The two compositions actually give different self-shielding (proves the
-    # per-domain composition -- not a shared one -- drives each collapse).
-    assert not np.array_equal(micros[0].data, micros[1].data)
-
-
-def test_goff_dilution_off_equals_direct_false_per_domain():
-    """Flag-off is identical to the direct from_multigroup_flux(False) call."""
-    lib = _fake_library()
-    mat0 = _uo2_material(12.5)
-    mat1 = _uo2_material(50.0)
-    flux0 = [1.0, 2.0, 3.0]
-    flux1 = [4.0, 5.0, 6.0]
-    canned = np.array([flux0, flux1]).reshape(2, N_GROUPS, 1, 1)
-
-    model = _bare_model()
+    # G-OFF: flag-off is identical to the direct from_multigroup_flux(False) call.
     _, micros_off = _run_wrapper_with_canned_flux(
-        model, [mat0, mat1], lib, canned, urr_material_dilution=False)
-
-    direct0 = MicroXS.from_multigroup_flux(
+        _bare_model(), [mat0, mat1], lib, canned, urr_material_dilution=False)
+    off0 = MicroXS.from_multigroup_flux(
         energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=False)
-    direct1 = MicroXS.from_multigroup_flux(
+    off1 = MicroXS.from_multigroup_flux(
         energies=EDGES, multigroup_flux=flux1, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=False)
-
-    np.testing.assert_array_equal(micros_off[0].data, direct0.data)
-    np.testing.assert_array_equal(micros_off[1].data, direct1.data)
+    np.testing.assert_array_equal(micros_off[0].data, off0.data)
+    np.testing.assert_array_equal(micros_off[1].data, off1.data)
 
     # Flag off must differ from flag on for the shielded domain (correction fires).
-    _, micros_on = _run_wrapper_with_canned_flux(
-        model, [mat0, mat1], lib, canned, urr_material_dilution=True)
     assert not np.array_equal(micros_off[0].data, micros_on[0].data)

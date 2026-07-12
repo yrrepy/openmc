@@ -938,6 +938,15 @@ CONSISTENCY_RTOL = 1e-5
 # total (or vice versa) is a genuine inconsistency and still warns.
 CONSISTENCY_ABS_FLOOR = 1e-15
 
+# Below this Sigma(all MF=10 partials)/total the isomeric branching is a
+# bit-identical evaluator placeholder (census: silent <= 3e-5, live >= 0.79)
+# while the real cross section lives only in the MF=3 total. On the qualified
+# collapse path the ground pathway is then filled by balance
+# (total - demanded metastables) inside the ground partial's own energy range;
+# see _silence_fill_ground. Hardwired (no per-run knob), mirroring the
+# MF=10-always-on precedent.
+SILENCE_EPS = 1e-3
+
 # Trailing metastable qualifier ('_m1') on nuclide names / qualified
 # reaction types.
 _ISOMER_SUFFIX = re.compile(r'_m\d+$')
@@ -1135,6 +1144,138 @@ def _chain_lfs_reactions(chain: Chain, nuc: str, base_reaction: str) -> dict:
     return by_lfs
 
 
+@dataclass(eq=False)
+class _SilenceFill:
+    """Result of the in-domain silence-fill of a reaction's ground pathway.
+
+    ``fired`` is True when at least one in-domain group is silent (the ground
+    was filled). ``e_dom`` / ``ground_dom`` are the union grid restricted to the
+    LFS=0 partial's own tabulated range and the filled ground on it, ready to
+    :func:`_group_average` into the tally structure. The remaining fields are
+    full-union-grid diagnostics reused by the partial-binding veto (a follow-on
+    feature): ``e`` the union of the MF=3 and every MF=10 partial grid, ``total``
+    the MF=3 total on ``e``, ``sum_all`` every library partial (all LFS,
+    demanded or not) on ``e``, ``silent`` the ``total > floor`` and
+    ``sum_all/total < eps`` mask, and ``ground0_range`` the ``(emin, emax)`` of
+    the LFS=0 partial (``None`` when the reaction carries no LFS=0 partial).
+    """
+    fired: bool
+    e_dom: np.ndarray
+    ground_dom: np.ndarray
+    e: np.ndarray
+    total: np.ndarray
+    sum_all: np.ndarray
+    silent: np.ndarray
+    ground0_range: tuple[float, float] | None
+
+
+def _silence_fill_ground(
+    pathways_fn,
+    pathway_xs_fn,
+    nuc: str,
+    mt: int,
+    energy3: np.ndarray,
+    xs3: np.ndarray,
+    demanded_lfs: set,
+    eps: float = SILENCE_EPS,
+    floor: float = CONSISTENCY_ABS_FLOOR,
+) -> _SilenceFill:
+    """In-domain silence-fill of a reaction's ground (LFS=0) pathway.
+
+    For a qualified (n,gamma)-style reaction whose MF=10 branching is a thermal
+    placeholder (every partial ~1e-20 b while the MF=3 total carries the real
+    1/v capture), replace the placeholder ground with ``total - Sigma(demanded
+    metastables)`` wherever the branching is silent
+    (``Sigma(all partials)/total < eps`` with ``total > floor``), restricted to
+    the LFS=0 partial's own tabulated range ("in-domain", so the fill only
+    REPLACES stored placeholder values and never extends the evaluation past its
+    last tabulated point). Elsewhere the ground stays the source-faithful LFS=0
+    partial, so a channel whose branching is live wherever the total is does not
+    fire and its ground row is bit-identical to the raw LFS=0 partial average.
+
+    The silence *test* sums EVERY library partial (all LFS -- including
+    undemanded ELIS-dropped partials and multi-product ``LFS{l}_ZAP{z}`` entries
+    enumerated via ``pathways_fn``); the *fill* subtracts only the demanded
+    metastables (``LFS > 0`` in ``demanded_lfs``). Using the full partial set
+    keeps an undemanded live partial from having its cross section absorbed into
+    ground by the subtraction. Positivity is automatic: a filled group is
+    silent, so ``Sigma(demanded m) <= Sigma(all) < eps*total`` and the ground
+    stays ``>= (1 - eps)*total > 0`` -- no clamp.
+
+    The union-grid / lin-lin / zero-fill-outside-range arithmetic mirrors
+    ``claude/ground_by_balance/merit_probe.load_channel``.
+
+    Parameters
+    ----------
+    pathways_fn : callable
+        ``pathways(nuclide, mt) -> [(lfs, izap), ...]`` (pointwise library).
+    pathway_xs_fn : callable
+        ``pathway_xs(nuclide, mt, lfs, izap) -> (energy, xs)`` (pointwise).
+    nuc : str
+        Nuclide GNDS name.
+    mt : int
+        Reaction MT number.
+    energy3, xs3 : numpy.ndarray
+        MF=3 total energy grid and cross section.
+    demanded_lfs : set of int
+        Chain-demanded LFS levels; only the ``LFS > 0`` members are subtracted.
+    eps, floor : float
+        Silence threshold on ``Sigma(all)/total`` and the significance floor on
+        ``total``.
+    """
+    energy3 = np.asarray(energy3, dtype=float)
+    xs3 = np.asarray(xs3, dtype=float)
+
+    grids = [energy3]
+    partials = []
+    for lfs, izap in pathways_fn(nuc, mt):
+        pe, pxs = pathway_xs_fn(nuc, mt, lfs, izap)
+        pe = np.asarray(pe, dtype=float)
+        pxs = np.asarray(pxs, dtype=float)
+        partials.append((lfs, pe, pxs))
+        grids.append(pe)
+
+    e = np.unique(np.concatenate(grids))
+    total = np.interp(e, energy3, xs3)
+    sum_all = np.zeros_like(e)
+    sum_demanded_meta = np.zeros_like(e)
+    ground0 = np.zeros_like(e)
+    g0_lo = g0_hi = None
+    for lfs, pe, pxs in partials:
+        y = np.interp(e, pe, pxs, left=0.0, right=0.0)
+        sum_all = sum_all + y
+        if lfs == 0:
+            ground0 = ground0 + y
+            g0_lo = pe[0] if g0_lo is None else min(g0_lo, pe[0])
+            g0_hi = pe[-1] if g0_hi is None else max(g0_hi, pe[-1])
+        elif lfs in demanded_lfs:
+            sum_demanded_meta = sum_demanded_meta + y
+
+    sig = total > floor
+    ratio = np.divide(sum_all, total, out=np.zeros_like(total), where=sig)
+    silent = sig & (ratio < eps)
+
+    if g0_lo is None:
+        in_domain = np.zeros_like(e, dtype=bool)
+        ground0_range = None
+    else:
+        in_domain = (e >= g0_lo) & (e <= g0_hi)
+        ground0_range = (float(g0_lo), float(g0_hi))
+    mask = silent & in_domain
+    fired = bool(mask.any())
+
+    # Restrict the filled ground to the LFS=0 native range so the terminal
+    # interval above the ground partial's last tabulated point stays
+    # source-faithful (zero contribution, no np.interp zero-fill down-ramp).
+    e_dom = e[in_domain]
+    ground_dom = np.where(mask[in_domain],
+                          total[in_domain] - sum_demanded_meta[in_domain],
+                          ground0[in_domain])
+    return _SilenceFill(fired=fired, e_dom=e_dom, ground_dom=ground_dom,
+                        e=e, total=total, sum_all=sum_all, silent=silent,
+                        ground0_range=ground0_range)
+
+
 def _build_xs_table_pendf(
     nuclides: Sequence[str],
     reactions: Sequence[str],
@@ -1247,6 +1388,13 @@ def _build_xs_table_pendf(
     # the MF=3 total was staged instead of pathway rows. Collected across the whole
     # build so the disagreement is reported once, not once per reaction.
     mismatched: list[tuple[str, str, set[int], set[int]]] = []
+
+    # (nuclide, base reaction) for qualified reactions whose GROUPED ground still
+    # carries the thermal placeholder (some group silent while the total is
+    # significant). Grouped libraries are not silence-filled at collapse time
+    # (the fill is a build-time bake), so these are collected for one summary
+    # warning. A pointwise build silence-fills instead and never populates this.
+    grouped_placeholder: list[tuple[str, str]] = []
 
     # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
     # ordinals seen per base reaction are collected to build the expanded axis.
@@ -1392,6 +1540,39 @@ def _build_xs_table_pendf(
                 else:
                     pe, pxs = pathway_xs_fn(nuc, mt, lfs, izap)
                     partial_g.append(_group_average(pe, pxs, energies))
+
+            # In-domain silence-fill (pointwise) / placeholder detection
+            # (grouped) of the ground pathway. Only on the qualified path with a
+            # demanded ground plus >=1 demanded metastable; the self-loop waiver
+            # already staged its base row from the MF=3 total (no LFS=0 partial),
+            # so it is excluded. missing is empty here (a demanded-LFS-missing
+            # reaction fell back to the total above), so a demanded ground means
+            # the library carries an LFS=0 partial.
+            if (not self_loop_waiver and 0 in demanded_lfs
+                    and any(lfs > 0 for lfs in demanded_lfs)):
+                if grouped:
+                    # Grouped libraries are not filled at collapse time. Detect a
+                    # still-placeholder ground (a group where the MF=3 total is
+                    # significant but every MF=10 partial is silent) and collect
+                    # it for one summary warning.
+                    sum_all_g = np.zeros(n_groups)
+                    for lfs, izap in pathways_fn(nuc, mt):
+                        sum_all_g = sum_all_g + pathway_xs_fn(nuc, mt, lfs, izap)
+                    sig_g = total_g > CONSISTENCY_ABS_FLOOR
+                    ratio_g = np.divide(sum_all_g, total_g,
+                                        out=np.zeros_like(total_g), where=sig_g)
+                    if (sig_g & (ratio_g < SILENCE_EPS)).any():
+                        grouped_placeholder.append((nuc, name))
+                else:
+                    fill = _silence_fill_ground(pathways_fn, pathway_xs_fn, nuc,
+                                                mt, energy, xs, demanded_lfs)
+                    if fill.fired:
+                        for i, (lfs, _izap) in enumerate(emit_pairs):
+                            if lfs == 0:
+                                partial_g[i] = _group_average(
+                                    fill.e_dom, fill.ground_dom, energies)
+                                break
+
             # Emit ground first, then ascending isomer order; the row name is the
             # bound chain reaction's type (ground keeps the base name R).
             for rx, xs_g in sorted(
@@ -1414,6 +1595,23 @@ def _build_xs_table_pendf(
              'reactions. The chain and library disagree -- regenerate the chain '
              'from this library with '
              'tools/add_pendf_isomeric_branching_to_chain.py.')
+
+    # One summary warning when a GROUPED library carries an unfilled placeholder
+    # ground for qualified reactions (pointwise builds silence-fill in place; a
+    # grouped build must bake the fill at group-binning time). Detection is
+    # robust in group space -- the placeholder-vs-total gap is ~20 decades even
+    # after group averaging.
+    if grouped_placeholder:
+        examples = ', '.join(f'{n} {r}' for n, r in grouped_placeholder[:5])
+        more = (f' (and {len(grouped_placeholder) - 5} more)'
+                if len(grouped_placeholder) > 5 else '')
+        warn('Grouped PENDF library carries an unfilled placeholder ground for '
+             f'{len(grouped_placeholder)} qualified reaction(s): {examples}'
+             f'{more}. The MF=10 branching is silent where the MF=3 total is '
+             'significant, so the ground pathway is the raw placeholder (grouped '
+             'libraries are not silence-filled at collapse time). Rebuild the '
+             'grouped h5 with the baked fill for correct thermal ground '
+             'production.')
 
     # Build the expanded reaction axis: every base name (always present, so the
     # dense result keeps a column for each requested reaction) followed by its
