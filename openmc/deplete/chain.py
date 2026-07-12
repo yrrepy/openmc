@@ -944,6 +944,7 @@ class Chain:
         :attr:`decay_matrix`, :meth:`form_matrix`
         """
         reactions = set()
+        iso_applied = set()
         n = len(self)
 
         # Accumulate indices/values and then create the matrix at the end to
@@ -987,36 +988,44 @@ class Chain:
                     if target is not None and path_rate != 0.0:
                         # Check for isomeric branching (using cached lookup)
                         if nuc_iso and r_type in nuc_iso:
-                            # Apply isomeric branching with strict validation
-                            # br from isomeric data represents the complete branching
-                            # distribution (sums to 1.0)
-                            total_ratio = 0.0
-                            missing_targets = []
-                            for iso_target, iso_br in nuc_iso[r_type].items():
-                                # Validate ratio value (guard against NaN/Inf from data corruption)
-                                if not math.isfinite(iso_br):
-                                    warn(f"Invalid isomeric branching ratio for {nuc.name} {r_type} -> "
-                                         f"{iso_target}: {iso_br}. Treating as 0.0.")
-                                    iso_br = 0.0
-                                if iso_target not in self.nuclide_dict:
-                                    # Critical error - missing target will cause mass conservation violation
-                                    missing_targets.append(iso_target)
-                                else:
-                                    k = self.nuclide_dict[iso_target]
-                                    setval(k, i, path_rate * iso_br)
-                                    total_ratio += iso_br
-                            # Raise error if any targets are missing
-                            if missing_targets:
-                                raise KeyError(
-                                    f"Isomeric branching for {nuc.name} {r_type} references "
-                                    f"target(s) not in chain: {missing_targets}. "
-                                    f"This would cause mass conservation violations. "
-                                    f"Check chain file or isomeric branching data.")
-                            # Verify branching ratios sum to approximately 1.0
-                            if total_ratio > 0.0 and not (0.98 <= total_ratio <= 1.02):
-                                warn(f"Isomeric branching ratios for {nuc.name} {r_type} "
-                                     f"sum to {total_ratio:.4f}, not 1.0. This may indicate "
-                                     f"incomplete or incorrect branching data.")
+                            # The distribution replaces the chain's static
+                            # split for ALL same-type entries -- apply it once
+                            # per reaction type (mirrors the loss-term guard)
+                            # so multi-entry branched reactions (e.g. official
+                            # chains with ground + metastable entries) do not
+                            # double-count production
+                            if r_type not in iso_applied:
+                                iso_applied.add(r_type)
+                                # Apply isomeric branching with strict validation
+                                # br from isomeric data represents the complete branching
+                                # distribution (sums to 1.0)
+                                total_ratio = 0.0
+                                missing_targets = []
+                                for iso_target, iso_br in nuc_iso[r_type].items():
+                                    # Validate ratio value (guard against NaN/Inf from data corruption)
+                                    if not math.isfinite(iso_br):
+                                        warn(f"Invalid isomeric branching ratio for {nuc.name} {r_type} -> "
+                                             f"{iso_target}: {iso_br}. Treating as 0.0.")
+                                        iso_br = 0.0
+                                    if iso_target not in self.nuclide_dict:
+                                        # Critical error - missing target will cause mass conservation violation
+                                        missing_targets.append(iso_target)
+                                    else:
+                                        k = self.nuclide_dict[iso_target]
+                                        setval(k, i, path_rate * iso_br)
+                                        total_ratio += iso_br
+                                # Raise error if any targets are missing
+                                if missing_targets:
+                                    raise KeyError(
+                                        f"Isomeric branching for {nuc.name} {r_type} references "
+                                        f"target(s) not in chain: {missing_targets}. "
+                                        f"This would cause mass conservation violations. "
+                                        f"Check chain file or isomeric branching data.")
+                                # Verify branching ratios sum to approximately 1.0
+                                if total_ratio > 0.0 and not (0.98 <= total_ratio <= 1.02):
+                                    warn(f"Isomeric branching ratios for {nuc.name} {r_type} "
+                                         f"sum to {total_ratio:.4f}, not 1.0. This may indicate "
+                                         f"incomplete or incorrect branching data.")
                         else:
                             # Original single target
                             k = self.nuclide_dict[target]
@@ -1037,6 +1046,7 @@ class Chain:
                             setval(k, i, yield_val)
 
             reactions.clear()
+            iso_applied.clear()
 
         return csc_array((vals, (rows, cols)), shape=(n, n))
 

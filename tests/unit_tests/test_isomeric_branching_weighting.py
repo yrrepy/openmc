@@ -544,3 +544,81 @@ def test_form_matrix_without_isomeric_uses_chain_br():
 
     assert np.isclose(gain_product, 1.2), \
         f"Expected gain term 1.2 (rate * br), got {gain_product}."
+
+
+def _build_multi_entry_chain():
+    """Chain with an official-chain-style branched reaction: two same-type entries."""
+    import openmc.deplete
+
+    chain = openmc.deplete.Chain()
+
+    parent = openmc.deplete.Nuclide('Parent')
+    parent.add_reaction('(n,gamma)', 'Product', Q=1e6, branching_ratio=0.92)
+    parent.add_reaction('(n,gamma)', 'Product_m1', Q=1e6, branching_ratio=0.08)
+    chain.add_nuclide(parent)
+
+    chain.add_nuclide(openmc.deplete.Nuclide('Product'))
+    chain.add_nuclide(openmc.deplete.Nuclide('Product_m1'))
+    return chain
+
+
+def test_form_rxn_matrix_multi_entry_runtime_mass_conservation():
+    """Runtime distribution is applied once per reaction type, conserving mass."""
+    from openmc.deplete import ReactionRates
+
+    chain = _build_multi_entry_chain()
+
+    nuclides = ['Parent', 'Product', 'Product_m1']
+    rates = ReactionRates(['mat1'], nuclides, ['(n,gamma)'])
+    rates[0, 0, 0] = 1.0
+
+    isomeric_branching = {
+        'Parent': {
+            '(n,gamma)': {
+                'Product': 0.7,
+                'Product_m1': 0.3
+            }
+        }
+    }
+
+    matrix = chain.form_rxn_matrix(rates[0], isomeric_branching=isomeric_branching)
+    dense = matrix.toarray()
+
+    parent_idx = chain.nuclide_dict['Parent']
+    product_idx = chain.nuclide_dict['Product']
+    product_m1_idx = chain.nuclide_dict['Product_m1']
+
+    gain_product = dense[product_idx, parent_idx]
+    gain_product_m1 = dense[product_m1_idx, parent_idx]
+
+    assert np.isclose(gain_product, 0.7), \
+        f"Expected gain term 0.7 (applied once), got {gain_product}."
+    assert np.isclose(gain_product_m1, 0.3), \
+        f"Expected gain term 0.3 (applied once), got {gain_product_m1}."
+
+    # Mass conservation: total gain into products equals loss from the parent
+    column_sum = dense[:, parent_idx].sum()
+    assert np.isclose(column_sum, 0.0), \
+        f"Mass conservation violated: parent column sums to {column_sum}."
+
+
+def test_form_rxn_matrix_multi_entry_static_br():
+    """Without runtime branching each duplicate entry keeps its own static br."""
+    from openmc.deplete import ReactionRates
+
+    chain = _build_multi_entry_chain()
+
+    nuclides = ['Parent', 'Product', 'Product_m1']
+    rates = ReactionRates(['mat1'], nuclides, ['(n,gamma)'])
+    rates[0, 0, 0] = 1.0
+
+    matrix = chain.form_rxn_matrix(rates[0], isomeric_branching=None)
+    dense = matrix.toarray()
+
+    parent_idx = chain.nuclide_dict['Parent']
+    product_idx = chain.nuclide_dict['Product']
+    product_m1_idx = chain.nuclide_dict['Product_m1']
+
+    assert np.isclose(dense[product_idx, parent_idx], 0.92)
+    assert np.isclose(dense[product_m1_idx, parent_idx], 0.08)
+    assert np.isclose(dense[:, parent_idx].sum(), 0.0)
