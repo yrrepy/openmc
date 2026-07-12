@@ -499,45 +499,14 @@ class GENDFLibrary:
         if lfs_values is None:
             raise ValueError("lfs_values required with target_names")
 
-        from openmc.deplete.gendf import IsomericBranching, MT_TO_REACTION
+        from openmc.deplete.gendf import build_runtime_branching
 
+        # C++ backend returns production XS already aligned to the full
+        # group grid; the BR computation is shared with the Python backend
         levels = self._get_production_xs(nuclide, mt)
-        if not levels:
-            return None
-
-        # Build LFS→XS lookup from C++ results
-        lfs_to_xs = {lfs: xs for lfs, izap, xs in levels}
-
-        # Filter to requested LFS values
-        n_groups = self.n_groups
-        prod_xs = []
-        for lfs in lfs_values:
-            if lfs in lfs_to_xs:
-                prod_xs.append(lfs_to_xs[lfs])
-            else:
-                # LFS not found in GENDF — zero production
-                prod_xs.append(np.zeros(n_groups))
-
-        prod_xs = np.array(prod_xs)  # (n_targets, n_groups)
-
-        # Compute branching ratios: BR_i = σ_prod_i / Σ σ_prod_j
-        total = prod_xs.sum(axis=0)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            br = np.where(total > 0, prod_xs / total, 0.0)
-
-        reaction = MT_TO_REACTION.get(mt, f'MT{mt}')
-        lfs_mapping = {name: lfs for name, lfs
-                       in zip(target_names, lfs_values) if lfs > 0}
-
-        return IsomericBranching(
-            energies=self.energy_bounds[:-1].copy(),
-            products=list(target_names),
-            branching_ratios=br,
-            parent_nuclide=nuclide,
-            reaction=reaction,
-            mt=mt,
-            lfs_mapping=lfs_mapping,
-        )
+        return build_runtime_branching(
+            levels, target_names, lfs_values, self.energy_bounds,
+            nuclide, mt)
 
     def __repr__(self):
         return (f"GENDFLibrary(lib_id={self._lib_id}, "

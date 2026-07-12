@@ -353,6 +353,70 @@ class IsomericBranching:
         )
 
 
+def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
+                            nuclide_name, mt):
+    """Build runtime-mode IsomericBranching from aligned production XS.
+
+    Shared by the Python and C++ backends: both fetch per-level MF=10
+    production XS aligned to the full group grid and feed it here, so the
+    branching-ratio computation cannot diverge between backends.
+
+    Parameters
+    ----------
+    levels : list of (int, int, numpy.ndarray)
+        (lfs, izap, xs) tuples with xs aligned to the full group grid
+    target_names : list of str
+        Product names from chain, ordered as lfs_values
+    lfs_values : list of int
+        LFS values corresponding to target_names
+    energy_bounds : numpy.ndarray
+        Full group-structure boundaries in eV, length n_groups + 1
+    nuclide_name : str
+        Parent nuclide name
+    mt : int
+        ENDF MT number
+
+    Returns
+    -------
+    IsomericBranching or None
+        None if no production levels are available
+    """
+    if not levels:
+        return None
+
+    lfs_to_xs = {lfs: xs for lfs, izap, xs in levels}
+    n_groups = len(energy_bounds) - 1
+
+    prod_xs = []
+    for lfs in lfs_values:
+        if lfs in lfs_to_xs:
+            prod_xs.append(lfs_to_xs[lfs])
+        else:
+            # LFS not found in GENDF — zero production
+            prod_xs.append(np.zeros(n_groups))
+
+    prod_xs = np.array(prod_xs)  # (n_targets, n_groups)
+
+    # Compute branching ratios: BR_i = σ_prod_i / Σ σ_prod_j
+    total = prod_xs.sum(axis=0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        br = np.where(total > 0, prod_xs / total, 0.0)
+
+    reaction = MT_TO_REACTION.get(mt, f'MT{mt}')
+    lfs_mapping = {name: lfs for name, lfs
+                   in zip(target_names, lfs_values) if lfs > 0}
+
+    return IsomericBranching(
+        energies=energy_bounds[:-1].copy(),
+        products=list(target_names),
+        branching_ratios=br,
+        parent_nuclide=nuclide_name,
+        reaction=reaction,
+        mt=mt,
+        lfs_mapping=lfs_mapping,
+    )
+
+
 class _PythonGENDFLibrary:
     """Python implementation of GENDF cross-section library.
 
@@ -2123,37 +2187,9 @@ class _PythonGENDFLibrary:
                 raise ValueError("lfs_values required with target_names")
 
             levels = self._get_production_xs(nuclide_name, mt)
-            if not levels:
-                return None
-
-            lfs_to_xs = {lfs: xs for lfs, izap, xs in levels}
-            n_groups = self.n_groups
-
-            prod_xs = []
-            for lfs in lfs_values:
-                if lfs in lfs_to_xs:
-                    prod_xs.append(lfs_to_xs[lfs])
-                else:
-                    prod_xs.append(np.zeros(n_groups))
-
-            prod_xs = np.array(prod_xs)
-            total = prod_xs.sum(axis=0)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                br = np.where(total > 0, prod_xs / total, 0.0)
-
-            reaction = MT_TO_REACTION.get(mt, f'MT{mt}')
-            lfs_mapping = {name: lfs for name, lfs
-                           in zip(target_names, lfs_values) if lfs > 0}
-
-            return IsomericBranching(
-                energies=self.energy_bounds[:-1].copy(),
-                products=list(target_names),
-                branching_ratios=br,
-                parent_nuclide=nuclide_name,
-                reaction=reaction,
-                mt=mt,
-                lfs_mapping=lfs_mapping,
-            )
+            return build_runtime_branching(
+                levels, target_names, lfs_values, self.energy_bounds,
+                nuclide_name, mt)
 
         # Patcher mode — ELIS/LFS-order mapping (requires decay file)
         if self.decay_lookup is None:
@@ -2537,6 +2573,7 @@ __all__ = [
     '_PythonGENDFLibrary',
     '_CppGENDFLibrary',
     'IsomericBranching',
+    'build_runtime_branching',
     'DecayState',
     'get_target_name',
     'get_product_name',
