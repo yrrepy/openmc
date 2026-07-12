@@ -5,7 +5,7 @@ IndependentOperator class for depletion.
 """
 
 from __future__ import annotations
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -415,6 +415,7 @@ def get_pendf_microxs_and_flux(
     *,
     urr_material_dilution: bool = False,
     mat_ssf_nuclides: Sequence[str] | None = None,
+    partial_binding: bool | Collection[tuple[str, str]] = False,
 ) -> tuple[list[np.ndarray], list[MicroXS]]:
     """Generate PENDF microscopic cross sections and fluxes for multiple domains.
 
@@ -505,6 +506,30 @@ def get_pendf_microxs_and_flux(
         default flagged list and the library's ptable coverage). ``None``
         (default) uses the full flagged list. Only used when
         ``urr_material_dilution`` is ``True``.
+    partial_binding : bool or collection of (str, str), optional
+        Opt-in switch, threaded to :meth:`MicroXS.from_multigroup_flux`, for
+        chain-**stock** reactions whose ELIS-failed metastable would otherwise
+        lump into the ground row. ``False`` (default) is today's behaviour
+        exactly (a stock reaction emits the single MF=3 total). ``True`` binds
+        every candidate that survives the veto; a collection of
+        ``(nuclide, reaction_type)`` pairs (the reaction type as it appears in
+        the chain / MicroXS row names, e.g. ``{('Np239', '(n,gamma)')}``) binds
+        only those. A candidate -- a stock reaction with an MF=10 LFS=0 ground
+        partial AND >=1 other partial -- binds its ground row to the LFS=0
+        partial and drops the unmapped metastables. **Three honest costs:**
+        (1) *library-dependence* -- the same chain then gives the MF=3 total on a
+        library without a usable MF=10 ground and the MF=10 ground on one with
+        it (``False`` preserves the library-independent "stock = MF=3 total"
+        invariant); (2) *convergent-channel degradation* -- the MF=3 total is the
+        true parent removal rate, so binding under-burns the parent by the
+        dropped metastable fraction AND under-produces a shared daughter the MF=3
+        lump delivers correctly (the switch is intended for the few
+        divergent-daughter exotics -- Bk247, Au176 class -- which the collection
+        form scopes; global ``True`` is exploration only); (3) *veto semantics*
+        -- binding is reason-blind, so a candidate whose LFS=0 is a thermal
+        placeholder (Bk247 class) or whose grid over-sums (``Sigma(all)/total >
+        1.5``) is refused and silently keeps the MF=3 total, with one summary
+        warning naming the bound, vetoed, and kept channels.
 
     Returns
     -------
@@ -684,7 +709,8 @@ def get_pendf_microxs_and_flux(
         MicroXS.from_multigroup_flux(
             energies=energies, multigroup_flux=flux_i, chain_file=chain,
             nuclides=nuclides, reactions=reactions, pendf_library=pendf_library,
-            urr_material_dilution=dilution, mat_ssf_nuclides=mat_ssf_nuclides)
+            urr_material_dilution=dilution, mat_ssf_nuclides=mat_ssf_nuclides,
+            partial_binding=partial_binding)
         for flux_i, dilution in zip(fluxes, dilution_per_domain)
     ]
 
@@ -946,6 +972,11 @@ CONSISTENCY_ABS_FLOOR = 1e-15
 # see _silence_fill_ground. Hardwired (no per-run knob), mirroring the
 # MF=10-always-on precedent.
 SILENCE_EPS = 1e-3
+
+# Sigma(all MF=10 partials)/total above this is a corrupt/over-summing grid,
+# so the opt-in partial-binding switch refuses to bind such a reaction's LFS=0
+# ground (decision B1). Same value as the retired patcher gate's spike cap.
+_SPIKE_CAP = 1.5
 
 # Trailing metastable qualifier ('_m1') on nuclide names / qualified
 # reaction types.
@@ -1276,12 +1307,80 @@ def _silence_fill_ground(
                         ground0_range=ground0_range)
 
 
+def _normalize_partial_binding(partial_binding):
+    """Normalize ``partial_binding`` to ``False``, ``True``, or a set of pairs.
+
+    Accepts ``False`` (off), ``True`` (bind every candidate that survives the
+    veto), or a collection of ``(nuclide, reaction_type)`` string pairs (bind
+    only those, e.g. ``{('Np239', '(n,gamma)')}``); ``None`` is treated as
+    ``False``. Returns ``False``, ``True``, or a ``set`` of ``(str, str)`` pairs.
+    """
+    if isinstance(partial_binding, bool):
+        return partial_binding
+    if partial_binding is None:
+        return False
+    try:
+        return {(str(nuc), str(rx)) for nuc, rx in partial_binding}
+    except (TypeError, ValueError):
+        raise ValueError(
+            'partial_binding must be a bool or a collection of '
+            f'(nuclide, reaction_type) pairs; got {partial_binding!r}')
+
+
+def _partial_binding_veto(fill: _SilenceFill) -> str | None:
+    """Veto reason for binding a stock ground to the LFS=0 partial, or ``None``.
+
+    The pointwise/tape analogue of decision B1: refuse to bind when, at or below
+    the LFS=0 partial's last tabulated point and where the MF=3 total is
+    significant, either the branching is silent anywhere (``'silent'`` -- a
+    placeholder/gap region exists, so the stored LFS=0 ground cannot be trusted
+    as the full ground row; the Bk247 thermal-placeholder class) or
+    ``Sigma(all)/total`` exceeds :data:`_SPIKE_CAP` anywhere (``'spike'`` -- a
+    corrupt/over-summing grid). Energies above the LFS=0 partial's last point
+    (the universal terminal sliver where the MF=10 partials have ended but the
+    MF=3 total still tails off) are NOT examined, matching the in-domain
+    silence-fill decision (a bound channel there behaves like a qualified one).
+    """
+    if fill.ground0_range is None:
+        return None
+    in_dom = fill.e <= fill.ground0_range[1]
+    if bool((fill.silent & in_dom).any()):
+        return 'silent'
+    sig = fill.total > CONSISTENCY_ABS_FLOOR
+    ratio = np.divide(fill.sum_all, fill.total,
+                      out=np.zeros_like(fill.total), where=sig)
+    if bool((sig & in_dom & (ratio > _SPIKE_CAP)).any()):
+        return 'spike'
+    return None
+
+
+def _partial_binding_veto_grouped(sum_all_g: np.ndarray,
+                                  total_g: np.ndarray) -> str | None:
+    """Group-space veto analogue for the grouped-library partial-binding path.
+
+    Conservative relative to :func:`_partial_binding_veto`: a grouped library
+    carries no pointwise grid, so the whole group range is examined and a top
+    group lying wholly in the terminal sliver (partials ended, MF=3 total still
+    live) may over-veto. Silent group = ``total`` significant and
+    ``Sigma(all)/total < SILENCE_EPS``; spike group = ratio ``> _SPIKE_CAP``.
+    """
+    sig_g = total_g > CONSISTENCY_ABS_FLOOR
+    ratio_g = np.divide(sum_all_g, total_g,
+                        out=np.zeros_like(total_g), where=sig_g)
+    if bool((sig_g & (ratio_g < SILENCE_EPS)).any()):
+        return 'silent'
+    if bool((sig_g & (ratio_g > _SPIKE_CAP)).any()):
+        return 'spike'
+    return None
+
+
 def _build_xs_table_pendf(
     nuclides: Sequence[str],
     reactions: Sequence[str],
     energies: Sequence[float],
     pendf_library,
     chain: Chain,
+    partial_binding: bool | Collection[tuple[str, str]] = False,
 ) -> _SparseXSTable:
     """Build a sparse group cross section table from a pointwise PENDF library.
 
@@ -1349,6 +1448,13 @@ def _build_xs_table_pendf(
         Depletion chain supplying isomeric row names (see above). Each MF=10
         ``LFS`` partial is bound to the chain reaction carrying that
         ``pendf_lfs``.
+    partial_binding : bool or collection of (str, str), optional
+        Opt-in switch (default ``False`` = today's behaviour exactly) that lets a
+        chain-**stock** reaction bind its ground row to the library's MF=10 LFS=0
+        partial and DROP the unmapped metastables, instead of routing the MF=3
+        total into ground. ``True`` binds every surviving candidate; a collection
+        of ``(nuclide, base-reaction)`` pairs binds only those. See the veto and
+        cost notes on :func:`get_pendf_microxs_and_flux`.
     """
     # Qualified names are expansion outputs, not inputs; reduce to distinct base
     # reactions so a qualified name never reaches ``REACTION_MT`` (KeyError).
@@ -1356,6 +1462,7 @@ def _build_xs_table_pendf(
     mts = [REACTION_MT[name] for name in reactions]
     energies = np.asarray(energies, dtype=float)
     n_groups = len(energies) - 1
+    partial_binding = _normalize_partial_binding(partial_binding)
 
     # Fast path: a grouped PENDF library exposes ``group_edges`` and pre-binned
     # ``xs_g``/``pathway_xs_g`` accessors, so rows are read straight from the
@@ -1395,6 +1502,15 @@ def _build_xs_table_pendf(
     # (the fill is a build-time bake), so these are collected for one summary
     # warning. A pointwise build silence-fills instead and never populates this.
     grouped_placeholder: list[tuple[str, str]] = []
+
+    # Partial-binding diagnostic (only emitted when the toggle is enabled),
+    # counted over CANDIDATES only (stock reactions with an LFS=0 ground plus
+    # >=1 other partial that are in scope): 'nuc rx' strings for the ground rows
+    # bound to the MF=10 LFS=0 partial, the vetoed ones (with '(silent)'/
+    # '(spike)'), and the ones kept on the MF=3 total for lack of a usable LFS=0.
+    pb_bound: list[str] = []
+    pb_vetoed: list[str] = []
+    pb_kept: list[str] = []
 
     # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
     # ordinals seen per base reaction are collected to build the expanded axis.
@@ -1459,8 +1575,58 @@ def _build_xs_table_pendf(
             # stock (rejected / no-decay-data / ELIS-tolerance), and the MF=3 total
             # equals the LFS=0 partial for a ground-only reaction, so a fallback
             # warning here would be pure by-design noise.
+            #
+            # Opt-in partial-binding (default off, bit-identical): a stock
+            # reaction whose library carries an LFS=0 ground partial AND >=1 other
+            # partial (an unmapped metastable, or a lumped second product) can
+            # instead bind its ground row to that LFS=0 partial and DROP the
+            # metastables -- past a silence/spike veto, because stockness is
+            # reason-blind (a band-rejected or thermal-placeholder LFS=0 must not
+            # replace the live MF=3 ground). See get_pendf_microxs_and_flux.
             if not lfs_reactions:
-                stage(nuc_idx, base_idx, name, total_g)
+                ground_g = None
+                if partial_binding is not False and have_pathways:
+                    pathway_list = list(pathways_fn(nuc, mt))
+                    ground_pairs = [(lfs, izap) for lfs, izap in pathway_list
+                                    if lfs == 0]
+                    # Candidate: a bindable LFS=0 ground plus >=1 other partial to
+                    # drop. A plain no-MF=10 stock reaction or an LFS=0-only
+                    # channel is never a candidate and is never counted.
+                    if ground_pairs and len(pathway_list) > 1 and (
+                            partial_binding is True
+                            or (nuc, name) in partial_binding):
+                        if grouped:
+                            sum_all_g = np.zeros(n_groups)
+                            for lfs, izap in pathway_list:
+                                sum_all_g = sum_all_g + pathway_xs_fn(
+                                    nuc, mt, lfs, izap)
+                            reason = _partial_binding_veto_grouped(
+                                sum_all_g, total_g)
+                        else:
+                            fill = _silence_fill_ground(
+                                pathways_fn, pathway_xs_fn, nuc, mt, energy, xs,
+                                set())
+                            reason = _partial_binding_veto(fill)
+                        if reason is not None:
+                            pb_vetoed.append(f'{nuc} {name} ({reason})')
+                        else:
+                            # Ground row = the LFS=0 partial's group average (a
+                            # multi-product ground sums into the single stock
+                            # ground row); the metastables are simply not staged.
+                            g = np.zeros(n_groups)
+                            for lfs, izap in ground_pairs:
+                                if grouped:
+                                    g = g + pathway_xs_fn(nuc, mt, lfs, izap)
+                                else:
+                                    pe, pxs = pathway_xs_fn(nuc, mt, lfs, izap)
+                                    g = g + _group_average(pe, pxs, energies)
+                            if g.any():
+                                ground_g = g
+                                pb_bound.append(f'{nuc} {name}')
+                            else:
+                                pb_kept.append(f'{nuc} {name}')
+                stage(nuc_idx, base_idx, name,
+                      total_g if ground_g is None else ground_g)
                 continue
 
             # Chain qualified: the chain (demand side) lists the LFS levels it
@@ -1612,6 +1778,19 @@ def _build_xs_table_pendf(
              'libraries are not silence-filled at collapse time). Rebuild the '
              'grouped h5 with the baked fill for correct thermal ground '
              'production.')
+
+    # One partial-binding summary per build (only when the toggle is enabled and
+    # at least one candidate was in scope), matching the one-summary-per-build
+    # style above. Counts and names are over candidates only.
+    if partial_binding is not False and (pb_bound or pb_vetoed or pb_kept):
+        b = f' [{", ".join(pb_bound)}]' if pb_bound else ''
+        v = f' [{", ".join(pb_vetoed)}]' if pb_vetoed else ''
+        k = f' [{", ".join(pb_kept)}]' if pb_kept else ''
+        warn(f'PENDF partial-binding (opt-in): {len(pb_bound)} bound to MF=10 '
+             f'ground{b}; {len(pb_vetoed)} vetoed{v}; {len(pb_kept)} kept '
+             f'MF=3 total, no usable LFS=0{k}. Bound stock reactions use the '
+             'library MF=10 ground and drop unmapped metastables (a '
+             'library-dependent choice; see get_pendf_microxs_and_flux).')
 
     # Build the expanded reaction axis: every base name (always present, so the
     # dense result keeps a column for each requested reaction) followed by its
@@ -1824,6 +2003,7 @@ class MicroXS:
         pendf_library=None,
         urr_material_dilution: openmc.Material | Mapping[str, float] | bool = False,
         mat_ssf_nuclides=None,
+        partial_binding: bool | Collection[tuple[str, str]] = False,
         **init_kwargs: dict,
     ) -> MicroXS | list[MicroXS]:
         """Generated microscopic cross sections from a known flux.
@@ -1942,6 +2122,37 @@ class MicroXS:
             the default flagged list and the library's ptable coverage). ``None``
             (default) uses the full flagged list. Only used when
             ``urr_material_dilution`` is true.
+        partial_binding : bool or collection of (str, str), optional
+            Opt-in switch (only meaningful on the PENDF path) for chain-**stock**
+            reactions whose ELIS-failed metastable would otherwise lump into the
+            ground row. ``False`` (default) is today's behaviour exactly: a stock
+            reaction emits the single MF=3 total. ``True`` binds every candidate
+            that survives the veto; a collection of ``(nuclide, reaction_type)``
+            pairs -- the reaction type as it appears in the chain / MicroXS row
+            names, e.g. ``{('Np239', '(n,gamma)')}`` -- binds only those. A
+            candidate is a stock reaction whose library carries an LFS=0 ground
+            partial AND >=1 other partial (an unmapped metastable, or a lumped
+            second product); it binds its ground row to the LFS=0 partial and
+            drops the unmapped metastables. **Three honest costs:**
+
+            1. *Library-dependence.* Under the toggle the same chain gives the
+               MF=3 total on a library without a usable MF=10 ground and the
+               MF=10 ground on one with it. ``False`` preserves the
+               library-independent "stock = MF=3 total" invariant.
+            2. *Convergent-channel degradation.* The MF=3 total is the TRUE
+               parent removal rate; binding under-burns the parent by the
+               dropped metastable fraction AND under-produces a shared daughter
+               that the MF=3 lump delivers correctly. The switch is intended for
+               the few divergent-daughter exotics (Bk247, Au176 class) -- that is
+               what the collection form scopes; global ``True`` is exploration
+               only.
+            3. *Veto semantics.* Binding is reason-blind (a stock reaction may be
+               band-rejected or carry a thermal-placeholder LFS=0, Bk247 class),
+               so a candidate is refused when, at/below the LFS=0 partial's last
+               tabulated point, the branching is silent anywhere (placeholder/gap)
+               or ``Sigma(all)/total`` spikes above 1.5 (corrupt grid). Vetoed
+               candidates silently keep the MF=3 total; one summary warning names
+               the bound, vetoed, and kept channels.
         **init_kwargs : dict
             Keyword arguments passed to :func:`openmc.lib.init`
 
@@ -2097,7 +2308,8 @@ class MicroXS:
         # Build the group cross section table once and collapse every flux
         if pendf_library is not None:
             table = _build_xs_table_pendf(
-                nuclides, reactions, energies, pendf_library, chain)
+                nuclides, reactions, energies, pendf_library, chain,
+                partial_binding=partial_binding)
             # URR material-dilution self-shielding: multiply the capture/fission
             # rows of flagged resonant nuclides by their per-group factor in the
             # URR-overlapping groups (in place). The =False path is untouched.

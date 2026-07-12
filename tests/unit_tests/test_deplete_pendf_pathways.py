@@ -1082,3 +1082,280 @@ def test_silence_fill_real_endfb81_ir192_noop():
                                       _group_average(pe0, px0, edges))
     finally:
         lib.close()
+
+
+# ---------- partial-binding (opt-in collapse switch; commit B) ----------
+#
+# A chain-STOCK reaction whose library carries an LFS=0 ground partial AND >=1
+# other partial can, under ``partial_binding``, bind its ground row to the LFS=0
+# partial and drop the unmapped metastables -- past a silence/spike veto (binding
+# is reason-blind, so a thermal-placeholder or corrupt-grid LFS=0 must not replace
+# the live MF=3 ground). Default off is bit-identical to today. Everything below
+# uses only helpers defined ABOVE this marker.
+
+def _pb_summary(record):
+    """The single partial-binding summary message captured in ``record``."""
+    msgs = [str(w.message) for w in record
+            if "partial-binding" in str(w.message)]
+    assert len(msgs) == 1
+    return msgs[0]
+
+
+def _stock_candidate_fake(nuc, grid, total, ground, meta):
+    """A ``_FakePendf`` + STOCK chain: library has LFS=0 ground + metastable but the
+    products are unmapped, so ``_chain_from_fake`` builds a stock chain."""
+    fake = _FakePendf(
+        mf3={nuc: {102: (grid, total)}},
+        mf10={nuc: {102: {0: (None, (grid, ground)),
+                          1: (None, (grid, meta))}}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # products None -> stock
+    return fake, chain
+
+
+def test_partial_binding_noncandidates_keep_mf3_total(recwarn):
+    """A non-candidate keeps the MF=3 total and emits no partial-binding diagnostic:
+    the toggle OFF (default and explicit False, bit-identical -- the regression
+    guard), an LFS=0-only library (nothing to drop) under True, and a plain stock
+    reaction with no MF=10 at all under True."""
+    import warnings
+
+    edges = np.array([1e-5, 0.625, 2e7])
+
+    # (a) Default off and explicit False build a bit-identical MF=3-total table with
+    # nothing emitted at all (the regression guard).
+    grid = np.array([1e-5, 1.0, 1e3, 1e6, 2e7])
+    total = np.array([10.0, 8.0, 4.0, 2.0, 1.0])
+    fake, chain = _stock_candidate_fake("P1", grid, total, total * 0.6,
+                                        total * 0.4)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                  # any warning -> failure
+        default = _build_xs_table_pendf(["P1"], ["(n,gamma)"], edges, fake, chain)
+        explicit = _build_xs_table_pendf(["P1"], ["(n,gamma)"], edges, fake, chain,
+                                         partial_binding=False)
+    total_g = _group_average(grid, total, edges)
+    assert default.reactions == ["(n,gamma)"]            # no metastable row
+    np.testing.assert_array_equal(_row(default, "(n,gamma)"), total_g)
+    assert default.reactions == explicit.reactions
+    np.testing.assert_array_equal(default.xs_matrix, explicit.xs_matrix)
+    assert list(default.rxn_indices) == list(explicit.rxn_indices)
+
+    # (b) An LFS=0-only library (nothing to drop) is NOT a candidate under True.
+    grid = np.array([1e-5, 1.0, 2e7])
+    total = np.array([5.0, 4.0, 1.0])
+    fake = _FakePendf(
+        mf3={"L0": {102: (grid, total)}},
+        mf10={"L0": {102: {0: (None, (grid, total))}}})   # LFS=0 only
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})     # stock
+    table = _build_xs_table_pendf(["L0"], ["(n,gamma)"], edges, fake, chain,
+                                  partial_binding=True)
+    np.testing.assert_array_equal(_row(table, "(n,gamma)"),
+                                  _group_average(grid, total, edges))
+    assert table.reactions == ["(n,gamma)"]
+
+    # (c) A plain stock reaction with no MF=10 at all is never a candidate.
+    fake = _FakePendf(mf3={"N0": {102: _const(2.0)}})     # MF=3 only
+    table = _build_xs_table_pendf(["N0"], ["(n,gamma)"], np.array([0.0, 2e7]),
+                                  fake, Chain(), partial_binding=True)
+    np.testing.assert_array_equal(_row(table, "(n,gamma)"), [2.0])
+
+    assert not [w for w in recwarn if "partial-binding" in str(w.message)]
+
+
+def test_partial_binding_binds_live_candidate():
+    """A LIVE stock candidate binds under True: the ground row becomes the group-
+    averaged LFS=0 partial (< MF=3 total), the metastable is dropped, and the
+    diagnostic names the bound channel -- both directly in ``_build_xs_table_pendf``
+    and threaded through the public :meth:`from_multigroup_flux` entry."""
+    grid = np.array([1e-5, 1.0, 1e3, 1e6, 2e7])
+    total = np.array([10.0, 8.0, 4.0, 2.0, 1.0])
+    ground = total * 0.6
+    fake, chain = _stock_candidate_fake("P2", grid, total, ground, total * 0.4)
+    edges = np.array([1e-5, 0.625, 2e7])
+
+    with pytest.warns(UserWarning, match="partial-binding") as record:
+        table = _build_xs_table_pendf(["P2"], ["(n,gamma)"], edges, fake, chain,
+                                      partial_binding=True)
+    assert table.reactions == ["(n,gamma)"]             # metastable absent
+    np.testing.assert_array_equal(_row(table, "(n,gamma)"),
+                                  _group_average(grid, ground, edges))
+    assert np.all(_row(table, "(n,gamma)") < _group_average(grid, total, edges))
+    assert "1 bound to MF=10 ground [P2 (n,gamma)]" in _pb_summary(record)
+
+    # The kwarg threads through the public entry point: off -> MF=3 total; on ->
+    # LFS=0 ground (< total), no metastable row.
+    grid = np.array([1e-5, 1.0, 2e7])
+    total = np.array([10.0, 8.0, 1.0])
+    fake, chain = _stock_candidate_fake("P9", grid, total, total * 0.6,
+                                        total * 0.4)
+    edges = [1e-5, 0.625, 2e7]
+    off = MicroXS.from_multigroup_flux(
+        energies=edges, multigroup_flux=[1.0, 1.0], chain_file=chain,
+        nuclides=["P9"], reactions=["(n,gamma)"], pendf_library=fake)
+    with pytest.warns(UserWarning, match="partial-binding"):
+        on = MicroXS.from_multigroup_flux(
+            energies=edges, multigroup_flux=[1.0, 1.0], chain_file=chain,
+            nuclides=["P9"], reactions=["(n,gamma)"], pendf_library=fake,
+            partial_binding=True)
+    assert "(n,gamma)_m1" not in on.reactions
+    assert on["P9", "(n,gamma)"][0] < off["P9", "(n,gamma)"][0]   # ground < total
+
+
+def test_partial_binding_veto_keeps_mf3():
+    """Binding is vetoed and the MF=3 total kept when the LFS=0 ground cannot be
+    trusted: a thermal-placeholder ground while the MF=3 total is live (silence
+    veto, Bk247 class), and partials that over-sum at an in-domain point (spike
+    veto, corrupt-grid class). The diagnostic names each with its veto reason."""
+    edges = np.array([1e-5, 0.625, 2e7])
+
+    # (a) Silence veto: LFS=0 (and metastable) are ~1e-20 placeholders < ~100 eV
+    # while the MF=3 total is live (8 b).
+    grid = np.array([1e-5, 1e-3, 0.1, 100.0, 1e3, 2e7])
+    total = np.array([8.0, 2.5, 0.8, 5.0, 4.0, 1.0])
+    ground = np.array([_PH, _PH, _PH, 3.0, 2.4, 0.6])   # placeholder < ~100 eV
+    meta = np.array([_PH, _PH, _PH, 2.0, 1.6, 0.4])
+    fake = _FakePendf(
+        mf3={"Bk247": {102: (grid, total)}},
+        mf10={"Bk247": {102: {0: (None, (grid, ground)),
+                              1: (None, (grid, meta))}}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # stock
+    with pytest.warns(UserWarning, match="partial-binding") as record:
+        table = _build_xs_table_pendf(["Bk247"], ["(n,gamma)"], edges, fake,
+                                      chain, partial_binding=True)
+    np.testing.assert_array_equal(_row(table, "(n,gamma)"),
+                                  _group_average(grid, total, edges))
+    assert table.reactions == ["(n,gamma)"]
+    msg = _pb_summary(record)
+    assert "0 bound" in msg
+    assert "1 vetoed [Bk247 (n,gamma) (silent)]" in msg
+
+    # (b) Spike veto: partials over-sum (Sigma(all)/total = 3 > 1.5) at one point.
+    grid = np.array([1e-5, 1.0, 10.0, 1e3, 2e7])
+    total = np.array([10.0, 8.0, 5.0, 4.0, 1.0])
+    ground = np.array([6.0, 5.0, 3.0, 2.4, 0.6])
+    meta = np.array([4.0, 3.0, 12.0, 1.6, 0.4])          # 3+12=15 vs 5 -> ratio 3
+    fake = _FakePendf(
+        mf3={"Sp1": {102: (grid, total)}},
+        mf10={"Sp1": {102: {0: (None, (grid, ground)),
+                            1: (None, (grid, meta))}}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})   # stock
+    with pytest.warns(UserWarning, match="partial-binding") as record:
+        table = _build_xs_table_pendf(["Sp1"], ["(n,gamma)"], edges, fake, chain,
+                                      partial_binding=True)
+    np.testing.assert_array_equal(_row(table, "(n,gamma)"),
+                                  _group_average(grid, total, edges))
+    assert "1 vetoed [Sp1 (n,gamma) (spike)]" in _pb_summary(record)
+
+
+def test_partial_binding_diagnostic_scope_and_counts():
+    """The single partial-binding summary scopes to the requested pairs and reports
+    per-channel counts with names: a Collection binds only its listed (nuclide, MT)
+    and leaves the rest on the MF=3 total (out-of-scope channels unnamed), and a
+    full True run reports N bound / V vetoed / K kept-no-usable-LFS=0 with names and
+    the veto reason."""
+    edges = np.array([1e-5, 0.625, 2e7])
+
+    # (a) A Collection listing only ('A', '(n,gamma)') binds A; B stays MF=3 total.
+    grid = np.array([1e-5, 1.0, 2e7])
+    tA = np.array([10.0, 8.0, 1.0])
+    tB = np.array([6.0, 5.0, 1.0])
+    fake = _FakePendf(
+        mf3={"A": {102: (grid, tA)}, "B": {102: (grid, tB)}},
+        mf10={"A": {102: {0: (None, (grid, tA * 0.6)),
+                          1: (None, (grid, tA * 0.4))}},
+              "B": {102: {0: (None, (grid, tB * 0.5)),
+                          1: (None, (grid, tB * 0.5))}}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})    # both stock
+    with pytest.warns(UserWarning, match="partial-binding") as record:
+        table = _build_xs_table_pendf(
+            ["A", "B"], ["(n,gamma)"], edges, fake, chain,
+            partial_binding={("A", "(n,gamma)")})
+    np.testing.assert_array_equal(_row(table, "(n,gamma)", nuc_idx=0),
+                                  _group_average(grid, tA * 0.6, edges))
+    np.testing.assert_array_equal(_row(table, "(n,gamma)", nuc_idx=1),
+                                  _group_average(grid, tB, edges))     # MF=3 total
+    msg = _pb_summary(record)
+    assert "1 bound to MF=10 ground [A (n,gamma)]" in msg
+    assert "B (n,gamma)" not in msg                       # out of scope, unnamed
+
+    # (b) A full True run: one bound (live), one vetoed (silent thermal placeholder),
+    # one kept (LFS=0 group-averages to zero while a metastable is live, so it passes
+    # the veto but has no bindable ground). The summary reports N=1 / V=1 / K=1.
+    grid = np.array([1e-5, 1.0, 1e3, 2e7])
+    tL = np.array([10.0, 8.0, 4.0, 1.0])                  # live candidate
+    tS = np.array([8.0, 0.5, 5.0, 1.0])                   # silent thermal
+    gS = np.array([_PH, _PH, 3.0, 0.6])
+    mS = np.array([_PH, _PH, 2.0, 0.4])
+    tK = np.array([6.0, 5.0, 3.0, 1.0])                   # LFS=0 zero, m live
+    fake = _FakePendf(
+        mf3={"Lv": {102: (grid, tL)}, "Si": {102: (grid, tS)},
+             "Kp": {102: (grid, tK)}},
+        mf10={"Lv": {102: {0: (None, (grid, tL * 0.6)),
+                           1: (None, (grid, tL * 0.4))}},
+              "Si": {102: {0: (None, (grid, gS)), 1: (None, (grid, mS))}},
+              "Kp": {102: {0: (None, (grid, np.zeros_like(tK))),
+                           1: (None, (grid, tK))}}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})    # all stock
+    with pytest.warns(UserWarning, match="partial-binding") as record:
+        _build_xs_table_pendf(["Lv", "Si", "Kp"], ["(n,gamma)"], edges, fake,
+                              chain, partial_binding=True)
+    msg = _pb_summary(record)
+    assert "1 bound to MF=10 ground [Lv (n,gamma)]" in msg
+    assert "1 vetoed [Si (n,gamma) (silent)]" in msg
+    assert "1 kept MF=3 total, no usable LFS=0 [Kp (n,gamma)]" in msg
+
+
+def test_partial_binding_grouped_binds_and_vetoes():
+    """Grouped-library path: the veto is group-space. Gb (live) binds to its LFS=0
+    group vector; Gs (thermal-group placeholder while the total is live) is
+    silence-vetoed and keeps the MF=3 total."""
+    edges = np.array([1e-5, 0.625, 2e7])
+    fake = _FakeGroupedPendf(
+        edges,
+        mf3_g={"Gb": {102: [10.0, 1.0]}, "Gs": {102: [8.0, 1.0]}},
+        mf10_g={"Gb": {102: {0: (None, [6.0, 0.6]), 1: (None, [4.0, 0.4])}},
+                "Gs": {102: {0: (None, [_PH, 0.6]), 1: (None, [_PH, 0.4])}}})
+    chain = _chain_from_fake(fake, {102: "(n,gamma)"})    # both stock
+
+    with pytest.warns(UserWarning, match="partial-binding") as record:
+        table = _build_xs_table_pendf(["Gb", "Gs"], ["(n,gamma)"], edges, fake,
+                                      chain, partial_binding=True)
+    np.testing.assert_array_equal(_row(table, "(n,gamma)", nuc_idx=0),
+                                  [6.0, 0.6])              # bound LFS=0 vector
+    np.testing.assert_array_equal(_row(table, "(n,gamma)", nuc_idx=1),
+                                  [8.0, 1.0])              # MF=3 total kept
+    msg = _pb_summary(record)
+    assert "1 bound to MF=10 ground [Gb (n,gamma)]" in msg
+    assert "1 vetoed [Gs (n,gamma) (silent)]" in msg
+
+
+@pytest.mark.skipif(not _JEFF_V1.exists(),
+                    reason="JEFF-4.0 v1 pointwise PENDF h5 not available")
+def test_partial_binding_real_jeff_np239():
+    # Np239 (n,gamma) in JEFF-4.0: LFS=0 is LIVE at thermal (~55 b) while the MF=3
+    # total is ~81 b (the metastable carries the rest). A stock chain + True binds
+    # the ground to the LFS=0 partial (< MF=3 total) and drops the metastable.
+    import openmc.data as od
+    lib = od.PendfLibrary(_JEFF_V1)
+    try:
+        pw = {lfs for lfs, _ in lib.pathways("Np239", 102)}
+        assert 0 in pw and any(l > 0 for l in pw)          # candidate-able
+        edges = np.array([1e-5, 0.625, 2e7])
+        total_g = _group_average(*lib.xs("Np239", 102), edges)
+        pe0, px0 = lib.pathway_xs("Np239", 102, 0, None)
+        ground0_g = _group_average(pe0, px0, edges)
+
+        # Off: today's behavior -- the MF=3 total (Np239 stock: absent from chain).
+        off = _build_xs_table_pendf(["Np239"], ["(n,gamma)"], edges, lib, Chain())
+        np.testing.assert_array_equal(_row(off, "(n,gamma)"), total_g)
+        assert off.reactions == ["(n,gamma)"]
+
+        # On: binds the live LFS=0 ground, drops the metastable.
+        with pytest.warns(UserWarning, match="partial-binding"):
+            on = _build_xs_table_pendf(["Np239"], ["(n,gamma)"], edges, lib,
+                                       Chain(), partial_binding=True)
+        assert on.reactions == ["(n,gamma)"]
+        np.testing.assert_array_equal(_row(on, "(n,gamma)"), ground0_g)
+        assert _row(on, "(n,gamma)")[0] > 1.0              # live thermal (~55 b)
+        assert _row(on, "(n,gamma)")[0] < total_g[0]       # below the MF=3 total
+    finally:
+        lib.close()
