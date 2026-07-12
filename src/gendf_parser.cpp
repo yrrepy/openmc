@@ -15,6 +15,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "openmc/error.h"
 #include "openmc/file_utils.h"
@@ -162,6 +163,12 @@ ExtractResult<double> extract_double_safe(
   }
 
   return result;
+}
+
+//! Lines spanned by a TAB1 interpolation table
+//! ENDF packs 2*NR integers (NBT,INT pairs) 6 per line, rounded up
+int interp_table_lines(int nr) {
+  return nr > 0 ? (2 * nr + 5) / 6 : 0;
 }
 
 //! Store validated section data into result
@@ -349,7 +356,8 @@ GENDFParseResult parse_gendf_validated(
         if (np_result.success && np_result.value > 0) {
           n_groups = np_result.value;
           in_data_section = true;
-          nr_lines_to_skip = nr_result.success ? nr_result.value : 0;
+          nr_lines_to_skip =
+            nr_result.success ? interp_table_lines(nr_result.value) : 0;
           current_xs.clear();
           current_xs.reserve(n_groups);
           current_energies.clear();
@@ -441,7 +449,8 @@ GENDFParseResult parse_gendf_validated(
           mf10_current_izap = izap_result.success ? izap_result.value : 0;
           mf10_current_lfs = lfs_result.success ? lfs_result.value : 0;
           mf10_n_groups = np_result.value;
-          mf10_nr_skip = nr_result.success ? nr_result.value : 0;
+          mf10_nr_skip =
+            nr_result.success ? interp_table_lines(nr_result.value) : 0;
 
           // Skip IZAP=0 (data quality issue). Enter discard mode so the
           // subsection's data lines are consumed rather than re-scanned as
@@ -555,6 +564,33 @@ GENDFParseResult parse_gendf_validated(
 }
 
 //==============================================================================
+// Warning surfacing: route parser diagnostics through warning(),
+// deduplicated and capped so a pathological file can't flood stdout
+//==============================================================================
+
+void emit_gendf_warnings(
+  const vector<std::string>& warnings, const std::string& context)
+{
+  constexpr size_t max_emit = 10;
+  std::unordered_set<std::string> seen;
+  size_t emitted = 0;
+  size_t suppressed = 0;
+  for (const auto& w : warnings) {
+    if (!seen.insert(w).second) continue;  // skip exact duplicates
+    if (emitted < max_emit) {
+      warning(w);
+      ++emitted;
+    } else {
+      ++suppressed;
+    }
+  }
+  if (suppressed > 0) {
+    warning("GENDF " + context + ": " + std::to_string(suppressed) +
+            " additional parser warning(s) suppressed");
+  }
+}
+
+//==============================================================================
 // MF=3-only GENDF parser (uses validated parser with optimized options)
 //==============================================================================
 
@@ -581,10 +617,8 @@ void parse_gendf_mf3_only(
     throw std::runtime_error(result.error_message);
   }
 
-  // Log warnings if any
-  for (const auto& warn : result.warnings) {
-    warning(warn);
-  }
+  // Surface warnings, capped and deduplicated
+  emit_gendf_warnings(result.warnings, filename);
 
   // Move results to output parameters
   xs_data = std::move(result.xs_data);

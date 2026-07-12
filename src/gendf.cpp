@@ -52,6 +52,10 @@ void GENDFMaterial::load_from_file(const std::string& filename)
     throw std::runtime_error(result.error_message);
   }
 
+  // Surface parser diagnostics (negative-XS clamps, energy/XS mismatches,
+  // bad ZA), capped and deduplicated to avoid flooding on pathological files
+  emit_gendf_warnings(result.warnings, nuclide_name_);
+
   za_ = result.za;
   zam_ = result.zam;
   xs_data_ = std::move(result.xs_data);

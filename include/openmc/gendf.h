@@ -292,6 +292,12 @@ GENDFParseResult parse_gendf_validated(
 //! \return True if valid
 bool validate_za(int za, std::string& error);
 
+//! Emit GENDF parser warnings via warning(), deduplicated and capped
+//! \param[in] warnings Warning messages from a GENDFParseResult
+//! \param[in] context Nuclide name or filename for the summary line
+void emit_gendf_warnings(
+  const vector<std::string>& warnings, const std::string& context);
+
 } // namespace openmc
 
 #endif // OPENMC_GENDF_H
