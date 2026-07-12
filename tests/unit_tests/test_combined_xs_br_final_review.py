@@ -722,14 +722,14 @@ def test_normalize_ratios_warns_on_deviation():
     assert np.isclose(sum(result.values()), 1.0)
 
 
-def test_normalize_ratios_zero_sum_raises():
-    """Verify ValueError when ratios sum to zero."""
+def test_normalize_ratios_zero_sum_returns_empty():
+    """Verify empty dict when ratios sum to zero (fall back to static BR)."""
     chain = _make_mock_chain()
     gendf = _make_mock_gendf()
     helper = IsomericBranchingHelper(chain, gendf)
 
-    with pytest.raises(ValueError, match="sum to 0"):
-        helper._normalize_ratios({'A': 0.0, 'B': 0.0}, 'test', 'test')
+    result = helper._normalize_ratios({'A': 0.0, 'B': 0.0}, 'test', 'test')
+    assert result == {}
 
 
 # ============================================================================

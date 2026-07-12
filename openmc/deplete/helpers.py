@@ -1818,9 +1818,11 @@ class IsomericBranchingHelper:
     ) -> Dict[str, float]:
         """Normalize weighted branching ratios to ensure probability conservation.
 
-        Validates that ratios sum to a positive value and normalizes them to
-        sum exactly to 1.0. Issues a warning if the original sum deviates
-        significantly (>1%) from 1.0, which may indicate data quality issues.
+        Normalizes ratios to sum exactly to 1.0. Issues a warning if the
+        original sum deviates significantly (>1%) from 1.0, which may
+        indicate data quality issues. A zero or negative sum returns an
+        empty dict (legitimate for threshold reactions with negligible
+        cross-section) so the caller falls back to static branching.
 
         Parameters
         ----------
@@ -1834,12 +1836,8 @@ class IsomericBranchingHelper:
         Returns
         -------
         dict
-            Normalized dictionary of {target: weighted_ratio} values
-
-        Raises
-        ------
-        ValueError
-            If ratios sum to zero or negative (indicates invalid data)
+            Normalized dictionary of {target: weighted_ratio} values.
+            Empty dict if ratios sum to zero or negative.
         """
         if not weighted_ratios:
             return {}
