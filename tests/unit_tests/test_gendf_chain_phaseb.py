@@ -172,3 +172,73 @@ def test_m4_embedded_roundtrip(tmp_path):
     gamma = next(r for r in reloaded['Ag107'].reactions
                  if r.type == '(n,gamma)')
     assert gamma.target == 'Ag108'
+
+
+# ---------------------------------------------------------------------------
+# Minor #2: malformed gendf_lfs must not abort Chain.from_xml
+# ---------------------------------------------------------------------------
+
+def test_minor2_malformed_gendf_lfs(tmp_path):
+    """A non-integer gendf_lfs token warns and is skipped, chain still loads."""
+    bad = _FLAGS_XML.replace('gendf_lfs="0 1"', 'gendf_lfs="0 x"')
+    src = tmp_path / "bad_lfs.xml"
+    src.write_text(bad)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chain = Chain.from_xml(src)
+
+    assert chain.isomeric_branching_targets == {'Nb93': {'(n,2n)': ['Nb92', 'Nb92_m1']}}
+    assert chain.isomeric_branching_lfs is None
+    assert any("Malformed gendf_lfs" in str(w.message) for w in caught)
+
+
+# ---------------------------------------------------------------------------
+# Minor #11: deterministic trailing (non-chain) nuclide order
+# ---------------------------------------------------------------------------
+
+def _fake_operator(chain_nuclides, model_nuclides):
+    """Minimal stand-in exercising OpenMCOperator._get_burnable_mats sorting."""
+    mat = SimpleNamespace(get_nuclides=lambda: list(model_nuclides),
+                          depletable=True, id=1, name='m',
+                          volume=1.0, fissionable_mass=0.0)
+    return SimpleNamespace(
+        materials=[mat],
+        nuclides_with_data=set(model_nuclides),
+        _decay_nucs=set(),
+        chain=SimpleNamespace(
+            nuclide_dict={n: i for i, n in enumerate(chain_nuclides)}),
+        heavy_metal=0.0)
+
+
+def test_minor11_trailing_order_deterministic_and_alphabetical():
+    """Non-chain nuclides append in alphabetical order regardless of set order."""
+    chain_nuclides = ['H1', 'He4', 'U235']
+    # Non-chain nuclides deliberately not alphabetical in the input set
+    model_nuclides = {'U235', 'Zr90', 'Ba140', 'Kr85', 'H1'}
+
+    _, _, nuclides = OpenMCOperator._get_burnable_mats(
+        _fake_operator(chain_nuclides, model_nuclides))
+
+    # Chain nuclides come first, in chain order
+    assert nuclides[:3] == ['H1', 'He4', 'U235']
+    # Trailing non-chain nuclides are alphabetical (deterministic)
+    trailing = nuclides[3:]
+    assert trailing == sorted(trailing)
+    assert trailing == ['Ba140', 'Kr85', 'Zr90']
+
+
+def test_minor11_stable_across_set_orderings():
+    """Result is identical for different input set iteration orders."""
+    chain_nuclides = ['H1', 'U235']
+    names = ['Zr90', 'Ba140', 'Kr85', 'Xe135', 'Cs137']
+
+    results = []
+    for shift in range(len(names)):
+        rotated = set(names[shift:] + names[:shift])
+        _, _, nuclides = OpenMCOperator._get_burnable_mats(
+            _fake_operator(chain_nuclides, rotated))
+        results.append(nuclides)
+
+    assert all(r == results[0] for r in results)
+    assert results[0] == ['H1', 'U235', 'Ba140', 'Cs137', 'Kr85', 'Xe135', 'Zr90']

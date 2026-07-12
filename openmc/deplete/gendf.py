@@ -353,6 +353,17 @@ class IsomericBranching:
         )
 
 
+# Dedup store for once-per-key runtime-branching warnings
+_WARNED_RUNTIME_BRANCHING: set = set()
+
+
+def _warn_runtime_branching(key, message):
+    """Emit a runtime-branching UserWarning once per key."""
+    if key not in _WARNED_RUNTIME_BRANCHING:
+        _WARNED_RUNTIME_BRANCHING.add(key)
+        warnings.warn(message, UserWarning)
+
+
 def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
                             nuclide_name, mt):
     """Build runtime-mode IsomericBranching from aligned production XS.
@@ -392,13 +403,30 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
         if lfs in lfs_to_xs:
             prod_xs.append(lfs_to_xs[lfs])
         else:
-            # LFS not found in GENDF — zero production
+            # Chain requested a level the GENDF file lacks -> BR=0. Warn once.
             prod_xs.append(np.zeros(n_groups))
+            _warn_runtime_branching(
+                ('lfs_missing', nuclide_name, mt),
+                f"{nuclide_name} MT={mt}: chain requested LFS={lfs} but the "
+                f"GENDF file has no such production level; its branching ratio "
+                f"is set to 0.")
 
     prod_xs = np.array(prod_xs)  # (n_targets, n_groups)
 
-    # Compute branching ratios: BR_i = σ_prod_i / Σ σ_prod_j
+    # Branching ratios: BR_i = σ_prod_i / Σ σ_prod_j. The denominator must
+    # include the ground state (LFS=0), which the chain almost always
+    # requests; a metastable-only request would otherwise normalize the
+    # subset to 1.0 -> wrong physics.
     total = prod_xs.sum(axis=0)
+    if 0 not in lfs_values:
+        if 0 in lfs_to_xs:
+            total = total + lfs_to_xs[0]
+        else:
+            _warn_runtime_branching(
+                ('no_ground', nuclide_name, mt),
+                f"{nuclide_name} MT={mt}: no ground-state (LFS=0) production in "
+                f"the GENDF file and none requested; branching ratios normalize "
+                f"over metastables only and may not reflect absolute yields.")
     with np.errstate(divide='ignore', invalid='ignore'):
         br = np.where(total > 0, prod_xs / total, 0.0)
 
@@ -443,10 +471,10 @@ class _PythonGENDFLibrary:
         products to OpenMC ``_m{n}`` naming based on excitation energy
         matching. **Highly recommended** for isomeric branching workflows.
     elis_rtol : float, optional
-        Relative tolerance for ELIS matching (default: 0.01 = 1%).
+        Relative tolerance for ELIS matching (default: 0.50 = 50%).
         Used with ``elis_atol`` to determine if GENDF and decay ELIS values match.
     elis_atol : float, optional
-        Absolute tolerance in eV for ELIS matching (default: 100.0 eV).
+        Absolute tolerance in eV for ELIS matching (default: 0.0, rtol-only).
         Provides a floor for matching low excitation energies.
     skip_zero_elis_metastables : bool, optional
         If True (default), skip metastable states (LISO > 0) that have ELIS=0.0
@@ -2484,14 +2512,15 @@ def GENDFLibrary(
         products to OpenMC ``_m{n}`` naming based on excitation energy
         matching. **Highly recommended** for isomeric branching workflows.
     elis_rtol : float, optional
-        Relative tolerance for ELIS matching (default: 0.01 = 1%).
+        Relative tolerance for ELIS matching (default: 0.50 = 50%).
     elis_atol : float, optional
-        Absolute tolerance in eV for ELIS matching (default: 100.0 eV).
+        Absolute tolerance in eV for ELIS matching (default: 0.0, rtol-only).
     skip_zero_elis_metastables : bool, optional
         If True, skip metastable states with ELIS=0 in decay library (likely
         data errors). Default is True.
     mapping_mode : {'elis', 'lfs_order'}, optional
         Isomeric state mapping mode:
+
         - 'elis' (default): Use excitation energy (ELIS) matching between
           GENDF MF=10 products and decay library. Most accurate method.
         - 'lfs_order': Use FISPACT-like positional mapping where the 1st

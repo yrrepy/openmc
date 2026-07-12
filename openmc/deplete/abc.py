@@ -783,7 +783,8 @@ class Integrator(ABC):
         start = time.time()
         results = deplete(
             self._solver, self.chain, n, rates, dt, i, matrix_func,
-            self.transfer_rates, self.external_source_rates, self.operator)
+            self.transfer_rates, self.external_source_rates,
+            operator=self.operator)
         if self.clip_min_atom_density is not None:
             volumes = self.operator.number.volume
             for j, r in enumerate(results):

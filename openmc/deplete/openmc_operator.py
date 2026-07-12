@@ -245,13 +245,14 @@ class OpenMCOperator(TransportOperator):
 
         # Sort the sets
         burnable_mats = sorted(burnable_mats, key=lambda x: int(x[0]))
-        # CRITICAL: Sort by chain index, not alphabetically!
-        # Chain order is based on atomic number (H1, H2, H3, ..., He3, He4, ...)
-        # which matches how CRAM solver returns concentrations
-        chain_nuclides = list(self.chain.nuclide_dict.keys())
-        model_nuclides = sorted(model_nuclides,
-                               key=lambda x: chain_nuclides.index(x)
-                               if x in chain_nuclides else float('inf'))
+        # Chain order is already guaranteed below by seeding ``nuclides`` with
+        # ``chain.nuclide_dict``; this sort only fixes the order in which any
+        # trailing non-chain nuclides are appended. Break ties on the name so
+        # that order is deterministic (alphabetical), not hash-randomized.
+        chain_index = {n: i for i, n in enumerate(self.chain.nuclide_dict)}
+        model_nuclides = sorted(
+            model_nuclides,
+            key=lambda x: (chain_index.get(x, float('inf')), x))
 
         # Store material names for later use
         burnable_mats, self.name_list = zip(*burnable_mats)

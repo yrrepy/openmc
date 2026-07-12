@@ -199,8 +199,15 @@ def _load_isomeric_branching_targets(root):
                     nuc_reactions[rx_type] = targets
                     lfs_attr = iso_elem.get('gendf_lfs', '')
                     if lfs_attr:
-                        lfs_vals = [int(v) for v in lfs_attr.split()]
-                        if len(lfs_vals) == len(targets):
+                        try:
+                            lfs_vals = [int(v) for v in lfs_attr.split()]
+                        except ValueError:
+                            warn(f"Malformed gendf_lfs '{lfs_attr}' for "
+                                 f"{nuc_name}/{rx_type}, ignoring LFS")
+                            lfs_vals = None
+                        if lfs_vals is None:
+                            pass
+                        elif len(lfs_vals) == len(targets):
                             nuc_lfs[rx_type] = lfs_vals
                         else:
                             warn(

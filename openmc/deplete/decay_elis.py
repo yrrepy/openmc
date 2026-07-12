@@ -39,6 +39,9 @@ _logger = logging.getLogger(__name__)
 ELIS_RTOL = 0.50   # 50% relative tolerance
 ELIS_ATOL = 0.0    # No absolute tolerance (rtol-only)
 
+# Dedup store for once-per-(Z, A) ELIS ambiguity warnings
+_WARNED_ELIS_AMBIGUITY: set = set()
+
 
 # ============================================================================
 # Data Classes
@@ -158,6 +161,19 @@ def elis_match(
     False
     """
     return abs(gendf_elis - dk_elis) <= atol + rtol * abs(dk_elis)
+
+
+def _warn_elis_ambiguity(z, a, target_elis, assigned, other, rtol):
+    """Warn once per (Z, A) when two decay levels both match the GENDF ELIS."""
+    key = (z, a)
+    if key in _WARNED_ELIS_AMBIGUITY:
+        return
+    _WARNED_ELIS_AMBIGUITY.add(key)
+    warnings.warn(
+        f"Ambiguous ELIS match for Z={z} A={a} (GENDF ELIS={target_elis:.1f} "
+        f"eV): assigned LISO={assigned[0]} (ELIS={assigned[1]:.1f} eV), but "
+        f"LISO={other[0]} (ELIS={other[1]:.1f} eV) also passes rtol={rtol}. "
+        f"Possible m1/m2 mis-assignment.", UserWarning)
 
 
 def lookup_liso(
@@ -297,20 +313,32 @@ def lookup_liso(
     if not metastables_valid:
         return {'status': 'no_metastables'}
 
-    # Find nearest match by absolute ELIS difference
+    # Find nearest and second-nearest matches by absolute ELIS difference
     nearest_match = None
     nearest_diff = float('inf')
+    second_match = None
+    second_diff = float('inf')
 
     for state in metastables_valid:
         diff = abs(target_elis - state.elis)
         if diff < nearest_diff:
+            second_diff, second_match = nearest_diff, nearest_match
             nearest_diff = diff
             nearest_match = (state.liso, state.elis)
+        elif diff < second_diff:
+            second_diff = diff
+            second_match = (state.liso, state.elis)
 
     liso, dk_elis = nearest_match
 
     # Check if within tolerance
     if elis_match(target_elis, dk_elis, rtol, atol):
+        # Ambiguity: a second level also passes tolerance -> possible m1/m2
+        # mis-assignment. Warn once per (Z, A).
+        if second_match is not None and \
+                elis_match(target_elis, second_match[1], rtol, atol):
+            _warn_elis_ambiguity(z, a, target_elis, nearest_match,
+                                 second_match, rtol)
         return {'status': 'matched', 'liso': liso, 'dk_elis': dk_elis}
     else:
         # Outside tolerance

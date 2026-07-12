@@ -4,6 +4,7 @@ Provided to avoid some circular imports
 """
 import inspect
 import warnings
+from functools import lru_cache
 from itertools import repeat, starmap
 from multiprocessing import Pool
 from typing import Any, Callable, List, Optional, TYPE_CHECKING
@@ -51,6 +52,12 @@ def _distribute(items: List) -> List:
         j += chunk_size
 
 
+@lru_cache(maxsize=None)
+def _accepts_isomeric_branching(matrix_func: Callable) -> bool:
+    """Cached check for whether matrix_func accepts an isomeric_branching arg."""
+    return 'isomeric_branching' in inspect.signature(matrix_func).parameters
+
+
 def deplete(
     func: Callable,
     chain: 'Chain',
@@ -61,8 +68,8 @@ def deplete(
     matrix_func: Optional[Callable] = None,
     transfer_rates: Optional['TransferRates'] = None,
     external_source_rates: Optional[Any] = None,
+    *matrix_args: Any,
     operator: Optional['TransportOperator'] = None,
-    *matrix_args: Any
 ) -> List[np.ndarray]:
     """Deplete materials using given reaction rates for a specified time
 
@@ -95,13 +102,13 @@ def deplete(
         External source rates for continuous removal/feed.
 
         .. versionadded:: 0.15.3
-    operator : OperatorBase, optional
+    matrix_args: Any, optional
+        Additional arguments passed to matrix_func
+    operator : OperatorBase, keyword-only, optional
         Transport operator instance. If provided, isomeric branching data
         will be extracted from operator._isomeric_branching
 
-        .. versionadded:: 0.15.3
-    matrix_args: Any, optional
-        Additional arguments passed to matrix_func
+        .. versionadded:: 0.15.4
 
     Returns
     -------
@@ -151,8 +158,7 @@ def deplete(
                 matrices.append(matrix)
     else:
         if isomeric_branching is not None:
-            sig = inspect.signature(matrix_func)
-            accepts_iso = 'isomeric_branching' in sig.parameters
+            accepts_iso = _accepts_isomeric_branching(matrix_func)
             matrices = []
             for c, r, fy, iso in zip(repeat(chain), rates,
                                     fission_yields, isomeric_branching):
