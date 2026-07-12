@@ -1577,7 +1577,13 @@ class IsomericBranchingHelper:
                                 target_names=targets,
                                 lfs_values=lfs)
                     except (KeyError, ValueError, NotImplementedError,
-                            OpenMCError):
+                            OpenMCError) as err:
+                        warnings.warn(
+                            f"Isomeric branching disabled for {nuclide} "
+                            f"{reaction}: could not get branching ratios "
+                            f"from GENDF ({err}). Metastable production "
+                            f"falls back to the chain's static branching "
+                            f"ratios.", UserWarning)
                         self._branching_cache[key] = None
         return self._branching_cache[key]
 

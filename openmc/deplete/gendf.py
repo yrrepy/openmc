@@ -1109,9 +1109,12 @@ class _PythonGENDFLibrary:
                 f"No 'sigma' data in MF=3, MT={mt} for {nuclide_name}")
 
         sigma = xs_data['sigma']
-        gendf_energies = sigma.x
-        gendf_xs = sigma.y
+        return self._align_to_group_grid(
+            sigma.x, sigma.y, f"{nuclide_name} MT={mt}", strict_alignment)
 
+    def _align_to_group_grid(self, gendf_energies, gendf_xs, context,
+                             strict_alignment):
+        """Align a section's (energies, xs) onto the full group grid. Returns a copy."""
         # Full energy range
         if len(gendf_energies) == len(self.energy_bounds):
             return gendf_xs[:self.n_groups].copy()
@@ -1131,7 +1134,7 @@ class _PythonGENDFLibrary:
             start_idx = start_matches[0]
         elif len(start_matches) > 1:
             warnings.warn(
-                f"Multiple energy boundary matches for {nuclide_name} MT={mt} "
+                f"Multiple energy boundary matches for {context} "
                 f"start energy {start_energy:.6e} eV. Using first match.",
                 UserWarning)
             start_idx = start_matches[0]
@@ -1143,7 +1146,7 @@ class _PythonGENDFLibrary:
 
             if strict_alignment:
                 raise ValueError(
-                    f"Cannot align GENDF energy grid for {nuclide_name} MT={mt}. "
+                    f"Cannot align GENDF energy grid for {context}. "
                     f"GENDF starts at {start_energy:.6e} eV, "
                     f"nearest library boundary is {nearest_energy:.6e} eV "
                     f"(relative difference: {relative_diff:.2e}). "
@@ -1151,7 +1154,7 @@ class _PythonGENDFLibrary:
                     f"Set strict_alignment=False to use nearest-group alignment.")
             else:
                 warnings.warn(
-                    f"Energy alignment uncertainty for {nuclide_name} MT={mt}: "
+                    f"Energy alignment uncertainty for {context}: "
                     f"GENDF starts at {start_energy:.6e} eV, "
                     f"using nearest boundary {nearest_energy:.6e} eV "
                     f"(relative difference: {relative_diff:.2e}). "
@@ -1171,13 +1174,13 @@ class _PythonGENDFLibrary:
                 relative_diff_end = abs(end_energy - expected_end) / max(end_energy, 1e-10)
                 if strict_alignment:
                     raise ValueError(
-                        f"GENDF energy range for {nuclide_name} MT={mt} does not "
+                        f"GENDF energy range for {context} does not "
                         f"align with library structure. End energy mismatch: "
                         f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
                         f"(relative difference: {relative_diff_end:.2e})")
                 else:
                     warnings.warn(
-                        f"End energy mismatch for {nuclide_name} MT={mt}: "
+                        f"End energy mismatch for {context}: "
                         f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
                         f"(relative difference: {relative_diff_end:.2e})",
                         UserWarning)
@@ -2053,6 +2056,8 @@ class _PythonGENDFLibrary:
         """Get raw MF=10 production XS without name mapping.
 
         Returns list of (lfs, izap, xs_array) sorted by LFS ascending.
+        Each xs_array is aligned to the full group grid (threshold
+        reactions carry partial-range MF=10 sections).
         """
         mf10_result = self._load_mf10_data(nuclide_name, mt)
         if mf10_result is None:
@@ -2066,11 +2071,20 @@ class _PythonGENDFLibrary:
             sigma = level['sigma']
             if izap == 0:
                 continue
-            # pyENDF returns Tabulated1D; extract y values as numpy array
-            # Tabulated1D may have n_groups+1 values; trim to n_groups
-            xs = np.asarray(sigma.y) if hasattr(sigma, 'y') else np.asarray(sigma)
-            if len(xs) > self.n_groups:
-                xs = xs[:self.n_groups]
+            if hasattr(sigma, 'x'):
+                # Energy-aware alignment onto the full group grid
+                # (mirrors the C++ backend, commit 6e66d2e18)
+                xs = self._align_to_group_grid(
+                    np.asarray(sigma.x), np.asarray(sigma.y),
+                    f"{nuclide_name} MT={mt} LFS={lfs} (MF=10)",
+                    strict_alignment=False)
+            else:
+                # No energy grid available — assume threshold data at the
+                # high-energy end (C++ backend fallback)
+                raw = np.asarray(sigma)
+                xs = np.zeros(self.n_groups)
+                n = min(len(raw), self.n_groups)
+                xs[self.n_groups - n:] = raw[:n]
             levels.append((lfs, izap, xs))
 
         levels.sort(key=lambda x: x[0])
