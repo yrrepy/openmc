@@ -58,6 +58,24 @@ scripts/nndc
 scripts/nndc_hdf5
 scripts/wmp
 scripts/JEFF32-ACE-*.zip
+
+# OpenMC run inputs generated at repo root
+/model.xml
+/geometry.xml
+/materials.xml
+/settings.xml
+/tallies.xml
+/plots.xml
+
+# In-tree install artifacts
+/bin/
+/lib/
+/lib64/
+/share/
+/include/openmc/version.h
+
+# Claude working files
+/claude/
 scripts/TSLs.tar.gz
 scripts/jeff-3.2
 scripts/jeff-3.2-hdf5
