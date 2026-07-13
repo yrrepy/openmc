@@ -1,36 +1,50 @@
-"""Unit tests for ELIS-based isomeric state mapping in GENDFLibrary.
+"""Unit tests for the Python GENDF library internals.
 
-This module tests the ELIS (excitation energy) matching functionality that maps
-GENDF MF=10 metastable products to OpenMC ``_m{n}`` naming using decay library data.
+Merges three former modules:
 
-Key features tested:
-- DecayState dataclass
-- elis_match() tolerance function
-- parse_decay_isomeric_levels() for directory and single-file formats
-- lookup_liso() for ELIS-based LISO lookup
-- get_branching_ratios() with ELIS mapping
+* ELIS-based isomeric-state mapping (``DecayState``, ``elis_match``,
+  ``parse_decay_isomeric_levels``, ``lookup_liso``, ``IsomericBranching``
+  serialization) -- from ``test_gendf_elis_mapping``.
+* Threshold-reaction MF=10 grid alignment in the real ``_PythonGENDFLibrary``
+  backend -- from ``test_gendf_threshold_alignment``.
+* Partial-LFS XML round-trip coverage -- lifted from
+  ``test_phase0_phase1_validation``.
 
-.. versionadded:: 0.15.3
+Shared mocks/factories/fixtures come from ``gendf_testing`` / ``conftest``.
 """
 
-import pytest
-import numpy as np
 import tempfile
-import os
+import types
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+import openmc.deplete
 from openmc.deplete.gendf import (
     DecayState,
+    GENDFLibrary,
+    IsomericBranching,
     elis_match,
-    parse_decay_isomeric_levels,
     lookup_liso,
-    ELIS_RTOL,
-    ELIS_ATOL
+    parse_decay_isomeric_levels,
 )
+from openmc.deplete.helpers import IsomericBranchingHelper
+
+from .gendf_testing import (
+    CCFE709_BOUNDS,
+    CCFE709_NGROUPS,
+    Tab1D,
+    make_python_gendf_lib,
+    threshold_level,
+)
+
+BOUNDS = CCFE709_BOUNDS
+N_GROUPS = CCFE709_NGROUPS
 
 
 # =============================================================================
-# Tests for DecayState dataclass
+# ELIS mapping -- DecayState dataclass
 # =============================================================================
 
 def test_decay_state_creation():
@@ -57,7 +71,7 @@ def test_decay_state_ground():
 
 
 # =============================================================================
-# Tests for elis_match() tolerance function
+# ELIS mapping -- elis_match() tolerance function
 # =============================================================================
 
 def test_elis_match_exact():
@@ -123,20 +137,8 @@ def test_elis_match_custom_tolerances():
 
 
 # =============================================================================
-# Tests for lookup_liso() function
+# ELIS mapping -- lookup_liso() function
 # =============================================================================
-
-@pytest.fixture
-def ir192_decay_lookup():
-    """Create a mock decay lookup for Ir-192 states."""
-    return {
-        (77, 192): [
-            DecayState(z=77, a=192, elis=0.0, liso=0),       # Ground
-            DecayState(z=77, a=192, elis=56720.0, liso=1),   # m1
-            DecayState(z=77, a=192, elis=168140.0, liso=2),  # m2
-        ]
-    }
-
 
 def test_lookup_liso_exact_match(ir192_decay_lookup):
     """Test LISO lookup with exact ELIS match."""
@@ -224,7 +226,7 @@ def test_lookup_liso_zero_elis_only():
 
 
 # =============================================================================
-# Tests for parse_decay_isomeric_levels()
+# ELIS mapping -- parse_decay_isomeric_levels()
 # =============================================================================
 
 def test_parse_decay_nonexistent_path():
@@ -247,35 +249,8 @@ def test_parse_decay_directory_format_detection(tmp_path):
 
 
 # =============================================================================
-# Integration tests (require real data)
+# ELIS mapping -- integration tests (real data; skip when unavailable)
 # =============================================================================
-
-@pytest.fixture
-def jeff33_decay_path():
-    """Get path to JEFF33 decay library."""
-    path = Path('/home/perry/NukeData/Activation/FISPACT/JEFF33data/decay/')
-    if not path.exists():
-        pytest.skip("JEFF33 decay data not available")
-    return path
-
-
-@pytest.fixture
-def jeff33_gendf_path():
-    """Get path to JEFF33 GENDF library."""
-    path = Path('/home/perry/NukeData/Activation/FISPACT/JEFF33data/jeff33-n/gxs-709/')
-    if not path.exists():
-        pytest.skip("JEFF33 GENDF data not available")
-    return path
-
-
-@pytest.fixture
-def ukdd12_path():
-    """Get path to UKDD12 decay file."""
-    path = Path('/home/perry/NukeData/Activation/ukdd-12_decay.dat')
-    if not path.exists():
-        pytest.skip("UKDD12 decay data not available")
-    return path
-
 
 def test_parse_decay_directory_jeff33(jeff33_decay_path):
     """Test parsing JEFF33 decay directory."""
@@ -312,8 +287,6 @@ def test_parse_single_file_ukdd12(ukdd12_path):
 
 def test_gendf_library_with_elis_mapping(jeff33_gendf_path, jeff33_decay_path):
     """Test GENDFLibrary with ELIS-based mapping."""
-    from openmc.deplete.gendf import GENDFLibrary
-
     # Create library with ELIS mapping
     lib = GENDFLibrary(
         jeff33_gendf_path,
@@ -327,8 +300,6 @@ def test_gendf_library_with_elis_mapping(jeff33_gendf_path, jeff33_decay_path):
 
 def test_library_without_decay_file(jeff33_gendf_path):
     """Test that GENDFLibrary works without decay_file but has no decay_lookup."""
-    from openmc.deplete.gendf import GENDFLibrary
-
     lib = GENDFLibrary(jeff33_gendf_path)
 
     # Without decay_file, decay_lookup is None
@@ -337,8 +308,6 @@ def test_library_without_decay_file(jeff33_gendf_path):
 
 def test_library_with_decay_file_works(jeff33_gendf_path, jeff33_decay_path):
     """Test that GENDFLibrary works with decay_file."""
-    from openmc.deplete.gendf import GENDFLibrary
-
     lib = GENDFLibrary(
         jeff33_gendf_path,
         decay_file=jeff33_decay_path,
@@ -354,13 +323,11 @@ def test_library_with_decay_file_works(jeff33_gendf_path, jeff33_decay_path):
 
 
 # =============================================================================
-# Tests for IsomericBranching to_dict/from_dict
+# ELIS mapping -- IsomericBranching to_dict/from_dict
 # =============================================================================
 
 def test_isomeric_branching_to_dict():
     """Test IsomericBranching.to_dict() serialization."""
-    from openmc.deplete.gendf import IsomericBranching
-
     branching = IsomericBranching(
         energies=np.array([1e5, 1e6, 1e7]),
         products=['Ir192', 'Ir192_m1'],
@@ -382,8 +349,6 @@ def test_isomeric_branching_to_dict():
 
 def test_isomeric_branching_from_dict():
     """Test IsomericBranching.from_dict() deserialization."""
-    from openmc.deplete.gendf import IsomericBranching
-
     d = {
         'energies': [1e5, 1e6, 1e7],
         'products': ['Ir192', 'Ir192_m1'],
@@ -405,8 +370,6 @@ def test_isomeric_branching_from_dict():
 
 def test_isomeric_branching_roundtrip():
     """Test IsomericBranching roundtrip (to_dict -> from_dict)."""
-    from openmc.deplete.gendf import IsomericBranching
-
     original = IsomericBranching(
         energies=np.array([1e5, 1e6, 1e7]),
         products=['Ag110', 'Ag110_m1'],
@@ -427,3 +390,184 @@ def test_isomeric_branching_roundtrip():
     assert reconstructed.parent_nuclide == original.parent_nuclide
     assert reconstructed.reaction == original.reaction
     assert reconstructed.mt == original.mt
+
+
+# =============================================================================
+# Grid alignment -- threshold MF=10 on the real _PythonGENDFLibrary backend
+# =============================================================================
+
+def test_production_xs_aligned_to_full_grid():
+    """Partial-range band lands in its energy groups, not at index 0."""
+    start = N_GROUPS - 50
+    lib = make_python_gendf_lib([threshold_level(1, 27058, start, 2.0, 2.0)])
+
+    levels = lib._get_production_xs('Co59', 16)
+
+    assert len(levels) == 1
+    lfs, izap, xs = levels[0]
+    assert lfs == 1
+    assert izap == 27058
+    assert xs.shape == (N_GROUPS,)
+    assert np.all(xs[:start] == 0.0)
+    np.testing.assert_allclose(xs[start:], 2.0)
+
+
+def test_threshold_branching_ratios_full_grid():
+    """Runtime BR array spans the full grid with data in the threshold band."""
+    start = N_GROUPS - 50
+    lib = make_python_gendf_lib([
+        threshold_level(0, 27058, start, 1.0, 0.5),    # ground
+        threshold_level(1, 27058, start, 0.5, 0.25),   # metastable = g/2
+    ])
+
+    br = lib.get_branching_ratios(
+        'Co59', 16, target_names=['Co58', 'Co58_m1'], lfs_values=[0, 1])
+
+    assert br.branching_ratios.shape == (2, N_GROUPS)
+    # Below threshold: no production -> zero ratios
+    assert np.all(br.branching_ratios[:, :start] == 0.0)
+    # In-band: m/(g+m) = 1/3 everywhere since m = g/2 pointwise
+    np.testing.assert_allclose(br.branching_ratios[0, start:], 2.0 / 3.0)
+    np.testing.assert_allclose(br.branching_ratios[1, start:], 1.0 / 3.0)
+
+
+def test_ragged_thresholds_do_not_raise():
+    """Different ground/metastable thresholds must not disable branching."""
+    g_start = N_GROUPS - 60
+    m_start = N_GROUPS - 50
+    lib = make_python_gendf_lib([
+        threshold_level(0, 27058, g_start, 1.0, 1.0),
+        threshold_level(1, 27058, m_start, 1.0, 1.0),
+    ])
+
+    br = lib.get_branching_ratios(
+        'Co59', 16, target_names=['Co58', 'Co58_m1'], lfs_values=[0, 1])
+
+    assert br.branching_ratios.shape == (2, N_GROUPS)
+    # Between the thresholds only the ground band produces
+    np.testing.assert_allclose(br.branching_ratios[0, g_start:m_start], 1.0)
+    np.testing.assert_allclose(br.branching_ratios[1, g_start:m_start], 0.0)
+    # Above both thresholds: equal XS -> 50/50
+    np.testing.assert_allclose(br.branching_ratios[0, m_start:], 0.5)
+    np.testing.assert_allclose(br.branching_ratios[1, m_start:], 0.5)
+
+
+def test_weighting_helper_threshold_no_index_error():
+    """End-to-end through _calculate_weighted: no IndexError, correct BR."""
+    start = N_GROUPS - 50
+    lib = make_python_gendf_lib([
+        threshold_level(0, 27058, start, 1.0, 0.5),
+        threshold_level(1, 27058, start, 0.5, 0.25),
+    ])
+    br = lib.get_branching_ratios(
+        'Co59', 16, target_names=['Co58', 'Co58_m1'], lfs_values=[0, 1])
+
+    # Fake MF=3 sigma: zero below threshold, 1 barn in-band
+    sigma_g = np.zeros(N_GROUPS)
+    sigma_g[start:] = 1.0
+    lib.get_xs = lambda nuc, mt, e=None, **kwargs: sigma_g
+
+    helper = IsomericBranchingHelper.__new__(IsomericBranchingHelper)
+    helper.gendf_library = lib
+
+    data = {
+        'energies': br.energies,
+        'targets': list(br.products),
+        'branching_ratios': {p: br.branching_ratios[i]
+                             for i, p in enumerate(br.products)},
+    }
+    weighted = helper._calculate_weighted(
+        data, np.ones(N_GROUPS), BOUNDS, 'Co59', '(n,2n)')
+
+    assert np.isclose(sum(weighted.values()), 1.0)
+    assert np.isclose(weighted['Co58'], 2.0 / 3.0)
+    assert np.isclose(weighted['Co58_m1'], 1.0 / 3.0)
+
+
+def test_branching_failure_warns_not_silent():
+    """A failed GENDF branching lookup warns instead of silently disabling."""
+    helper = IsomericBranchingHelper.__new__(IsomericBranchingHelper)
+    helper._branching_cache = {}
+    helper.chain = types.SimpleNamespace(
+        isomeric_branching_embedded=None,
+        isomeric_branching_targets={'Co59': {'(n,2n)': ['Co58', 'Co58_m1']}},
+        isomeric_branching_lfs={'Co59': {'(n,2n)': [0, 1]}},
+    )
+
+    def _raise(*args, **kwargs):
+        raise ValueError("bad MF=10 data")
+    helper.gendf_library = types.SimpleNamespace(get_branching_ratios=_raise)
+
+    with pytest.warns(UserWarning,
+                      match=r"Isomeric branching disabled for Co59"):
+        result = helper._get_branching_data('Co59', '(n,2n)')
+    assert result is None
+
+
+def test_full_range_band_unchanged():
+    """Full-range MF=10 (e.g. (n,gamma)) keeps its original behavior."""
+    lib = make_python_gendf_lib([
+        {'LFS': 0, 'IZAP': 47110, 'sigma': Tab1D(BOUNDS, np.full(len(BOUNDS), 3.0))},
+        {'LFS': 1, 'IZAP': 47110, 'sigma': Tab1D(BOUNDS, np.full(len(BOUNDS), 1.0))},
+    ])
+
+    br = lib.get_branching_ratios(
+        'Ag109', 102, target_names=['Ag110', 'Ag110_m1'], lfs_values=[0, 1])
+
+    assert br.branching_ratios.shape == (2, N_GROUPS)
+    np.testing.assert_allclose(br.branching_ratios[0], 0.75)
+    np.testing.assert_allclose(br.branching_ratios[1], 0.25)
+
+    # Real _align_to_group_grid truncates a full-length (N_GROUPS+1) MF=10 band
+    # to N_GROUPS, dropping the last point and preserving the rest in order.
+    # Real-backend cover for the dropped inline full-range-no-op / n+1
+    # truncation arithmetic tests.
+    ramp = np.arange(len(BOUNDS), dtype=float)
+    lib2 = make_python_gendf_lib(
+        [{'LFS': 0, 'IZAP': 47110, 'sigma': Tab1D(BOUNDS, ramp)}])
+    xs = lib2._get_production_xs('Ag109', 102)[0][2]
+    assert xs.shape == (N_GROUPS,)
+    np.testing.assert_array_equal(xs, ramp[:N_GROUPS])
+
+
+# =============================================================================
+# Partial-LFS XML round-trip (from test_phase0_phase1_validation)
+# =============================================================================
+
+def test_partial_lfs_coverage():
+    """Chain with LFS on one reaction but not another."""
+    chain = openmc.deplete.Chain()
+
+    parent = openmc.deplete.Nuclide('Ag109')
+    parent.add_reaction('(n,gamma)', 'Ag110', Q=6.8e6, branching_ratio=1.0)
+    parent.add_reaction('(n,2n)', 'Ag108', Q=-9.5e6, branching_ratio=1.0)
+    chain.add_nuclide(parent)
+
+    for name in ['Ag110', 'Ag110_m1', 'Ag108', 'Ag108_m1']:
+        nuc = openmc.deplete.Nuclide(name)
+        nuc.half_life = 1e5
+        chain.add_nuclide(nuc)
+
+    chain.isomeric_branching_targets = {
+        'Ag109': {
+            '(n,gamma)': ['Ag110', 'Ag110_m1'],
+            '(n,2n)': ['Ag108', 'Ag108_m1']
+        }
+    }
+    chain.isomeric_branching_lfs = {
+        'Ag109': {
+            '(n,gamma)': [0, 5]
+        }
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        xml_path = Path(tmpdir) / "partial_lfs.xml"
+        chain.export_to_xml(xml_path)
+        reloaded = openmc.deplete.Chain.from_xml(xml_path)
+
+        assert reloaded.isomeric_branching_lfs is not None
+        assert reloaded.isomeric_branching_lfs['Ag109']['(n,gamma)'] == [0, 5]
+        assert '(n,2n)' not in reloaded.isomeric_branching_lfs.get('Ag109', {})
+
+        assert '(n,gamma)' in reloaded.isomeric_branching_targets['Ag109']
+        assert '(n,2n)' in reloaded.isomeric_branching_targets['Ag109']

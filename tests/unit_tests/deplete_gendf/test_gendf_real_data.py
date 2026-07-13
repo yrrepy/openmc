@@ -1,60 +1,21 @@
-"""End-to-end test: Activator scenario with real GENDF data.
+"""End-to-end GENDF tests exercised against real nuclear data.
 
-Reproduces the original bug where IsomericBranchingHelper crashed
-when using a chain patched without gendf_lfs, then verifies the
-new runtime mode works with a properly patched chain.
+Merges the real-data tests from ``test_activator_e2e.py`` (Activator scenario:
+runtime/patcher branching, cross-backend parity, full IsomericBranchingHelper)
+and the three MF=10/MT=4 extraction tests from ``test_nn_prime_reaction.py``.
 
-Requires:
-- TENDL-2017 GENDF library at the standard path
-- Optionally: decay data for patcher-mode testing
+All fixtures (``gendf_dir``, ``decay_file``, ``chain_path``) come from the
+shared ``conftest.py`` and resolve under ``$OPENMC_GENDF_TEST_DATA`` /
+``$OPENMC_GENDF_TEST_CHAINS``; each skips with an informative reason when the
+data is absent.
 """
 
 import warnings
 import numpy as np
 import pytest
-from pathlib import Path
 
 from openmc.mgxs import GROUP_STRUCTURES
 from openmc.deplete.helpers import IsomericBranchingHelper
-
-
-# ============================================================================
-# Fixtures
-# ============================================================================
-
-@pytest.fixture
-def gendf_dir():
-    """Path to TENDL-2017 GENDF files."""
-    path = Path('/home/perry/NukeData/Activation/FISPACT/TENDL2017data/tal2017-n/gxs-709')
-    if not path.exists():
-        pytest.skip(f"GENDF directory not found: {path}")
-    return path
-
-
-@pytest.fixture
-def decay_file():
-    """Path to decay data file."""
-    paths_to_try = [
-        Path('/home/perry/NukeData/Activation/FISPACT/TENDL2017data/tal2017-n/decay_2020.endf'),
-        Path('/home/perry/NukeData/Activation/decay/decay_2020.endf'),
-    ]
-    for path in paths_to_try:
-        if path.exists():
-            return path
-    pytest.skip("Decay file not found")
-
-
-@pytest.fixture
-def chain_path():
-    """Path to activation chain file."""
-    paths_to_try = [
-        Path('/home/perry/Codes/OpenMC/chains/chain_activator_TENDL2017_ccfe709_lfs.xml'),
-        Path('/home/perry/Codes/OpenMC/chains/chain_activator_TENDL2017_ccfe709.xml'),
-    ]
-    for path in paths_to_try:
-        if path.exists():
-            return path
-    pytest.skip("Chain file not found")
 
 
 # ============================================================================
@@ -62,11 +23,7 @@ def chain_path():
 # ============================================================================
 
 def test_cpp_backend_ag109_branching(gendf_dir):
-    """C++ backend: Ag109(n,gamma) produces branching ratios for
-    Ag110/Ag110_m1 using runtime mode with LFS values.
-
-    This is the scenario that previously crashed with ValueError.
-    """
+    """C++ backend: Ag109(n,gamma) runtime branching for Ag110/Ag110_m1."""
     from openmc.deplete.gendf import GENDFLibrary
     from openmc.deplete.gendf import _CppGENDFLibrary
 
@@ -130,8 +87,7 @@ def test_cpp_backend_ag107_branching(gendf_dir):
 
 
 def test_cpp_backend_threshold_alignment(gendf_dir):
-    """C++ backend: threshold reaction (n,2n) places production XS at
-    correct energy index using energy-aware alignment."""
+    """C++ backend: threshold (n,2n) production XS is placed by energy."""
     from openmc.deplete.gendf import GENDFLibrary, _CppGENDFLibrary
 
     if _CppGENDFLibrary is None:
@@ -195,8 +151,7 @@ def test_python_backend_ag109_patcher_mode(gendf_dir, decay_file):
 # ============================================================================
 
 def test_cross_backend_parity_ir191(gendf_dir, decay_file):
-    """Ir191 MT=102: C++ and Python backends produce identical branching
-    ratios when using runtime mode with the same LFS values."""
+    """Ir191 MT=102: C++ and Python backends give identical runtime BR."""
     from openmc.deplete.gendf import GENDFLibrary, _CppGENDFLibrary
 
     if _CppGENDFLibrary is None:
@@ -274,3 +229,81 @@ def test_helper_with_real_gendf_and_chain(gendf_dir, chain_path):
             for target, ratio in ratios.items():
                 assert 0.0 <= ratio <= 1.0, \
                     f"{nuclide} {reaction} -> {target}: ratio={ratio} out of [0,1]"
+
+
+# ============================================================================
+# GENDF MF=10/MT=4 (n,n') extraction tests (from test_nn_prime_reaction.py)
+# ============================================================================
+
+def test_in115_mt4_data_exists(gendf_dir):
+    """Verify In115 GENDF file contains MF=10/MT=4 data."""
+    # Check file exists
+    in115_file = gendf_dir / 'In115g.asc'
+    if not in115_file.exists():
+        pytest.skip(f"In115 GENDF file not found: {in115_file}")
+
+    # Read and search for MF=10, MT=4 section
+    content = in115_file.read_text()
+
+    # ENDF format: columns 71-72=MF, 73-75=MT for data cards
+    # Section header marker for MF=10, MT=4
+    assert '4931110  4' in content or '493110  4' in content, \
+        "MF=10/MT=4 section not found in In115 GENDF file"
+
+
+def test_extract_branching_mt4(gendf_dir, decay_file):
+    """Test extraction of isomeric branching for MT=4."""
+    from openmc.deplete.gendf import GENDFLibrary
+
+    lib = GENDFLibrary(gendf_dir, decay_file=decay_file, mapping_mode='elis')
+
+    # Get branching ratios for MT=4
+    branching = lib.get_branching_ratios('In115', 4)
+
+    if branching is None:
+        pytest.skip("No MF=10/MT=4 data extracted for In115")
+
+    # Should have (n,n') key
+    assert "(n,n')" in branching, f"Missing (n,n') key, got: {list(branching.keys())}"
+
+    products = branching["(n,n')"]
+
+    # Should have ground state and metastable
+    assert 'In115' in products, "Missing ground state In115"
+    assert 'In115_m1' in products, "Missing metastable In115_m1"
+
+    # Ratios should be reasonable (non-zero, positive)
+    for nuclide, ratio in products.items():
+        if isinstance(ratio, np.ndarray):
+            assert np.all(ratio >= 0), f"Negative ratio for {nuclide}"
+            assert np.any(ratio > 0), f"All-zero ratio for {nuclide}"
+        else:
+            assert ratio >= 0, f"Negative ratio for {nuclide}"
+
+
+def test_extract_branching_ir192_multilevel(gendf_dir, decay_file):
+    """Test extraction of three-level branching for Ir192."""
+    from openmc.deplete.gendf import GENDFLibrary
+
+    lib = GENDFLibrary(gendf_dir, decay_file=decay_file, mapping_mode='elis')
+
+    # Get branching ratios for MT=4
+    branching = lib.get_branching_ratios('Ir192', 4)
+
+    if branching is None:
+        pytest.skip("No MF=10/MT=4 data extracted for Ir192")
+
+    if "(n,n')" not in branching:
+        pytest.skip("No (n,n') data for Ir192")
+
+    products = branching["(n,n')"]
+
+    # Ir192 should have 3 product states (NS=3)
+    # Ground + m1 + m2
+    product_names = list(products.keys())
+    assert len(product_names) >= 2, f"Expected multiple products, got: {product_names}"
+
+    # Check for metastable states
+    metastable_products = [p for p in product_names if '_m' in p]
+    assert len(metastable_products) >= 1, \
+        f"Expected at least one metastable product for Ir192, got: {product_names}"
