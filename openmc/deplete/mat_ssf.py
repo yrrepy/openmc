@@ -76,6 +76,25 @@ DEFAULT_FLAGGED = frozenset({
 # resonant nuclide's smooth reaction XS at the URR nodes for factor-form tables.
 _BASE_REACTION_MT = {'(n,gamma)': 102, 'fission': 18}
 
+# Fixed-point controls for the mutual-shielding sigma_0 refinement (C2). These
+# are policy constants, NOT API parameters: iteration is unconditional when the
+# URR flag is on and always uses these bounds. FISPACT reports "a few passes";
+# the map d(p) -> (1/f_p) sum_{q!=p} f_q sigma_t,inf(q) R_q(d) is contractive
+# (R in (0, 1] -> a monotone-decreasing sequence from d0), so the tolerance is
+# reached in a handful of passes: URR-only PENDF tables converge in ~4, and the
+# GENDF sibling's resolved-range CALENDF tables need ~10 (nat-W), which is what
+# sizes the cap. The cap is a safety bound, inert once the tolerance breaks the
+# loop. No damping (add 0.5 damping only if a gate ever shows oscillation -- it
+# is not expected).
+SIGMA0_ITER_MAX = 15
+SIGMA0_ITER_TOL = 1e-3
+
+# Barn-scale floor for the relative-change denominator max(d, eps): guards groups
+# where the background is ~0 (a pure absorber, or groups outside every diluter's
+# tabulated span) from a spurious large relative delta. Background changes below
+# this floor are physically irrelevant.
+_SIGMA0_EPS = 1e-10
+
 
 def material_dilution_sigma0(densities, resonant, group_totals):
     r"""Homogeneous background cross section :math:`\sigma_0` per group.
@@ -274,7 +293,10 @@ def mat_ssf_factors(ptab, sigma0_g, group_edges, reaction, flux_g=None,
         Ascending energy group boundaries in eV, length ``n_groups + 1``.
     reaction : str
         Reaction name; ``'(n,gamma)'`` (and its ``'_m*'`` isomeric variants) map
-        to the capture column, ``'fission'`` to the fission column.
+        to the capture column, ``'fission'`` to the fission column, and
+        ``'total'`` to the total column (band 1) -- the flux-weight total whose
+        self-shielding factor drives the mutual-shielding sigma_0 iteration
+        (fold via :func:`mat_ssf_total_factors`).
     flux_g : numpy.ndarray, optional
         Accepted for API symmetry but unused: the collapse flux is constant
         within a group, so it cancels in the per-group ratio and the
@@ -303,14 +325,14 @@ def mat_ssf_factors(ptab, sigma0_g, group_edges, reaction, flux_g=None,
     # cycle. _group_average / _ISOMER_SUFFIX are module-internal helpers.
     from .microxs import _group_average, _ISOMER_SUFFIX
 
-    col_map = {'(n,gamma)': 4, 'fission': 3}
+    col_map = {'(n,gamma)': 4, 'fission': 3, 'total': 1}
     base = _ISOMER_SUFFIX.sub('', reaction)
     try:
         col = col_map[base]
     except KeyError:
         raise ValueError(
-            f"mat_ssf is only defined for capture/fission; got {reaction!r} "
-            f"(base {base!r})")
+            f"mat_ssf is only defined for capture/fission/total; got "
+            f"{reaction!r} (base {base!r})")
 
     energy = np.asarray(ptab.energy, dtype=float)
     edges = np.asarray(group_edges, dtype=float)
@@ -352,6 +374,156 @@ def mat_ssf_factors(ptab, sigma0_g, group_edges, reaction, flux_g=None,
     return f_g
 
 
+def mat_ssf_total_factors(ptab, sigma0_g, group_edges, smooth_total=None):
+    r"""Per-group total-cross-section self-shielding factor :math:`R_{tot,g}`.
+
+    The C1 total-XS shielding factor consumed by the C2 mutual-shielding sigma_0
+    iteration. It folds the *total* column (band 1) exactly as the partial
+    factors fold capture/fission, so the numerator's shielded total and the
+    denominator's infinite-dilution total are the same :math:`\sigma_{t,b}` that
+    already sets the partial fold's flux weight :math:`w_b = p_b/(\sigma_0 +
+    \sigma_{t,b})` (band 1 for absolute tables, :math:`\tau_{t,b}\,S_t` for
+    factor tables):
+
+    .. math::
+
+        R_{tot,g} = \frac{\sigma_{t,\mathrm{eff},g}(\sigma_0)}
+            {\sigma_{t,\infty,g}},\qquad
+        \sigma_{t,\mathrm{eff}} = \frac{\sum_b w_b \sigma_{t,b}}{\sum_b w_b},
+        \quad \sigma_{t,\infty} = \frac{\sum_b p_b \sigma_{t,b}}{\sum_b p_b}.
+
+    :math:`R_{tot,g} \in (0, 1]`: exactly 1 in groups outside the URR span and
+    approaching 1 as :math:`\sigma_0 \to \infty` (infinite dilution, no
+    shielding). It is folded at each URR node at that node's group background and
+    group-averaged onto ``group_edges``, identically to the partial factors.
+
+    Parameters
+    ----------
+    ptab : openmc.data.urr.ProbabilityTables
+        Probability tables (band dimension 1 = total).
+    sigma0_g : numpy.ndarray or float
+        Background cross section per group (barns), length ``n_groups``.
+    group_edges : numpy.ndarray
+        Ascending energy group boundaries in eV, length ``n_groups + 1``.
+    smooth_total : numpy.ndarray, optional
+        Absolute smooth total cross section (barns) at each URR node
+        ``ptab.energy``. Required when ``ptab.multiply_smooth`` is True (the
+        factor bands are absolutized against it); ignored otherwise.
+
+    Returns
+    -------
+    numpy.ndarray
+        Total self-shielding factor :math:`R_{tot,g}`, length ``n_groups``; 1 in
+        groups outside the URR span.
+    """
+    # The total is folded as its own "reaction" (band 1). For a factor table the
+    # reaction smooth IS the total smooth, so the absolutized band is
+    # sigma_t,b = tau_t,b * S_t -- exactly the flux-weight total. Passing
+    # smooth_rxn = smooth_total makes sig_x == sig_t inside _fold_node.
+    return mat_ssf_factors(
+        ptab, sigma0_g, group_edges, 'total',
+        smooth_total=smooth_total, smooth_rxn=smooth_total)
+
+
+def iterate_material_dilution_sigma0(densities, group_totals, coupling,
+                                     group_edges):
+    r"""Mutual-shielding refinement of the material-dilution background (C2).
+
+    Starts from the first Bondarenko approximation :math:`d^{(0)}` (each diluter
+    at its infinite-dilute total, :func:`material_dilution_sigma0`) and refines
+    it so every probability-table-carrying nuclide contributes its own
+    *shielded* total, following FISPACT-II (Sublet et al., NDS 139 (2017),
+    ch2 s26):
+
+    .. math::
+
+        d^{(i+1)}(p,g) = \frac{1}{f_p} \sum_{q \neq p} f_q\,
+            \sigma_{t,\infty}(q,g)\, R_q^{(i)}(g),\qquad
+        R_q^{(i)}(g) = R_{tot}\bigl(q, g, d^{(i)}(q,g)\bigr).
+
+    All backgrounds are updated simultaneously from the same iterate (Jacobi, so
+    the result is order-independent). Diluters outside ``coupling`` (no
+    probability tables, or a factor table with no smooth total to absolutize)
+    keep :math:`R \equiv 1` -- their infinite-dilute contribution is unchanged,
+    so a resonant-plus-inert mixture reduces to the first approximation for the
+    inert part. The map is contractive (:math:`R \in (0,1]`), so the sequence
+    decreases monotonically to its fixed point; there is no damping.
+
+    Parameters
+    ----------
+    densities : dict
+        Maps nuclide name to number density (or fraction); the composition
+        snapshot.
+    group_totals : dict
+        Maps each diluter nuclide (nonzero density) to its group-averaged
+        infinite-dilution total :math:`\sigma_{t,\infty}(q,g)` (barns).
+    coupling : dict
+        Maps each probability-table-carrying nuclide ``q`` (the iterated set) to
+        a ``(ptab, smooth_total)`` pair: ``ptab`` its
+        :class:`~openmc.data.urr.ProbabilityTables`, ``smooth_total`` its smooth
+        total at ``ptab.energy`` (or ``None`` for absolute tables). Every key
+        must also appear in ``group_totals``.
+    group_edges : numpy.ndarray
+        Ascending energy group boundaries in eV, length ``n_groups + 1``.
+
+    Returns
+    -------
+    sigma0 : dict
+        Converged background :math:`\sigma_0(p,g)` (barns) for every ``p`` in
+        ``coupling``.
+    info : dict
+        ``{'n_iter', 'converged', 'trajectory', 'max_rel'}``: the number of
+        update passes taken, whether the tolerance was met, the list of
+        per-iteration background dicts starting at :math:`d^{(0)}`, and the list
+        of per-iteration max relative changes.
+    """
+    edges = np.asarray(group_edges, dtype=float)
+    n_groups = len(edges) - 1
+    coupled = list(coupling)
+
+    # d^(0): first Bondarenko approximation for every coupled nuclide (and the
+    # place a genuinely missing diluter is named, via material_dilution_sigma0).
+    d = {p: material_dilution_sigma0(densities, p, group_totals)
+         for p in coupled}
+
+    info = {'n_iter': 0, 'converged': len(coupled) == 0,
+            'trajectory': [dict(d)], 'max_rel': []}
+
+    for it in range(SIGMA0_ITER_MAX):
+        # R_q at the current background, for every coupled nuclide (Jacobi: all
+        # evaluated from the same iterate d before any update).
+        R = {}
+        for q in coupled:
+            ptab_q, smooth_total_q = coupling[q]
+            R[q] = mat_ssf_total_factors(
+                ptab_q, d[q], edges, smooth_total=smooth_total_q)
+
+        d_new = {}
+        max_rel = 0.0
+        for p in coupled:
+            f_p = densities[p]
+            acc = np.zeros(n_groups)
+            for j, n_j in densities.items():
+                if j == p or n_j <= 0 or j not in group_totals:
+                    continue
+                r_j = R[j] if j in R else 1.0
+                acc = acc + n_j * np.asarray(group_totals[j], dtype=float) * r_j
+            d_new[p] = acc / f_p
+            denom = np.maximum(d_new[p], _SIGMA0_EPS)
+            max_rel = max(max_rel,
+                          float(np.max(np.abs(d_new[p] - d[p]) / denom)))
+
+        d = d_new
+        info['n_iter'] = it + 1
+        info['trajectory'].append(dict(d))
+        info['max_rel'].append(max_rel)
+        if max_rel < SIGMA0_ITER_TOL:
+            info['converged'] = True
+            break
+
+    return d, info
+
+
 def _library_group_total(lib, nuc, group_edges, grouped):
     r"""Group-averaged total cross section :math:`\sigma_{t,g}` of one nuclide.
 
@@ -369,9 +541,23 @@ def _library_group_total(lib, nuc, group_edges, grouped):
     if nuc not in lib.nuclides:
         return None
     mts = set(lib.reactions(nuc))
-    order = [1] if 1 in mts else [mt for mt in (2, 102, 18) if mt in mts]
-    if not order:
-        return None
+    if 1 in mts:
+        order = [1]
+    else:
+        order = [mt for mt in (2, 102, 18) if mt in mts]
+        if not order:
+            return None
+        if 2 not in mts:
+            # Neither the total (MT=1) nor elastic (MT=2) is present, so the
+            # reconstructed "total" is capture/fission only -- it omits the
+            # dominant elastic channel, understates the diluter total and hence
+            # sigma_0, and over-shields silently. (The JEFF-3.3 URR library
+            # carries MT=1, so this fires only on a thinned library.)
+            warnings.warn(
+                f"{nuc}: neither MT=1 (total) nor MT=2 (elastic) is present in "
+                f"the library; reconstructing the diluter total from {order} "
+                f"only understates sigma_0 for the URR self-shielding background "
+                f"and over-shields. Add MT=1 or MT=2 for {nuc} to the library.")
     total = None
     for mt in order:
         part = (np.asarray(lib.xs_g(nuc, mt), dtype=float) if grouped
@@ -415,10 +601,15 @@ def _apply_mat_ssf(table, pendf_library, energies, densities,
     Mutates ``table.xs_matrix`` in place: each capture/fission row of a flagged
     resonant nuclide is multiplied by its per-group self-shielding factor
     :math:`f_g` (:func:`mat_ssf_factors`), evaluated at the homogeneous
-    background :math:`\sigma_0` built from the composition snapshot
-    (:func:`material_dilution_sigma0`). The correction is confined to
-    URR-overlapping groups (:math:`f_g = 1` elsewhere). This is the C4 collapse
-    hook consumed by :meth:`MicroXS.from_multigroup_flux` when
+    background :math:`\sigma_0`. The background starts from the composition
+    snapshot's first Bondarenko approximation (:func:`material_dilution_sigma0`)
+    and is then refined to mutual-shielding self-consistency
+    (:func:`iterate_material_dilution_sigma0`, C2): every probability-table
+    diluter contributes its own *shielded* total, not its infinite-dilute one,
+    so self-diluted resonant mixtures (nat-W, U metal/oxide) are shielded more
+    deeply. Iteration is unconditional when the flag is on. The correction is
+    confined to URR-overlapping groups (:math:`f_g = 1` elsewhere). This is the
+    C4 collapse hook consumed by :meth:`MicroXS.from_multigroup_flux` when
     ``urr_material_dilution=True``.
 
     **Limitations.** :math:`\sigma_0` is homogeneous (no escape/Dancoff
@@ -494,8 +685,43 @@ def _apply_mat_ssf(table, pendf_library, energies, densities,
         if tot is not None:
             group_totals[j] = tot
 
-    sigma0_cache = {}       # nuc -> sigma0_g
+    # Coupling set for the mutual-shielding sigma_0 iteration (C2): every
+    # nonzero-density nuclide in the composition that carries probability tables
+    # AND has a library total. Its smooth total (factor tables) is read once here
+    # and reused for the reaction fold below. Nuclides outside this set keep
+    # R = 1 -- their infinite-dilute total contributes unchanged (a W+Fe mix
+    # reduces to the first approximation for Fe).
     smooth_total_cache = {}  # nuc -> smooth total at that nuc's URR nodes
+    coupling = {}            # nuc -> (ptab, smooth_total or None)
+    for q, n_q in densities.items():
+        if n_q <= 0 or q not in group_totals:
+            continue
+        ptab_q = pendf_library.ptables(q)
+        if ptab_q is None:
+            continue
+        if ptab_q.multiply_smooth:
+            nodes = np.asarray(ptab_q.energy, dtype=float)
+            st = _smooth_at_nodes(pendf_library, q, nodes, [1], grouped, edges)
+            if st is None:
+                st = _smooth_at_nodes(
+                    pendf_library, q, nodes, [2, 102, 18], grouped, edges)
+            if st is None:
+                # Factor table with no smooth total to absolutize against: R
+                # cannot be formed, so this nuclide stays at infinite dilution
+                # (R = 1) in the coupling. A shielded row for it raises below.
+                continue
+            smooth_total_cache[q] = st
+            coupling[q] = (ptab_q, st)
+        else:
+            coupling[q] = (ptab_q, None)
+
+    # Refine the background to mutual-shielding self-consistency (unconditional
+    # when the flag is on). Nuclides outside the coupling fall back to the
+    # first-approximation d0 in the row loop.
+    sigma0_iter, _ = iterate_material_dilution_sigma0(
+        densities, group_totals, coupling, edges)
+
+    sigma0_cache = {}       # nuc -> sigma0_g (iterated where available)
     f_cache = {}            # (nuc, base reaction) -> f_g
     warned = set()
 
@@ -527,8 +753,13 @@ def _apply_mat_ssf(table, pendf_library, energies, densities,
         if f_g is None:
             sigma0_g = sigma0_cache.get(nuc)
             if sigma0_g is None:
-                sigma0_g = material_dilution_sigma0(
-                    densities, nuc, group_totals)
+                sigma0_g = sigma0_iter.get(nuc)
+                if sigma0_g is None:
+                    # Not in the coupling (no library total / no smooth total):
+                    # fall back to the first-approximation background with
+                    # unshielded diluters.
+                    sigma0_g = material_dilution_sigma0(
+                        densities, nuc, group_totals)
                 sigma0_cache[nuc] = sigma0_g
             if ptab.multiply_smooth:
                 nodes = np.asarray(ptab.energy, dtype=float)
