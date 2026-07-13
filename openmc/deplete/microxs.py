@@ -514,7 +514,9 @@ def get_pendf_microxs_and_flux(
         :func:`get_gendfxs_and_flux`, which returns ``(flux, energy-bounds)``
         tuples, this wrapper returns bare flux arrays.
     list of MicroXS
-        Cross section data in [b] for each domain.
+        Cross section data in [b] for each domain. Negative final one-group
+        collapsed values are clamped to zero with a summary warning (see
+        :meth:`MicroXS.from_multigroup_flux`).
 
     See Also
     --------
@@ -1501,6 +1503,53 @@ def _collapse_fluxes(
     return micros
 
 
+def _clamp_negative_pendf_microxs(micros: list[MicroXS]) -> None:
+    """Clamp negative final PENDF collapsed cross sections to zero, in place.
+
+    A cross section is physically non-negative, but the PENDF collapse can
+    occasionally yield a slightly negative FINAL one-group value from noisy or
+    internally inconsistent source data (e.g. a group-averaged MF=10 partial
+    that dips below zero). This always-on backstop clamps any such negative
+    value -- per ``(nuclide, reaction, domain)``, not per energy bin or
+    pointwise -- to ``0.0`` across every :class:`MicroXS` of one collapse
+    invocation, and emits a single summary :func:`warnings.warn` giving the
+    count and up to ten of the most-negative ``(nuclide, reaction[, domain])``
+    offenders.
+
+    When no value is negative the ``micros`` are left completely untouched, so
+    a clean collapse stays bit-identical: the strict ``< 0`` mask never
+    disturbs a ``-0.0`` and no warning fires (the overwhelmingly common case).
+    """
+    # Fast path: act only when a genuine negative exists. A strict ``< 0`` test
+    # excludes ``-0.0``, so a clean collapse is left bit-for-bit unchanged
+    # (an unconditional np.maximum would flip -0.0 to +0.0 and perturb it).
+    if not any((m.data < 0).any() for m in micros):
+        return
+
+    multi = len(micros) > 1
+    offenders = []  # (value, nuclide, reaction, domain_index)
+    for d, m in enumerate(micros):
+        neg = m.data < 0
+        if not neg.any():
+            continue
+        nuc_idx, rxn_idx, _ = np.nonzero(neg)
+        for ni, ri in zip(nuc_idx, rxn_idx):
+            offenders.append((float(m.data[ni, ri, 0]),
+                              m.nuclides[ni], m.reactions[ri], d))
+        m.data[neg] = 0.0  # leaves -0.0 and positive values untouched
+
+    # Most-negative first; list up to ten as (nuclide, reaction[, domain]).
+    offenders.sort(key=lambda o: o[0])
+    parts = []
+    for val, nuc, rxn, dom in offenders[:10]:
+        if multi:
+            parts.append(f'{nuc} {rxn} (domain {dom}): {val:.3e} b')
+        else:
+            parts.append(f'{nuc} {rxn}: {val:.3e} b')
+    warn(f'PENDF collapse clamped {len(offenders)} negative one-group cross '
+         f'section value(s) to 0. Most-negative offender(s): {"; ".join(parts)}.')
+
+
 def _check_pathway_consistency(chain: Chain, micro_xs: MicroXS):
     """Fail on chain/MicroXS isomeric-pathway mismatches before depletion.
 
@@ -1712,7 +1761,10 @@ class MicroXS:
             canonical name and metastable products are qualified, e.g.
             ``(n,gamma)_m1``, so the returned ``reactions`` axis may contain
             product-qualified names. A partial with no matching chain reaction
-            falls back to the MF=3 total (one summary warning).
+            falls back to the MF=3 total (one summary warning). Any negative
+            final one-group value (from noisy or internally inconsistent source
+            data) is clamped to zero, with one summary warning naming the
+            offenders.
         urr_material_dilution : openmc.Material or dict or False, optional
             Only valid with ``pendf_library``. Enables the unresolved resonance
             region (URR) material-dilution self-shielding correction: the
@@ -1924,6 +1976,11 @@ class MicroXS:
                 cross_sections=cross_sections, **init_kwargs)
 
         micros = _collapse_fluxes(table, fluxes)
+        # PENDF-only always-on backstop: clamp any negative FINAL collapsed
+        # value to zero with one summary warning. Gated on pendf_library so the
+        # continuous-energy path (pendf_library is None) stays untouched.
+        if pendf_library is not None:
+            _clamp_negative_pendf_microxs(micros)
         return micros[0] if single else micros
 
     @classmethod

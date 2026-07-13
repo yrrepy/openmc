@@ -7,6 +7,7 @@ in :meth:`MicroXS.from_multigroup_flux`, and the re-added group-length guard in
 """
 import io
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from openmc.deplete.microxs import (
     _SparseXSTable,
     _group_average,
     _build_xs_table_pendf,
+    _collapse_fluxes,
 )
 
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
@@ -220,6 +222,97 @@ def test_from_multigroup_flux_pendf_accepts_temperature_none():
         pendf_library=fake, temperature=None)
     assert isinstance(micro, MicroXS)
     assert micro["U235", "(n,gamma)"] == pytest.approx([5.0])
+
+
+# ---------------------------------------------------------------------------
+# Non-negativity guard: negative FINAL collapsed values clamped to 0
+# (PENDF path only; see MicroXS._clamp_negative_pendf_microxs)
+# ---------------------------------------------------------------------------
+
+def _fake_with_negative():
+    """Fake library whose Gd157 (n,gamma) is a negative constant (-3 b)."""
+    e = np.array([0.0, 2.0e7])
+    return _FakePendf({
+        "Gd157": {102: (e, np.array([-3.0, -3.0]))},  # negative -> clamped
+        "U235":  {102: (e, np.array([5.0, 5.0]))},    # clean positive control
+    })
+
+
+def test_from_multigroup_flux_pendf_clamps_negative():
+    """A negative collapsed PENDF value is clamped to 0.0 with one warning."""
+    fake = _fake_with_negative()
+    edges = [0.0, 1.0e3, 1.0e5, 1.0e7, 2.0e7]
+    flux = [1.0, 2.0, 3.0, 4.0]
+
+    with pytest.warns(UserWarning) as record:
+        micro = MicroXS.from_multigroup_flux(
+            energies=edges, multigroup_flux=flux, chain_file=CHAIN_FILE,
+            nuclides=["Gd157", "U235"], reactions=["(n,gamma)"],
+            pendf_library=fake)
+
+    # The negative entry is clamped to *exactly* 0.0 ...
+    assert micro["Gd157", "(n,gamma)"][0] == 0.0
+    # ... while the clean control row is left alone.
+    assert micro["U235", "(n,gamma)"] == pytest.approx([5.0])
+
+    # Exactly one clamp warning, naming the offending nuclide + reaction + count.
+    clamp = [str(w.message) for w in record
+             if "clamped" in str(w.message) and "negative" in str(w.message)]
+    assert len(clamp) == 1
+    assert "clamped 1 negative" in clamp[0]
+    assert "Gd157 (n,gamma)" in clamp[0]
+
+
+def test_from_multigroup_flux_pendf_clean_bit_identical_no_warning():
+    """Clean data: no warning at all, and output bit-identical to the un-guarded
+    collapse (a directly-built table + _collapse_fluxes never runs the clamp)."""
+    fake = _fake_two_by_two()
+    edges = np.array([0.0, 1.0e3, 1.0e5, 1.0e7, 2.0e7])
+    flux = np.array([1.0, 2.0, 3.0, 4.0])
+
+    # Un-guarded reference: the shared collapse of a directly-built table
+    # bypasses the PENDF-only clamp in from_multigroup_flux entirely.
+    table = _build_xs_table_pendf(
+        ["Gd157", "U235"], ["(n,gamma)", "fission"], edges, fake, Chain())
+    reference = _collapse_fluxes(table, [flux])[0]
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        guarded = MicroXS.from_multigroup_flux(
+            energies=list(edges), multigroup_flux=list(flux),
+            chain_file=CHAIN_FILE, nuclides=["Gd157", "U235"],
+            reactions=["(n,gamma)", "fission"], pendf_library=fake)
+
+    assert not record, [str(w.message) for w in record]  # guard stays silent
+    # Bit-identical (exact, not approx): the clean guard must be a pure no-op.
+    np.testing.assert_array_equal(guarded.data, reference.data)
+
+
+def test_from_multigroup_flux_pendf_clamps_negative_batch_one_warning():
+    """A batch (multi-domain) collapse clamps per domain but warns once,
+    tagging each offender with its domain index."""
+    fake = _fake_with_negative()
+    edges = [0.0, 1.0e3, 1.0e5, 1.0e7, 2.0e7]
+    fluxes = [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]]  # two domains
+
+    with pytest.warns(UserWarning) as record:
+        micros = MicroXS.from_multigroup_flux(
+            energies=edges, multigroup_flux=fluxes, chain_file=CHAIN_FILE,
+            nuclides=["Gd157", "U235"], reactions=["(n,gamma)"],
+            pendf_library=fake)
+
+    assert isinstance(micros, list) and len(micros) == 2
+    # Negative row clamped to 0 in *every* domain; control untouched.
+    for m in micros:
+        assert m["Gd157", "(n,gamma)"][0] == 0.0
+        assert m["U235", "(n,gamma)"] == pytest.approx([5.0])
+
+    # ONE aggregate warning for the whole invocation, spanning both domains.
+    clamp = [str(w.message) for w in record
+             if "clamped" in str(w.message) and "negative" in str(w.message)]
+    assert len(clamp) == 1
+    assert "clamped 2 negative" in clamp[0]
+    assert "domain 0" in clamp[0] and "domain 1" in clamp[0]
 
 
 # ---------------------------------------------------------------------------
