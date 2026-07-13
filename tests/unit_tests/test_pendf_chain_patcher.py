@@ -516,8 +516,9 @@ def test_audit_four_way_split_intermediate_only():
     # A fixture broken ONLY in the intermediate band [1e5, 1e6): partials are
     # 0.5x total there and = total in the thermal/epithermal/fast bands. The
     # four-way split isolates it -> ratio_intermediate ~ 0.5 while the other
-    # three read ~ 1.0. With reject_band_ratio=0.3 only that band exceeds, so the
-    # reaction is left stock and the criterion records band_ratio:intermediate.
+    # three read ~ 1.0. Rejection is ONE-SIDED: an UNDER-summing band (0.5 < 1)
+    # never rejects -- deep silence is the collapse silence-fill's job -- so the
+    # reaction decorates despite reject_band_ratio=0.3.
     grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 2.0e5, 5.0e5, 2.0e6, 1.0e7]
     total = [10.0] * 9
     ground = [10.0, 10.0, 10.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0]  # 0.5x in [1e5,1e6)
@@ -540,19 +541,17 @@ def test_audit_four_way_split_intermediate_only():
     branching, stats = map_library(source, chain, _decay_lookup(),
                                    "elis", 0.50, 0.0,
                                    reject_rtol=None, reject_band_ratio=0.3)
-    assert stats["rejected_count"] == 1
-    rej = stats["rejected"][0]
-    assert rej["parent"] == "In115"
-    assert rej["criterion"] == "band_ratio:intermediate"
-    assert "In115" not in branching                  # rejected -> not decorated
+    assert stats["rejected_count"] == 0              # under-summing -> not rejected
+    assert "In115" in branching                      # decorated
 
 
 def test_reject_band_ratio_leaves_offender_stock(tmp_path):
-    # reject_band_ratio set (reject_rtol unset): a reaction broken only in the
-    # thermal band is rejected on the band criterion and left stock in the XML.
+    # reject_band_ratio set (reject_rtol unset): a reaction OVER-summing only in
+    # the thermal band (partials 1.3x total -- MF=10 corruption) is rejected on
+    # the one-sided band criterion and left stock in the XML.
     grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
     total = [10.0] * 8
-    ground = [5.0, 5.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]   # 0.5x in thermal
+    ground = [13.0, 13.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]   # 1.3x in thermal
     rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
         dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0,
              energy=grid, xs=ground),
@@ -700,13 +699,13 @@ def test_band_dust_floor_thermal_none_no_reject():
 def test_self_loop_ground_band_reject_exempt():
     # In113 (n,n') is a ground-state self-loop: its LFS=0 partial (izap 49113)
     # produces In113 itself, so the ground pathway is a transmutation-matrix
-    # no-op. The fast band is badly broken (partials sum ~0.13x total -- MF=10
-    # enumerates only ~13% of the inelastic), but only the m1 partial carries
-    # real isomer production, so the band-reject gate is exempted.
+    # no-op. The fast band OVER-sums (partials 1.5x total -- MF=10 corruption
+    # that the one-sided gate would reject), but the ground route is a no-op and
+    # only the m1 partial carries real isomer production, so the gate is exempted.
     grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
     total = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]
-    ground = [0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0]
-    meta = [0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 1.5, 1.8]        # sum = 0.13x (fast)
+    ground = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]   # self-loop ground = total
+    meta = [0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 25.0, 30.0]     # sum_all = 1.5x (fast, over)
     rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
         dict(lfs=0, izap=49113, qi=0.0, qm=0.0, elfs=0.0,
              energy=grid, xs=ground),
@@ -734,11 +733,12 @@ def test_self_loop_ground_band_reject_exempt():
 
 def test_metastable_parent_ground_not_exempt():
     # In115_m1 (n,n') -> In115 (ground) is isomer BURNUP, a real transition, not
-    # a self-loop: gnds_name(49,115,0)='In115' != parent 'In115_m1'. A broken
-    # fast band must therefore STILL trigger band rejection (no exemption).
+    # a self-loop: gnds_name(49,115,0)='In115' != parent 'In115_m1'. An
+    # OVER-summing fast band must therefore STILL trigger the one-sided band
+    # rejection (no exemption).
     grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
     total = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]
-    ground = [0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0]         # 0.1x total (fast)
+    ground = [0.0, 0.0, 0.0, 0.0, 0.0, 60.0, 75.0, 90.0]     # 1.5x total (fast, over)
     rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
         dict(lfs=0, izap=49115, qi=0.0, qm=0.0, elfs=0.0,
              energy=grid, xs=ground),
@@ -757,3 +757,41 @@ def test_metastable_parent_ground_not_exempt():
     assert stats["rejected"][0]["parent"] == "In115_m1"
     assert "band_ratio" in stats["rejected"][0]["criterion"]
     assert "In115_m1" not in branching               # rejected -> not decorated
+
+
+def test_band_ratio_rejection_one_sided():
+    # One-sided band rejection at threshold 0.3: an UNDER-summing band (ratio ~0,
+    # |r-1| = 1) never rejects (deep silence is the collapse silence-fill's job);
+    # an OVER-summing band (ratio 1.4) still rejects (partials exceed the total,
+    # MF=10 corruption). Both fixtures are broken only in the thermal band.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 2.0e5, 5.0e5, 2.0e6, 1.0e7]
+    total = [10.0] * 9
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 0.0)]})
+
+    # Under-summing thermal (ground ~0 while total significant): NOT rejected.
+    under = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0, energy=grid,
+             xs=[0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[0.0] * 9)])
+    src_u = _FakeSource({"In115": {102: under}})
+    assert _audit_reaction(src_u, "In115", 102,
+                           under["partials"])["ratio_thermal"] == pytest.approx(0.0)
+    _, stats_u = map_library(src_u, chain, _decay_lookup(), "elis", 0.50, 0.0,
+                             reject_rtol=None, reject_band_ratio=0.3)
+    assert stats_u["rejected_count"] == 0            # under-summing spared
+
+    # Over-summing thermal (partials 1.4x total): STILL rejected.
+    over = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=0, izap=49116, qi=0.0, qm=0.0, elfs=0.0, energy=grid,
+             xs=[14.0, 14.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+        dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0, elfs=127270.0,
+             energy=grid, xs=[0.0] * 9)])
+    src_o = _FakeSource({"In115": {102: over}})
+    assert _audit_reaction(src_o, "In115", 102,
+                           over["partials"])["ratio_thermal"] == pytest.approx(1.4)
+    _, stats_o = map_library(src_o, chain, _decay_lookup(), "elis", 0.50, 0.0,
+                             reject_rtol=None, reject_band_ratio=0.3)
+    assert stats_o["rejected_count"] == 1            # over-summing rejected
+    assert "thermal" in stats_o["rejected"][0]["criterion"]

@@ -136,7 +136,7 @@ def build_parser():
     parser.add_argument('-a', '--atol',             type=float,                                   default=0.0,    help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
     parser.add_argument('--audit-emax',             type=float,                                   default=2.0e7,  help='Cap the MF=10-vs-MF=3 audit at E <= this many eV (default: 2.0e7 = application group cap; MF=10 partials legitimately stop near 30 MeV while MF=3 runs to 200 MeV)')
     parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help='Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (default: None = audit only, reject nothing)')
-    parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has |ratio-1| > X (default: None = off; None-ratio bands never trigger)')
+    parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has ratio-1 > X (over-summing ONLY; under-summing never rejects -- the collapse silence-fill and Class-4 policy own it) (default: None = off; None-ratio bands never trigger)')
     parser.add_argument('-v', '--verbose',          action='store_true',                          default=True,   help='Enable verbose output (default: True)')
     parser.add_argument('-q', '--quiet',            action='store_true',                          default=False,  help='Disable verbose output')
     parser.add_argument('--prune-nn-prime-self-loops', action='store_true',                       default=False,  help="Remove (n,n') reactions with no isomeric branching whose target is EXACTLY the parent -- ground-parent self-loops that are an exact no-op in the depletion matrix. A metastable parent's (n,n') to ground is real isomer burnup and is KEPT. Default: keep all (n,n') reactions.")
@@ -677,7 +677,10 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
 
     * ``reject_rtol`` is set and the audit max relative deviation exceeds it, OR
     * ``reject_band_ratio`` is set and any DEFINED lethargy band ratio has
-      ``|ratio - 1| > reject_band_ratio`` (``None`` band ratios never trigger).
+      ``ratio - 1 > reject_band_ratio`` -- ONE-SIDED, over-summing only
+      (``None`` band ratios never trigger; under-summing never rejects, since
+      deep silence is the collapse silence-fill's job and a live under-sum is
+      Class-4 source-faithful by policy).
 
     Self-loop-ground exemption: a reaction whose GROUND product is the parent
     itself (see :func:`_self_loop_ground`) is EXEMPT from the band-ratio gate --
@@ -753,7 +756,12 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                                       ('ratio_intermediate', 'intermediate'),
                                       ('ratio_fast', 'fast')):
                         r = audit.get(key)
-                        if r is not None and abs(r - 1.0) > reject_band_ratio:
+                        # One-sided: reject only OVER-summing bands (partials
+                        # exceed the total -- MF=10 corruption, e.g. the 0.00859
+                        # eV spike class). Under-summing never rejects: deep
+                        # silence is the collapse silence-fill's job and a live
+                        # under-sum is Class-4 source-faithful by policy.
+                        if r is not None and (r - 1.0) > reject_band_ratio:
                             band_fired.append(f'band_ratio:{band}')
 
                 # Self-loop-ground exemption: when the reaction's ground pathway
@@ -1427,7 +1435,8 @@ def _write_rejected_section(f, rejected, reject_rtol, reject_band_ratio=None):
     f.write("Criterion: a reaction is left stock (no <isomeric_branching> "
             "child) when its MF=10-vs-MF=3 audit max relative deviation exceeds "
             "the rtol threshold, OR any DEFINED lethargy band ratio has "
-            "|ratio-1| exceeding the band threshold.\n")
+            "ratio-1 exceeding the band threshold (one-sided: over-summing "
+            "only; under-summing never rejects).\n")
     f.write("Consequence: MF=3 total routes to the ground target; isomeric "
             "branching discarded.\n\n")
     if not rejected:
@@ -1755,7 +1764,7 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     else:
         rtol_msg = (f"worst rel dev > {reject_rtol:.3e}"
                     if reject_rtol is not None else "off")
-        band_msg = (f"|band ratio - 1| > {reject_band_ratio:.3e}"
+        band_msg = (f"band ratio - 1 > {reject_band_ratio:.3e} (over-sum only)"
                     if reject_band_ratio is not None else "off")
         print(f"  MF=10 audit rejection: rtol {rtol_msg}; band {band_msg} "
               f"-> reaction left stock")
@@ -1885,7 +1894,8 @@ if __name__ == '__main__':
     else:
         rtol_msg = (f"worst rel dev > {args.mf10_reject_rtol}"
                     if args.mf10_reject_rtol is not None else "off")
-        band_msg = (f"|band ratio - 1| > {args.mf10_reject_band_ratio}"
+        band_msg = (f"band ratio - 1 > {args.mf10_reject_band_ratio} "
+                    "(over-sum only)"
                     if args.mf10_reject_band_ratio is not None else "off")
         print(f"MF=10 reject: rtol {rtol_msg}; band {band_msg}")
     print(f"\nInput chain:  {base_chain}")
