@@ -120,6 +120,8 @@ __all__ = [
     'find_tpe',
     'material_dilution_sigma0',
     'mat_ssf_factors_gendf',
+    'mat_ssf_total_factors_gendf',
+    'iterate_material_dilution_sigma0_gendf',
     'compute_mat_ssf',
 ]
 
@@ -160,6 +162,30 @@ _PROB_ATOL = 1e-3       # |Sum_b p_b - 1|
 _EDGE_RTOL = 5e-3       # ENG<->library-edge match (library edges are 5 sig figs)
 
 _REACTION_MT = {'capture': _MT_CAPTURE, 'fission': _MT_FISSION}
+
+# Reaction name -> library-side MT (the collapse row the shielding factor
+# multiplies): capture folds onto MT=102, fission onto MT=18.
+_REACTION_LIB_MT = {'capture': _LIB_CAPTURE_MT, 'fission': _LIB_FISSION_MT}
+
+# Fixed-point controls for the mutual-shielding sigma_0 refinement (C3). These
+# are policy constants, NOT API parameters: iteration is unconditional when the
+# URR flag is on and always uses these bounds. FISPACT reports "a few passes";
+# the map d(p) -> (1/f_p) sum_{q!=p} f_q sigma_t,inf(q) R_q(d) is contractive
+# (R in (0, 1] -> a monotone-decreasing sequence from d0), so the tolerance is
+# reached in a handful of passes: the resolved-range CALENDF tables shield far
+# more deeply than URR-only tables (nat-W needs ~10 passes vs the PENDF
+# sibling's ~4), which is what sizes the cap. The cap is a safety bound, inert
+# once the tolerance breaks the loop. No damping (add 0.5 damping only if a
+# gate ever shows oscillation -- it is not expected). Same names and values as
+# the PENDF sibling (:mod:`openmc.deplete.mat_ssf`).
+SIGMA0_ITER_MAX = 15
+SIGMA0_ITER_TOL = 1e-3
+
+# Barn-scale floor for the relative-change denominator max(d, eps): guards groups
+# where the background is ~0 (a pure absorber, or groups outside every diluter's
+# tabulated span) from a spurious large relative delta. Background changes below
+# this floor are physically irrelevant.
+_SIGMA0_EPS = 1e-10
 
 
 class _BandGroup:
@@ -590,6 +616,183 @@ def mat_ssf_factors_gendf(tables, sigma0_g, n_groups, reaction):
     return f
 
 
+def mat_ssf_total_factors_gendf(tables, sigma0_g, n_groups):
+    r"""Per-group total-cross-section self-shielding factor ``R_tot_g`` (C3).
+
+    The total-XS shielding factor that drives the C3 mutual-shielding ``sigma0``
+    iteration (:func:`iterate_material_dilution_sigma0_gendf`). It folds the band
+    **total** ``sigma_t,b`` exactly as :func:`mat_ssf_factors_gendf` folds a
+    partial reaction, so the numerator's shielded total and the denominator's
+    infinite-dilution total use the same ``sigma_t,b`` that already sets the
+    partial fold's flux weight ``w_b = p_b / (sigma0_g + sigma_t,b)``::
+
+        R_tot_g   = sigma_t,eff_g(sigma0) / sigma_t,inf_g
+        sigma_t,eff = Sum_b w_b sigma_t,b / Sum_b w_b,  w_b = p_b/(sigma0_g+sigma_t,b)
+        sigma_t,inf = Sum_b p_b sigma_t,b / Sum_b p_b
+
+    ``R_tot_g`` lies in ``(0, 1]``: exactly 1 in groups the ``.tpe`` table does
+    not cover (no bands -> no shielding) and approaching 1 as ``sigma0 ->
+    infinity`` (infinite dilution). A diluter whose bands END inside the URR (the
+    TENDL-2017 W ceilings at ~13-17 keV) simply has no band records above its
+    ceiling, so ``R_tot_g`` there is 1 -- that diluter reverts to its
+    infinite-dilute contribution in the uncovered groups (graceful degradation,
+    mirroring FISPACT-II's own data limit). A partial URR span is therefore
+    handled cleanly: the per-group ``.tpe`` coverage is the only mask needed.
+
+    Band-total source (the "no MT=1 band record" approximation, work-order
+    requirement)
+    ------------------------------------------------------------------------
+    The CALENDF ``.tpe`` format carries the absolute band total ``sigma_t,b``
+    directly in column 1 of every band record (parsed into ``_BandGroup.total``
+    and validated by :func:`read_tpe`'s sum rule, ``total ~= Sum(partials)`` to
+    ``<= 1.1e-5`` rel). ``R_tot`` therefore folds that authoritative total column
+    directly -- the "reuse, don't fork" reading of "the SAME total reconstruction
+    used for the flux weight" (``mat_ssf_factors_gendf`` also weights with
+    ``g.total``). The total column is present in **every** real ``.tpe`` record,
+    so the work-order fallback -- approximate ``sigma_t,b ~= MT2 + MT101 + MT18``
+    band partials plus a smooth remainder when no total (MT=1) band record is
+    present -- is only exercised defensively, if a group's total column were ever
+    degenerate (all ``<= 0``, which does not occur in the TENDL-2017 tables). In
+    that last-resort case this fold reconstructs the band total from the
+    extracted partials ``sigma_t,b ~= elastic (MT2) + capture (MT101) + fission
+    (MT18)``; that reconstruction OMITS the inelastic (MT=4) and any other smooth
+    channel the authoritative total column includes, so it understates the total
+    and is retained only as a guard, never as the working path.
+
+    Parameters
+    ----------
+    tables : TpeTable
+        Parsed CALENDF probability tables (bands keyed by library group index).
+    sigma0_g : numpy.ndarray or float
+        Background cross section per library group (length ``n_groups``), or a
+        scalar broadcast to all groups (e.g. ``0.0`` for a pure absorber).
+    n_groups : int
+        Number of groups in the target library (length of the returned array).
+
+    Returns
+    -------
+    numpy.ndarray
+        ``R_tot_g`` of length ``n_groups``, default 1.0 (groups without bands).
+    """
+    sigma0_g = np.asarray(sigma0_g, dtype=float)
+    if sigma0_g.ndim == 0:
+        sigma0_g = np.full(n_groups, float(sigma0_g))
+    elif len(sigma0_g) != n_groups:
+        raise ValueError(
+            f"sigma0_g length {len(sigma0_g)} != n_groups {n_groups}")
+
+    R = np.ones(n_groups, dtype=float)
+    for i, g in tables.groups.items():
+        if not (0 <= i < n_groups):
+            continue
+        sig_t = g.total
+        if not np.any(sig_t > 0.0):
+            # Defensive no-total fallback (does not occur in real .tpe data):
+            # reconstruct the band total from the extracted partials. Omits the
+            # inelastic channel, so it understates -- guard only, see docstring.
+            sig_t = g.elastic + g.capture + g.fission
+        p = g.prob
+        sig_inf = float((p * sig_t).sum() / p.sum())
+        if sig_inf <= 0.0:
+            continue
+        w = p / (sigma0_g[i] + sig_t)
+        sig_eff = float((w * sig_t).sum() / w.sum())
+        R[i] = sig_eff / sig_inf
+    return R
+
+
+def iterate_material_dilution_sigma0_gendf(densities, group_totals, coupling,
+                                           n_groups):
+    r"""Mutual-shielding refinement of the material-dilution background (C3).
+
+    Starts from the first Bondarenko approximation ``d0`` (each diluter at its
+    infinite-dilute total, :func:`material_dilution_sigma0`) and refines it so
+    every probability-table-carrying nuclide contributes its own *shielded*
+    total, following FISPACT-II (Sublet et al., NDS 139 (2017), ch2 s26)::
+
+        d(i+1)(p,g) = (1/f_p) Sum_{q != p} f_q sigma_t,inf(q,g) R_q(i)(g),
+        R_q(i)(g)   = mat_ssf_total_factors_gendf(tables_q, d(i)(q,g)).
+
+    All backgrounds are updated simultaneously from the same iterate (Jacobi, so
+    the result is order-independent). Diluters outside ``coupling`` (no ``.tpe``
+    probability table, or no library total) keep ``R == 1`` -- their
+    infinite-dilute contribution is unchanged, so a resonant-plus-inert mixture
+    reduces to the first approximation for the inert part. The map is contractive
+    (``R in (0, 1]``), so the sequence decreases monotonically to its fixed
+    point; there is no damping. This is the exact GENDF sibling of
+    :func:`openmc.deplete.mat_ssf.iterate_material_dilution_sigma0`; it takes
+    ``n_groups`` in place of the PENDF ``group_edges`` because the CALENDF factors
+    are already indexed by library group.
+
+    Parameters
+    ----------
+    densities : dict
+        Maps nuclide name to number density (or fraction); the composition
+        snapshot. Only ratios matter.
+    group_totals : dict
+        Maps each diluter nuclide (nonzero density) to its infinite-dilution
+        group total ``sigma_t,inf(q,g)`` (barns), e.g. ``get_xs(q, MT=1)``. Every
+        ``coupling`` key must also appear here.
+    coupling : dict
+        Maps each probability-table-carrying nuclide ``q`` (the iterated set) to
+        its parsed :class:`TpeTable`. Nuclides absent from ``coupling`` keep
+        ``R == 1``.
+    n_groups : int
+        Number of library groups (length of every background/total array).
+
+    Returns
+    -------
+    sigma0 : dict
+        Converged background ``sigma0(p,g)`` (barns) for every ``p`` in
+        ``coupling``.
+    info : dict
+        ``{'n_iter', 'converged', 'trajectory', 'max_rel'}``: the number of
+        update passes taken, whether the tolerance was met, the list of
+        per-iteration background dicts starting at ``d0``, and the list of
+        per-iteration max relative changes.
+    """
+    coupled = list(coupling)
+
+    # d0: first Bondarenko approximation for every coupled nuclide.
+    d = {p: material_dilution_sigma0(densities, p, group_totals,
+                                     n_groups=n_groups)
+         for p in coupled}
+
+    info = {'n_iter': 0, 'converged': len(coupled) == 0,
+            'trajectory': [dict(d)], 'max_rel': []}
+
+    for it in range(SIGMA0_ITER_MAX):
+        # R_q at the current background, for every coupled nuclide (Jacobi: all
+        # evaluated from the same iterate d before any update).
+        R = {q: mat_ssf_total_factors_gendf(coupling[q], d[q], n_groups)
+             for q in coupled}
+
+        d_new = {}
+        max_rel = 0.0
+        for p in coupled:
+            f_p = densities[p]
+            acc = np.zeros(n_groups)
+            for j, n_j in densities.items():
+                if j == p or n_j <= 0 or j not in group_totals:
+                    continue
+                r_j = R[j] if j in R else 1.0
+                acc = acc + n_j * np.asarray(group_totals[j], dtype=float) * r_j
+            d_new[p] = acc / f_p
+            denom = np.maximum(d_new[p], _SIGMA0_EPS)
+            max_rel = max(max_rel,
+                          float(np.max(np.abs(d_new[p] - d[p]) / denom)))
+
+        d = d_new
+        info['n_iter'] = it + 1
+        info['trajectory'].append(dict(d))
+        info['max_rel'].append(max_rel)
+        if max_rel < SIGMA0_ITER_TOL:
+            info['converged'] = True
+            break
+
+    return d, info
+
+
 def compute_mat_ssf(tables, densities, resonant, group_totals, n_groups,
                     reactions=('capture', 'fission')):
     """Apply-layer seam: fold one nuclide's tables into ``f_g`` per reaction.
@@ -647,6 +850,20 @@ def _apply_mat_ssf_gendf(table, gendf_library, calendf_path, densities, mts,
     as well as the URR, so ``f_g`` deviates from 1 across both (in some
     resolved-range groups capture anti-correlates with the total, giving
     ``f_g`` > 1 -- legitimate ``multxs=1`` behaviour, not a bug).
+
+    ``sigma0_mat`` starts from the composition snapshot's first Bondarenko
+    approximation (:func:`material_dilution_sigma0`) and is then refined to
+    mutual-shielding self-consistency (C3,
+    :func:`iterate_material_dilution_sigma0_gendf`): every ``.tpe``-carrying
+    diluter contributes its own *shielded* total, not its infinite-dilute one, so
+    self-diluted resonant mixtures (nat-W, U metal/oxide) are shielded more
+    deeply. Iteration is unconditional when the flag is on -- it is the same
+    physics done correctly, not a new feature (the ``urr_material_dilution``
+    signature is frozen). Diluters whose bands END inside the URR (the TENDL-2017
+    W ceilings at ~13-17 keV) keep ``R = 1`` in the uncovered groups (graceful
+    degradation); diluters with no ``.tpe`` table keep ``R = 1`` everywhere, so a
+    resonant-plus-inert mixture reduces to the first approximation for the inert
+    part.
 
     The table is modified **in place**; nothing is returned.
 
@@ -724,7 +941,12 @@ def _apply_mat_ssf_gendf(table, gendf_library, calendf_path, densities, mts,
                 gendf_library.get_xs(name, _LIB_TOTAL_MT), dtype=float)
         return diluter_total_cache[name]
 
+    # --- pass 1: which flagged nuclides actually get folded? ------------------
+    # A nuclide is foldable if it is present in the table with a shieldable
+    # (capture / fission) row, has a positive density, and has a .tpe table.
+    # Each .tpe is read exactly once here and reused for the coupling below.
     warned = set()
+    foldable = []   # (nuc, row_ids, row_mt, want_capture, want_fission, tpe)
     for nuc in table.nuclides:
         if nuc not in flagged:
             continue
@@ -754,22 +976,60 @@ def _apply_mat_ssf_gendf(table, gendf_library, calendf_path, densities, mts,
                 warned.add(nuc)
             continue
         tpe = read_tpe(tpe_path, group_structure=group_structure)
+        foldable.append((nuc, row_ids, row_mt, want_capture, want_fission, tpe))
 
-        # sigma0_mat from the OTHER positive-density nuclides' group totals.
-        group_totals = {j: _diluter_total(j)
-                        for j in pos_densities if j != nuc}
+    # Nothing to shield: leave the table untouched (and, as before, do not read
+    # any diluter total, so an absent-from-library diluter raises no error unless
+    # it is actually needed for a fold).
+    if not foldable:
+        return
+
+    # --- mutual-shielding sigma0 iteration (C3) -------------------------------
+    # Global diluter group totals for the background: every positive-density
+    # nuclide (raises via _diluter_total if one is absent from the GENDF library
+    # -- unchanged error). Only density ratios matter.
+    group_totals = {j: _diluter_total(j) for j in pos_densities}
+
+    # Coupling set: every positive-density nuclide that carries a CALENDF .tpe
+    # table AND a library total. Its R_tot shields its own contribution to the
+    # background; nuclides outside the coupling keep R = 1 (infinite-dilute). The
+    # foldable tables are reused; other resonant diluters are looked up once.
+    coupling = {nuc: tpe for (nuc, _r, _m, _c, _f, tpe) in foldable}
+    for q in pos_densities:
+        if q in coupling or q not in group_totals:
+            continue
+        q_path = find_tpe(calendf_path, q)
+        if q_path is None:
+            continue
+        coupling[q] = read_tpe(q_path, group_structure=group_structure)
+
+    # Refine the background to mutual-shielding self-consistency (unconditional
+    # when the flag is on). Nuclides outside the coupling fall back to the
+    # first-approximation d0 in the fold below.
+    sigma0_iter, _info = iterate_material_dilution_sigma0_gendf(
+        pos_densities, group_totals, coupling, n_groups)
+
+    # --- pass 2: fold each nuclide's rows at its iterated background -----------
+    for nuc, row_ids, row_mt, want_capture, want_fission, tpe in foldable:
+        sigma0_g = sigma0_iter.get(nuc)
+        if sigma0_g is None:
+            # Not in the coupling (no .tpe / no library total): fall back to the
+            # first-approximation background with unshielded diluters.
+            sigma0_g = material_dilution_sigma0(
+                pos_densities, nuc, group_totals, n_groups=n_groups)
+
+        # Fold capture / fission at this background. Fission is skipped (f = 1)
+        # for nuclides whose tables carry no MT=18 partial (matches compute_mat_ssf).
         need = (['capture'] if want_capture else []) \
             + (['fission'] if want_fission else [])
-        f_by_reaction = compute_mat_ssf(
-            tpe, pos_densities, nuc, group_totals, n_groups,
-            reactions=tuple(need))
-
-        # Cache f_g by library MT so repeated rows do not refold.
+        has_fis = tpe.has_fission()
         f_by_mt = {}
-        if 'capture' in f_by_reaction:
-            f_by_mt[_LIB_CAPTURE_MT] = f_by_reaction['capture']
-        if 'fission' in f_by_reaction:
-            f_by_mt[_LIB_FISSION_MT] = f_by_reaction['fission']
+        for rx in need:
+            if rx == 'fission' and not has_fis:
+                f_g = np.ones(n_groups, dtype=float)
+            else:
+                f_g = mat_ssf_factors_gendf(tpe, sigma0_g, n_groups, rx)
+            f_by_mt[_REACTION_LIB_MT[rx]] = f_g
 
         for r in row_ids:
             f = f_by_mt.get(row_mt[int(r)])
