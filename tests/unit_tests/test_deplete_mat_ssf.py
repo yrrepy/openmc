@@ -160,3 +160,178 @@ def test_urr_material_dilution_material_matches_dict():
     assert on_dict == pytest.approx(_ON_EXPECT, rel=1e-9)
     # Material and equivalent dict are byte-identical.
     assert on_mat == pytest.approx(on_dict, rel=0.0, abs=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Mutual-shielding sigma_0 iteration (C2): total-XS factor + Jacobi fixed point
+# ---------------------------------------------------------------------------
+from openmc.deplete.mat_ssf import (              # noqa: E402
+    SIGMA0_ITER_MAX, SIGMA0_ITER_TOL,
+    material_dilution_sigma0, mat_ssf_total_factors,
+    iterate_material_dilution_sigma0)
+
+# One URR-overlapping group ([1e3, 1e5]) with many nodes inside it, so
+# ``_group_average`` can integrate the folded pointwise total (a single node
+# would average to 0 and leave R=1).
+_ITER_EDGES = np.array([0.0, 1.0e3, 1.0e5, 2.0e7])
+_ITER_NODES = np.geomspace(2.0e3, 8.0e4, 12)
+_MID = 1  # index of the URR-overlapping group
+
+
+def _band_ptab(total_lo, total_hi):
+    """A synthetic two-equiprobable-band absolute table, totals [lo, hi]."""
+    band = np.array([
+        [0.5, 1.0],              # 0 cumulative probability
+        [total_lo, total_hi],    # 1 total (drives R_tot)
+        [0.0, 0.0],              # 2 elastic
+        [0.0, 0.0],              # 3 fission
+        [0.0, 0.0],              # 4 (n,gamma) -- irrelevant to the total factor
+        [0.0, 0.0],              # 5 heating
+    ])
+    return _FakePtab(_ITER_NODES, np.stack([band] * len(_ITER_NODES)))
+
+
+def _dense_fixed_point(densities, group_totals, coupling, edges, passes=500):
+    """Independent high-iteration reference solution of the sigma_0 fixed point.
+
+    Runs the same Jacobi map far past the production ``SIGMA0_ITER_MAX`` cap, so
+    the result is the true fixed point to solve against (contraction guarantees
+    convergence).
+    """
+    n_groups = len(edges) - 1
+    d = {p: material_dilution_sigma0(densities, p, group_totals) for p in coupling}
+    for _ in range(passes):
+        R = {q: mat_ssf_total_factors(coupling[q][0], d[q], edges,
+                                      smooth_total=coupling[q][1])
+             for q in coupling}
+        d_new = {}
+        for p in coupling:
+            acc = np.zeros(n_groups)
+            for j, n_j in densities.items():
+                if j == p or n_j <= 0 or j not in group_totals:
+                    continue
+                r_j = R[j] if j in R else 1.0
+                acc = acc + n_j * np.asarray(group_totals[j]) * r_j
+            d_new[p] = acc / densities[p]
+        d = d_new
+    return d
+
+
+def test_mat_ssf_total_factor_limits():
+    """R_tot matches the analytic band harmonic/arithmetic ratio and -> 1 dilute."""
+    ptab = _band_ptab(10.0, 100.0)   # p=[.5,.5], sigma_t,inf = 55 b
+    # sigma_0 = 0: sigma_t,eff = 1 / (0.5/10 + 0.5/100) = 18.1818 b -> R = 0.33058
+    r0 = mat_ssf_total_factors(ptab, np.zeros(3), _ITER_EDGES)
+    assert r0[_MID] == pytest.approx((1.0 / 0.055) / 55.0, rel=1e-9)
+    # infinite dilution: R -> 1 exactly; outside the URR span: R == 1
+    r_inf = mat_ssf_total_factors(ptab, np.full(3, 1.0e12), _ITER_EDGES)
+    assert r_inf[_MID] == pytest.approx(1.0, rel=1e-6)
+    assert r0[0] == 1.0 and r0[2] == 1.0
+    # monotone increasing in sigma_0 (more dilution -> less shielding)
+    rs = [mat_ssf_total_factors(ptab, np.full(3, s), _ITER_EDGES)[_MID]
+          for s in (0.0, 5.0, 55.0, 1.0e3)]
+    assert np.all(np.diff(rs) > 0)
+
+
+def test_sigma0_iteration_converges_to_fixed_point():
+    """G-A: two synthetic resonant nuclides -> iteration reaches the analytic d*."""
+    edges = _ITER_EDGES
+    coupling = {'A': (_band_ptab(20.0, 80.0), None),
+                'B': (_band_ptab(30.0, 70.0), None)}
+    densities = {'A': 0.6, 'B': 0.4}
+    group_totals = {'A': np.full(3, 50.0), 'B': np.full(3, 50.0)}
+
+    sigma0, info = iterate_material_dilution_sigma0(
+        densities, group_totals, coupling, edges)
+
+    # Converged within the production bound.
+    assert info['converged']
+    assert info['n_iter'] <= SIGMA0_ITER_MAX
+
+    ref = _dense_fixed_point(densities, group_totals, coupling, edges)
+    R = {q: mat_ssf_total_factors(coupling[q][0], sigma0[q], edges)
+         for q in coupling}
+    for p in ('A', 'B'):
+        # Matches the independent high-iteration reference fixed point.
+        assert sigma0[p][_MID] == pytest.approx(ref[p][_MID], rel=SIGMA0_ITER_TOL)
+        # Satisfies the fixed-point equation d(p) = (1/f_p) sum_{q!=p} f_q s_q R_q.
+        rhs = sum(densities[j] * group_totals[j][_MID] * R[j][_MID]
+                  for j in coupling if j != p) / densities[p]
+        assert abs(sigma0[p][_MID] - rhs) / sigma0[p][_MID] < SIGMA0_ITER_TOL
+        # Mutual shielding strictly lowers sigma_0 from the first approximation.
+        assert sigma0[p][_MID] < info['trajectory'][0][p][_MID]
+
+    # Contraction: the per-pass update shrinks monotonically (no oscillation).
+    assert np.all(np.diff(info['max_rel']) < 0)
+
+
+def test_sigma0_iteration_jacobi_order_independent():
+    """G-A companion: the simultaneous update is independent of nuclide order."""
+    edges = _ITER_EDGES
+    pA, pB = _band_ptab(20.0, 80.0), _band_ptab(30.0, 70.0)
+    gt = {'A': np.full(3, 50.0), 'B': np.full(3, 50.0)}
+    d1, _ = iterate_material_dilution_sigma0(
+        {'A': 0.6, 'B': 0.4}, gt, {'A': (pA, None), 'B': (pB, None)}, edges)
+    d2, _ = iterate_material_dilution_sigma0(
+        {'B': 0.4, 'A': 0.6}, gt, {'B': (pB, None), 'A': (pA, None)}, edges)
+    assert np.array_equal(d1['A'], d2['A'])
+    assert np.array_equal(d1['B'], d2['B'])
+
+
+def test_sigma0_iteration_mono_noop():
+    """G-B: a single resonant nuclide (no diluters) -> bit-identical no-op."""
+    edges = _ITER_EDGES
+    densities = {'X': 1.0}
+    group_totals = {'X': np.full(3, 50.0)}
+    coupling = {'X': (_band_ptab(20.0, 80.0), None)}
+
+    d0 = material_dilution_sigma0(densities, 'X', group_totals)
+    sigma0, info = iterate_material_dilution_sigma0(
+        densities, group_totals, coupling, edges)
+    assert np.array_equal(d0, np.zeros(3))         # pure absorber, sigma_0 = 0
+    assert np.array_equal(sigma0['X'], d0)         # iteration leaves it untouched
+    assert info['converged']
+
+
+def test_sigma0_iteration_inert_diluter_noop():
+    """G-B: one resonant nuclide in a non-ptable diluter -> iteration no-op."""
+    edges = _ITER_EDGES
+    densities = {'X': 1.0, 'M': 4.0}               # M inert (no ptable, R=1)
+    group_totals = {'X': np.full(3, 50.0), 'M': np.full(3, 6.0)}
+    coupling = {'X': (_band_ptab(20.0, 80.0), None)}
+
+    d0 = material_dilution_sigma0(densities, 'X', group_totals)
+    sigma0, _ = iterate_material_dilution_sigma0(
+        densities, group_totals, coupling, edges)
+    # X sees only the inert diluter: sigma_0 = n_M * s_M / n_X = 24 b, unchanged.
+    assert sigma0['X'][_MID] == pytest.approx(24.0)
+    assert np.array_equal(sigma0['X'], d0)
+
+
+# ---------------------------------------------------------------------------
+# D3 rider: warn when a diluter "total" is reconstructed without MT=1 or MT=2
+# ---------------------------------------------------------------------------
+from openmc.deplete.mat_ssf import _library_group_total   # noqa: E402
+
+_D3_E = np.array([0.0, 2.0e7])
+_D3_EDGES = np.array([0.0, 1.0e3, 1.0e5, 2.0e7])
+
+
+def _mt_lib(mts):
+    return _FakePendfURR({'D': {mt: (_D3_E, np.array([1.0, 1.0])) for mt in mts}})
+
+
+def test_library_group_total_warns_only_without_total_or_elastic():
+    """MT=1 or MT=2 present -> silent; capture-only reconstruction -> warns."""
+    import warnings
+
+    # MT=1 present, or MT=2 present: no warning.
+    for mts in ([1, 102], [2, 102]):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            assert _library_group_total(_mt_lib(mts), 'D', _D3_EDGES, False) \
+                is not None
+
+    # Neither MT=1 nor MT=2: the elastic channel is missing -> warn.
+    with pytest.warns(UserWarning, match="neither MT=1 .* nor MT=2"):
+        _library_group_total(_mt_lib([102, 18]), 'D', _D3_EDGES, False)
