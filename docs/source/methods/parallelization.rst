@@ -659,6 +659,27 @@ where the accumulator (and, for ``rma``, the moments) live:
   :math:`1/N`. Users sizing runs against this memory model should budget for the
   extra plane.
 
+All three modes preserve the statistical semantics of the ``replicated``
+default. Because scores accumulate locally within a batch and are reduced or
+folded exactly once per batch, the sample mean is statistically exact --
+identical to a serial run to within floating-point round-off -- and the
+variance is unbiased regardless of how histories are batched across ranks
+[Romano2012]_; the resulting run-to-run non-reproducibility of the parallel
+variance estimate is an accepted property of batch statistics, not an artifact
+of the storage modes. Independent of the storage mode, global tallies --
+including :math:`k`-effective -- remain replicated and are reduced every
+batch, a precondition for serial-equivalent tally means when the tally
+reduction is deferred or distributed [Romano2013b]_. Using too few generations
+per batch in a problem with a high dominance ratio underpredicts the tally
+variance, again independent of storage mode, because of inter-generation
+correlation of the fission source [Romano2012]_ [Gelbard1990]_.
+
+The distributed modes realize future work identified for OpenMC in
+[Romano2013b]_ (section 6.5): one-sided fetch-and-add tally accumulation
+without dedicated tally-server ranks (the ``rma`` mode), and the combination of
+distributed tally storage with on-node shared-memory parallelism (the
+``shared`` mode, and ``rma`` under the serialized threading model below).
+
 .. _methods_parallel_thread_level:
 
 MPI thread level
@@ -693,14 +714,26 @@ opt-in rather than the default [Rising2025]_.
    Radiation Penetration Calculations on a Parallel Computer,"
    *Trans. Am. Nucl. Soc.*, **17**, 260 (1973).
 
+.. [Gelbard1990] E. M. Gelbard and R. Prael, "Computation of Standard
+   Deviations in Eigenvalue Calculations," *Prog. Nucl. Energy*, **24**, 237
+   (1990).
+
 .. [Romano2011] P. K. Romano, B. Forget, and F. B. Brown, "Towards Scalable
    Parallelism in Monte Carlo Particle Transport Codes Using Remote Memory
    Access," *Prog. Nucl. Sci. Technol.*, **2**, 670--675 (2011).
+
+.. [Romano2012] P. K. Romano and B. Forget, "Reducing Parallel Communication
+   in Monte Carlo Simulations via Batch Statistics," *Trans. Am. Nucl. Soc.*,
+   **107**, 519 (2012).
 
 .. [Romano2013] P. K. Romano, A. R. Siegel, B. Forget, and K. Smith, "Data
    decomposition of Monte Carlo particle transport simulations via tally
    servers," *J. Comput. Phys.*, **252**, 20--36 (2013).
    `doi:10.1016/j.jcp.2013.06.011 <https://doi.org/10.1016/j.jcp.2013.06.011>`_.
+
+.. [Romano2013b] P. K. Romano, "Parallel Algorithms for Monte Carlo Particle
+   Transport Simulation on Exascale Computing Architectures," Ph.D. thesis,
+   Massachusetts Institute of Technology (2013).
 
 .. [Dun2015] N. Dun, H. Fujita, J. R. Tramm, A. A. Chien, and A. R. Siegel,
    "Data Decomposition in Monte Carlo Neutron Transport Simulations using Global
