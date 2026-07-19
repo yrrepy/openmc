@@ -272,6 +272,21 @@ def test_sigma0_iteration_converges_to_fixed_point():
     assert np.all(np.diff(info['max_rel']) < 0)
 
 
+def test_sigma0_iteration_warns_on_nonconvergence(monkeypatch):
+    """Loop exhausted below tolerance -> UserWarning + converged False."""
+    edges = _ITER_EDGES
+    coupling = {'A': (_band_ptab(20.0, 80.0), None),
+                'B': (_band_ptab(30.0, 70.0), None)}
+    densities = {'A': 0.6, 'B': 0.4}
+    group_totals = {'A': np.full(3, 50.0), 'B': np.full(3, 50.0)}
+
+    monkeypatch.setattr('openmc.deplete.mat_ssf.SIGMA0_ITER_MAX', 1)
+    with pytest.warns(UserWarning, match="did not converge"):
+        _, info = iterate_material_dilution_sigma0(
+            densities, group_totals, coupling, edges)
+    assert not info['converged']
+
+
 def test_sigma0_iteration_jacobi_order_independent():
     """G-A companion: the simultaneous update is independent of nuclide order."""
     edges = _ITER_EDGES

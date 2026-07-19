@@ -521,6 +521,13 @@ def iterate_material_dilution_sigma0(densities, group_totals, coupling,
             info['converged'] = True
             break
 
+    if not info['converged']:
+        warnings.warn(
+            f"URR sigma0 mutual-shielding iteration did not converge in "
+            f"{info['n_iter']} passes (max relative change "
+            f"{info['max_rel'][-1]:.3e} > tol {SIGMA0_ITER_TOL:g}); using the "
+            f"last iterate")
+
     return d, info
 
 
