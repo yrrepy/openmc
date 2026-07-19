@@ -131,6 +131,20 @@ def test_sigma0_iteration_gendf_converges_to_fixed_point():
     assert np.all(np.diff(info['max_rel']) < 0)
 
 
+def test_sigma0_iteration_gendf_warns_on_nonconvergence(monkeypatch):
+    """Loop exhausted below tolerance -> UserWarning + converged False."""
+    coupling = {'A': _band_tpe(20.0, 80.0), 'B': _band_tpe(30.0, 70.0)}
+    densities = {'A': 0.6, 'B': 0.4}
+    group_totals = {'A': np.full(_N_GROUPS, 50.0),
+                    'B': np.full(_N_GROUPS, 50.0)}
+
+    monkeypatch.setattr('openmc.deplete.calendf.SIGMA0_ITER_MAX', 1)
+    with pytest.warns(UserWarning, match="did not converge"):
+        _, info = iterate_material_dilution_sigma0_gendf(
+            densities, group_totals, coupling, _N_GROUPS)
+    assert not info['converged']
+
+
 def test_sigma0_iteration_gendf_jacobi_order_independent():
     """G-A companion: the simultaneous update is independent of nuclide order."""
     tA, tB = _band_tpe(20.0, 80.0), _band_tpe(30.0, 70.0)
