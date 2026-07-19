@@ -21,6 +21,7 @@ from openmc.exceptions import DataError
 import openmc.lib
 from openmc.mpi import comm
 from .abc import OperatorResult
+from .nuclide import _ISOMER_SUFFIX
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
 from .results import Results
@@ -81,6 +82,30 @@ def _get_nuclides_with_data(cross_sections):
                 nuclides.add(name)
 
     return nuclides
+
+
+def _check_chain_not_isomeric(chain):
+    """Reject a product-qualified isomeric depletion chain.
+
+    A folded PENDF chain unfolds into reaction types such as ``(n,gamma)_m1``
+    that continuous-energy transport cannot tally as isomer-resolved partials.
+    Raise a :class:`ValueError` naming an offending type and pointing at the
+    transport-independent (MicroXS + IndependentOperator) workflow.
+
+    Parameters
+    ----------
+    chain : openmc.deplete.Chain
+        Depletion chain whose aggregated reaction types are inspected.
+
+    """
+    for rx in chain.reactions:
+        if _ISOMER_SUFFIX.search(rx):
+            raise ValueError(
+                f"The depletion chain carries product-qualified isomeric "
+                f"reaction types (e.g. '{rx}'); transport-coupled depletion "
+                f"cannot tally isomer-resolved partials. Use the "
+                f"transport-independent workflow (MicroXS + IndependentOperator) "
+                f"or a chain without <isomeric_branching> decoration.")
 
 
 class CoupledOperator(OpenMCOperator):
@@ -265,6 +290,8 @@ class CoupledOperator(OpenMCOperator):
             fission_q=fission_q,
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level)
+
+        _check_chain_not_isomeric(self.chain)
 
     def _differentiate_burnable_mats(self):
         """Assign distribmats for each burnable material"""
