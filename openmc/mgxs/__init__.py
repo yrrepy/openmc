@@ -1362,3 +1362,13 @@ GROUP_STRUCTURES['ECCO-1968'] = np.array([
 with np.load(Path(__file__).with_name('group_structures.npz')) as _f:
     GROUP_STRUCTURES['FOMG-16k'] = _f['FOMG-16k']
     GROUP_STRUCTURES['VESTA-43k'] = _f['VESTA-43k']
+
+
+def _canonical_group_structure_name(name):
+    """Resolve a group-structure name case-insensitively.
+
+    Returns the canonical key in :data:`GROUP_STRUCTURES` matching ``name``
+    up to case; raises :class:`KeyError` if no such group structure exists.
+    """
+    canonical = {k.upper(): k for k in GROUP_STRUCTURES}
+    return canonical[name.upper()]

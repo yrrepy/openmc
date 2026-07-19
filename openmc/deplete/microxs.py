@@ -22,7 +22,7 @@ import numpy as np
 
 from openmc.checkvalue import check_type, check_value, check_iterable_type, PathLike
 from openmc import StatePoint
-from openmc.mgxs import GROUP_STRUCTURES
+from openmc.mgxs import GROUP_STRUCTURES, _canonical_group_structure_name
 from openmc.data import REACTION_MT, open_pendf_library
 import openmc
 from .chain import Chain, REACTIONS, _get_chain
@@ -599,7 +599,7 @@ def get_pendf_microxs_and_flux(
                 'PENDF library (openmc.data.GroupedPendfLibrary), whose '
                 'group_edges then define the group structure')
     if isinstance(energies, str):
-        energies = GROUP_STRUCTURES[energies]
+        energies = GROUP_STRUCTURES[_canonical_group_structure_name(energies)]
 
     # ``urr_material_dilution=True`` shields each domain with its own
     # composition. Every domain must therefore resolve to a single Material: a
@@ -2298,7 +2298,7 @@ class MicroXS:
 
         # if energy is string then use group structure of that name
         if isinstance(energies, str):
-            energies = GROUP_STRUCTURES[energies]
+            energies = GROUP_STRUCTURES[_canonical_group_structure_name(energies)]
         else:
             # if user inputs energies check they are ascending (low to high) as
             # some depletion codes use high energy to low energy.
