@@ -89,14 +89,46 @@ def test_energy_filter_from_group_structure(name, n_bins):
 
 @pytest.mark.parametrize("name,n_bins", NAME_LOOKUP_CASES.items())
 def test_energy_groups_from_name(name, n_bins):
-    """EnergyGroups accepts a group-structure name and looks it up with the raw
-    key (see openmc/mgxs/groups.py)."""
+    """EnergyGroups accepts a group-structure name and resolves it against
+    GROUP_STRUCTURES (see openmc/mgxs/groups.py)."""
     expected = openmc.mgxs.GROUP_STRUCTURES[name]
 
     groups = openmc.mgxs.EnergyGroups(name)
 
     assert np.array_equal(groups.group_edges, expected)
     assert groups.num_groups == n_bins
+
+
+# Case-insensitive resolution: an EnergyGroups name is matched to its canonical
+# GROUP_STRUCTURES key regardless of case, and that canonical key is stored as
+# ``_name``. Covers all-uppercase keys ('CASMO-2') and the mixed-case PENDF keys
+# ('FOMG-16k') that must round-trip to their exact stored spelling.
+NAME_CASE_CASES = [
+    ('casmo-2', 'CASMO-2', 2),
+    ('CASMO-2', 'CASMO-2', 2),
+    ('Casmo-2', 'CASMO-2', 2),
+    ('fomg-16k', 'FOMG-16k', 16000),
+    ('FOMG-16K', 'FOMG-16k', 16000),
+    ('vesta-43k', 'VESTA-43k', 43000),
+]
+
+
+@pytest.mark.parametrize("name,canonical,n_bins", NAME_CASE_CASES)
+def test_energy_groups_name_case_insensitive(name, canonical, n_bins):
+    """EnergyGroups resolves a name case-insensitively to the canonical
+    GROUP_STRUCTURES key and stores that key (see openmc/mgxs/groups.py)."""
+    groups = openmc.mgxs.EnergyGroups(name)
+
+    assert groups.num_groups == n_bins
+    assert groups._name == canonical
+    assert np.array_equal(groups.group_edges,
+                          openmc.mgxs.GROUP_STRUCTURES[canonical])
+
+
+def test_energy_groups_unknown_name_raises():
+    """An unrecognized group-structure name raises KeyError (as upstream did)."""
+    with pytest.raises(KeyError):
+        openmc.mgxs.EnergyGroups('not-a-real-structure')
 
 
 @pytest.mark.parametrize("name,n_bins", NAME_LOOKUP_CASES.items())
