@@ -831,9 +831,9 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
             dup_by_liso = defaultdict(list)
             for rec in records:
                 bucket = rec['bucket']
-                counts[bucket] += 1
+                if bucket != 'matched':
+                    counts[bucket] += 1
                 if bucket == 'matched':
-                    nuclides_with_branching.add(parent)
                     hl = _half_life(chain, rec['product'])
                     mrow = dict(parent=parent, reaction=r_name, mt=mt,
                                 product=rec['product'], lfs=rec['lfs'],
@@ -843,6 +843,17 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                                         else 'elis'),
                                 half_life=hl if hl is not None else 'stable',
                                 target_z=rec['z'], target_a=rec['a'])
+                    # A matched pathway on an audit-rejected reaction is left
+                    # stock (no <isomeric_branching>): it is booked separately,
+                    # NOT credited as ELIS-matched, and its parent gains no
+                    # branching. The row is still listed -- tagged REJECTED, to
+                    # cross-reference the MF=10 REJECTED REACTIONS section.
+                    if reject_this:
+                        counts['matched_rejected'] += 1
+                        mrow['notes'] = 'REJECTED (band)'
+                    else:
+                        counts['matched'] += 1
+                        nuclides_with_branching.add(parent)
                     isomer_mappings.append(mrow)
                     mapped.append(rec)
                 elif bucket == 'product_not_in_chain':
@@ -930,6 +941,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         nuclides_with_branching=len(nuclides_with_branching),
         total_lfs=total_lfs,
         matched=counts['matched'],
+        matched_rejected=counts['matched_rejected'],
         products_not_in_chain=counts['product_not_in_chain'],
         rtol_exceeded=counts['rtol_exceeded'],
         no_dk=counts['no_dk'],
@@ -1098,7 +1110,8 @@ def _prune_nn_prime_self_loops(chain):
 # =============================================================================
 
 def print_stats(stats, mode):
-    total_lfs = (stats['matched'] + stats['products_not_in_chain']
+    total_lfs = (stats['matched'] + stats['matched_rejected']
+                 + stats['products_not_in_chain']
                  + stats['rtol_exceeded'] + stats['no_dk'] + stats['zero_elis']
                  + stats['duplicate_discarded'] + stats['lfs_order_dropped'])
     print(f"\n                      nuclides in PENDF library: {stats['pendf_nuclides_total']:5d}")
@@ -1109,6 +1122,8 @@ def print_stats(stats, mode):
         print(f"                                   ELIS matched: {stats['matched']:5d}")
     else:
         print(f"                              LFS-order mapped: {stats['matched']:5d}")
+    if stats['matched_rejected']:
+        print(f"         matched but band-rejected (left stock): {stats['matched_rejected']:5d}")
     if stats['rtol_exceeded']:
         print(f"                             ELIS rtol exceeded: {stats['rtol_exceeded']:5d}")
     if stats['no_dk']:
@@ -1596,7 +1611,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         else:
             f.write("In LFS-order mode: tolerance used for ELIS reference warnings only.\n\n")
 
-        total_lfs = (stats['matched'] + stats['products_not_in_chain']
+        total_lfs = (stats['matched'] + stats['matched_rejected']
+                     + stats['products_not_in_chain']
                      + stats['rtol_exceeded'] + stats['no_dk']
                      + stats['zero_elis'] + stats['duplicate_discarded']
                      + stats['lfs_order_dropped'])
@@ -1608,6 +1624,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             f.write(f"                                   ELIS matched: {stats['matched']:5d}\n")
         else:
             f.write(f"                              LFS-order mapped: {stats['matched']:5d}\n")
+        if stats['matched_rejected']:
+            f.write(f"         matched but band-rejected (left stock): {stats['matched_rejected']:5d}\n")
         if stats['rtol_exceeded']:
             f.write(f"                             ELIS rtol exceeded: {stats['rtol_exceeded']:5d}\n")
         if stats['no_dk']:
