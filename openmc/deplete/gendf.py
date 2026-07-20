@@ -16,18 +16,15 @@ The module supports:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Optional
-from dataclasses import dataclass, field
-from collections import defaultdict
+from typing import Any, Optional, TYPE_CHECKING
+from dataclasses import dataclass
 import warnings
-import os
 
 import numpy as np
 import endf
 
 from openmc.checkvalue import check_type, check_value, PathLike
 from openmc.mgxs import GROUP_STRUCTURES
-from openmc.data import REACTION_MT
 from openmc.deplete.chain import REACTIONS
 
 # Import ELIS/decay functions from dedicated module
@@ -39,6 +36,9 @@ from openmc.deplete.decay_elis import (
     ELIS_RTOL,
     ELIS_ATOL,
 )
+
+if TYPE_CHECKING:
+    from openmc.deplete.chain import Chain
 
 
 # Supported energy group structures for GENDF libraries
@@ -171,7 +171,7 @@ def get_product_name(izap: int, lfs: int) -> Optional[str]:
     if Z not in ATOMIC_SYMBOL:
         warnings.warn(
             f"Invalid atomic number Z={Z} from IZAP={izap}. "
-            f"Valid range is 1-100.",
+            "Valid range is 1-100.",
             UserWarning
         )
         return None
@@ -292,8 +292,8 @@ class IsomericBranching:
     elis_mapping : Dict[str, Dict[str, Any]], optional
         Mapping from product name to isomeric mapping information. Contains details
         about how each metastable product was mapped, including:
-        - 'method': 'elis' (matched via excitation energy), 'lfs_order' (positional
-          mapping based on sorted LFS values), or 'unmatched' (product omitted)
+        - 'method': 'elis' (matched via excitation energy) or 'lfs_order'
+          (positional mapping based on sorted LFS values)
         - 'elis': Excitation energy in eV (from GENDF QM-QI calculation)
         - 'liso': Isomeric state number (1 for _m1(m), 2 for _m2(n), etc.)
         - For 'lfs_order' mode, additional fields: 'lfs' (original LFS value),
@@ -419,8 +419,8 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
             _warn_runtime_branching(
                 ('lfs_missing', nuclide_name, mt),
                 f"{nuclide_name} MT={mt}: chain requested LFS={lfs} but the "
-                f"GENDF file has no such production level; its branching ratio "
-                f"is set to 0.")
+                "GENDF file has no such production level; its branching ratio "
+                "is set to 0.")
 
     prod_xs = np.array(prod_xs)  # (n_targets, n_groups)
 
@@ -436,8 +436,8 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
             _warn_runtime_branching(
                 ('no_ground', nuclide_name, mt),
                 f"{nuclide_name} MT={mt}: no ground-state (LFS=0) production in "
-                f"the GENDF file and none requested; branching ratios normalize "
-                f"over metastables only and may not reflect absolute yields.")
+                "the GENDF file and none requested; branching ratios normalize "
+                "over metastables only and may not reflect absolute yields.")
     with np.errstate(divide='ignore', invalid='ignore'):
         br = np.where(total > 0, prod_xs / total, 0.0)
 
@@ -729,7 +729,7 @@ class _PythonGENDFLibrary:
             raise ValueError(
                 f"GENDF library at {self.library_path} maps two files to "
                 f"nuclide '{name}': '{existing.name}' and '{filepath.name}'. "
-                f"Remove or rename one so the cross sections are unambiguous.")
+                "Remove or rename one so the cross sections are unambiguous.")
         self._file_index[name] = filepath
 
     def _parse_gendf_mf3_only(self, filepath: Path) -> dict:
@@ -1102,7 +1102,7 @@ class _PythonGENDFLibrary:
             if not np.allclose(energy_bounds, self.energy_bounds,
                               rtol=GENDF_RTOL_MATCH, atol=GENDF_ATOL):
                 raise ValueError(
-                    f"Provided energy bounds do not match library energy "
+                    "Provided energy bounds do not match library energy "
                     f"structure '{self.energy_structure}'")
             self._energy_validated = True
 
@@ -1216,15 +1216,15 @@ class _PythonGENDFLibrary:
                     f"GENDF starts at {start_energy:.6e} eV, "
                     f"nearest library boundary is {nearest_energy:.6e} eV "
                     f"(relative difference: {relative_diff:.2e}). "
-                    f"This may indicate incompatible energy structures. "
-                    f"Set strict_alignment=False to use nearest-group alignment.")
+                    "This may indicate incompatible energy structures. "
+                    "Set strict_alignment=False to use nearest-group alignment.")
             else:
                 warnings.warn(
                     f"Energy alignment uncertainty for {context}: "
                     f"GENDF starts at {start_energy:.6e} eV, "
                     f"using nearest boundary {nearest_energy:.6e} eV "
                     f"(relative difference: {relative_diff:.2e}). "
-                    f"Cross-section placement may be off by one energy group.",
+                    "Cross-section placement may be off by one energy group.",
                     UserWarning)
                 start_idx = nearest_idx
 
@@ -1241,7 +1241,7 @@ class _PythonGENDFLibrary:
                 if strict_alignment:
                     raise ValueError(
                         f"GENDF energy range for {context} does not "
-                        f"align with library structure. End energy mismatch: "
+                        "align with library structure. End energy mismatch: "
                         f"GENDF {end_energy:.6e} eV vs expected {expected_end:.6e} eV "
                         f"(relative difference: {relative_diff_end:.2e})")
                 else:
@@ -1609,7 +1609,7 @@ class _PythonGENDFLibrary:
                 f"WARNING: ELIS_TOL_EXCEEDED: {nuclide_name}({reaction_name})->"
                 f"{base_nuclide} LFS={lfs} ELIS={elis_str} eV. "
                 f"Nearest _m{liso}: {dk_elis:.0f}eV ({diff_percent:.1f}% diff). "
-                f"Product skipped; branching will be renormalized.",
+                "Product skipped; branching will be renormalized.",
                 UserWarning
             )
             # Find half_life for the closest match
@@ -1635,10 +1635,10 @@ class _PythonGENDFLibrary:
             warnings.warn(
                 f"WARNING: ZERO_ELIS_METASTABLES: {nuclide_name}({reaction_name})->"
                 f"{base_nuclide}_m? LFS={lfs} ELIS={elis_str} eV. "
-                f"Metastable state(s) exist but have ELIS=0.0 (data quality issue): "
+                "Metastable state(s) exist but have ELIS=0.0 (data quality issue): "
                 f"{skipped_str}. "
-                f"Consider using a decay library with complete ELIS data. "
-                f"Product skipped; branching will be renormalized.",
+                "Consider using a decay library with complete ELIS data. "
+                "Product skipped; branching will be renormalized.",
                 UserWarning
             )
             # Store for logging
@@ -1657,13 +1657,13 @@ class _PythonGENDFLibrary:
             elif status == 'no_metastables':
                 reason = f"No metastable states in decay library for (Z={z}, A={a})"
             else:
-                reason = f"No matching metastable state found"
+                reason = "No matching metastable state found"
 
             warnings.warn(
                 f"WARNING: NO_METASTABLE_DECAY_DATA: {nuclide_name}({reaction_name})->"
                 f"{base_nuclide}_m? LFS={lfs} ELIS={elis_str} eV. "
                 f"{reason}. "
-                f"Product skipped; branching will be renormalized.",
+                "Product skipped; branching will be renormalized.",
                 UserWarning
             )
 
@@ -1754,7 +1754,7 @@ class _PythonGENDFLibrary:
                     f"LFS_ORDER_DROPPED: {nuclide_name}({reaction_name})->"
                     f"{base_nuclide}_m{position} LFS={lfs}. "
                     f"DK-Lib has only {dk_meta_count} metastable state(s). "
-                    f"Product skipped; branching will be renormalized.",
+                    "Product skipped; branching will be renormalized.",
                     UserWarning
                 )
                 continue
@@ -1798,7 +1798,7 @@ class _PythonGENDFLibrary:
                                 f"but ELIS matching would map to _m{elis_liso}. "
                                 f"(GENDF ELIS={gendf_elis:.0f}eV, DK _m{liso} ELIS={dk_elis:.0f}eV, "
                                 f"DK _m{elis_liso} ELIS={elis_dk_elis:.0f}eV). "
-                                f"Consider using mapping_mode='elis' for production.",
+                                "Consider using mapping_mode='elis' for production.",
                                 UserWarning
                             )
 
@@ -1871,8 +1871,8 @@ class _PythonGENDFLibrary:
             raise ValueError(
                 f"MF=10 data for {nuclide_name} MT={mt} has metastable state(s) "
                 f"({meta_products_str}) but no ground state (LFS=0). This indicates "
-                f"corrupted GENDF data - isomeric branching requires both ground "
-                f"and metastable cross-sections."
+                "corrupted GENDF data - isomeric branching requires both ground "
+                "and metastable cross-sections."
             )
 
         # Use union of energy grids from ground + ALL metastable states
@@ -1927,7 +1927,7 @@ class _PythonGENDFLibrary:
         # Validate computed branching ratios
         if len(energies_list) == 0:
             warnings.warn(
-                f"No valid energy points with positive cross-section for "
+                "No valid energy points with positive cross-section for "
                 f"{nuclide_name} MT={mt}. Cannot compute branching ratios.",
                 UserWarning
             )
@@ -1937,7 +1937,7 @@ class _PythonGENDFLibrary:
         if not np.all(np.isfinite(branching_array)):
             nan_count = np.sum(~np.isfinite(branching_array))
             warnings.warn(
-                f"Invalid values (NaN/Inf) found in branching ratios for "
+                "Invalid values (NaN/Inf) found in branching ratios for "
                 f"{nuclide_name} MT={mt}: {nan_count} out of "
                 f"{branching_array.size} values. Replacing with 0.0.",
                 UserWarning
@@ -1955,7 +1955,7 @@ class _PythonGENDFLibrary:
                 f"Internal error: Branching ratios for {nuclide_name} MT={mt} "
                 f"do not sum to 1.0 at {len(bad_indices)} energy points. "
                 f"Sum range: [{column_sums.min():.6f}, {column_sums.max():.6f}]. "
-                f"This indicates a bug in the branching ratio calculation."
+                "This indicates a bug in the branching ratio calculation."
             )
 
         # Get reaction name
@@ -2015,7 +2015,7 @@ class _PythonGENDFLibrary:
                 warnings.warn(
                     f"Skipping MF=10 level in {nuclide_name} MT={mt}: "
                     f"Invalid IZAP={izap} (product not specified in GENDF file). "
-                    f"This is a data quality issue in the source GENDF library.",
+                    "This is a data quality issue in the source GENDF library.",
                     UserWarning
                 )
                 continue
@@ -2027,7 +2027,7 @@ class _PythonGENDFLibrary:
             if z_prod not in ATOMIC_SYMBOL:
                 warnings.warn(
                     f"Invalid atomic number Z={z_prod} from IZAP={izap}. "
-                    f"Skipping this level.",
+                    "Skipping this level.",
                     UserWarning
                 )
                 continue
@@ -2380,7 +2380,7 @@ class _PythonGENDFLibrary:
                              f"{len(shown)})")
             raise RuntimeError(
                 f"process_library_for_branching encountered {n} unexpected "
-                f"error(s) during isomeric branching extraction:\n"
+                "error(s) during isomeric branching extraction:\n"
                 + "\n".join(lines)
             )
 
@@ -2568,8 +2568,8 @@ def GENDFLibrary(
         if mapping_mode != 'elis':
             warnings.warn(
                 f"mapping_mode='{mapping_mode}' ignored for C++ backend. "
-                f"C++ backend uses runtime mode with pre-resolved LFS values "
-                f"from the chain. Pass decay_file to use Python backend with "
+                "C++ backend uses runtime mode with pre-resolved LFS values "
+                "from the chain. Pass decay_file to use Python backend with "
                 f"'{mapping_mode}' mapping.",
                 UserWarning
             )
