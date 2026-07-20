@@ -1498,6 +1498,17 @@ def _warn_isomeric_normalize(key, message):
         warnings.warn(message, UserWarning)
 
 
+# Dedup store for once-per-key weighted-XS data-integrity warnings
+_WARNED_WEIGHTED_XS: set = set()
+
+
+def _warn_weighted_xs(key, message):
+    """Emit a weighted-XS data-integrity UserWarning once per key."""
+    if key not in _WARNED_WEIGHTED_XS:
+        _WARNED_WEIGHTED_XS.add(key)
+        warnings.warn(message, UserWarning)
+
+
 class IsomericBranchingHelper:
     """Helper for automatic reaction-rate weighted isomeric branching calculations.
 
@@ -1948,7 +1959,19 @@ class IsomericBranchingHelper:
 
         try:
             sigma_g = self.gendf_library.get_xs(nuclide, mt, energy_bins)
-        except (KeyError, ValueError, OpenMCError):
+        except KeyError:
+            # Nuclide/reaction absent from GENDF: reaction won't occur.
+            # Static-fallback by design, no warning.
+            return {}
+        except (ValueError, OpenMCError) as err:
+            # Data-integrity failure (e.g. strict-alignment or oversized MF=10).
+            # Runtime lane still falls back to static, but not silently.
+            _warn_weighted_xs(
+                (nuclide, reaction),
+                f"Could not compute isomeric branching for {nuclide} "
+                f"{reaction} from the GENDF library: {err}. "
+                f"Falling back to static chain branching ratios."
+            )
             return {}
     
         if len(sigma_g) != n_flux_groups:

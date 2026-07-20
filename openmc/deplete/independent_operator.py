@@ -536,20 +536,9 @@ class IndependentOperator(OpenMCOperator):
             self._gendf_library,
         )
 
-        # The group structure is authoritative on the GENDF library. If a flux
-        # carries its own energy bounds, validate them against the library and
-        # fail loudly on mismatch; otherwise proceed on the library grid. All
-        # pairs share the same bounds after HDF5 reload, so one check suffices.
-        for _, bounds in self._flux_with_energy:
-            if bounds is not None:
-                if not np.allclose(bounds, helper.expected_energies,
-                                   rtol=2e-5, atol=50.0):
-                    raise ValueError(
-                        "Flux energy bounds do not match the GENDF library's "
-                        f"'{helper.energy_structure}' group structure."
-                    )
-                break
-
+        # The group structure is authoritative on the GENDF library; flux-carried
+        # energy bounds are inert metadata here. The helper takes spectra only and
+        # always collapses on the library grid.
         self._isomeric_branching = helper.compute_for_materials(
             [flux_spectrum for flux_spectrum, _ in self._flux_with_energy]
         )

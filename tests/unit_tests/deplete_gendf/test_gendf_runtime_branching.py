@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 
 import openmc.deplete
+from openmc.exceptions import OpenMCError
 from openmc.deplete import CoupledOperator, ReactionRates
 from openmc.deplete.chain import Chain
 from openmc.deplete.decay_elis import lookup_liso
@@ -493,16 +494,43 @@ def test_no_isomeric_targets_returns_empty():
     assert helper.weighted_branching_ratios(np.ones(NG)) == {}
 
 
-def test_skip_when_nuclide_not_in_gendf():
-    """Nuclide missing from the GENDF library -> skipped, empty result."""
-    def _missing(*a, **k):
-        raise KeyError("Ag109 not found")
+@pytest.mark.parametrize('exc, expect_warn', [
+    (KeyError("Ag109 (n,gamma) not in library"), False),  # absent -> silent
+    (ValueError("strict alignment failed"),      True),   # data-integrity
+    (OpenMCError("oversized MF=10 level"),        True),   # data-integrity
+])
+def test_skip_when_nuclide_not_in_gendf(exc, expect_warn):
+    """get_xs failure in _calculate_weighted -> static fallback ({} result).
+
+    A KeyError (nuclide/reaction absent from GENDF) is expected and stays
+    silent. ValueError/OpenMCError are data-integrity failures (strict-alignment
+    or oversized MF=10): still a static fallback, but warned once per
+    (nuclide, reaction) with the exception text; a repeated call reuses the
+    dedup store and does not re-warn (R1-65).
+    """
+    def _raise(*a, **k):
+        raise exc
 
     chain = _ag109_chain()
-    gendf = make_mock_gendf(NG, ENERGIES, xs=_missing, branching=None)
+    gendf = make_mock_gendf(NG, ENERGIES, xs=_raise,
+                            branching=_ag109_branching())
     helper = IsomericBranchingHelper(chain, gendf)
-    result = helper.weighted_branching_ratios(np.ones(NG))
-    assert result == {} or 'Ag109' not in result
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        result = helper.weighted_branching_ratios(np.ones(NG))
+    assert result == {}                              # static fallback intact
+    integrity = [w for w in rec if 'Falling back' in str(w.message)]
+    if expect_warn:
+        assert len(integrity) == 1
+        assert str(exc) in str(integrity[0].message)
+        # Repeated call: same (nuclide, reaction) key -> no second warning
+        with warnings.catch_warnings(record=True) as rec2:
+            warnings.simplefilter("always")
+            assert helper.weighted_branching_ratios(np.ones(NG)) == {}
+        assert not [w for w in rec2 if 'Falling back' in str(w.message)]
+    else:
+        assert not integrity
 
 
 def test_zero_weight_sum_returns_empty():
@@ -609,11 +637,13 @@ def test_target_filtering_with_reduced_chain():
         assert np.isclose(ratios['Ag110'], 1.0)
 
 
-def test_independent_operator_bounds_from_library():
-    """IndependentOperator sources the branching grid from the GENDF library.
+def test_independent_operator_ignores_flux_bounds():
+    """IndependentOperator always sources the branching grid from the library.
 
-    A flux with no bounds, or bounds matching the library, sets up branching
-    with no raise; bounds inconsistent with the library raise (R1-19).
+    Flux-carried energy bounds are inert metadata in the operator (bounds are
+    the user's responsibility, R1-65): branching is set up on the library grid
+    whether the flux carries no bounds, bounds matching the library, or bounds
+    inconsistent with the library. None of the three cases raises.
     """
     from openmc.deplete import IndependentOperator
 
@@ -636,16 +666,17 @@ def test_independent_operator_bounds_from_library():
     op._setup_isomeric_branching()
     assert op._isomeric_branching is not None
 
-    # Bounds matching the library -> no raise
+    # Bounds matching the library -> no raise, grid still from library
     op = _make_op(ENERGIES.copy())
     op._setup_isomeric_branching()
     assert op._isomeric_branching is not None
 
-    # Bounds inconsistent with the library -> raise
+    # Bounds inconsistent with the library -> ignored, no raise
     bad = ENERGIES.copy()
     bad[5] += 1e6
-    with pytest.raises(ValueError, match="do not match"):
-        _make_op(bad)._setup_isomeric_branching()
+    op = _make_op(bad)
+    op._setup_isomeric_branching()
+    assert op._isomeric_branching is not None
 
 
 @pytest.mark.parametrize('iso_indices, below, above', [

@@ -125,7 +125,9 @@ def _clear_gendf_warn_dedup():
     g._WARNED_RUNTIME_BRANCHING.clear()
     de._WARNED_ELIS_AMBIGUITY.clear()
     h._WARNED_ISOMERIC_NORMALIZE.clear()
+    h._WARNED_WEIGHTED_XS.clear()
     yield
     g._WARNED_RUNTIME_BRANCHING.clear()
     de._WARNED_ELIS_AMBIGUITY.clear()
     h._WARNED_ISOMERIC_NORMALIZE.clear()
+    h._WARNED_WEIGHTED_XS.clear()
