@@ -119,7 +119,6 @@ def test_operator_ingests_flux_forms():
         stored_flux, stored_eb = op._flux_with_energy[0]
         np.testing.assert_array_equal(stored_flux, arr)
         np.testing.assert_array_equal(stored_eb, eb)
-        np.testing.assert_array_equal(op._energy_bins, eb)
 
     # Flux is unwrapped to a plain ndarray on storage
     assert type(op_flux._flux_with_energy[0][0]) is np.ndarray
@@ -128,7 +127,6 @@ def test_operator_ingests_flux_forms():
     stored_flux, stored_eb = op_bare._flux_with_energy[0]
     np.testing.assert_array_equal(stored_flux, arr)
     assert stored_eb is None
-    assert op_bare._energy_bins is None
 
 
 # ===========================================================================
@@ -490,21 +488,35 @@ def test_ordering_preserved(tmp_path):
 
 # --- Flux tests ---
 
-def test_flux_roundtrip(tmp_path):
-    """Write with flux tuples (flux, energy_bounds), verify round-trip."""
+@pytest.mark.parametrize("as_flux", [False, True])
+def test_flux_roundtrip(tmp_path, as_flux):
+    """Round-trip energy bounds as (flux, bounds) tuples and bare Flux objects.
+
+    Both forms must persist the ``energy_bounds`` dataset (R1-19); a bare Flux
+    subclass carries its bounds in ``.energy_bounds``.
+    """
     micros = _make_micros(3)
     mat_ids = _mat_ids(3)
     energy_bounds = np.array([0.0, 0.625, 1e6, 2e7])
-    fluxes = [(np.array([1.0, 2.0, 3.0]), energy_bounds) for _ in range(3)]
+    arr = np.array([1.0, 2.0, 3.0])
+    if as_flux:
+        fluxes = [Flux(arr, energy_bounds=energy_bounds) for _ in range(3)]
+    else:
+        fluxes = [(arr, energy_bounds) for _ in range(3)]
     fname = tmp_path / 'microxs.h5'
 
     write_global_microxs_hdf5(micros, fname, mat_ids, fluxes=fluxes)
+
+    # The energy_bounds dataset must be present on disk for both flux forms
+    with h5py.File(fname, 'r') as f:
+        assert 'energy_bounds' in f
+
     _, flux_data, _ = read_local_microxs_hdf5(fname, mat_ids)
 
     assert flux_data is not None
     assert len(flux_data) == 3
     for flux_arr, e_bounds in flux_data:
-        np.testing.assert_array_equal(flux_arr, [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(flux_arr, arr)
         np.testing.assert_array_equal(e_bounds, energy_bounds)
 
 

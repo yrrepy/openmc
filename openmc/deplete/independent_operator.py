@@ -184,9 +184,9 @@ class IndependentOperator(OpenMCOperator):
             fluxes = [fluxes[i] for i in index_sort]
             micros = [micros[i] for i in index_sort]
 
-        # Store energy bins if present. Accept (flux, energy_bounds) tuples, a
-        # Flux ndarray subclass (carries .energy_bounds), or a bare array.
-        self._energy_bins = None
+        # Store per-material flux with optional energy bounds. Accept
+        # (flux, energy_bounds) tuples, a Flux ndarray subclass (carries
+        # .energy_bounds), or a bare array.
         self._flux_with_energy = []
         for flux_item in fluxes:
             if isinstance(flux_item, tuple) and len(flux_item) == 2:
@@ -197,8 +197,6 @@ class IndependentOperator(OpenMCOperator):
             else:
                 flux_arr, energy_bounds = flux_item, None
             self._flux_with_energy.append((flux_arr, energy_bounds))
-            if energy_bounds is not None and self._energy_bins is None:
-                self._energy_bins = energy_bounds
         super().__init__(
             materials=materials,
             cross_sections=micros,
@@ -529,31 +527,27 @@ class IndependentOperator(OpenMCOperator):
                 "or use a chain without isomeric branching data."
             )
 
-        if not self._flux_with_energy or self._energy_bins is None or len(self._energy_bins) == 0:
-            raise ValueError(
-                "Chain has isomeric branching targets but flux spectra or "
-                "energy bins are missing. Provide per-material flux spectra "
-                "with energy bins, or use a chain without isomeric branching "
-                "data."
-            )
-
         helper = IsomericBranchingHelper(
             self.chain,
             self._gendf_library,
         )
 
-        # Validate all materials have energy information
-        for i, (flux_spectrum, energy) in enumerate(self._flux_with_energy):
-            if energy is None or not isinstance(flux_spectrum, np.ndarray):
-                raise RuntimeError(
-                    f"Material {i} is missing flux spectrum or energy information. "
-                    f"All materials must have flux spectra with "
-                    f"{helper.energy_structure} energy structure when using "
-                    f"energy-dependent isomeric branching."
-                )
+        # The group structure is authoritative on the GENDF library. If a flux
+        # carries its own energy bounds, validate them against the library and
+        # fail loudly on mismatch; otherwise proceed on the library grid. All
+        # pairs share the same bounds after HDF5 reload, so one check suffices.
+        for _, bounds in self._flux_with_energy:
+            if bounds is not None:
+                if not np.allclose(bounds, helper.expected_energies,
+                                   rtol=2e-5, atol=50.0):
+                    raise ValueError(
+                        "Flux energy bounds do not match the GENDF library's "
+                        f"'{helper.energy_structure}' group structure."
+                    )
+                break
 
         self._isomeric_branching = helper.compute_for_materials(
-            self._flux_with_energy
+            [flux_spectrum for flux_spectrum, _ in self._flux_with_energy]
         )
 
     def _get_burnable_mats(self):

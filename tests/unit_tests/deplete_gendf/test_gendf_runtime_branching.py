@@ -458,16 +458,16 @@ def test_negative_flux_raises():
     gendf = make_mock_gendf(branching=_ag109_branching())
     helper = IsomericBranchingHelper(chain, gendf)
     with pytest.raises(ValueError, match="negative"):
-        helper.weighted_branching_ratios(-np.ones(NG), ENERGIES)
+        helper.weighted_branching_ratios(-np.ones(NG))
 
 
 def test_flux_energy_length_mismatch_raises():
-    """flux length != len(energy_bins) - 1 raises."""
+    """flux length != library group count raises."""
     chain = _ag109_chain()
     gendf = make_mock_gendf(branching=_ag109_branching())
     helper = IsomericBranchingHelper(chain, gendf)
     with pytest.raises(ValueError, match="groups"):
-        helper.weighted_branching_ratios(np.ones(500), ENERGIES)
+        helper.weighted_branching_ratios(np.ones(500))
 
 
 def test_group_structure_mismatch_raises():
@@ -477,7 +477,7 @@ def test_group_structure_mismatch_raises():
                             branching=_ag109_branching())
     helper = IsomericBranchingHelper(chain, gendf)
     with pytest.raises(ValueError, match="group structure mismatch"):
-        helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
+        helper.weighted_branching_ratios(np.ones(NG))
 
 
 def test_no_isomeric_targets_returns_empty():
@@ -485,7 +485,7 @@ def test_no_isomeric_targets_returns_empty():
     chain = make_mock_chain(None)
     gendf = make_mock_gendf(NG, ENERGIES)
     helper = IsomericBranchingHelper(chain, gendf)
-    assert helper.weighted_branching_ratios(np.ones(NG), ENERGIES) == {}
+    assert helper.weighted_branching_ratios(np.ones(NG)) == {}
 
 
 def test_skip_when_nuclide_not_in_gendf():
@@ -496,7 +496,7 @@ def test_skip_when_nuclide_not_in_gendf():
     chain = _ag109_chain()
     gendf = make_mock_gendf(NG, ENERGIES, xs=_missing, branching=None)
     helper = IsomericBranchingHelper(chain, gendf)
-    result = helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
+    result = helper.weighted_branching_ratios(np.ones(NG))
     assert result == {} or 'Ag109' not in result
 
 
@@ -510,7 +510,7 @@ def test_zero_weight_sum_returns_empty():
     gendf = make_mock_gendf(NG, ENERGIES, xs=gendf_xs,
                             branching=_ag109_branching())
     helper = IsomericBranchingHelper(chain, gendf)
-    result = helper.weighted_branching_ratios(flux, ENERGIES)
+    result = helper.weighted_branching_ratios(flux)
     assert result == {} or '(n,gamma)' not in result.get('Ag109', {})
 
 
@@ -529,7 +529,7 @@ def test_activator_no_lfs_graceful():
 
     gendf = make_mock_gendf(NG, ENERGIES, branching=br_handler)
     helper = IsomericBranchingHelper(chain, gendf)
-    result = helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
+    result = helper.weighted_branching_ratios(np.ones(NG))
     assert isinstance(result, dict)
 
 
@@ -553,7 +553,7 @@ def test_weighted_conservation():
     gendf = make_mock_gendf(NG, ENERGIES, branching=lambda *a, **k: mock_br)
     helper = IsomericBranchingHelper(chain, gendf)
 
-    result = helper.weighted_branching_ratios(flux, ENERGIES)
+    result = helper.weighted_branching_ratios(flux)
     if 'Test' in result and '(n,gamma)' in result['Test']:
         total = sum(result['Test']['(n,gamma)'].values())
         assert np.isclose(total, 1.0)
@@ -583,7 +583,7 @@ def test_weighted_branching_with_embedded():
     gendf = make_mock_gendf(branching=_ir191_branching())
     helper = IsomericBranchingHelper(chain, gendf)
 
-    result = helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
+    result = helper.weighted_branching_ratios(np.ones(NG))
     assert 'Ir191' in result
     ratios = result['Ir191']['(n,gamma)']
     assert 'Ir192_m2' not in ratios
@@ -596,7 +596,7 @@ def test_target_filtering_with_reduced_chain():
     gendf = _ag109_gendf()
     helper = IsomericBranchingHelper(chain, gendf)
 
-    result = helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
+    result = helper.weighted_branching_ratios(np.ones(NG))
     if 'Ag109' in result and '(n,gamma)' in result['Ag109']:
         ratios = result['Ag109']['(n,gamma)']
         assert 'Ag110' in ratios
@@ -604,17 +604,43 @@ def test_target_filtering_with_reduced_chain():
         assert np.isclose(ratios['Ag110'], 1.0)
 
 
-def test_energy_validation_cached():
-    """Energy validation runs once (flag-based caching)."""
-    chain = make_mock_chain({'X': {'(n,gamma)': ['Y']}})
-    gendf = make_mock_gendf(NG, ENERGIES)
-    helper = IsomericBranchingHelper(chain, gendf)
+def test_independent_operator_bounds_from_library():
+    """IndependentOperator sources the branching grid from the GENDF library.
 
-    assert not helper._energy_validated
-    helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
-    assert helper._energy_validated
-    helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
-    assert helper._energy_validated
+    A flux with no bounds, or bounds matching the library, sets up branching
+    with no raise; bounds inconsistent with the library raise (R1-19).
+    """
+    from openmc.deplete import IndependentOperator
+
+    chain = make_mock_chain({'Ag109': {'(n,gamma)': ['Ag110', 'Ag110_m1']}},
+                            lfs={'Ag109': {'(n,gamma)': [0, 1]}})
+    mock_br = make_isomeric_branching(
+        'Ag109', '(n,gamma)', ['Ag110', 'Ag110_m1'], ENERGIES[:-1].copy(),
+        [np.full(NG, 0.9), np.full(NG, 0.1)])
+
+    def _make_op(bounds):
+        op = IndependentOperator.__new__(IndependentOperator)
+        op.chain = chain
+        op._gendf_library = make_mock_gendf(
+            NG, ENERGIES, branching=lambda *a, **k: mock_br)
+        op._flux_with_energy = [(np.ones(NG), bounds)]
+        return op
+
+    # Bare flux (no bounds) -> grid from library, branching computed
+    op = _make_op(None)
+    op._setup_isomeric_branching()
+    assert op._isomeric_branching is not None
+
+    # Bounds matching the library -> no raise
+    op = _make_op(ENERGIES.copy())
+    op._setup_isomeric_branching()
+    assert op._isomeric_branching is not None
+
+    # Bounds inconsistent with the library -> raise
+    bad = ENERGIES.copy()
+    bad[5] += 1e6
+    with pytest.raises(ValueError, match="do not match"):
+        _make_op(bad)._setup_isomeric_branching()
 
 
 @pytest.mark.parametrize('iso_indices, below, above', [
@@ -672,9 +698,8 @@ def test_multiple_materials_same_chain():
     gendf = make_mock_gendf(NG, ENERGIES, branching=lambda *a, **k: mock_br)
     helper = IsomericBranchingHelper(chain, gendf)
 
-    pairs = [(np.ones(NG), ENERGIES), (np.ones(NG) * 2.0, ENERGIES),
-             (np.ones(NG) * 0.5, ENERGIES)]
-    result = helper.compute_for_materials(pairs)
+    spectra = [np.ones(NG), np.ones(NG) * 2.0, np.ones(NG) * 0.5]
+    result = helper.compute_for_materials(spectra)
 
     assert len(result) == 3
     for mat in result:
@@ -691,7 +716,7 @@ def test_all_empty_warns_and_returns_none():
 
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter('always')
-        result = helper.compute_for_materials([(np.ones(NG), ENERGIES)])
+        result = helper.compute_for_materials([np.ones(NG)])
     assert result is None
     assert any('could not be calculated' in str(w.message) for w in rec)
 
@@ -762,7 +787,7 @@ def test_direct_helper_raises_with_targets():
 
 
 def test_calculate_isomeric_branching_uses_helper_surface():
-    """Flux/energy pairs are built from the rate helper via duck typing."""
+    """Per-material flux spectra are built from the rate helper via duck typing."""
     rate_helper = Mock(spec=['energies', 'get_flux_spectrum'])
     rate_helper.energies = ENERGIES
     rate_helper.get_flux_spectrum = lambda i: np.full(NG, float(i + 1))
@@ -776,11 +801,10 @@ def test_calculate_isomeric_branching_uses_helper_surface():
 
     result = op._calculate_isomeric_branching()
     assert result == {'ok': True}
-    pairs = op._isomeric_helper.compute_for_materials.call_args[0][0]
-    assert len(pairs) == 2
-    assert np.allclose(pairs[0][0], 1.0)
-    assert np.allclose(pairs[1][0], 2.0)
-    assert np.array_equal(pairs[0][1], ENERGIES)
+    spectra = op._isomeric_helper.compute_for_materials.call_args[0][0]
+    assert len(spectra) == 2
+    assert np.allclose(spectra[0], 1.0)
+    assert np.allclose(spectra[1], 2.0)
 
 
 def test_coupled_operator_no_targets_silent():

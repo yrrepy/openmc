@@ -1556,7 +1556,6 @@ class IsomericBranchingHelper:
         self.chain: 'Chain' = chain
         self.isomeric_targets: Optional[Dict] = chain.isomeric_branching_targets
         self._branching_cache: Dict = {}
-        self._energy_validated: bool = False
         self.gendf_library = gendf_library
         self.energy_structure: str = gendf_library.energy_structure
         self.expected_energies: np.ndarray = gendf_library.energy_bounds.copy()
@@ -1601,21 +1600,20 @@ class IsomericBranchingHelper:
 
     def weighted_branching_ratios(
         self,
-        flux_spectrum: np.ndarray,
-        energy_bins: np.ndarray
+        flux_spectrum: np.ndarray
     ) -> Dict[str, Dict[str, Dict[str, float]]]:
         """Calculate σ×φ-weighted branching ratios from GENDF at runtime.
 
         Fetches energy-dependent branching ratios from the GENDF library,
         filters to targets present in the chain, and computes σ×φ-weighted
-        effective ratios.
+        effective ratios. The energy group structure is sourced from the GENDF
+        library (``self.expected_energies``); the flux supplies only the
+        per-material spectrum values.
 
         Parameters
         ----------
         flux_spectrum : numpy.ndarray
             Neutron flux in each energy group [n-cm/src].
-        energy_bins : numpy.ndarray
-            Energy bin boundaries in [eV].
 
         Returns
         -------
@@ -1627,17 +1625,11 @@ class IsomericBranchingHelper:
         if self.isomeric_targets is None:
             return {}
 
-        if not self._energy_validated:
-            if not np.allclose(energy_bins, self.expected_energies, rtol=2e-5, atol=50.0):
-                raise ValueError(
-                    f"Energy bins do not match {self.energy_structure} structure"
-                )
-            self._energy_validated = True
-
-        if len(flux_spectrum) != len(energy_bins) - 1:
+        # Group-count mismatch is the real dimension safety net; fail loudly.
+        if len(flux_spectrum) != self.n_groups:
             raise ValueError(
                 f"Flux has {len(flux_spectrum)} groups, "
-                f"energy bins define {len(energy_bins) - 1}"
+                f"{self.energy_structure} defines {self.n_groups}"
             )
 
         for nuclide, reactions in self.isomeric_targets.items():
@@ -1682,20 +1674,20 @@ class IsomericBranchingHelper:
                     continue
 
                 weighted = self._calculate_weighted(
-                    data, flux_spectrum, energy_bins, nuclide, reaction
+                    data, flux_spectrum, self.expected_energies, nuclide, reaction
                 )
                 if weighted:
                     result[nuclide][reaction] = weighted
 
         return dict(result)
 
-    def compute_for_materials(self, flux_energy_pairs):
+    def compute_for_materials(self, flux_spectra):
         """Compute σ×φ-weighted branching for a list of materials.
 
         Parameters
         ----------
-        flux_energy_pairs : list of (numpy.ndarray, numpy.ndarray)
-            Each element is (flux_spectrum, energy_bins) for one material.
+        flux_spectra : list of numpy.ndarray
+            Per-material flux spectrum on the GENDF library group structure.
 
         Returns
         -------
@@ -1703,8 +1695,8 @@ class IsomericBranchingHelper:
             Weighted branching dicts per material, or None if no branching.
         """
         results = []
-        for flux_spectrum, energy_bins in flux_energy_pairs:
-            weighted = self.weighted_branching_ratios(flux_spectrum, energy_bins)
+        for flux_spectrum in flux_spectra:
+            weighted = self.weighted_branching_ratios(flux_spectrum)
             results.append(weighted)
 
         if not any(bool(d) for d in results):

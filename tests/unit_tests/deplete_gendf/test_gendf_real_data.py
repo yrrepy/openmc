@@ -14,7 +14,6 @@ import warnings
 import numpy as np
 import pytest
 
-from openmc.mgxs import GROUP_STRUCTURES
 from openmc.deplete.helpers import IsomericBranchingHelper
 
 
@@ -206,14 +205,13 @@ def test_helper_with_real_gendf_and_chain(gendf_dir, chain_path):
 
     helper = IsomericBranchingHelper(chain, lib)
 
-    energy_bins = GROUP_STRUCTURES['CCFE-709']
     n_groups = 709
 
     # Use flat flux (thermal reactor-like spectrum would be better,
     # but flat is sufficient for correctness testing)
     flux = np.ones(n_groups)
 
-    result = helper.weighted_branching_ratios(flux, energy_bins)
+    result = helper.weighted_branching_ratios(flux)
 
     # Should produce results for at least some nuclides
     if not result:

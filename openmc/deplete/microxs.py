@@ -1180,6 +1180,11 @@ def _write_flux_data(f, fluxes, dtype='float64', compression=None,
             flux_arrays.append(np.asarray(item[0], dtype=dtype))
             if energy_bounds is None:
                 energy_bounds = np.asarray(item[1], dtype='float64')
+        elif getattr(item, 'energy_bounds', None) is not None:
+            # Flux ndarray subclass carries its own energy_bounds
+            flux_arrays.append(np.asarray(item, dtype=dtype))
+            if energy_bounds is None:
+                energy_bounds = np.asarray(item.energy_bounds, dtype='float64')
         else:
             flux_arrays.append(np.asarray(item, dtype=dtype))
 
