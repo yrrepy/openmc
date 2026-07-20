@@ -416,8 +416,9 @@ class CoupledOperator(OpenMCOperator):
             return None
 
         energy_bins = self._rate_helper.energies
-        pairs = [(self._rate_helper.get_flux_spectrum(i), energy_bins)
-                 for i in range(len(self.local_mats))]
+        pairs = [(self._rate_helper.get_flux_spectrum(self._mat_index_map[mat]),
+                  energy_bins)
+                 for mat in self.local_mats]
         return self._isomeric_helper.compute_for_materials(pairs)
 
     def _differentiate_burnable_mats(self):

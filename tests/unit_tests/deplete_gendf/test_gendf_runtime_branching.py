@@ -757,6 +757,7 @@ def test_calculate_isomeric_branching_uses_helper_surface():
     op = CoupledOperator.__new__(CoupledOperator)
     op._rate_helper = rate_helper
     op.local_mats = ['1', '2']
+    op._mat_index_map = {'1': 0, '2': 1}
     op._isomeric_helper = Mock()
     op._isomeric_helper.compute_for_materials.return_value = {'ok': True}
 
