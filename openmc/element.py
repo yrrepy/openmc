@@ -9,6 +9,24 @@ from openmc.data import NATURAL_ABUNDANCE, atomic_mass, zam, \
     isotopes as natural_isotopes
 
 
+def _partition_absent_isotopes(abundances, mutual_nuclides, absent_nuclides,
+                               element):
+    """Fold absent natural isotopes into a present neighbor (O16/Ta181/W182)."""
+    for nuclide in absent_nuclides:
+        if nuclide in ('O17', 'O18') and 'O16' in mutual_nuclides:
+            abundances['O16'] += NATURAL_ABUNDANCE[nuclide]
+        elif nuclide == 'Ta180_m1' and 'Ta181' in mutual_nuclides:
+            abundances['Ta181'] += NATURAL_ABUNDANCE[nuclide]
+        elif nuclide == 'W180' and 'W182' in mutual_nuclides:
+            abundances['W182'] += NATURAL_ABUNDANCE[nuclide]
+        else:
+            msg = (f'Unsure how to partition natural abundance of isotope '
+                   f'{nuclide} into other natural isotopes of element '
+                   f'{element} present in the cross section library provided. '
+                   'Consider adding the isotopes of this element individually.')
+            raise ValueError(msg)
+
+
 class Element(str):
     """A natural element that auto-expands to add the isotopes of an element to
     a material in their natural abundance. Internally, the OpenMC Python API
@@ -152,24 +170,28 @@ class Element(str):
             mutual_nuclides = sorted(mutual_nuclides, key=zam)
             absent_nuclides = sorted(absent_nuclides, key=zam)
 
-            # If all naturally occurring isotopes are in GENDF library
+            # If all naturally occurring isotopes are in the GENDF library,
+            # add them based on their abundance
             if len(absent_nuclides) == 0:
                 for nuclide in mutual_nuclides:
                     abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
+
+            # If some are absent, check for the elemental "X0" nuclide (e.g. C0)
+            elif (self + '0') in library_nuclides:
+                abundances[self + '0'] = 1.0
+
             elif len(mutual_nuclides) == 0:
                 msg = (f'Unable to expand element {self} because the GENDF '
                        'library provided does not contain any of '
                        'the natural isotopes for that element.')
                 raise ValueError(msg)
+
+            # Add the mutual isotopes, then fold in the absent ones
             else:
-                # Add mutual isotopes, warn about absent ones
                 for nuclide in mutual_nuclides:
                     abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
-                if absent_nuclides:
-                    warnings.warn(
-                        f'GENDF library missing natural isotopes {absent_nuclides} '
-                        f'for element {self}. Their abundance will be ignored.'
-                    )
+                _partition_absent_isotopes(
+                    abundances, mutual_nuclides, absent_nuclides, self)
 
         # Otherwise, check HDF5 cross_sections library
         else:
@@ -217,25 +239,11 @@ class Element(str):
                 # For the absent nuclides, add them based on our knowledge of the
                 # common cross section libraries (ENDF, JEFF, and JENDL)
                 else:
-                    # Add the mutual isotopes
+                    # Add the mutual isotopes, then fold in the absent ones
                     for nuclide in mutual_nuclides:
                         abundances[nuclide] = NATURAL_ABUNDANCE[nuclide]
-
-                # Adjust the abundances for the absent nuclides
-                for nuclide in absent_nuclides:
-                    if nuclide in ['O17', 'O18'] and 'O16' in mutual_nuclides:
-                        abundances['O16'] += NATURAL_ABUNDANCE[nuclide]
-                    elif nuclide == 'Ta180_m1' and 'Ta181' in mutual_nuclides:
-                            abundances['Ta181'] += NATURAL_ABUNDANCE[nuclide]
-                    elif nuclide == 'W180' and 'W182' in mutual_nuclides:
-                        abundances['W182'] += NATURAL_ABUNDANCE[nuclide]
-                    else:
-                        msg = 'Unsure how to partition natural abundance of ' \
-                              'isotope {0} into other natural isotopes of ' \
-                              'this element that are present in the cross ' \
-                              'section library provided. Consider adding ' \
-                              'the isotopes of this element individually.'
-                        raise ValueError(msg)
+                    _partition_absent_isotopes(
+                        abundances, mutual_nuclides, absent_nuclides, self)
 
             # If a cross_section library is not present, expand the element into
             # its natural nuclides

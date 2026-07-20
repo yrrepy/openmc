@@ -8,7 +8,6 @@ transport solver by using user-provided multigroup fluxes and cross sections.
 from __future__ import annotations
 from collections.abc import Iterable
 import copy
-import warnings
 
 import numpy as np
 from uncertainties import ufloat
@@ -505,30 +504,27 @@ class IndependentOperator(OpenMCOperator):
             return
 
         if self._gendf_library is None:
-            warnings.warn(
+            raise ValueError(
                 "Chain has isomeric branching targets but no GENDF library "
-                "was provided. Isomeric branching will be disabled.",
-                UserWarning
+                "was provided. Pass gendf_library= to the operator, or use a "
+                "chain without isomeric branching data."
             )
-            return
 
         if not hasattr(self._gendf_library, 'get_branching_ratios'):
-            warnings.warn(
+            raise ValueError(
                 "GENDF library backend does not support get_branching_ratios(). "
-                "Isomeric branching will be disabled. Re-patch chain with "
-                "updated patcher tool to add gendf_lfs attribute, or use "
-                "Python backend with decay_file.",
-                UserWarning
+                "Re-patch chain with the updated patcher tool to add the "
+                "gendf_lfs attribute, use the Python backend with a decay_file, "
+                "or use a chain without isomeric branching data."
             )
-            return
 
         if not self._flux_with_energy or self._energy_bins is None or len(self._energy_bins) == 0:
-            warnings.warn(
+            raise ValueError(
                 "Chain has isomeric branching targets but flux spectra or "
-                "energy bins are missing. Isomeric branching will be disabled.",
-                UserWarning
+                "energy bins are missing. Provide per-material flux spectra "
+                "with energy bins, or use a chain without isomeric branching "
+                "data."
             )
-            return
 
         helper = IsomericBranchingHelper(
             self.chain,

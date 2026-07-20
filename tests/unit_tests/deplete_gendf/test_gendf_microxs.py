@@ -699,3 +699,116 @@ def test_bad_compression_raises(tmp_path):
     with pytest.raises(ValueError, match="compression"):
         write_global_microxs_hdf5(micros, tmp_path / 'x.h5', ['1'],
                                   compression='invalid')
+
+
+# --- mmap sidecar (identity-token verified) ---
+
+def _sidecar_path(fname):
+    """Sidecar path matching write_global_microxs_hdf5's naming."""
+    return Path(fname).with_suffix('.microxs.npy')
+
+
+def test_mmap_roundtrip_matches_heap(tmp_path):
+    """mmap=True returns the same values and ordering as the mmap=False read."""
+    micros = _make_micros(5)
+    mat_ids = _mat_ids(5)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids, write_sidecar=True)
+    heap, _, ref_heap = read_local_microxs_hdf5(fname, mat_ids)
+    mapped, _, ref_mmap = read_local_microxs_hdf5(fname, mat_ids, mmap=True)
+
+    assert ref_heap is None
+    assert ref_mmap is not None
+    for h, m, orig in zip(heap, mapped, micros):
+        np.testing.assert_array_equal(m.data, h.data)
+        np.testing.assert_array_equal(m.data, orig.data)
+        assert m.nuclides == h.nuclides == orig.nuclides
+        assert m.reactions == h.reactions == orig.reactions
+
+
+def test_mmap_subset_reordered(tmp_path):
+    """A subset requested out of order under mmap returns the right rows."""
+    micros = _make_micros(8)
+    mat_ids = _mat_ids(8)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids, write_sidecar=True)
+
+    local_ids = ['6', '2', '5']
+    result, _, _ = read_local_microxs_hdf5(fname, local_ids, mmap=True)
+
+    assert len(result) == 3
+    for local_id, loaded in zip(local_ids, result):
+        orig_idx = mat_ids.index(local_id)
+        np.testing.assert_array_equal(loaded.data, micros[orig_idx].data)
+
+
+def test_mmap_ref_is_live_memmap(tmp_path):
+    """The third return value is a live np.memmap backing the returned XS."""
+    micros = _make_micros(4)
+    mat_ids = _mat_ids(4)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids, write_sidecar=True)
+    result, _, mmap_ref = read_local_microxs_hdf5(fname, mat_ids, mmap=True)
+
+    assert isinstance(mmap_ref, np.memmap)
+    # XS are views into the memmap and remain valid while mmap_ref is held.
+    assert np.shares_memory(result[0].data, mmap_ref)
+    for loaded, orig in zip(result, micros):
+        np.testing.assert_array_equal(loaded.data, orig.data)
+
+
+def test_mmap_stale_sidecar_same_shape_raises(tmp_path):
+    """A regenerated sidecar with identical shape is caught by the row hash."""
+    micros = _make_micros(5)
+    mat_ids = _mat_ids(5)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids, write_sidecar=True)
+
+    # Overwrite the sidecar with different data of the same shape and dtype.
+    sidecar = _sidecar_path(fname)
+    original = np.load(sidecar)
+    np.save(sidecar, np.full_like(original, 3.14))
+
+    with pytest.raises(ValueError, match="Sidecar"):
+        read_local_microxs_hdf5(fname, mat_ids, mmap=True)
+
+
+def test_mmap_stale_sidecar_wrong_shape_raises(tmp_path):
+    """A sidecar with a mismatched shape is caught by the header check."""
+    micros = _make_micros(5)
+    mat_ids = _mat_ids(5)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids, write_sidecar=True)
+
+    sidecar = _sidecar_path(fname)
+    np.save(sidecar, np.zeros((2, N_NUC, N_RXN, 1)))
+
+    with pytest.raises(ValueError, match="Sidecar"):
+        read_local_microxs_hdf5(fname, mat_ids, mmap=True)
+
+
+def test_mmap_legacy_no_token_warns(tmp_path):
+    """An HDF5 file lacking the identity token warns once and still reads."""
+    micros = _make_micros(4)
+    mat_ids = _mat_ids(4)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids, write_sidecar=True)
+
+    # Simulate an older file: strip the sidecar identity token attributes.
+    with h5py.File(fname, 'a') as f:
+        for key in ('sidecar_format', 'sidecar_shape',
+                    'sidecar_dtype', 'sidecar_sha256'):
+            del f.attrs[key]
+
+    with pytest.warns(UserWarning, match="unverified"):
+        result, _, mmap_ref = read_local_microxs_hdf5(fname, mat_ids, mmap=True)
+
+    assert isinstance(mmap_ref, np.memmap)
+    for loaded, orig in zip(result, micros):
+        np.testing.assert_array_equal(loaded.data, orig.data)

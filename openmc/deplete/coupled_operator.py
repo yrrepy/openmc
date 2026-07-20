@@ -355,66 +355,53 @@ class CoupledOperator(OpenMCOperator):
     def _setup_isomeric_branching(self):
         """Set up isomeric branching for CoupledOperator.
 
-        Isomeric branching is enabled when:
-        1. A GENDF library is provided (for multigroup cross-sections)
-        2. A flux-tallying reaction rate mode is used ("direct_with_flux"
-           or "gendf-flux")
-        3. Isomeric branching data exists in the chain
-
-        When enabled, uses the GENDF library for on-the-fly cross-section
-        lookup combined with the tallied flux spectrum to compute σ×φ-weighted
-        isomeric branching ratios after each transport solve.
-
-        When not enabled (missing GENDF or no flux spectrum tally), isomeric
-        branching is disabled and default chain branching ratios are used.
+        Requires a GENDF library, a flux-tallying reaction rate mode
+        ("direct_with_flux" or "gendf-flux") on the GENDF group structure, and
+        a backend exposing get_branching_ratios(). Chains carrying isomeric
+        branching targets raise when any of these is missing; chains without
+        such targets skip branching silently.
         """
-        # Check if we can enable isomeric branching
-        if self._gendf_library is None:
-            # No GENDF library - disable isomeric branching
-            self._isomeric_helper = None
-            self._isomeric_branching = None
+        self._isomeric_helper = None
+        self._isomeric_branching = None
+
+        if not self.chain.isomeric_branching_targets:
             return
+
+        if self._gendf_library is None:
+            raise ValueError(
+                "Chain has isomeric branching targets but no GENDF library "
+                "was provided. Pass gendf_library= to the operator, or use a "
+                "chain without isomeric branching data."
+            )
 
         if not hasattr(self._rate_helper, 'get_flux_spectrum'):
-            # Not using flux tallying - disable isomeric branching
-            if self.chain.isomeric_branching_targets:
-                warn(
-                    "GENDF library provided but the reaction rate helper does "
-                    "not tally a flux spectrum. Isomeric branching requires "
-                    "'direct_with_flux' or 'gendf-flux' mode. Isomeric "
-                    "branching will be disabled."
-                )
-            self._isomeric_helper = None
-            self._isomeric_branching = None
-            return
+            raise ValueError(
+                "Chain has isomeric branching targets but the reaction rate "
+                "helper does not tally a flux spectrum. Use 'direct_with_flux' "
+                "or 'gendf-flux' mode, or use a chain without isomeric "
+                "branching data."
+            )
 
         # The flux tally must use the GENDF group structure for the
         # branching-ratio weights to apply (only 'flux' mode can differ)
         expected = GROUP_STRUCTURES[self._gendf_library.energy_structure]
         if not np.array_equal(self._rate_helper.energies, expected):
-            if self.chain.isomeric_branching_targets:
-                raise ValueError(
-                    "Isomeric branching requires the flux tally energy group "
-                    "boundaries to match the GENDF library's "
-                    f"'{self._gendf_library.energy_structure}' group "
-                    f"structure ({len(expected) - 1} groups); got "
-                    f"{len(self._rate_helper.energies) - 1} groups. Omit "
-                    "reaction_rate_opts['energies'] to use the GENDF "
-                    "structure automatically.")
-            self._isomeric_helper = None
-            self._isomeric_branching = None
-            return
+            raise ValueError(
+                "Isomeric branching requires the flux tally energy group "
+                "boundaries to match the GENDF library's "
+                f"'{self._gendf_library.energy_structure}' group "
+                f"structure ({len(expected) - 1} groups); got "
+                f"{len(self._rate_helper.energies) - 1} groups. Omit "
+                "reaction_rate_opts['energies'] to use the GENDF "
+                "structure automatically.")
 
         if not hasattr(self._gendf_library, 'get_branching_ratios'):
-            warn(
+            raise ValueError(
                 "GENDF library backend does not support get_branching_ratios(). "
-                "Isomeric branching will be disabled. Re-patch chain with "
-                "updated patcher tool to add gendf_lfs attribute, or use "
-                "Python backend with decay_file."
+                "Re-patch chain with the updated patcher tool to add the "
+                "gendf_lfs attribute, use the Python backend with a decay_file, "
+                "or use a chain without isomeric branching data."
             )
-            self._isomeric_helper = None
-            self._isomeric_branching = None
-            return
 
         self._isomeric_helper = IsomericBranchingHelper(
             self.chain,
@@ -492,15 +479,10 @@ class CoupledOperator(OpenMCOperator):
         has_isomeric = bool(self.chain.isomeric_branching_targets)
 
         if reaction_rate_mode == "direct":
+            # Isomeric targets in 'direct' mode raise later in
+            # _setup_isomeric_branching (no flux spectrum tallied)
             self._rate_helper = DirectReactionRateHelper(
                 self.reaction_rates.n_nuc, self.reaction_rates.n_react)
-            if has_isomeric:
-                warn(
-                    "Isomeric branching data exists in chain but CoupledOperator is using "
-                    "reaction_rate_mode='direct'. Use 'direct_with_flux' for automatic isomeric "
-                    "branching support. Isomeric branching will be disabled.",
-                    UserWarning
-                )
 
         elif reaction_rate_mode == "direct_with_flux":
             if ((has_isomeric or self._gendf_mt4_fallback)

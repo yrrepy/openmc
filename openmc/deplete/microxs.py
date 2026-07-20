@@ -7,10 +7,12 @@ IndependentOperator class for depletion.
 from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 from typing import Union, TypeAlias, Self
+import warnings
 
 import h5py
 import pandas as pd
@@ -1187,6 +1189,76 @@ def _write_flux_data(f, fluxes, dtype='float64', compression=None,
         f.create_dataset('energy_bounds', data=energy_bounds)
 
 
+def _open_h5_readonly(filename: PathLike) -> h5py.File:
+    """Open an HDF5 file read-only with file locking disabled (NFS-safe).
+
+    Many ranks open the same global file concurrently; default HDF5 locking is
+    fragile on NFS. Retry without the kwarg on older h5py/HDF5 that lacks it.
+    """
+    try:
+        return h5py.File(filename, 'r', locking=False)
+    except (TypeError, ValueError):
+        return h5py.File(filename, 'r')
+
+
+# Sidecar identity token: a full-content hash at read time would page in the
+# entire memmap and defeat the point of mmap. The threat model is a stale or
+# mismatched sidecar (regeneration/reordering), not bit rot, so a small sample
+# of rows is enough to catch it while touching only a handful of pages.
+def _sidecar_sample_indices(n_rows: int, cap: int = 64) -> list[int]:
+    """Deterministic sorted, deduplicated row-index sample for the sidecar hash."""
+    if n_rows <= 0:
+        return []
+    if n_rows <= cap:
+        return list(range(n_rows))
+    idx = {0, n_rows // 2, n_rows - 1}
+    stride = n_rows / (cap - len(idx))
+    idx.update(int(i * stride) for i in range(cap - len(idx)))
+    return sorted(idx)
+
+
+def _sidecar_sample_hash(arr: np.ndarray, indices: Sequence[int]) -> str:
+    """SHA-256 hex over the given rows of ``arr``, concatenated in index order."""
+    h = hashlib.sha256()
+    for i in indices:
+        h.update(np.ascontiguousarray(arr[i]).tobytes())
+    return h.hexdigest()
+
+
+def _validate_sidecar(f: h5py.File, h5_path: PathLike, sidecar_path: Path,
+                      memmap: np.ndarray) -> None:
+    """Verify a memmapped sidecar against the identity token in HDF5 file ``f``."""
+    if 'sidecar_format' not in f.attrs:
+        warnings.warn(
+            f"sidecar unverified: {h5_path} carries no identity token "
+            f"(written by older OpenMC), so {sidecar_path} cannot be checked "
+            f"for staleness; proceeding.")
+        return
+
+    exp_shape = tuple(int(x) for x in f.attrs['sidecar_shape'])
+    exp_dtype = f.attrs['sidecar_dtype']
+    if isinstance(exp_dtype, bytes):
+        exp_dtype = exp_dtype.decode()
+    exp_hash = f.attrs['sidecar_sha256']
+    if isinstance(exp_hash, bytes):
+        exp_hash = exp_hash.decode()
+
+    remedy = ("Regenerate the sidecar, or rewrite with "
+              "write_global_microxs_hdf5(..., write_sidecar=True).")
+    # Header check reads only the .npy header, not the array data.
+    if memmap.shape != exp_shape or str(memmap.dtype) != exp_dtype:
+        raise ValueError(
+            f"Sidecar {sidecar_path} does not match {h5_path}: shape/dtype "
+            f"{memmap.shape}/{memmap.dtype} != expected {exp_shape}/{exp_dtype}. "
+            f"{remedy}")
+    # Sampled-row hash touches only the sampled pages of the memmap.
+    sample = _sidecar_sample_indices(memmap.shape[0])
+    if _sidecar_sample_hash(memmap, sample) != exp_hash:
+        raise ValueError(
+            f"Sidecar {sidecar_path} is stale relative to {h5_path} "
+            f"(row-sample hash mismatch). {remedy}")
+
+
 def write_global_microxs_hdf5(
     micros: Sequence[MicroXS],
     filename: PathLike,
@@ -1302,6 +1374,15 @@ def write_global_microxs_hdf5(
             _write_flux_data(f, fluxes, dtype=dtype,
                              compression=comp, compression_opts=comp_opts)
 
+        # Stamp an identity token so a mmap read can detect a stale sidecar
+        # (see _sidecar_sample_indices for the sampling rationale).
+        if write_sidecar:
+            sample = _sidecar_sample_indices(stacked.shape[0])
+            f.attrs['sidecar_format'] = 1
+            f.attrs['sidecar_shape'] = np.asarray(stacked.shape, dtype='int64')
+            f.attrs['sidecar_dtype'] = str(stacked.dtype)
+            f.attrs['sidecar_sha256'] = _sidecar_sample_hash(stacked, sample)
+
     if write_sidecar:
         sidecar_path = Path(filename).with_suffix('.microxs.npy')
         np.save(sidecar_path, stacked)
@@ -1329,8 +1410,9 @@ def read_local_microxs_hdf5(
     mmap : bool, optional
         Use memory-mapped sidecar file instead of reading into heap.
         Requires a ``.microxs.npy`` sidecar written by
-        :func:`write_global_microxs_hdf5` with ``write_sidecar=True``.
-        Default ``False``.
+        :func:`write_global_microxs_hdf5` with ``write_sidecar=True``. The
+        sidecar is validated against an identity token in the HDF5 file; a
+        stale or mismatched sidecar raises ``ValueError``. Default ``False``.
 
     Returns
     -------
@@ -1352,7 +1434,7 @@ def read_local_microxs_hdf5(
     if len(local_mat_ids) == 0:
         return [], None, None
 
-    with h5py.File(filename, 'r') as f:
+    with _open_h5_readonly(filename) as f:
         version = f.attrs.get('version', None)
         if version != 1:
             raise ValueError(
@@ -1388,6 +1470,7 @@ def read_local_microxs_hdf5(
                     f"Sidecar file {sidecar_path} not found. Re-run "
                     f"write_global_microxs_hdf5 with write_sidecar=True.")
             global_xs = np.load(str(sidecar_path), mmap_mode='r')
+            _validate_sidecar(f, filename, sidecar_path, global_xs)
             micros = [MicroXS(global_xs[row], nuclides, reactions)
                       for row in local_rows]
             mmap_ref = global_xs

@@ -509,7 +509,14 @@ state), the depletion chain records the possible targets as
 computed from the GENDF cross sections weighted by the local flux spectrum
 (:math:`\sigma \cdot \phi` weighting), so a single chain remains valid across
 different spectra. This requires a GENDF library, provided through
-``gendf_library`` as shown above.
+``gendf_library`` as shown above: a chain carrying ``<isomeric_branching>``
+flags raises an error at operator setup when no GENDF library (or flux-spectrum
+tally on the matching group structure) is available to build the runtime split.
+Chains without these flags are unaffected. Each state's ratio is normalized by
+the summed production over only the isomeric states the chain requests (plus the
+file's ground state when it is not among them), so any yield to untracked file
+levels is reattributed onto the tracked isomers and the total reaction rate into
+the chain is conserved.
 
 The ``keep_isomeric_siblings`` argument (default ``True``) keeps ground and
 metastable siblings together when the chain is reduced, which is required for

@@ -184,6 +184,21 @@ def test_runtime_branching_both_levels_unchanged():
     np.testing.assert_allclose(br.branching_ratios[1], [0.2, 0.5, 0.0])
 
 
+def test_runtime_branching_clamps_negative_production():
+    """NJOY-noise negative production clamps to 0: no negative ratios, and the
+    negative group behaves as zero metastable production."""
+    levels = [
+        (0, 500, np.array([8.0, 4.0, 5.0])),      # ground
+        (1, 501, np.array([2.0, -1e-10, 1.0])),   # m1: tiny negative in group 1
+    ]
+    br = build_runtime_branching(
+        levels, ['Xx', 'Xx_m1'], [0, 1], ENERGY_BOUNDS_3G, 'Xx0', 102)
+    assert np.all(br.branching_ratios >= 0.0)
+    # Group 1 (clamped m1 -> 0): all yield to ground, none to m1
+    np.testing.assert_allclose(br.branching_ratios[0], [0.8, 1.0, 5.0 / 6.0])
+    np.testing.assert_allclose(br.branching_ratios[1], [0.2, 0.0, 1.0 / 6.0])
+
+
 def test_runtime_branching_no_ground_in_file_warns():
     """Metastable-only request with no LFS=0 warns and normalizes the subset."""
     eb = np.array([0.0, 1.0, 2.0])
@@ -723,17 +738,14 @@ def test_mismatched_energies_disabled_without_targets():
     assert op._isomeric_helper is None
 
 
-def test_direct_helper_disables_with_warning():
-    """A rate helper without a flux spectrum disables isomeric branching."""
+def test_direct_helper_raises_with_targets():
+    """A rate helper without a flux spectrum is a hard error when chain has data."""
     helper = DirectReactionRateHelper(1, 1)
     op = bare_coupled_operator(gendf_library=MockGENDFLibrary(),
                                rate_helper=helper,
                                targets={'Al27': {'(n,gamma)': ['Al28']}})
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter('always')
+    with pytest.raises(ValueError, match='flux spectrum'):
         op._setup_isomeric_branching()
-    assert op._isomeric_helper is None
-    assert any('flux spectrum' in str(w.message) for w in rec)
 
 
 def test_calculate_isomeric_branching_uses_helper_surface():
@@ -757,19 +769,25 @@ def test_calculate_isomeric_branching_uses_helper_surface():
     assert np.array_equal(pairs[0][1], ENERGIES)
 
 
-def test_coupled_operator_disabled_without_gendf():
-    """No GENDF library -> isomeric branching disabled; calc returns None."""
-    mock_coupled = Mock(spec=CoupledOperator)
-    mock_coupled._gendf_library = None
+def test_coupled_operator_no_targets_silent():
+    """Conventional chain (no targets) + no GENDF -> silent, no helper built."""
+    op = bare_coupled_operator(gendf_library=None, targets={})
+    op._setup_isomeric_branching()
+    assert op._isomeric_helper is None
+    assert op._isomeric_branching is None
+    assert CoupledOperator._calculate_isomeric_branching(op) is None
 
-    CoupledOperator._setup_isomeric_branching(mock_coupled)
-    assert mock_coupled._isomeric_helper is None
-    assert mock_coupled._isomeric_branching is None
-    assert CoupledOperator._calculate_isomeric_branching(mock_coupled) is None
+
+def test_coupled_operator_raises_without_gendf():
+    """Patched chain (targets) + no GENDF -> hard error."""
+    op = bare_coupled_operator(gendf_library=None,
+                               targets={'Al27': {'(n,gamma)': ['Al28']}})
+    with pytest.raises(ValueError, match='no GENDF library'):
+        op._setup_isomeric_branching()
 
 
 def test_hasattr_guard_independent_operator():
-    """IndependentOperator warns and disables when the backend lacks the method."""
+    """IndependentOperator raises when the backend lacks get_branching_ratios."""
     from openmc.deplete.independent_operator import IndependentOperator
 
     mock_op = Mock(spec=IndependentOperator)
@@ -777,10 +795,32 @@ def test_hasattr_guard_independent_operator():
         {'Ag109': {'(n,gamma)': ['Ag110', 'Ag110_m1']}})
     mock_op._gendf_library = Mock(spec=[])
 
-    with warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter('always')
+    with pytest.raises(ValueError, match='get_branching_ratios'):
         IndependentOperator._setup_isomeric_branching(mock_op)
-    assert any('get_branching_ratios' in str(w.message) for w in rec)
+
+
+def test_independent_operator_raises_without_gendf():
+    """Patched chain (targets) + no GENDF -> hard error on IndependentOperator."""
+    from openmc.deplete.independent_operator import IndependentOperator
+
+    mock_op = Mock(spec=IndependentOperator)
+    mock_op.chain = make_mock_chain(
+        {'Ag109': {'(n,gamma)': ['Ag110', 'Ag110_m1']}})
+    mock_op._gendf_library = None
+
+    with pytest.raises(ValueError, match='no GENDF library'):
+        IndependentOperator._setup_isomeric_branching(mock_op)
+
+
+def test_independent_operator_no_targets_silent():
+    """Conventional chain (no targets) + no GENDF -> silent, no helper built."""
+    from openmc.deplete.independent_operator import IndependentOperator
+
+    mock_op = Mock(spec=IndependentOperator)
+    mock_op.chain = make_mock_chain({})
+    mock_op._gendf_library = None
+
+    IndependentOperator._setup_isomeric_branching(mock_op)
     assert mock_op._isomeric_branching is None
 
 

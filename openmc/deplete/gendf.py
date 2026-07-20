@@ -372,6 +372,11 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
     production XS aligned to the full group grid and feed it here, so the
     branching-ratio computation cannot diverge between backends.
 
+    The denominator sums production XS over the chain-requested LFS levels only
+    (plus the file's ground when not requested), so yield to any untracked file
+    levels is reattributed onto the tracked isomers -- conserving total reaction
+    rate into the chain and matching the patcher convention.
+
     Parameters
     ----------
     levels : list of (int, int, numpy.ndarray)
@@ -395,7 +400,9 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
     if not levels:
         return None
 
-    lfs_to_xs = {lfs: xs for lfs, izap, xs in levels}
+    # NJOY noise can leave tiny negative MF=10 production values; clamp to 0 so
+    # they never enter the numerator/denominator (patcher and C++ clamp too).
+    lfs_to_xs = {lfs: np.maximum(xs, 0.0) for lfs, izap, xs in levels}
     n_groups = len(energy_bounds) - 1
 
     prod_xs = []

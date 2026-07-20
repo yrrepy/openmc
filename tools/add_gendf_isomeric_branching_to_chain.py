@@ -8,6 +8,12 @@ Supports two mapping modes:
 
 IMPORTANT: decay_file is REQUIRED for both modes (for count validation and logging).
 
+IMPORTANT: the input base_chain MUST be an UNPATCHED chain. Re-running this
+patcher on an already-patched chain silently zeroes every isomeric-pathway Q
+value, because the ground-state Q it derives them from was consumed (moved onto
+the <isomeric_branching> element) by the first pass. Always start from a clean,
+unpatched chain.
+
 v12 Changes:
 - Added single-target isomeric yields detection and logging
 - Always logs single-target cases with reason (GENDF_SINGLE_LFS, NO_DECAY_DATA, etc.)
@@ -200,7 +206,11 @@ def build_parser():
 
     parser = argparse.ArgumentParser(
         description='GENDF Isomeric Branching Chain Patcher v12\n\n'
-                    'Adds energy-dependent isomeric branching from GENDF MF=10 data to OpenMC chains.',
+                    'Adds energy-dependent isomeric branching from GENDF MF=10 data to OpenMC chains.\n\n'
+                    'IMPORTANT: the input base_chain must be an UNPATCHED chain. Re-running this '
+                    'patcher on an already-patched chain silently zeroes every isomeric-pathway Q '
+                    'value (the ground-state Q it derives them from was consumed by the first pass). '
+                    'Always start from a clean, unpatched chain.',
         epilog=epilog,
         formatter_class=CustomFormatter
     )
