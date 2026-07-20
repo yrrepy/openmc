@@ -1059,8 +1059,11 @@ class Chain:
                 # Gain term; allow for total annihilation for debug purposes
                 if r_type != 'fission':
                     if target is not None and path_rate != 0.0:
-                        # Check for isomeric branching (using cached lookup)
-                        if nuc_iso and r_type in nuc_iso:
+                        # Isomeric branching only with a usable distribution;
+                        # empty/all-zero/NaN dicts fall to the static target
+                        iso_dist = nuc_iso.get(r_type)
+                        if iso_dist and any(math.isfinite(v) and v > 0.0
+                                            for v in iso_dist.values()):
                             # The distribution replaces the chain's static
                             # split for ALL same-type entries -- apply it once
                             # per reaction type (mirrors the loss-term guard)
@@ -1074,7 +1077,7 @@ class Chain:
                                 # distribution (sums to 1.0)
                                 total_ratio = 0.0
                                 missing_targets = []
-                                for iso_target, iso_br in nuc_iso[r_type].items():
+                                for iso_target, iso_br in iso_dist.items():
                                     # Validate ratio value (guard against NaN/Inf from data corruption)
                                     if not math.isfinite(iso_br):
                                         warn(f"Invalid isomeric branching ratio for {nuc.name} {r_type} -> "
@@ -1100,6 +1103,11 @@ class Chain:
                                          f"sum to {total_ratio:.4f}, not 1.0. This may indicate "
                                          f"incomplete or incorrect branching data.")
                         else:
+                            if iso_dist is not None:
+                                warn(f"Isomeric branching for {nuc.name} "
+                                     f"{r_type} has no usable (finite, "
+                                     f"positive) ratios; using the chain's "
+                                     f"static target.")
                             # Original single target
                             k = self.nuclide_dict[target]
                             setval(k, i, path_rate * br)

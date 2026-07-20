@@ -980,7 +980,8 @@ def test_form_matrix_self_transmutation_nn_prime():
 
 
 def test_form_matrix_nan_br_warns():
-    """form_matrix warns on NaN/Inf branching ratios."""
+    """A degenerate (all-NaN) distribution warns and falls back to the
+    static target, conserving mass."""
     chain = openmc.deplete.Chain()
     parent = openmc.deplete.Nuclide('Parent')
     parent.add_reaction('(n,gamma)', 'Product', Q=1e6, branching_ratio=1.0)
@@ -990,8 +991,12 @@ def test_form_matrix_nan_br_warns():
     rates = ReactionRates(['mat1'], ['Parent', 'Product'], ['(n,gamma)'])
     rates[0, 0, 0] = 1.0
     iso_br = {'Parent': {'(n,gamma)': {'Product': float('nan')}}}
-    with pytest.warns(UserWarning, match="Invalid isomeric branching ratio"):
-        chain.form_matrix(rates[0], isomeric_branching=iso_br)
+    with pytest.warns(UserWarning, match="no usable"):
+        dense = chain.form_matrix(
+            rates[0], isomeric_branching=iso_br).toarray()
+    # Static fallback: full rate reaches Product, column conserves
+    assert dense[chain.nuclide_dict['Product'],
+                 chain.nuclide_dict['Parent']] == 1.0
 
 
 def test_form_matrix_missing_target_raises():
