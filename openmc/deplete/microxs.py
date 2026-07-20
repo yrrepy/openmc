@@ -476,7 +476,7 @@ def get_gendfxs_and_flux(
     energies = gendf_library.energy_bounds
 
     # Save any original tallies on the model
-    original_tallies = model.tallies
+    original_tallies = list(model.tallies)
 
     # Determine what reactions and nuclides are available
     chain = _get_chain(chain_file)

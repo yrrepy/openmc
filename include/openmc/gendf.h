@@ -32,20 +32,21 @@ constexpr double GENDF_ATOL = 0.0;
 
 //! Validation options for GENDF parsing
 struct GENDFParserOptions {
-  bool validate_za {true};           //!< Check ZA is physically valid
-  bool validate_xs_positive {true};  //!< Check XS values are non-negative
-  bool warn_short_lines {true};      //!< Warn about skipped short lines
-  bool require_mf1_header {true};    //!< Require MF=1, MT=451 header
+  bool validate_za {true};          //!< Check ZA is physically valid
+  bool validate_xs_positive {true}; //!< Check XS values are non-negative
+  bool warn_short_lines {true};     //!< Warn about skipped short lines
+  bool require_mf1_header {true};   //!< Require MF=1, MT=451 header
   bool parse_mf10 {true};           //!< Also parse MF=10 production XS
-  int min_file_lines {10};           //!< Minimum expected lines in file
+  int min_file_lines {10};          //!< Minimum expected lines in file
 };
 
 //! Result from parsing with diagnostics
 struct GENDFParseResult {
-  int za {0};                                           //!< Z*1000 + A
-  int zam {0};                                          //!< Z*1000 + A + isomeric state
-  std::unordered_map<int, vector<double>> xs_data;      //!< MT -> cross-sections
-  std::unordered_map<int, vector<double>> energy_data;  //!< MT -> energy boundaries
+  int za {0};  //!< Z*1000 + A
+  int zam {0}; //!< Z*1000 + A + isomeric state
+  std::unordered_map<int, vector<double>> xs_data; //!< MT -> cross-sections
+  std::unordered_map<int, vector<double>>
+    energy_data; //!< MT -> energy boundaries
 
   //! MF=10 production XS: key = MT*1000 + LFS (MT<=891, LFS<=50, no collision)
   std::unordered_map<int, vector<double>> prod_xs_data;
@@ -54,12 +55,12 @@ struct GENDFParseResult {
   //! MF=10 metadata: key = MT*1000 + LFS -> IZAP (Z*1000+A of product)
   std::unordered_map<int, int> prod_izap_data;
 
-  int lines_read {0};                                   //!< Total lines read
-  int lines_skipped {0};                                //!< Lines skipped (too short)
-  int negative_xs_count {0};                            //!< Count of negative XS clamped
-  vector<std::string> warnings;                         //!< Warning messages
-  bool success {false};                                 //!< Parsing succeeded
-  std::string error_message;                            //!< Error message if failed
+  int lines_read {0};           //!< Total lines read
+  int lines_skipped {0};        //!< Lines skipped (too short)
+  int negative_xs_count {0};    //!< Count of negative XS clamped
+  vector<std::string> warnings; //!< Warning messages
+  bool success {false};         //!< Parsing succeeded
+  std::string error_message;    //!< Error message if failed
 };
 
 //==============================================================================
@@ -67,9 +68,9 @@ struct GENDFParseResult {
 //==============================================================================
 
 struct ProductionLevel {
-  int lfs;               //!< Level flag (0=ground, >0=metastable)
-  int izap;              //!< Product Z*1000 + A
-  vector<double> xs;     //!< Production cross-sections per group
+  int lfs;           //!< Level flag (0=ground, >0=metastable)
+  int izap;          //!< Product Z*1000 + A
+  vector<double> xs; //!< Production cross-sections per group
 };
 
 //==============================================================================
@@ -94,17 +95,18 @@ public:
   //! Get cross-section data for specific MT number with energy-aware alignment
   //! \param[in] mt ENDF MT reaction number
   //! \param[in] n_groups Number of energy groups
-  //! \param[in] library_bounds Library energy group boundaries for threshold alignment
-  //! \return Vector of cross-section values (one per group)
-  vector<double> get_xs(int mt, int n_groups, const vector<double>& library_bounds) const;
+  //! \param[in] library_bounds Library energy group boundaries for threshold
+  //! alignment \return Vector of cross-section values (one per group)
+  vector<double> get_xs(
+    int mt, int n_groups, const vector<double>& library_bounds) const;
 
   //! Get MF=10 production XS for all levels of a given MT
   //! \param[in] mt ENDF MT reaction number
   //! \param[in] n_groups Number of energy groups in library
   //! \param[in] library_bounds Library energy group boundaries for alignment
   //! \return Vector of ProductionLevel sorted by LFS ascending
-  vector<ProductionLevel> get_production_xs(int mt, int n_groups,
-      const vector<double>& library_bounds) const;
+  vector<ProductionLevel> get_production_xs(
+    int mt, int n_groups, const vector<double>& library_bounds) const;
 
   //! Check if MT reaction exists in this material (MF=3)
   bool has_mt(int mt) const;
@@ -125,9 +127,9 @@ public:
 
 private:
   // Data members
-  std::string nuclide_name_;           //!< Nuclide name (e.g., "U235")
-  int za_ {0};                         //!< Z*1000 + A
-  int zam_ {0};                        //!< Z*1000 + A + isomeric state
+  std::string nuclide_name_; //!< Nuclide name (e.g., "U235")
+  int za_ {0};               //!< Z*1000 + A
+  int zam_ {0};              //!< Z*1000 + A + isomeric state
 
   //! MF=3 cross-section data: map MT -> vector<double> (one value per group)
   std::unordered_map<int, vector<double>> xs_data_;
@@ -163,8 +165,7 @@ public:
   //! \param[in] library_path Path to directory containing GENDF .asc files
   //! \param[in] energy_bounds Energy group boundaries in [eV]
   //! \param[in] energy_structure_name Optional name of energy structure
-  explicit GENDFLibrary(
-    const std::string& library_path,
+  explicit GENDFLibrary(const std::string& library_path,
     const vector<double>& energy_bounds,
     const std::string& energy_structure_name = "");
 
@@ -176,17 +177,13 @@ public:
   //! \param[in] energy_bounds Energy group boundaries in [eV]
   //! \return Vector of cross-section values (one per group)
   vector<double> get_xs(
-    const std::string& nuclide,
-    int mt,
-    const vector<double>& energy_bounds);
+    const std::string& nuclide, int mt, const vector<double>& energy_bounds);
 
   //! Get MF=10 production XS for all levels of a given MT
   //! \param[in] nuclide Nuclide name
   //! \param[in] mt ENDF MT reaction number
   //! \return Vector of ProductionLevel sorted by LFS ascending
-  vector<ProductionLevel> get_production_xs(
-    const std::string& nuclide,
-    int mt);
+  vector<ProductionLevel> get_production_xs(const std::string& nuclide, int mt);
 
   //! Check if nuclide is available in library
   //! \param[in] nuclide Nuclide name
@@ -205,16 +202,17 @@ public:
 
 private:
   // Data members
-  std::string library_path_;                 //!< Path to GENDF library directory
-  std::string energy_structure_;             //!< Energy group structure name
-  vector<double> energy_bounds_;             //!< Energy group boundaries in [eV]
-  int n_groups_ {0};                         //!< Number of energy groups
+  std::string library_path_;     //!< Path to GENDF library directory
+  std::string energy_structure_; //!< Energy group structure name
+  vector<double> energy_bounds_; //!< Energy group boundaries in [eV]
+  int n_groups_ {0};             //!< Number of energy groups
 
   //! Material cache: map nuclide name -> GENDFMaterial
   std::unordered_map<std::string, unique_ptr<GENDFMaterial>> material_cache_;
 
-  //! Mutex for thread-safe cache access (mutable for const method compatibility)
-  //! Uses shared_mutex for read/write locking: multiple readers OR single writer
+  //! Mutex for thread-safe cache access (mutable for const method
+  //! compatibility) Uses shared_mutex for read/write locking: multiple readers
+  //! OR single writer
   mutable std::shared_mutex cache_mutex_;
 
   //! File index: map nuclide name -> file path
@@ -260,8 +258,8 @@ extern int n_gendf_libraries;
 std::string strip_mass_leading_zeros(const std::string& name);
 
 //! Convert GENDF filename stem to OpenMC nuclide name
-//! Handles metastable suffixes: mg->_m1, ng->_m2, og->_m3, pg->_m4, qg->_m5, g->ground
-//! \param[in] stem GENDF filename stem (e.g., "U235g", "Am242mg")
+//! Handles metastable suffixes: mg->_m1, ng->_m2, og->_m3, pg->_m4, qg->_m5,
+//! g->ground \param[in] stem GENDF filename stem (e.g., "U235g", "Am242mg")
 //! \return OpenMC nuclide name (e.g., "U235", "Am242_m1")
 std::string convert_gendf_to_openmc_name(const std::string& stem);
 
@@ -271,20 +269,16 @@ std::string convert_gendf_to_openmc_name(const std::string& stem);
 //! \param[out] energy_data Map of MT -> vector<double> (energy boundaries)
 //! \param[out] za Z*1000 + A
 //! \param[out] zam Z*1000 + A + isomeric state
-void parse_gendf_mf3_only(
-  const std::string& filename,
+void parse_gendf_mf3_only(const std::string& filename,
   std::unordered_map<int, vector<double>>& xs_data,
-  std::unordered_map<int, vector<double>>& energy_data,
-  int& za,
-  int& zam);
+  std::unordered_map<int, vector<double>>& energy_data, int& za, int& zam);
 
 //! Parse GENDF file with validation and diagnostics (G9 fix)
 //! \param[in] filename Path to GENDF .asc file
 //! \param[in] options Parser validation options
 //! \return Parse result with diagnostics
-GENDFParseResult parse_gendf_validated(
-  const std::string& filename,
-  const GENDFParserOptions& options = GENDFParserOptions{});
+GENDFParseResult parse_gendf_validated(const std::string& filename,
+  const GENDFParserOptions& options = GENDFParserOptions {});
 
 //! Validate ZA value is physically reasonable
 //! \param[in] za Z*1000 + A value

@@ -29,7 +29,8 @@ namespace openmc {
 //! Trim whitespace from both ends of string
 //! \param[in] str String to trim
 //! \return Trimmed string
-std::string trim(const std::string& str) {
+std::string trim(const std::string& str)
+{
   auto start = str.begin();
   while (start != str.end() && std::isspace(*start)) {
     ++start;
@@ -47,7 +48,8 @@ std::string trim(const std::string& str) {
 // ZA validation
 //==============================================================================
 
-bool validate_za(int za, std::string& error) {
+bool validate_za(int za, std::string& error)
+{
   if (za <= 0) {
     error = "ZA value is zero or negative: " + std::to_string(za);
     return false;
@@ -57,8 +59,7 @@ bool validate_za(int za, std::string& error) {
   int A = za % 1000;
 
   if (Z < 1 || Z > 118) {
-    error = "Invalid atomic number Z=" + std::to_string(Z) +
-            " (must be 1-118)";
+    error = "Invalid atomic number Z=" + std::to_string(Z) + " (must be 1-118)";
     return false;
   }
 
@@ -94,8 +95,9 @@ struct ExtractResult {
 
 //! Extract integer with error tracking
 ExtractResult<int> extract_int_safe(
-    const std::string& line, size_t start, size_t length) {
-  ExtractResult<int> result{0, false, ""};
+  const std::string& line, size_t start, size_t length)
+{
+  ExtractResult<int> result {0, false, ""};
 
   if (line.length() <= start) {
     result.error = "Line too short for column " + std::to_string(start);
@@ -107,7 +109,7 @@ ExtractResult<int> extract_int_safe(
 
   if (substr.empty()) {
     result.value = 0;
-    result.success = true;  // Empty field is valid (means 0)
+    result.success = true; // Empty field is valid (means 0)
     return result;
   }
 
@@ -131,8 +133,9 @@ ExtractResult<int> extract_int_safe(
 
 //! Extract double with error tracking
 ExtractResult<double> extract_double_safe(
-    const std::string& line, size_t start, size_t length) {
-  ExtractResult<double> result{0.0, false, ""};
+  const std::string& line, size_t start, size_t length)
+{
+  ExtractResult<double> result {0.0, false, ""};
 
   if (line.length() <= start) {
     result.error = "Line too short for column " + std::to_string(start);
@@ -167,7 +170,8 @@ ExtractResult<double> extract_double_safe(
 
 //! Lines spanned by a TAB1 interpolation table
 //! ENDF packs 2*NR integers (NBT,INT pairs) 6 per line, rounded up
-int interp_table_lines(int nr) {
+int interp_table_lines(int nr)
+{
   return nr > 0 ? (2 * nr + 5) / 6 : 0;
 }
 
@@ -177,22 +181,18 @@ int interp_table_lines(int nr) {
 //! \param[in,out] xs Cross-section data (moved out)
 //! \param[in,out] energies Energy boundary data (moved out)
 //! \param[out] result Parse result to store into
-void store_section_data(
-  const std::string& basename,
-  int mt,
-  vector<double>& xs,
-  vector<double>& energies,
-  GENDFParseResult& result)
+void store_section_data(const std::string& basename, int mt, vector<double>& xs,
+  vector<double>& energies, GENDFParseResult& result)
 {
-  if (xs.empty()) return;
+  if (xs.empty())
+    return;
 
   // Validate energy-XS count consistency (H3 fix)
   if (energies.size() != xs.size()) {
     result.warnings.push_back(
       "Energy-XS count mismatch in " + basename + " (MF=3, MT=" +
-      std::to_string(mt) + "): " +
-      std::to_string(energies.size()) + " energies vs " +
-      std::to_string(xs.size()) + " XS values");
+      std::to_string(mt) + "): " + std::to_string(energies.size()) +
+      " energies vs " + std::to_string(xs.size()) + " XS values");
     size_t min_size = std::min(energies.size(), xs.size());
     energies.resize(min_size);
     xs.resize(min_size);
@@ -209,8 +209,7 @@ void store_section_data(
 //==============================================================================
 
 GENDFParseResult parse_gendf_validated(
-  const std::string& filename,
-  const GENDFParserOptions& options)
+  const std::string& filename, const GENDFParserOptions& options)
 {
   GENDFParseResult result;
 
@@ -231,7 +230,7 @@ GENDFParseResult parse_gendf_validated(
   int current_mf = 0;
   int current_mt = 0;
   vector<double> current_xs;
-  vector<double> current_energies;  // Energy boundaries for threshold alignment
+  vector<double> current_energies; // Energy boundaries for threshold alignment
   int n_groups = 0;
   bool in_data_section = false;
   int nr_lines_to_skip = 0;
@@ -262,11 +261,12 @@ GENDFParseResult parse_gendf_validated(
     // Track short lines
     if (line.length() < 70) {
       ++result.lines_skipped;
-      if (options.warn_short_lines && result.lines_skipped <= max_short_line_warnings) {
-        result.warnings.push_back(
-          "Short line in " + basename + " at line " +
-          std::to_string(line_number) + " (" +
-          std::to_string(line.length()) + " chars), skipped");
+      if (options.warn_short_lines &&
+          result.lines_skipped <= max_short_line_warnings) {
+        result.warnings.push_back("Short line in " + basename + " at line " +
+                                  std::to_string(line_number) + " (" +
+                                  std::to_string(line.length()) +
+                                  " chars), skipped");
       }
       continue;
     }
@@ -276,9 +276,8 @@ GENDFParseResult parse_gendf_validated(
     auto mt_result = extract_int_safe(line, 72, 3);
 
     if (!mf_result.success || !mt_result.success) {
-      result.warnings.push_back(
-        "Line " + std::to_string(line_number) +
-        ": Could not parse MF/MT fields");
+      result.warnings.push_back("Line " + std::to_string(line_number) +
+                                ": Could not parse MF/MT fields");
       continue;
     }
 
@@ -295,7 +294,8 @@ GENDFParseResult parse_gendf_validated(
       if (mf != current_mf || mt != current_mt) {
         // Save previous MF=3 section
         if (current_mf == 3) {
-          store_section_data(basename, current_mt, current_xs, current_energies, result);
+          store_section_data(
+            basename, current_mt, current_xs, current_energies, result);
           current_xs.clear();
           current_energies.clear();
         }
@@ -323,7 +323,8 @@ GENDFParseResult parse_gendf_validated(
 
     // Parse MF=1, MT=451 header (only first record is HEAD, rest are TEXT)
     // Per ENDF-6 format: only the first record contains actual ZA data,
-    // subsequent records are documentation where columns 1-66 are free-form text
+    // subsequent records are documentation where columns 1-66 are free-form
+    // text
     if (mf == 1 && mt == 451 && !found_mf1_header) {
       found_mf1_header = true;
 
@@ -361,7 +362,8 @@ GENDFParseResult parse_gendf_validated(
           current_xs.clear();
           current_xs.reserve(n_groups);
           current_energies.clear();
-          current_energies.reserve(n_groups + 1);  // n_groups + 1 energy boundaries
+          current_energies.reserve(
+            n_groups + 1); // n_groups + 1 energy boundaries
           continue;
         }
       }
@@ -376,23 +378,24 @@ GENDFParseResult parse_gendf_validated(
       // Even indices (0, 2, 4) = energy values
       // Odd indices (1, 3, 5) = cross-section values
       if (in_data_section && nr_lines_to_skip == 0 && line.length() >= 66) {
-        for (int i = 0; i < 6 && current_xs.size() < static_cast<size_t>(n_groups); ++i) {
+        for (int i = 0;
+             i < 6 && current_xs.size() < static_cast<size_t>(n_groups); ++i) {
           int col_start = i * 11;
           if (col_start + 11 <= 66) {
             auto val_result = extract_double_safe(line, col_start, 11);
 
-            if (i % 2 == 0) {  // Energy values at even indices
+            if (i % 2 == 0) { // Energy values at even indices
               if (val_result.success) {
                 current_energies.push_back(val_result.value);
               } else {
                 // Could not parse energy - use 0 but track
                 current_energies.push_back(0.0);
                 result.warnings.push_back(
-                  "Parse error (energy) in " + basename + " (MF=3, MT=" +
-                  std::to_string(current_mt) + ") at line " +
+                  "Parse error (energy) in " + basename +
+                  " (MF=3, MT=" + std::to_string(current_mt) + ") at line " +
                   std::to_string(line_number) + ": " + val_result.error);
               }
-            } else {  // XS values at odd indices
+            } else { // XS values at odd indices
               if (val_result.success) {
                 double xs_val = val_result.value;
 
@@ -405,10 +408,10 @@ GENDFParseResult parse_gendf_validated(
                     oss << std::scientific << xs_val;
                     result.warnings.push_back(
                       "Negative XS in " + basename + " (MF=3, MT=" +
-                      std::to_string(current_mt) + "): value=" +
-                      oss.str() + " at line " + std::to_string(line_number));
+                      std::to_string(current_mt) + "): value=" + oss.str() +
+                      " at line " + std::to_string(line_number));
                   }
-                  xs_val = 0.0;  // Clamp to zero
+                  xs_val = 0.0; // Clamp to zero
                 }
 
                 current_xs.push_back(xs_val);
@@ -416,8 +419,8 @@ GENDFParseResult parse_gendf_validated(
                 // Could not parse - use 0 but track
                 current_xs.push_back(0.0);
                 result.warnings.push_back(
-                  "Parse error in " + basename + " (MF=3, MT=" +
-                  std::to_string(current_mt) + ") at line " +
+                  "Parse error in " + basename +
+                  " (MF=3, MT=" + std::to_string(current_mt) + ") at line " +
                   std::to_string(line_number) + ": " + val_result.error);
               }
             }
@@ -457,9 +460,9 @@ GENDFParseResult parse_gendf_validated(
           // potential subsection heads.
           if (mf10_current_izap == 0) {
             result.warnings.push_back(
-              "Skipping MF=10 level in " + basename + " MT=" +
-              std::to_string(current_mt) + " LFS=" +
-              std::to_string(mf10_current_lfs) + ": IZAP=0");
+              "Skipping MF=10 level in " + basename +
+              " MT=" + std::to_string(current_mt) +
+              " LFS=" + std::to_string(mf10_current_lfs) + ": IZAP=0");
             mf10_discard = true;
           }
 
@@ -467,9 +470,9 @@ GENDFParseResult parse_gendf_validated(
             std::string izap_error;
             if (!validate_za(mf10_current_izap, izap_error)) {
               result.warnings.push_back(
-                "MF=10 IZAP validation in " + basename + " MT=" +
-                std::to_string(current_mt) + " LFS=" +
-                std::to_string(mf10_current_lfs) + ": " + izap_error);
+                "MF=10 IZAP validation in " + basename +
+                " MT=" + std::to_string(current_mt) +
+                " LFS=" + std::to_string(mf10_current_lfs) + ": " + izap_error);
             }
           }
 
@@ -488,13 +491,15 @@ GENDFParseResult parse_gendf_validated(
       }
 
       if (mf10_in_data && mf10_nr_skip == 0 && line.length() >= 66) {
-        for (int i = 0; i < 6 && mf10_current_xs.size() < static_cast<size_t>(mf10_n_groups); ++i) {
+        for (int i = 0; i < 6 && mf10_current_xs.size() <
+                                   static_cast<size_t>(mf10_n_groups);
+             ++i) {
           int col_start = i * 11;
           if (col_start + 11 <= 66) {
             auto val_result = extract_double_safe(line, col_start, 11);
             if (i % 2 == 0) {
               mf10_current_energies.push_back(
-                  val_result.success ? val_result.value : 0.0);
+                val_result.success ? val_result.value : 0.0);
             } else {
               double xs_val = val_result.success ? val_result.value : 0.0;
               if (options.validate_xs_positive && xs_val < 0) {
@@ -515,7 +520,8 @@ GENDFParseResult parse_gendf_validated(
 
   // Save last section
   if (current_mf == 3) {
-    store_section_data(basename, current_mt, current_xs, current_energies, result);
+    store_section_data(
+      basename, current_mt, current_xs, current_energies, result);
   }
 
   // Save last MF=10 subsection
@@ -530,9 +536,9 @@ GENDFParseResult parse_gendf_validated(
 
   // Final validation
   if (result.lines_read < options.min_file_lines) {
-    result.error_message = "File too small: only " +
-      std::to_string(result.lines_read) + " lines (minimum: " +
-      std::to_string(options.min_file_lines) + ")";
+    result.error_message =
+      "File too small: only " + std::to_string(result.lines_read) +
+      " lines (minimum: " + std::to_string(options.min_file_lines) + ")";
     return result;
   }
 
@@ -547,16 +553,15 @@ GENDFParseResult parse_gendf_validated(
   }
 
   if (result.lines_skipped > result.lines_read / 2) {
-    result.warnings.push_back(
-      "More than 50% of lines were skipped (" +
-      std::to_string(result.lines_skipped) + "/" +
-      std::to_string(result.lines_read) + ")");
+    result.warnings.push_back("More than 50% of lines were skipped (" +
+                              std::to_string(result.lines_skipped) + "/" +
+                              std::to_string(result.lines_read) + ")");
   }
 
   if (result.negative_xs_count > 3) {
-    result.warnings.push_back(
-      "Total " + std::to_string(result.negative_xs_count) +
-      " negative XS values clamped to zero");
+    result.warnings.push_back("Total " +
+                              std::to_string(result.negative_xs_count) +
+                              " negative XS values clamped to zero");
   }
 
   result.success = true;
@@ -576,7 +581,8 @@ void emit_gendf_warnings(
   size_t emitted = 0;
   size_t suppressed = 0;
   for (const auto& w : warnings) {
-    if (!seen.insert(w).second) continue;  // skip exact duplicates
+    if (!seen.insert(w).second)
+      continue; // skip exact duplicates
     if (emitted < max_emit) {
       warning(w);
       ++emitted;
@@ -594,21 +600,18 @@ void emit_gendf_warnings(
 // MF=3-only GENDF parser (uses validated parser with optimized options)
 //==============================================================================
 
-void parse_gendf_mf3_only(
-  const std::string& filename,
+void parse_gendf_mf3_only(const std::string& filename,
   std::unordered_map<int, vector<double>>& xs_data,
-  std::unordered_map<int, vector<double>>& energy_data,
-  int& za,
-  int& zam)
+  std::unordered_map<int, vector<double>>& energy_data, int& za, int& zam)
 {
   // Use validated parser with minimal warnings for performance
   // This ensures consistent behavior and validation across both entry points
   GENDFParserOptions options;
-  options.warn_short_lines = false;  // Don't accumulate short line warnings
-  options.validate_za = true;        // Keep ZA validation
+  options.warn_short_lines = false;    // Don't accumulate short line warnings
+  options.validate_za = true;          // Keep ZA validation
   options.validate_xs_positive = true; // Keep XS validation
   options.require_mf1_header = true;
-  options.parse_mf10 = false;        // MF=3 only for speed
+  options.parse_mf10 = false; // MF=3 only for speed
   options.min_file_lines = 10;
 
   GENDFParseResult result = parse_gendf_validated(filename, options);
