@@ -72,8 +72,8 @@ def _make_material(mat_id):
 
 # --- from_microxs_file integration tests ---
 
-def test_from_microxs_file(tmp_path):
-    """from_microxs_file produces a working operator."""
+def test_from_microxs_file(tmp_path, monkeypatch):
+    """from_microxs_file produces a working operator; over-decomposition fails fast."""
     micro_xs = MicroXS.from_csv(ONE_GROUP_XS)
     n_mats = 3
     materials = [_make_material(i + 1) for i in range(n_mats)]
@@ -90,6 +90,14 @@ def test_from_microxs_file(tmp_path):
     assert len(op.fluxes) == n_mats
     for xs in op.cross_sections:
         np.testing.assert_array_equal(xs.data, micro_xs.data)
+
+    # More ranks than materials fails fast (same on every rank -> no deadlock).
+    from types import SimpleNamespace
+    import openmc.deplete.independent_operator as iop
+    monkeypatch.setattr(iop, 'comm', SimpleNamespace(size=n_mats + 1, rank=0))
+    with pytest.raises(ValueError, match="over-decomposition"):
+        IndependentOperator.from_microxs_file(
+            materials, fname, chain_file=CHAIN_PATH)
 
 
 def test_from_microxs_file_with_flux(tmp_path):

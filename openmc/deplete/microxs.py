@@ -1201,6 +1201,12 @@ def _open_h5_readonly(filename: PathLike) -> h5py.File:
         return h5py.File(filename, 'r')
 
 
+def _read_global_material_count(filename: PathLike) -> int:
+    """Number of materials in a global MicroXS HDF5 file (reads only shape)."""
+    with _open_h5_readonly(filename) as f:
+        return f['material_ids'].shape[0]
+
+
 # Sidecar identity token: a full-content hash at read time would page in the
 # entire memmap and defeat the point of mmap. The threat model is a stale or
 # mismatched sidecar (regeneration/reordering), not bit rot, so a small sample

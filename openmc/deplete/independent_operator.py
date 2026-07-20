@@ -18,7 +18,7 @@ from openmc.mpi import comm
 from .abc import ReactionRateHelper, OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
-from .microxs import MicroXS, read_local_microxs_hdf5
+from .microxs import MicroXS, read_local_microxs_hdf5, _read_global_material_count
 from .results import Results
 from .helpers import (ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper,
                       IsomericBranchingHelper)
@@ -412,6 +412,17 @@ class IndependentOperator(OpenMCOperator):
             volume[str(m.id)] = m.volume
             heavy_metal += m.fissionable_mass
         name_list = [m.name for m in all_depletable]
+
+        # Fail fast on over-decomposition before any per-rank work: more ranks
+        # than materials leaves empty-slice ranks that KeyError mid-step and
+        # deadlock the rest. All ranks read the same file, so this check is
+        # deterministic and every rank raises together (no deadlock).
+        n_materials = _read_global_material_count(microxs_file)
+        if comm.size > n_materials:
+            raise ValueError(
+                f"MPI over-decomposition: {comm.size} ranks for {n_materials} "
+                f"materials in {microxs_file}. Use at most {n_materials} ranks "
+                f"for this file.")
 
         local_mats = _distribute(burnable_mats)
 
