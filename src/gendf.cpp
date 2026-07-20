@@ -567,14 +567,20 @@ int openmc_gendf_library_create(const char* library_path, int n_energy_bounds,
 
 int openmc_gendf_library_free(int32_t lib_id)
 {
-  auto it = g_gendf_libs.find(lib_id);
-  if (it == g_gendf_libs.end()) {
-    set_errmsg("Invalid GENDF library ID");
-    return OPENMC_E_INVALID_ID;
-  }
+  try {
+    auto it = g_gendf_libs.find(lib_id);
+    if (it == g_gendf_libs.end()) {
+      set_errmsg("Invalid GENDF library ID");
+      return OPENMC_E_INVALID_ID;
+    }
 
-  g_gendf_libs.erase(it);
-  return 0;
+    g_gendf_libs.erase(it);
+    return 0;
+
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
 }
 
 int openmc_gendf_library_get_n_groups(int32_t lib_id, int* n_groups)
@@ -588,8 +594,14 @@ int openmc_gendf_library_get_n_groups(int32_t lib_id, int* n_groups)
   if (!lib)
     return OPENMC_E_INVALID_ID;
 
-  *n_groups = lib->n_groups();
-  return 0;
+  try {
+    *n_groups = lib->n_groups();
+    return 0;
+
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
 }
 
 int openmc_gendf_library_get_energy_bounds(
@@ -604,9 +616,15 @@ int openmc_gendf_library_get_energy_bounds(
   if (!lib)
     return OPENMC_E_INVALID_ID;
 
-  *bounds = lib->energy_bounds().data();
-  *n = lib->energy_bounds().size();
-  return 0;
+  try {
+    *bounds = lib->energy_bounds().data();
+    *n = lib->energy_bounds().size();
+    return 0;
+
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
 }
 
 int openmc_gendf_library_has_nuclide(
@@ -621,8 +639,14 @@ int openmc_gendf_library_has_nuclide(
   if (!lib)
     return OPENMC_E_INVALID_ID;
 
-  *has = lib->has_nuclide(nuclide);
-  return 0;
+  try {
+    *has = lib->has_nuclide(nuclide);
+    return 0;
+
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
 }
 
 int openmc_gendf_library_available_nuclides(
@@ -642,7 +666,7 @@ int openmc_gendf_library_available_nuclides(
     *n = nuc_list.size();
 
     // Allocate array of C strings
-    *nuclides = (char**)malloc(*n * sizeof(char*));
+    *nuclides = static_cast<char**>(malloc(*n * sizeof(char*)));
     if (!*nuclides) {
       set_errmsg("Failed to allocate memory for nuclides array");
       return OPENMC_E_ALLOCATE;
@@ -683,6 +707,16 @@ int openmc_gendf_get_xs(int32_t lib_id, const char* nuclide, int32_t mt,
   if (!lib)
     return OPENMC_E_INVALID_ID;
 
+  // Validate the caller-supplied bound count before constructing a vector from
+  // the raw pointer. get_xs requires the count to match the library grid
+  // exactly (n_groups + 1); checking here avoids an out-of-bounds read (a
+  // negative count is read as a huge unsigned range, an oversized count over-
+  // reads the buffer) that would otherwise occur before get_xs's size check.
+  if (n_energy_bounds != lib->n_groups() + 1) {
+    set_errmsg("n_energy_bounds must equal the GENDF library group count + 1");
+    return OPENMC_E_INVALID_SIZE;
+  }
+
   try {
     // Create energy bounds vector for validation
     vector<double> bounds(energy_bounds, energy_bounds + n_energy_bounds);
@@ -692,7 +726,7 @@ int openmc_gendf_get_xs(int32_t lib_id, const char* nuclide, int32_t mt,
     *n_groups = xs.size();
 
     // Allocate output array
-    *xs_data = (double*)malloc(*n_groups * sizeof(double));
+    *xs_data = static_cast<double*>(malloc(*n_groups * sizeof(double)));
     if (!*xs_data) {
       set_errmsg("Failed to allocate memory for cross-section data");
       return OPENMC_E_ALLOCATE;
@@ -762,9 +796,9 @@ int openmc_gendf_get_production_xs(int32_t lib_id, const char* nuclide,
     int nl = levels.size();
     int ng = *n_groups;
 
-    *lfs_out = (int*)malloc(nl * sizeof(int));
-    *izap_out = (int*)malloc(nl * sizeof(int));
-    *xs_out = (double*)malloc(nl * ng * sizeof(double));
+    *lfs_out = static_cast<int*>(malloc(nl * sizeof(int)));
+    *izap_out = static_cast<int*>(malloc(nl * sizeof(int)));
+    *xs_out = static_cast<double*>(malloc(nl * ng * sizeof(double)));
 
     if (!*lfs_out || !*izap_out || !*xs_out) {
       free(*lfs_out);

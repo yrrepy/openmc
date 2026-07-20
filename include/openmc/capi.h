@@ -347,8 +347,14 @@ int openmc_gendf_library_free(int32_t lib_id);
 int openmc_gendf_library_get_n_groups(int32_t lib_id, int* n_groups);
 
 //! Get energy group boundaries from GENDF library
+//!
+//! The returned pointer borrows storage owned by the library (its internal
+//! std::vector). The caller must NOT free it; it is valid only until the
+//! library is freed with openmc_gendf_library_free, after which it dangles.
+//! Not thread-safe against concurrent destruction of the same library.
 //! \param[in] lib_id Library ID
-//! \param[out] bounds Pointer to energy bounds array
+//! \param[out] bounds Pointer to library-owned energy bounds array (do not
+//! free)
 //! \param[out] n Number of boundaries
 //! \return Error code
 int openmc_gendf_library_get_energy_bounds(
@@ -395,8 +401,8 @@ void openmc_gendf_free_nuclides(char** nuclides, int n);
 
 //! Get MF=10 production cross-sections for all levels of a reaction
 int openmc_gendf_get_production_xs(int32_t lib_id, const char* nuclide,
-  int32_t mt, int* n_levels, int* n_groups,
-  int** lfs_out, int** izap_out, double** xs_out);
+  int32_t mt, int* n_levels, int* n_groups, int** lfs_out, int** izap_out,
+  double** xs_out);
 
 //! Free arrays allocated by openmc_gendf_get_production_xs
 void openmc_gendf_free_production_xs(int* lfs, int* izap, double* xs);

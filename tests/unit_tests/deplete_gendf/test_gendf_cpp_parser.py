@@ -148,6 +148,30 @@ def test_mf3_nr2_xs_and_python_parity(tmp_path):
     np.testing.assert_allclose(cpp_xs, py_xs)
 
 
+def test_get_xs_rejects_bad_n_energy_bounds(tmp_path):
+    """C-API get_xs validates n_energy_bounds before building a vector (R1-33)."""
+    import ctypes
+
+    from openmc.lib import _dll
+    from openmc.exceptions import OpenMCError
+
+    lib_dir = tmp_path / 'gendf'
+    lib_dir.mkdir()
+    write_synthetic_gendf(lib_dir / 'Al27g.asc', 'nr_skip')
+    lib = lib_gendf.GENDFLibrary(str(lib_dir), ENERGY_BOUNDS, 'test-3g')
+
+    # Bypass the wrapper (which always passes len(energy_bounds)) and hit the raw
+    # C-API with counts that do not match the library grid (n_groups + 1). A
+    # negative/oversized count would otherwise over-read the raw pointer.
+    bounds = ENERGY_BOUNDS.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    xs = ctypes.POINTER(ctypes.c_double)()
+    ng = ctypes.c_int()
+    for bad_n in (-1, 0, len(ENERGY_BOUNDS) + 1):
+        with pytest.raises(OpenMCError):
+            _dll.openmc_gendf_get_xs(lib._lib_id, b'Al27', 102, bad_n, bounds,
+                                     ctypes.pointer(xs), ctypes.pointer(ng))
+
+
 def test_mf10_nr2_production_level(tmp_path):
     """MF=10 with NR=2: production level survives and has correct XS."""
     lib_dir = tmp_path / 'gendf'

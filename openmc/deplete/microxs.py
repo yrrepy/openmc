@@ -647,13 +647,13 @@ class _SparseXSTable:
     nuc_indices: np.ndarray
     rxn_indices: np.ndarray
 
-    def collapse(self, phi_norm: np.ndarray) -> np.ndarray:
+    def collapse(self, flux: np.ndarray) -> np.ndarray:
         """Collapse group XS against the supplied group weights.
 
         Pass a normalized flux (sum=1) to get one-group cross sections, or the
         raw group flux to get reaction rates (sigma_g * phi_g summed).
         """
-        collapsed_sparse = self.xs_matrix @ phi_norm
+        collapsed_sparse = self.xs_matrix @ flux
         result = np.zeros((len(self.nuclides), len(self.reactions)))
         result[self.nuc_indices, self.rxn_indices] = collapsed_sparse
         return result
