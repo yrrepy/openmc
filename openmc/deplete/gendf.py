@@ -821,57 +821,6 @@ class _PythonGENDFLibrary:
 
         return section_data
 
-    def _find_gendf_file(self, nuclide_name: str) -> Path:
-        """Find GENDF file for a nuclide, trying multiple naming conventions.
-
-        Parameters
-        ----------
-        nuclide_name : str
-            Nuclide name in OpenMC format (e.g., 'Al27', 'Ag110m')
-
-        Returns
-        -------
-        pathlib.Path
-            Path to the GENDF file
-
-        Raises
-        ------
-        KeyError
-            If file cannot be found with any naming convention
-        """
-        # Parse nuclide name (e.g., 'Al27', 'Ag110m' -> element='Al'/'Ag', mass=27/110, meta=''/m)
-        import re
-        match = re.match(r'([A-Z][a-z]?)(\d+)(m\d*)?', nuclide_name)
-        if not match:
-            raise ValueError(f"Cannot parse nuclide name: {nuclide_name}")
-
-        element = match.group(1)
-        mass = match.group(2)
-        meta = match.group(3) or ''
-
-        # Try multiple naming patterns
-        patterns = [
-            # Pattern 1: Leading zeros, 'g' suffix (ENDF-B8, TENDL, JEFF-3.x)
-            f"{element}{int(mass):03d}{meta}g.asc",
-            # Pattern 2: No leading zeros, 'g' suffix (JEFF-4.0)
-            f"{element}{mass}{meta}g.asc",
-            # Pattern 3: Leading zeros, no 'g' suffix (alternative)
-            f"{element}{int(mass):03d}{meta}.asc",
-            # Pattern 4: No leading zeros, no 'g' suffix (alternative)
-            f"{element}{mass}{meta}.asc",
-        ]
-
-        # Try each pattern
-        for pattern in patterns:
-            filepath = self.library_path / pattern
-            if filepath.exists():
-                return filepath
-
-        # If not found, raise error
-        raise KeyError(
-            f"Nuclide '{nuclide_name}' not found in GENDF library. "
-            f"Tried patterns: {patterns}")
-
     def _validate_metastable_name(self, preliminary_name: str):
         """Validate and correct metastable nuclide naming using MF=1 MT=451 metadata.
 
@@ -937,7 +886,7 @@ class _PythonGENDFLibrary:
         Parameters
         ----------
         nuclide_name : str
-            Nuclide name in OpenMC format (e.g., 'Ac225', 'Ag110m')
+            Nuclide name in OpenMC format (e.g., 'Ac225', 'Ag110_m1')
         require_full_parser : bool, optional
             If True, forces use of the full endf.Material parser.
             Required for accessing MF=10 data (isomeric branching).
@@ -973,36 +922,31 @@ class _PythonGENDFLibrary:
             else:
                 return cached
 
-        # Find the file (tries multiple naming patterns)
+        # Resolve the file from the exact-name index built by _build_file_index
         filepath = None
 
-        # First try direct lookup
         if nuclide_name in self._file_index:
             filepath = self._file_index[nuclide_name]
-        else:
-            # Try _find_gendf_file which handles multiple naming patterns
-            try:
-                filepath = self._find_gendf_file(nuclide_name)
-            except KeyError:
-                # For metastable nuclides, check if we have it under a different metastable level
-                import re
-                if '_m' in nuclide_name:
-                    match = re.match(r'([A-Z][a-z]?\d+)_m\d+', nuclide_name)
-                    if match:
-                        base = match.group(1)
-                        # Check all pending metastables with this base
-                        for pending_name in list(self._pending_metastable.keys()):
-                            if pending_name.startswith(base + '_m'):
-                                correct_name = self._validate_metastable_name(pending_name)
-                                if correct_name == nuclide_name:
-                                    # Found it after validation
-                                    filepath = self._file_index[correct_name]
-                                    break
+        elif '_m' in nuclide_name:
+            # Metastable rescue: the requested level may still be pending
+            # validation under a different preliminary _m level.
+            import re
+            match = re.match(r'([A-Z][a-z]?\d+)_m\d+', nuclide_name)
+            if match:
+                base = match.group(1)
+                # Check all pending metastables with this base
+                for pending_name in list(self._pending_metastable.keys()):
+                    if pending_name.startswith(base + '_m'):
+                        correct_name = self._validate_metastable_name(pending_name)
+                        if correct_name == nuclide_name:
+                            # Found it after validation
+                            filepath = self._file_index[correct_name]
+                            break
 
-                if not filepath:
-                    raise KeyError(
-                        f"Nuclide '{nuclide_name}' not found in GENDF library. "
-                        f"Available nuclides: {sorted(list(self._file_index.keys())[:10])}...")
+        if not filepath:
+            raise KeyError(
+                f"Nuclide '{nuclide_name}' not found in GENDF library. "
+                f"Available nuclides: {sorted(list(self._file_index.keys())[:10])}...")
 
         # Load material from file
         try:

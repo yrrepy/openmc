@@ -119,3 +119,54 @@ def test_parser_warnings_surface_to_stderr(tmp_path, capfd):
     combined = captured.err + captured.out
     assert 'WARNING' in combined
     assert 'Negative XS' in combined
+
+
+def test_metastable_not_resolved_to_ground_state(tmp_path):
+    """R1-1: a metastable request must not silently return ground-state data.
+
+    With only a ground-state file (Al27g.asc -> 'Al27') in the library, a
+    request for the metastable 'Al27_m1' (or the legacy 'Al27m' alias) must
+    report not-found on BOTH backends -- never fall back to the ground file.
+    The removed Python ``_find_gendf_file`` filename-guessing fallback used to
+    hand back the ground data for exactly this request. Pins backend parity of
+    the exact-name resolution rule.
+    """
+    from openmc.deplete.gendf import _PythonGENDFLibrary
+    from openmc.exceptions import OpenMCError
+
+    lib_dir = tmp_path / 'gendf'
+    lib_dir.mkdir()
+    write_synthetic_gendf(lib_dir / 'Al27g.asc', 'izap0')  # ground only
+
+    # --- Python backend --------------------------------------------------
+    # Instantiate the backend directly: the GENDFLibrary factory auto-selects
+    # C++ when the compiled lib is present and no decay_file is given.
+    py = _PythonGENDFLibrary(
+        lib_dir, validate_energy_grid=False, _energy_structure='CCFE-709')
+
+    # Ground state resolves and carries MF=3 data.
+    assert py.has_nuclide('Al27') is True
+    assert (3, 102) in py._load_material('Al27').section_data
+
+    # Canonical metastable: not found, and access raises KeyError (no fallback
+    # to the ground file).
+    assert py.has_nuclide('Al27_m1') is False
+    with pytest.raises(KeyError):
+        py.get_xs('Al27_m1', 102)
+
+    # Legacy alias spelling (ground name + 'm', no underscore): also rejected
+    # (the removed alias acceptance).
+    assert py.has_nuclide('Al27m') is False
+    with pytest.raises(KeyError):
+        py.get_xs('Al27m', 102)
+
+    # --- C++ backend (parity) -------------------------------------------
+    # Guarded by the module-level pytest.importorskip('openmc.lib.gendf').
+    cpp = lib_gendf.GENDFLibrary(str(lib_dir), ENERGY_BOUNDS, 'test-3g')
+
+    assert cpp.has_nuclide('Al27') is True
+    np.testing.assert_allclose(cpp.get_xs('Al27', 102, ENERGY_BOUNDS), MF3_XS)
+
+    assert cpp.has_nuclide('Al27_m1') is False
+    with pytest.raises(OpenMCError):
+        cpp.get_xs('Al27_m1', 102, ENERGY_BOUNDS)
