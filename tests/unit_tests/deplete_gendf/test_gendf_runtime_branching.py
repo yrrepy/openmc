@@ -20,7 +20,6 @@ warn-dedup reset and the ``ir192_lookup`` fixture.
 """
 
 import inspect
-import os
 import warnings
 from unittest.mock import Mock
 
@@ -49,9 +48,6 @@ from .gendf_testing import (
 ENERGIES = GROUP_STRUCTURES['CCFE-709']
 NG = len(ENERGIES) - 1
 AG109_MASK = (ENERGIES[:-1] >= 1e5) & (ENERGIES[:-1] < 1e7)
-
-# C++ source (one directory deeper than the pre-consolidation location)
-_SRC_DIR = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'src')
 
 # 3-group grid; ground XS=[8,4,0], m1 XS=[2,4,0] (runtime build_runtime tests)
 ENERGY_BOUNDS_3G = np.array([0.0, 1.0, 2.0, 3.0])
@@ -132,38 +128,6 @@ def test_python_backend_runtime_requires_lfs():
     with pytest.raises(ValueError, match="lfs_values required"):
         _PythonGENDFLibrary.get_branching_ratios(
             mock_lib, 'Ir191', 102, target_names=['Ir192'], lfs_values=None)
-
-
-@pytest.mark.parametrize('names, lfs, expected', [
-    (['Ir192', 'Ir192_m1', 'Ir192_m2'], [0, 3, 15], {'Ir192_m1': 3, 'Ir192_m2': 15}),
-    (['Ir192'], [0], {}),
-    (['X', 'X_m1', 'X_m2'], [0, 1, 3], {'X_m1': 1, 'X_m2': 3}),
-    (['Y', 'Y_m1'], [0, 2], {'Y_m1': 2}),
-])
-def test_lfs_mapping_construction(names, lfs, expected):
-    """lfs_mapping keeps only lfs>0 (ground excluded); shared C++/Python rule."""
-    mapping = {n: l for n, l in zip(names, lfs) if l > 0}
-    assert mapping == expected
-
-
-def test_mt_lfs_key_no_collision():
-    """MT*1000 + LFS is collision-free over valid MT/LFS ranges."""
-    seen = set()
-    for mt in range(1, 892):
-        for lfs in range(0, 51):
-            key = mt * 1000 + lfs
-            assert key not in seen
-            seen.add(key)
-
-
-@pytest.mark.parametrize('mt, lfs, key', [
-    (102, 0, 102000), (102, 3, 102003), (102, 15, 102015),
-    (16, 0, 16000), (16, 2, 16002), (891, 50, 891050),
-])
-def test_lfs_extraction_from_key(mt, lfs, key):
-    """LFS recovers from the MT*1000+LFS composite key."""
-    assert mt * 1000 + lfs == key
-    assert key - mt * 1000 == lfs
 
 
 # ============================================================================
@@ -438,15 +402,6 @@ def test_c_api_get_production_xs_signature():
     assert 'mt' in params
 
 
-@pytest.mark.parametrize('field',
-                         ['prod_energy_data', 'prod_xs_data', 'prod_izap_data'])
-def test_parser_mf10_save_points(field):
-    """Parser saves each MF=10 data map at all three transition points."""
-    with open(os.path.join(_SRC_DIR, 'gendf_parser.cpp')) as f:
-        content = f.read()
-    assert content.count(f'result.{field}[key]') == 3
-
-
 # ============================================================================
 # 4. Helper weighting (IsomericBranchingHelper)
 # ============================================================================
@@ -587,9 +542,10 @@ def test_weighted_conservation():
     helper = IsomericBranchingHelper(chain, gendf)
 
     result = helper.weighted_branching_ratios(flux)
-    if 'Test' in result and '(n,gamma)' in result['Test']:
-        total = sum(result['Test']['(n,gamma)'].values())
-        assert np.isclose(total, 1.0)
+    assert 'Test' in result
+    assert '(n,gamma)' in result['Test']
+    total = sum(result['Test']['(n,gamma)'].values())
+    assert np.isclose(total, 1.0)
 
 
 def test_weighted_branching_with_embedded():
@@ -630,11 +586,12 @@ def test_target_filtering_with_reduced_chain():
     helper = IsomericBranchingHelper(chain, gendf)
 
     result = helper.weighted_branching_ratios(np.ones(NG))
-    if 'Ag109' in result and '(n,gamma)' in result['Ag109']:
-        ratios = result['Ag109']['(n,gamma)']
-        assert 'Ag110' in ratios
-        assert 'Ag110_m1' not in ratios
-        assert np.isclose(ratios['Ag110'], 1.0)
+    assert 'Ag109' in result
+    assert '(n,gamma)' in result['Ag109']
+    ratios = result['Ag109']['(n,gamma)']
+    assert 'Ag110' in ratios
+    assert 'Ag110_m1' not in ratios
+    assert np.isclose(ratios['Ag110'], 1.0)
 
 
 def test_independent_operator_ignores_flux_bounds():

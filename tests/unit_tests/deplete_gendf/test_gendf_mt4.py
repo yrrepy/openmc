@@ -362,29 +362,6 @@ def test_self_transmutation_chain_structure(tmp_path):
     assert "(n,n')" in reactions
 
 
-def test_branching_ratios_sum_to_unity():
-    """Verify isomeric branching ratios sum to 1.0 for mass conservation."""
-    # In115 example from implementation plan
-    branching = {
-        'In115': 0.85,  # Ground state
-        'In115_m1': 0.15  # Metastable
-    }
-    total = sum(branching.values())
-    assert abs(total - 1.0) < 1e-10, f"Branching ratios sum to {total}, not 1.0"
-
-
-def test_three_way_branching_ratios():
-    """Test that three-way branching (NS=3) sums correctly for Ir192."""
-    # Example branching at ~5 MeV from implementation_inelastic_activation.md
-    branching_5mev = {
-        'Ir192': 0.74,      # 74% ground
-        'Ir192_m1': 0.22,   # 22% m1
-        'Ir192_m2': 0.04    # 4% m2
-    }
-    total = sum(branching_5mev.values())
-    assert abs(total - 1.0) < 1e-10
-
-
 def test_chain_xml_with_nn_prime(tmp_path):
     """Test that chain XML with (n,n') reactions loads correctly."""
     from openmc.deplete import Chain
