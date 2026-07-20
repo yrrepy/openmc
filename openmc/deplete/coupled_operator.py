@@ -189,6 +189,8 @@ class CoupledOperator(OpenMCOperator):
         - False: Original behavior. Isomeric states treated independently.
           May cause isomeric branching failures with partial exclusions.
 
+        .. versionadded:: 0.15.4
+
     diff_volume_method : str
         Specifies how the volumes of the new materials should be found. Default
         is to 'divide equally' which divides the original material volume
@@ -216,10 +218,6 @@ class CoupledOperator(OpenMCOperator):
 
         .. versionadded:: 0.15.4
 
-        .. versionadded:: 0.15.4
-        .. versionchanged:: 0.15.4
-            Now fully functional with ``direct_with_flux`` mode for isomeric
-            branching (previously placeholder only).
     Attributes
     ----------
     model : openmc.model.Model

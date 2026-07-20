@@ -590,7 +590,7 @@ class Integrator(ABC):
         each interval is subdivided into `substeps` identical sub-intervals
         and LU factorizations are reused across them, improving accuracy
         for nuclides with large decay-constant × timestep products.
-        Only used when `solver` is ``cram48"`` or ``cram16``.
+        Only used when `solver` is ``cram48`` or ``cram16``.
 
         .. versionadded:: 0.15.3
     continue_timesteps : bool, optional
@@ -609,8 +609,9 @@ class Integrator(ABC):
         solve, nuclides with density below this value are clipped to
         zero. CRAM can produce small negative values for nearly-depleted
         nuclides; setting this to 0.0 clips only negatives. A typical
-        value is 1e-20. For multi-stage integrators (CE/CM, CF4, etc.),
-        clipping is applied after each CRAM sub-step.
+        value is 1e-20. Clipping is applied after each integrator stage's
+        CRAM solve (i.e. after every ``deplete()`` call), not between the
+        internal ``substeps`` of a single solve.
 
         .. versionadded:: 0.15.4
 
@@ -924,7 +925,7 @@ class Integrator(ABC):
             path: PathLike = 'depletion_results.h5',
             write_rates: bool = False,
             hdf5_dtype: str = 'float64',
-            hdf5_compression: str = None,
+            hdf5_compression: Optional[str] = None,
         ):
         """Perform the entire depletion process across all steps
 
@@ -1229,8 +1230,9 @@ class SIIntegrator(Integrator):
         solve, nuclides with density below this value are clipped to
         zero. CRAM can produce small negative values for nearly-depleted
         nuclides; setting this to 0.0 clips only negatives. A typical
-        value is 1e-20. For multi-stage integrators (CE/CM, CF4, etc.),
-        clipping is applied after each CRAM sub-step.
+        value is 1e-20. Clipping is applied after each integrator stage's
+        CRAM solve (i.e. after every ``deplete()`` call), not between the
+        internal ``substeps`` of a single solve.
 
         .. versionadded:: 0.15.4
 

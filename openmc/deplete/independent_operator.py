@@ -69,7 +69,9 @@ class IndependentOperator(OpenMCOperator):
         ``"normalization_mode" == "fission-q"``.
     reduce_chain_level : int, optional
         Depth of the search when reducing the depletion chain. The default
-        value of ``None`` implies no limit on the depth.
+        value of ``None`` implies no limit on the depth. Not supported when
+        the operator is created via :meth:`from_microxs_file` (raises
+        ``ValueError``).
     keep_isomeric_siblings : bool, optional
         Whether to keep all isomeric state siblings together during chain
         reduction. Only takes effect when the chain carries
@@ -81,6 +83,8 @@ class IndependentOperator(OpenMCOperator):
           isomeric branching calculations. May increase chain size by 10-30%.
         - False: Original behavior. Isomeric states treated independently.
           May cause isomeric branching failures with partial exclusions.
+
+        .. versionadded:: 0.15.4
 
     fission_yield_opts : dict of str to option, optional
         Optional arguments to pass to the

@@ -7,6 +7,7 @@ timestep.
 import copy
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import h5py
 import numpy as np
@@ -574,7 +575,7 @@ class StepResult:
         write_rates: bool = False,
         path: PathLike = "depletion_results.h5",
         hdf5_dtype: str = 'float64',
-        hdf5_compression: str = None,
+        hdf5_compression: Optional[str] = None,
     ):
         """Creates and writes depletion results to disk
 

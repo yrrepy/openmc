@@ -1311,7 +1311,7 @@ def write_global_microxs_hdf5(
     Stores cross section data for every burnable material in a stacked 4D
     dataset that can be efficiently subset-read by individual MPI ranks
     using :func:`read_local_microxs_hdf5`.
-    This is meant to reduce RAM usage by each individal rank and enable greater MPI scaling.
+    This is meant to reduce RAM usage by each individual rank and enable greater MPI scaling.
     
     .. versionadded:: 0.15.4
 
@@ -1435,7 +1435,7 @@ def read_local_microxs_hdf5(
 
     Reads only the rows corresponding to ``local_mat_ids`` from the stacked
     dataset, using h5py fancy indexing for efficient I/O.
-    This is meant to reduce RAM usage by each individal rank and enable greater MPI scaling.
+    This is meant to reduce RAM usage by each individual rank and enable greater MPI scaling.
 
     .. versionadded:: 0.15.4
 
