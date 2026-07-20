@@ -699,7 +699,7 @@ class _PythonGENDFLibrary:
                     preliminary_name = raw_name + openmc_suffix
 
                 # Store filepath and mark as needing validation
-                self._file_index[preliminary_name] = filepath
+                self._register_file(preliminary_name, filepath)
                 self._pending_metastable[preliminary_name] = True
 
             else:
@@ -720,7 +720,17 @@ class _PythonGENDFLibrary:
                     # If parsing fails, use raw name
                     nuclide_name = raw_name
 
-                self._file_index[nuclide_name] = filepath
+                self._register_file(nuclide_name, filepath)
+
+    def _register_file(self, name: str, filepath: Path):
+        """Index name->filepath, raising if two files map to the same nuclide."""
+        existing = self._file_index.get(name)
+        if existing is not None and existing != filepath:
+            raise ValueError(
+                f"GENDF library at {self.library_path} maps two files to "
+                f"nuclide '{name}': '{existing.name}' and '{filepath.name}'. "
+                f"Remove or rename one so the cross sections are unambiguous.")
+        self._file_index[name] = filepath
 
     def _parse_gendf_mf3_only(self, filepath: Path) -> dict:
         """Fast parser that only extracts MF=3 (cross-section) data.
@@ -852,10 +862,12 @@ class _PythonGENDFLibrary:
 
             # Update index if name changed
             if correct_name != preliminary_name:
-                # Remove old entry
+                # A LISO-corrected name that lands on an existing entry is the
+                # same collision as in _build_file_index: raise rather than
+                # silently overwrite another file's cross sections.
+                self._register_file(correct_name, filepath)
+                # Remove old (preliminary) entry
                 del self._file_index[preliminary_name]
-                # Add with correct name
-                self._file_index[correct_name] = filepath
                 # Invalidate nuclides set cache (keys changed)
                 self._nuclides_set_cache = None
 
@@ -1109,6 +1121,7 @@ class _PythonGENDFLibrary:
     def get_all_xs(
         self,
         nuclide_name: str,
+        *,
         strict_alignment: bool = True,
         mts: Optional[list[int]] = None
     ) -> dict[int, np.ndarray]:

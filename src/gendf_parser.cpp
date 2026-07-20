@@ -349,10 +349,6 @@ GENDFParseResult parse_gendf_validated(
               "ZA validation in " + basename + " (MF=1, MT=451): " + za_error);
           }
         }
-
-        if (result.zam == 0) {
-          result.zam = result.za;
-        }
       }
     }
 
@@ -610,7 +606,7 @@ void emit_gendf_warnings(
 
 void parse_gendf_mf3_only(const std::string& filename,
   std::unordered_map<int, vector<double>>& xs_data,
-  std::unordered_map<int, vector<double>>& energy_data, int& za, int& zam)
+  std::unordered_map<int, vector<double>>& energy_data, int& za)
 {
   // Use validated parser with minimal warnings for performance
   // This ensures consistent behavior and validation across both entry points
@@ -635,7 +631,6 @@ void parse_gendf_mf3_only(const std::string& filename,
   xs_data = std::move(result.xs_data);
   energy_data = std::move(result.energy_data);
   za = result.za;
-  zam = result.zam;
 }
 
 } // namespace openmc

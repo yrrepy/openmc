@@ -25,6 +25,7 @@ from openmc.deplete.gendf import (
     DecayState,
     GENDFLibrary,
     IsomericBranching,
+    _PythonGENDFLibrary,
     elis_match,
     lookup_liso,
     parse_decay_isomeric_levels,
@@ -246,6 +247,16 @@ def test_parse_decay_directory_format_detection(tmp_path):
     # Just verify it doesn't crash on empty directory
     result = parse_decay_isomeric_levels(tmp_path)
     assert isinstance(result, dict)
+
+
+def test_file_index_collision_raises(tmp_path):
+    """Two files normalizing to the same nuclide name raise, not silently overwrite (R1-9)."""
+    (tmp_path / 'Al027g.asc').write_text('')
+    (tmp_path / 'Al27g.asc').write_text('')
+    lib = _PythonGENDFLibrary.__new__(_PythonGENDFLibrary)
+    lib.library_path = tmp_path
+    with pytest.raises(ValueError, match="two files"):
+        lib._build_file_index()
 
 
 # =============================================================================

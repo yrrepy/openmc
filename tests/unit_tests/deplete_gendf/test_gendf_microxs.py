@@ -24,6 +24,7 @@ from openmc import Material
 from openmc.deplete import Flux, IndependentOperator, MicroXS
 from openmc.deplete.helpers import GENDFFluxCollapseHelper
 from openmc.deplete.microxs import (
+    _build_sparse_xs_table,
     write_global_microxs_hdf5,
     read_local_microxs_hdf5,
 )
@@ -64,15 +65,19 @@ def test_flux_default_energy_bounds_none():
     assert f.energy_bounds is None
 
 
-def test_flux_slice_keeps_energy_bounds():
-    """__array_finalize__ propagates energy_bounds through views/slices."""
+def test_flux_energy_bounds_shape_tracking():
+    """energy_bounds survives shape-preserving ops but is dropped on length change (R1-20)."""
     eb = np.array([0.0, 1.0, 2.0, 3.0])
     f = Flux([1.0, 2.0, 3.0], energy_bounds=eb)
+    # Shape-preserving ops keep the (still-valid) bounds
+    np.testing.assert_array_equal((f + 1).energy_bounds, eb)
+    np.testing.assert_array_equal((f * 2.0).energy_bounds, eb)
+    # Length-changing slices would leave stale bounds -> must be dropped
     sl = f[1:]
     assert isinstance(sl, Flux)
-    np.testing.assert_array_equal(sl.energy_bounds, eb)
-    # Arithmetic results keep the attribute too
-    assert (f + 1).energy_bounds is not None
+    assert sl.energy_bounds is None
+    # Reductions (0-d result) must not keep bounds either
+    assert getattr(f.sum(), 'energy_bounds', None) is None
 
 
 def test_flux_pickle_roundtrip():
@@ -175,6 +180,14 @@ def test_collapse_matches_hand_calculation():
         [3 * xs_ng @ flux[1], 0.0, xs_n2n @ flux[1]],
     ])
     assert np.allclose(rates, expected)
+
+
+def test_build_sparse_xs_table_duplicate_mt_raises():
+    """Duplicate MTs collapse a table column silently; the builder must raise (R1-21)."""
+    gendf = MockGENDFLibrary({'Al27': {102: np.ones(NG)}})
+    with pytest.raises(ValueError, match="Duplicate reaction MT"):
+        _build_sparse_xs_table(
+            gendf, ['Al27'], ['(n,gamma)', '(n,gamma)_dup'], [102, 102])
 
 
 def test_missing_nuclide_zero_rates_and_single_warning():

@@ -85,7 +85,16 @@ class Flux(np.ndarray):
     def __array_finalize__(self, obj):
         if obj is None:
             return
-        self.energy_bounds = getattr(obj, 'energy_bounds', None)
+        # Only carry the group boundaries when the array length still matches
+        # the group structure (len(bounds) == len(self) + 1). Views/ufuncs that
+        # preserve shape (e.g. flux * 2.0) keep them; slices and reductions that
+        # change the length would leave stale bounds, so drop them.
+        bounds = getattr(obj, 'energy_bounds', None)
+        if (bounds is not None and self.ndim == 1
+                and len(bounds) == self.shape[0] + 1):
+            self.energy_bounds = bounds
+        else:
+            self.energy_bounds = None
 
     def __reduce__(self):
         # Append energy_bounds to ndarray's pickle state
@@ -678,6 +687,20 @@ def _build_sparse_xs_table(
         raise ValueError(
             f"reactions ({len(reactions)}) and mts ({len(mts)}) "
             f"must have same length")
+
+    # Each MT maps to exactly one table column; duplicate MTs would collapse
+    # in mt_to_rxn_idx and silently zero one reaction's column. Fail loudly.
+    if len(set(mts)) != len(mts):
+        seen = {}
+        dups = []
+        for name, mt in zip(reactions, mts):
+            if mt in seen:
+                dups.append(f"'{seen[mt]}' and '{name}' (MT={mt})")
+            else:
+                seen[mt] = name
+        raise ValueError(
+            "Duplicate reaction MT numbers requested for the GENDF sparse "
+            "table; each MT maps to a single column: " + "; ".join(dups))
 
     n_groups = gendf_library.n_groups
     rows = []

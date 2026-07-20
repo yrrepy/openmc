@@ -169,7 +169,6 @@ void GENDFMaterial::load_from_file(const std::string& filename)
   emit_gendf_warnings(result.warnings, nuclide_name_);
 
   za_ = result.za;
-  zam_ = result.zam;
   xs_data_ = std::move(result.xs_data);
   energy_data_ = std::move(result.energy_data);
   prod_xs_data_ = std::move(result.prod_xs_data);
@@ -283,7 +282,7 @@ void GENDFMaterial::parse_mf3_only(const std::string& filename)
 {
   std::filesystem::path p(filename);
   nuclide_name_ = convert_gendf_to_openmc_name(p.stem().string());
-  parse_gendf_mf3_only(filename, xs_data_, energy_data_, za_, zam_);
+  parse_gendf_mf3_only(filename, xs_data_, energy_data_, za_);
 }
 
 //==============================================================================

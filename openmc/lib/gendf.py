@@ -410,7 +410,7 @@ class GENDFLibrary:
 
         return xs_array
 
-    def get_all_xs(self, nuclide: str,
+    def get_all_xs(self, nuclide: str, *,
                    mts: Optional[list[int]] = None) -> dict[int, np.ndarray]:
         """Get cross-sections for all requested reactions for a nuclide.
 

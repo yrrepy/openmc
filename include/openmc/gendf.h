@@ -42,8 +42,7 @@ struct GENDFParserOptions {
 
 //! Result from parsing with diagnostics
 struct GENDFParseResult {
-  int za {0};  //!< Z*1000 + A
-  int zam {0}; //!< Z*1000 + A + isomeric state
+  int za {0};                                      //!< Z*1000 + A
   std::unordered_map<int, vector<double>> xs_data; //!< MT -> cross-sections
   std::unordered_map<int, vector<double>>
     energy_data; //!< MT -> energy boundaries
@@ -122,14 +121,12 @@ public:
 
   // Accessors
   const std::string& nuclide_name() const { return nuclide_name_; }
-  int za() const { return za_; }   //!< Z*1000 + A
-  int zam() const { return zam_; } //!< Z*1000 + A + isomeric state
+  int za() const { return za_; } //!< Z*1000 + A
 
 private:
   // Data members
   std::string nuclide_name_; //!< Nuclide name (e.g., "U235")
   int za_ {0};               //!< Z*1000 + A
-  int zam_ {0};              //!< Z*1000 + A + isomeric state
 
   //! MF=3 cross-section data: map MT -> vector<double> (one value per group)
   std::unordered_map<int, vector<double>> xs_data_;
@@ -254,10 +251,9 @@ std::string convert_gendf_to_openmc_name(const std::string& stem);
 //! \param[out] xs_data Map of MT -> vector<double> (cross-sections)
 //! \param[out] energy_data Map of MT -> vector<double> (energy boundaries)
 //! \param[out] za Z*1000 + A
-//! \param[out] zam Z*1000 + A + isomeric state
 void parse_gendf_mf3_only(const std::string& filename,
   std::unordered_map<int, vector<double>>& xs_data,
-  std::unordered_map<int, vector<double>>& energy_data, int& za, int& zam);
+  std::unordered_map<int, vector<double>>& energy_data, int& za);
 
 //! Parse GENDF file with validation and diagnostics (G9 fix)
 //! \param[in] filename Path to GENDF .asc file
