@@ -529,6 +529,15 @@ The flags themselves are added to an existing chain with the
 ``MF=10`` sections and a decay file to resolve each final state to an OpenMC
 isomer name.
 
+An in-chain :math:`(n,n')` reaction is a parent-to-parent self-loop (same
+:math:`Z`, same :math:`A`), so on its own it is net-zero in the transmutation
+matrix and does not change the inventory. It is present only as the carrier for
+the runtime GENDF isomeric split: the ``<isomeric_branching>`` flags on that
+reaction redirect part of the rate onto the metastable target. A
+:math:`(n,n')` entry that carries no such branching therefore has no effect, and
+these inert self-loops can be dropped from the chain with the patcher's
+``--prune-nn-prime-self-loops`` flag.
+
 Caveats and limitations
 -----------------------
 

@@ -39,7 +39,10 @@ _logger = logging.getLogger(__name__)
 ELIS_RTOL = 0.50   # 50% relative tolerance
 ELIS_ATOL = 0.0    # No absolute tolerance (rtol-only)
 
-# Dedup store for once-per-(Z, A) ELIS ambiguity warnings
+# Dedup store for once-per-(Z, A) ELIS ambiguity warnings.
+# Reset at the start of every parse_decay_isomeric_levels() call so each
+# library load gets its warnings again (a long-lived process that loads
+# several libraries is not silenced after the first).
 _WARNED_ELIS_AMBIGUITY: set = set()
 
 
@@ -413,6 +416,10 @@ def parse_decay_isomeric_levels(
     lookup_liso : Find LISO for given excitation energy
     DecayState : Data class for nuclear state information
     """
+    # New library load: re-arm the once-per-(Z, A) ambiguity warnings so a
+    # second load in the same process is not silently deduped against the first.
+    _WARNED_ELIS_AMBIGUITY.clear()
+
     decay_path = Path(decay_path)
 
     if not decay_path.exists():

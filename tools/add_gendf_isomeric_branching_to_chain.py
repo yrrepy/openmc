@@ -245,17 +245,10 @@ def build_parser():
     )
 
     parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        default=True,
-        help='Enable verbose output (default: True)'
-    )
-
-    parser.add_argument(
         '-q', '--quiet',
         action='store_true',
         default=False,
-        help='Disable verbose output'
+        help='Disable the verbose progress output (on by default)'
     )
 
     parser.add_argument(
@@ -2660,7 +2653,7 @@ if __name__ == '__main__':
     # Get library configuration
     config = LIBRARY_CONFIGS[args.library]
 
-    # Determine verbose setting (--quiet overrides --verbose)
+    # Verbose output is the default; --quiet is the opt-out
     verbose = not args.quiet
 
     # Build output filenames with mapping suffix

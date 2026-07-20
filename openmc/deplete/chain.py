@@ -135,8 +135,8 @@ def _load_isomeric_branching_targets(root):
       alongside ``targets``/``gendf_lfs``.
 
     The per-pathway Q list is retained in ``q_data`` purely so the writer can
-    re-emit it losslessly (round-trip fidelity); it is not consumed at runtime
-    (Q does not enter :meth:`form_rxn_matrix`).
+    re-emit it via ``str()`` at full float precision (an exact round-trip); it
+    is not consumed at runtime (Q does not enter :meth:`form_rxn_matrix`).
     """
     from openmc._xml import get_text
 
@@ -358,7 +358,8 @@ def _write_isomeric_branching_targets(root_elem, targets_data, lfs_data=None,
                 continue
             emitted.add(rx_type)
 
-            # Embedded ratios take precedence: emit the lossless legacy form and
+            # Embedded ratios take precedence: emit the legacy <isomeric_yields>
+            # form (energies and ratios at %.6e, i.e. 7 significant figures) and
             # leave the reaction's scalar target/Q untouched.
             if has_embedded:
                 _write_embedded_yields(reaction_elem,
@@ -869,8 +870,9 @@ class Chain:
 
         .. versionadded:: 0.15.3
             Isomeric branching data is now included in exported XML files.
-            Both flag-only branching (targets, ``gendf_lfs``, per-pathway Q)
-            and embedded energy-dependent ratios round-trip losslessly.
+            Flag-only branching (targets, ``gendf_lfs``, per-pathway Q)
+            round-trips exactly, while embedded energy-dependent ratios
+            round-trip to 7 significant figures (``%.6e``).
 
         Parameters
         ----------
@@ -883,7 +885,8 @@ class Chain:
             root_elem.append(nuclide.to_xml_element())
 
         # Write isomeric branching data if present. Flags (targets + gendf_lfs)
-        # and embedded energy-dependent ratios both round-trip losslessly.
+        # round-trip exactly; embedded energy-dependent ratios round-trip to 7
+        # significant figures (%.6e).
         if (self.isomeric_branching_targets is not None
                 or self.isomeric_branching_embedded is not None):
             _write_isomeric_branching_targets(root_elem,
