@@ -422,6 +422,15 @@ def test_m4_embedded_roundtrip(tmp_path):
     gamma = next(r for r in reloaded['Ag107'].reactions if r.type == '(n,gamma)')
     assert gamma.target == 'Ag108'
 
+    # A malformed embedded ratio block (row count != target count) must raise
+    # rather than silently downgrade to flags form and drop the ratios.
+    bad = _EMBEDDED_XML.replace(
+        "          9.000000e-01 8.000000e-01\n", "")
+    bad_src = tmp_path / "emb_bad.xml"
+    bad_src.write_text(bad)
+    with pytest.raises(ValueError, match="Malformed <isomeric_yields>"):
+        Chain.from_xml(bad_src)
+
 
 def test_minor2_malformed_gendf_lfs(tmp_path):
     """A non-integer gendf_lfs token warns and is skipped, chain still loads."""

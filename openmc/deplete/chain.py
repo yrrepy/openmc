@@ -232,7 +232,10 @@ def _load_isomeric_branching_targets(root):
                                 f"{nuc_name}/{rx_type}, ignoring Q")
                 continue
 
-            # Legacy <isomeric_yields> with embedded ratios
+            # Legacy <isomeric_yields> with embedded ratios. These blocks are
+            # machine-generated (GENDF chain patcher), so a malformed ratio
+            # block means a corrupted/hand-edited file -- raise loudly rather
+            # than silently degrade to flags form and lose the ratios.
             legacy_elem = reaction_elem.find('isomeric_yields')
             if legacy_elem is not None:
                 targets_elem = legacy_elem.find('targets')
@@ -241,38 +244,52 @@ def _load_isomeric_branching_targets(root):
                 targets = targets_elem.text.split()
                 if not targets:
                     continue
-                nuc_reactions[rx_type] = targets
 
+                ctx = f"<isomeric_yields> for {nuc_name}/{rx_type}"
                 energies_elem = legacy_elem.find('energies')
                 branching_elem = legacy_elem.find('branching_ratios')
-                if (energies_elem is not None and energies_elem.text
-                        and branching_elem is not None and branching_elem.text):
-                    try:
-                        energies = np.array([float(e) for e in
-                                             energies_elem.text.split()])
-                        lines = []
-                        for line in branching_elem.text.strip().split('\n'):
-                            line = line.strip()
-                            if line and not line.startswith('<!--'):
-                                if '<!--' in line:
-                                    line = line[:line.index('<!--')].strip()
-                                if line:
-                                    lines.append(line)
-                        if len(lines) == len(targets):
-                            br = {}
-                            for target, line in zip(targets, lines):
-                                ratios = np.array([float(r) for r in
-                                                   line.split()])
-                                if len(ratios) == len(energies):
-                                    br[target] = ratios
-                            if br:
-                                embedded_data[(nuc_name, rx_type)] = {
-                                    'energies': energies,
-                                    'targets': targets,
-                                    'branching_ratios': br
-                                }
-                    except (ValueError, AttributeError):
-                        pass
+                if (energies_elem is None or not energies_elem.text
+                        or branching_elem is None or not branching_elem.text):
+                    raise ValueError(
+                        f"Malformed {ctx}: missing <energies> or "
+                        "<branching_ratios> text")
+
+                try:
+                    energies = np.array([float(e) for e in
+                                         energies_elem.text.split()])
+                    lines = []
+                    for line in branching_elem.text.strip().split('\n'):
+                        line = line.strip()
+                        if line and not line.startswith('<!--'):
+                            if '<!--' in line:
+                                line = line[:line.index('<!--')].strip()
+                            if line:
+                                lines.append(line)
+                    ratio_rows = [np.array([float(r) for r in line.split()])
+                                  for line in lines]
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Malformed {ctx}: non-numeric ratio text ({exc})"
+                    ) from exc
+
+                if len(ratio_rows) != len(targets):
+                    raise ValueError(
+                        f"Malformed {ctx}: {len(ratio_rows)} ratio rows != "
+                        f"{len(targets)} targets")
+                br = {}
+                for target, ratios in zip(targets, ratio_rows):
+                    if len(ratios) != len(energies):
+                        raise ValueError(
+                            f"Malformed {ctx}: target {target} has "
+                            f"{len(ratios)} ratios != {len(energies)} energies")
+                    br[target] = ratios
+
+                nuc_reactions[rx_type] = targets
+                embedded_data[(nuc_name, rx_type)] = {
+                    'energies': energies,
+                    'targets': targets,
+                    'branching_ratios': br,
+                }
 
         if nuc_reactions:
             targets_data[nuc_name] = nuc_reactions

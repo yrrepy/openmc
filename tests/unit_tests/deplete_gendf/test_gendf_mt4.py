@@ -460,8 +460,11 @@ def test_form_matrix_with_nn_prime(tmp_path):
     rates = reaction_rates.ReactionRates(["mat1"], nuclides, chain.reactions)
     rates.set("mat1", "In115", "(n,n')", 1e-10)  # 1e-10 s^-1 reaction rate
 
-    # Form the depletion matrix
-    matrix = chain.form_matrix(rates[0])
+    # Apply the runtime isomeric distribution -- without it the (n,n') reaction
+    # only self-loops In115->In115 and the metastable path is never exercised.
+    reaction_rate = 1e-10
+    iso = {'In115': {"(n,n')": {'In115': 0.85, 'In115_m1': 0.15}}}
+    matrix = chain.form_matrix(rates[0], isomeric_branching=iso)
 
     # Matrix should be sparse
     assert sp.issparse(matrix)
@@ -470,18 +473,19 @@ def test_form_matrix_with_nn_prime(tmp_path):
     i_in115 = chain.nuclide_dict['In115']
     i_in115_m1 = chain.nuclide_dict['In115_m1']
 
-    # Convert to dense for inspection
+    # Convert to dense for inspection. Matrix is [row, col]; col is the source.
     dense = matrix.toarray()
 
-    # Check that there is transfer from In115 to In115_m1
-    # The matrix element [In115_m1, In115] should be positive (production)
-    # Note: Matrix is [row, col] where col is the source nuclide
+    # Metastable production = reaction_rate * metastable branching ratio.
     transfer_rate = dense[i_in115_m1, i_in115]
+    assert transfer_rate == pytest.approx(reaction_rate * 0.15)
 
-    # Due to isomeric branching with 0.15 ratio the production rate is
-    # reaction_rate * branching_ratio; just verify there's positive transfer.
-    assert transfer_rate >= 0, \
-        f"Expected positive transfer rate to In115_m1, got {transfer_rate}"
+    # Ground self-term = parent loss (-rate) + ground branch gain (+rate*0.85).
+    assert dense[i_in115, i_in115] == pytest.approx(reaction_rate * (0.85 - 1.0))
+
+    # (n,n') conserves nuclide count: the In115 source column (pure reaction,
+    # In115 is stable) sums to zero across parent-loss and both product-gains.
+    assert dense[:, i_in115].sum() == pytest.approx(0.0, abs=1e-20)
 
 
 # ==============================================================================
