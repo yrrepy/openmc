@@ -29,6 +29,127 @@ int n_gendf_libraries {0};
 } // namespace data
 
 //==============================================================================
+// Group-grid alignment (shared by MF=3 and MF=10 lanes)
+//==============================================================================
+
+namespace {
+
+//! Align a GENDF section onto the full library group grid.
+//!
+//! Mirrors the Python backend's _align_to_group_grid. Coverage is decided from
+//! the stored ENERGY grid, never from the value count: a full-range section has
+//! one energy point per group boundary (size == n_groups + 1), and its last
+//! cross section is the TAB1 top-boundary dummy y(NP) which is dropped. A
+//! threshold section stores n_real = energies.size() - 1 real values plus that
+//! dummy; the reals are placed starting at the group whose boundary matches the
+//! section's first energy. Sections with more points than a full grid, or a
+//! threshold section with no energy grid to place it, throw (never silently
+//! yield an all-zero cross section).
+//!
+//! \param[in] energies Stored per-section energy grid (size == raw_xs.size())
+//! \param[in] raw_xs Stored per-section cross sections (includes dummy y(NP))
+//! \param[in] n_groups Number of library energy groups
+//! \param[in] library_bounds Library group boundaries (size == n_groups + 1)
+//! \param[in] context Nuclide/MT[/LFS] label for warnings and errors
+//! \return Cross sections aligned to the library grid (length n_groups)
+vector<double> align_to_group_grid(const vector<double>& energies,
+  const vector<double>& raw_xs, int n_groups,
+  const vector<double>& library_bounds, const std::string& context)
+{
+  auto ng = static_cast<size_t>(n_groups);
+
+  // Full energy range: NP == n_groups + 1. Return the first n_groups values,
+  // dropping the top-boundary dummy.
+  if (energies.size() == ng + 1) {
+    return vector<double>(raw_xs.begin(), raw_xs.begin() + n_groups);
+  }
+
+  // Malformed: more points than a full grid. Fail loudly (K20/R1-10) rather
+  // than push an all-zero level; get_xs and get_production_xs behave alike.
+  if (energies.size() > ng + 1) {
+    throw std::runtime_error(
+      "Cross-section size mismatch for " + context + ": expected at most " +
+      std::to_string(n_groups + 1) + " energy points, got " +
+      std::to_string(energies.size()));
+  }
+
+  // Threshold reaction: energy-aware placement onto a zero-filled grid.
+  vector<double> aligned(n_groups, 0.0);
+
+  // The Python backend always stores per-section energies; an empty grid (or
+  // absent library bounds) leaves no way to place the section, so throw.
+  if (energies.empty() || library_bounds.empty()) {
+    throw std::runtime_error("Cannot align " + context +
+                             ": threshold section has no energy grid for "
+                             "group placement");
+  }
+
+  double start_energy = energies.front();
+
+  // Find the library boundary matching the section start (relative tolerance).
+  int start_idx = -1;
+  for (size_t i = 0; i < library_bounds.size(); ++i) {
+    double diff = std::abs(library_bounds[i] - start_energy);
+    double threshold = GENDF_RTOL_MATCH * std::abs(start_energy) + GENDF_ATOL;
+    if (diff <= threshold) {
+      start_idx = static_cast<int>(i);
+      break;
+    }
+  }
+
+  // No exact match: snap to the nearest boundary, warn if the gap is large.
+  if (start_idx < 0) {
+    double min_diff = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < library_bounds.size(); ++i) {
+      double diff = std::abs(library_bounds[i] - start_energy);
+      if (diff < min_diff) {
+        min_diff = diff;
+        start_idx = static_cast<int>(i);
+      }
+    }
+    double rel_diff = min_diff / std::abs(start_energy);
+    if (rel_diff > GENDF_RTOL_WARN) {
+      warning("Energy alignment uncertainty for " + context +
+              ": GENDF starts at " + std::to_string(start_energy) +
+              " eV, using nearest boundary at " +
+              std::to_string(library_bounds[start_idx]) +
+              " eV (rel diff: " + std::to_string(rel_diff) + ")");
+    }
+  }
+
+  // Real group values = energy points minus the top-boundary dummy.
+  int n_real = static_cast<int>(energies.size()) - 1;
+  int end_idx = std::min(start_idx + n_real, n_groups);
+
+  // Validate the section end boundary against the library grid (contiguity
+  // sanity check, mirrors the Python backend; warn only in this lenient path).
+  if (end_idx < n_groups &&
+      static_cast<size_t>(end_idx) < library_bounds.size()) {
+    double end_energy = energies.back();
+    double expected_end = library_bounds[end_idx];
+    double end_rtol = GENDF_RTOL_MATCH * 10.0; // 1e-5, matches Python
+    if (std::abs(expected_end - end_energy) >
+        end_rtol * std::abs(end_energy) + GENDF_ATOL) {
+      double rel_diff_end = std::abs(end_energy - expected_end) /
+                            std::max(std::abs(end_energy), 1.0e-10);
+      warning("End energy mismatch for " + context + ": GENDF " +
+              std::to_string(end_energy) + " eV vs expected " +
+              std::to_string(expected_end) +
+              " eV (rel diff: " + std::to_string(rel_diff_end) + ")");
+    }
+  }
+
+  // Copy only the real values (never the dummy), clipped at the grid top.
+  int n_copy = std::min(end_idx - start_idx, n_real);
+  for (int i = 0; i < n_copy; ++i) {
+    aligned[start_idx + i] = raw_xs[i];
+  }
+  return aligned;
+}
+
+} // namespace
+
+//==============================================================================
 // GENDFMaterial implementation
 //==============================================================================
 
@@ -76,81 +197,17 @@ vector<double> GENDFMaterial::get_xs(
 
   const auto& xs = xs_it->second;
 
-  // Check if we have energy data for this reaction
+  // Coverage is driven by the stored per-section energy grid, not the value
+  // count (mirrors the Python backend and keeps this lane identical to
+  // get_production_xs). energy_data_ is populated alongside xs_data_ by the
+  // parser, so an absent grid means malformed data and the helper throws.
+  static const vector<double> empty_energies;
   auto energy_it = energy_data_.find(mt);
-  bool has_energy =
-    (energy_it != energy_data_.end() && !energy_it->second.empty());
+  const vector<double>& energies =
+    (energy_it != energy_data_.end()) ? energy_it->second : empty_energies;
 
-  // Full energy range case - direct return
-  if (xs.size() == static_cast<size_t>(n_groups)) {
-    return xs;
-  } else if (xs.size() == static_cast<size_t>(n_groups + 1)) {
-    // GENDF file has n_groups+1 values, return first n_groups
-    return vector<double>(xs.begin(), xs.begin() + n_groups);
-  } else if (xs.size() < static_cast<size_t>(n_groups)) {
-    // Threshold reaction - need energy-aware placement
-    vector<double> padded(n_groups, 0.0);
-
-    // Use energy data for correct alignment if available
-    if (has_energy && library_bounds.size() > 0) {
-      const auto& energies = energy_it->second;
-      double start_energy = energies.front();
-
-      // Find start index in library bounds using relative tolerance
-      int start_idx = -1;
-
-      for (size_t i = 0; i < library_bounds.size(); ++i) {
-        double diff = std::abs(library_bounds[i] - start_energy);
-        double threshold =
-          GENDF_RTOL_MATCH * std::abs(start_energy) + GENDF_ATOL;
-        if (diff <= threshold) {
-          start_idx = static_cast<int>(i);
-          break;
-        }
-      }
-
-      // Snap to nearest group boundary when threshold doesn't align exactly
-      if (start_idx < 0) {
-        double min_diff = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < library_bounds.size(); ++i) {
-          double diff = std::abs(library_bounds[i] - start_energy);
-          if (diff < min_diff) {
-            min_diff = diff;
-            start_idx = static_cast<int>(i);
-          }
-        }
-        double rel_diff = min_diff / std::abs(start_energy);
-        if (rel_diff > GENDF_RTOL_WARN) {
-          warning("Energy alignment uncertainty for " + nuclide_name_ +
-                  " MT=" + std::to_string(mt) + ": GENDF starts at " +
-                  std::to_string(start_energy) +
-                  " eV, using nearest boundary at " +
-                  std::to_string(library_bounds[start_idx]) +
-                  " eV (rel diff: " + std::to_string(rel_diff) + ")");
-        }
-      }
-
-      // Copy XS data to correct position
-      size_t n_to_copy =
-        std::min(xs.size(), static_cast<size_t>(n_groups - start_idx));
-      for (size_t i = 0; i < n_to_copy; ++i) {
-        padded[start_idx + i] = xs[i];
-      }
-    } else {
-      // Fallback: no energy boundaries available, assume threshold reaction
-      // data starts at high-energy end (physically typical for (n,xn)
-      // reactions)
-      size_t offset = n_groups - xs.size();
-      std::copy(xs.begin(), xs.end(), padded.begin() + offset);
-    }
-
-    return padded;
-  } else {
-    throw std::runtime_error(
-      "Cross-section size mismatch for MT=" + std::to_string(mt) +
-      ": expected " + std::to_string(n_groups) + " or " +
-      std::to_string(n_groups + 1) + ", got " + std::to_string(xs.size()));
-  }
+  return align_to_group_grid(energies, xs, n_groups, library_bounds,
+    nuclide_name_ + " MT=" + std::to_string(mt));
 }
 
 bool GENDFMaterial::has_mt(int mt) const
@@ -190,6 +247,7 @@ vector<ProductionLevel> GENDFMaterial::get_production_xs(
 {
   vector<ProductionLevel> levels;
   int base = mt * 1000;
+  static const vector<double> empty_energies;
 
   for (const auto& kv : prod_xs_data_) {
     if (kv.first < base || kv.first >= base + 1000)
@@ -205,64 +263,18 @@ vector<ProductionLevel> GENDFMaterial::get_production_xs(
       izap = izap_it->second;
     }
 
-    // Align to library energy grid (energy-aware, same as get_xs)
-    vector<double> aligned_xs(n_groups, 0.0);
+    // Align to the library energy grid using the shared helper — identical
+    // full-range/threshold logic and identical loud failure on malformed
+    // sizes as get_xs (K20/R1-10: no silent all-zero production level).
+    auto energy_it = prod_energy_data_.find(kv.first);
+    const vector<double>& energies = (energy_it != prod_energy_data_.end())
+                                       ? energy_it->second
+                                       : empty_energies;
 
-    if (raw_xs.size() == static_cast<size_t>(n_groups)) {
-      aligned_xs.assign(raw_xs.begin(), raw_xs.end());
-    } else if (raw_xs.size() == static_cast<size_t>(n_groups + 1)) {
-      aligned_xs.assign(raw_xs.begin(), raw_xs.begin() + n_groups);
-    } else if (raw_xs.size() < static_cast<size_t>(n_groups)) {
-      // Threshold — use energy data for correct placement
-      auto energy_it = prod_energy_data_.find(kv.first);
-      bool has_energy =
-        (energy_it != prod_energy_data_.end() && !energy_it->second.empty());
-
-      if (has_energy && library_bounds.size() > 0) {
-        double start_energy = energy_it->second.front();
-        int start_idx = -1;
-
-        for (size_t i = 0; i < library_bounds.size(); ++i) {
-          double diff = std::abs(library_bounds[i] - start_energy);
-          double threshold =
-            GENDF_RTOL_MATCH * std::abs(start_energy) + GENDF_ATOL;
-          if (diff <= threshold) {
-            start_idx = static_cast<int>(i);
-            break;
-          }
-        }
-
-        if (start_idx < 0) {
-          // Snap to nearest boundary
-          double min_diff = std::numeric_limits<double>::max();
-          for (size_t i = 0; i < library_bounds.size(); ++i) {
-            double diff = std::abs(library_bounds[i] - start_energy);
-            if (diff < min_diff) {
-              min_diff = diff;
-              start_idx = static_cast<int>(i);
-            }
-          }
-          double rel_diff = min_diff / std::abs(start_energy);
-          if (rel_diff > GENDF_RTOL_WARN) {
-            warning("MF=10 energy alignment for " + nuclide_name_ +
-                    " MT=" + std::to_string(mt) +
-                    " LFS=" + std::to_string(lfs) + ": start at " +
-                    std::to_string(start_energy) + " eV, nearest boundary " +
-                    std::to_string(library_bounds[start_idx]) +
-                    " eV (rel diff: " + std::to_string(rel_diff) + ")");
-          }
-        }
-
-        size_t n_to_copy =
-          std::min(raw_xs.size(), static_cast<size_t>(n_groups - start_idx));
-        for (size_t i = 0; i < n_to_copy; ++i) {
-          aligned_xs[start_idx + i] = raw_xs[i];
-        }
-      } else {
-        size_t offset = n_groups - raw_xs.size();
-        std::copy(raw_xs.begin(), raw_xs.end(), aligned_xs.begin() + offset);
-      }
-    }
+    vector<double> aligned_xs =
+      align_to_group_grid(energies, raw_xs, n_groups, library_bounds,
+        "MF=10 " + nuclide_name_ + " MT=" + std::to_string(mt) +
+          " LFS=" + std::to_string(lfs));
 
     levels.push_back({lfs, izap, std::move(aligned_xs)});
   }

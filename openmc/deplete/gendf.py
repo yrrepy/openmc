@@ -1152,8 +1152,16 @@ class _PythonGENDFLibrary:
                 f"No 'sigma' data in MF=3, MT={mt} for {nuclide_name}")
 
         sigma = xs_data['sigma']
-        return self._align_to_group_grid(
+        xs = self._align_to_group_grid(
             sigma.x, sigma.y, f"{nuclide_name} MT={mt}", strict_alignment)
+        # Clamp negative values to zero, matching the C++ parser
+        negative = xs < 0
+        if negative.any():
+            warnings.warn(
+                f"Clamping {negative.sum()} negative XS values to zero in "
+                f"MF=3, MT={mt} for {nuclide_name}", UserWarning)
+            xs[negative] = 0.0
+        return xs
 
     def _align_to_group_grid(self, gendf_energies, gendf_xs, context,
                              strict_alignment):

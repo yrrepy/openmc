@@ -229,61 +229,82 @@ def endf6_line(fields, mat, mf, mt):
     return f'{body}{mat:>4}{mf:>2}{mt:>3}\n'
 
 
+# Top-boundary TAB1 point for the 3-group grid [1, 1e3, 1e6, 1e9]. Real GENDF
+# sections store NP = n_groups+1 points: every group boundary plus a trailing
+# dummy y(NP) at the top boundary. The dummy XS below (99.0) is deliberately
+# large so any test asserting a 3-group result proves it was dropped, never
+# leaked into a group.
+_TOP_BOUNDARY_E = '1.000000+9'
+_DUMMY_TOP_XS = '9.900000+1'
+
+
 def write_synthetic_gendf(path, variant='izap0', mat=None):
     """Write a synthetic ENDF-6/GENDF file for the C++ parser regression tests.
 
     Variants: ``'izap0'`` (MF=10 IZAP=0 subsection then a real level, NR=1),
     ``'nr_skip'`` (MF=3 and MF=10 TAB1 with NR=2), ``'negative_xs'`` (MF=3 with a
-    negative middle-group XS). 3-group grid ``[1, 1e3, 1e6, 1e9]``.
+    negative middle-group XS). 3-group grid ``[1, 1e3, 1e6, 1e9]``; full-range
+    sections carry NP=4 points (three groups + the top-boundary dummy).
     """
+    def top(mf):
+        """Second data line: the top-boundary (E, dummy-XS) point."""
+        return endf6_line([_TOP_BOUNDARY_E, _DUMMY_TOP_XS, '', '', '', ''],
+                          mat, mf, 102)
+
     if variant == 'izap0':
         mat = 1325 if mat is None else mat
         lines = [endf6_line(['1.302700+4', '2.675000+1', 0, 0, 0, 5], mat, 1, 451)]
         lines += [endf6_line(['synthetic', 'test', 'file', '', '', ''], mat, 1, 451)
                   for _ in range(4)]
-        lines.append(endf6_line(['0.0', '0.0', 0, 0, 1, 3], mat, 3, 102))
-        lines.append(endf6_line([3, 1, '', '', '', ''], mat, 3, 102))
+        lines.append(endf6_line(['0.0', '0.0', 0, 0, 1, 4], mat, 3, 102))
+        lines.append(endf6_line([4, 1, '', '', '', ''], mat, 3, 102))
         lines.append(endf6_line(['1.000000+0', '1.100000+0', '1.000000+3',
                                  '2.200000+0', '1.000000+6', '3.300000+0'],
                                 mat, 3, 102))
-        lines.append(endf6_line(['-1.305820+7', '-1.305820+7', 0, 0, 1, 3],
+        lines.append(top(3))
+        lines.append(endf6_line(['-1.305820+7', '-1.305820+7', 0, 0, 1, 4],
                                 mat, 10, 102))
-        lines.append(endf6_line([3, 1, '', '', '', ''], mat, 10, 102))
+        lines.append(endf6_line([4, 1, '', '', '', ''], mat, 10, 102))
         lines.append(endf6_line(['1.000000+0', '9.900000+0', '1.000000+3',
                                  '8.800000+0', '1.000000+6', '7.700000+0'],
                                 mat, 10, 102))
-        lines.append(endf6_line(['-1.305820+7', '-1.328660+7', 13028, 1, 1, 3],
+        lines.append(top(10))
+        lines.append(endf6_line(['-1.305820+7', '-1.328660+7', 13028, 1, 1, 4],
                                 mat, 10, 102))
-        lines.append(endf6_line([3, 1, '', '', '', ''], mat, 10, 102))
+        lines.append(endf6_line([4, 1, '', '', '', ''], mat, 10, 102))
         lines.append(endf6_line(['1.000000+0', '1.500000-1', '1.000000+3',
                                  '2.500000-1', '1.000000+6', '3.500000-1'],
                                 mat, 10, 102))
+        lines.append(top(10))
     elif variant == 'nr_skip':
         mat = 1325 if mat is None else mat
         lines = [endf6_line(['1.302700+4', '2.675000+1', 0, 0, 0, 5], mat, 1, 451)]
         lines += [endf6_line(['synthetic', 'test', 'file', '', '', ''], mat, 1, 451)
                   for _ in range(4)]
-        lines.append(endf6_line(['0.0', '0.0', 0, 0, 2, 3], mat, 3, 102))
-        lines.append(endf6_line([2, 2, 3, 2, '', ''], mat, 3, 102))
+        lines.append(endf6_line(['0.0', '0.0', 0, 0, 2, 4], mat, 3, 102))
+        lines.append(endf6_line([2, 2, 4, 2, '', ''], mat, 3, 102))
         lines.append(endf6_line(['1.000000+0', '1.100000+0', '1.000000+3',
                                  '2.200000+0', '1.000000+6', '3.300000+0'],
                                 mat, 3, 102))
-        lines.append(endf6_line(['-1.305820+7', '-1.328660+7', 13028, 1, 2, 3],
+        lines.append(top(3))
+        lines.append(endf6_line(['-1.305820+7', '-1.328660+7', 13028, 1, 2, 4],
                                 mat, 10, 102))
-        lines.append(endf6_line([2, 2, 3, 2, '', ''], mat, 10, 102))
+        lines.append(endf6_line([2, 2, 4, 2, '', ''], mat, 10, 102))
         lines.append(endf6_line(['1.000000+0', '1.500000-1', '1.000000+3',
                                  '2.500000-1', '1.000000+6', '3.500000-1'],
                                 mat, 10, 102))
+        lines.append(top(10))
     elif variant == 'negative_xs':
         mat = 2631 if mat is None else mat
         lines = [endf6_line(['2.605600+4', '5.545400+1', 0, 0, 0, 9], mat, 1, 451)]
         lines += [endf6_line(['synthetic', 'test', 'file', '', '', ''], mat, 1, 451)
                   for _ in range(8)]
-        lines.append(endf6_line(['0.0', '0.0', 0, 0, 1, 3], mat, 3, 102))
-        lines.append(endf6_line([3, 2, '', '', '', ''], mat, 3, 102))
+        lines.append(endf6_line(['0.0', '0.0', 0, 0, 1, 4], mat, 3, 102))
+        lines.append(endf6_line([4, 2, '', '', '', ''], mat, 3, 102))
         lines.append(endf6_line(['1.000000+0', '1.100000+0', '1.000000+3',
                                  '-5.000000+0', '1.000000+6', '3.300000+0'],
                                 mat, 3, 102))
+        lines.append(top(3))
     else:
         raise ValueError(f"unknown variant {variant!r}")
 
