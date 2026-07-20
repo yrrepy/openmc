@@ -326,7 +326,9 @@ class IsomericBranching:
             'branching_ratios': self.branching_ratios.tolist(),
             'parent_nuclide': self.parent_nuclide,
             'reaction': self.reaction,
-            'mt': self.mt
+            'mt': self.mt,
+            'lfs_mapping': self.lfs_mapping,
+            'elis_mapping': self.elis_mapping
         }
 
     @classmethod
@@ -349,7 +351,9 @@ class IsomericBranching:
             branching_ratios=np.array(data['branching_ratios']),
             parent_nuclide=data['parent_nuclide'],
             reaction=data['reaction'],
-            mt=data['mt']
+            mt=data['mt'],
+            lfs_mapping=data.get('lfs_mapping'),
+            elis_mapping=data.get('elis_mapping')
         )
 
 
@@ -589,8 +593,6 @@ class _PythonGENDFLibrary:
             check_type('decay_file', decay_file, (str, Path))
             self._decay_file = Path(decay_file)
             self.decay_lookup = parse_decay_isomeric_levels(self._decay_file)
-            n_nuclides = len(self.decay_lookup)
-            n_states = sum(len(states) for states in self.decay_lookup.values())
 
         # Skip redundant energy validation after first successful check
         self._energy_validated = False
@@ -2323,10 +2325,6 @@ class _PythonGENDFLibrary:
                                               for m in branching.elis_mapping.values())
                                 if methods == {'elis'}:
                                     method_tag = " [ELIS]"
-                                elif 'unmatched' in methods:
-                                    method_tag = " [ELIS+RENORM]"
-                                elif methods == {'order'}:
-                                    method_tag = " [ORDER]"
                             print(f"  {nuclide_name} {reaction_name}: "
                                   f"{n_energies} energy points{method_tag}")
                             print(f"    Products: {branching.products}")
@@ -2582,22 +2580,14 @@ def GENDFLibrary(
 
 
 # Export public interface and backend classes (for type checking)
+# Public GENDF API re-exported into the openmc.deplete namespace via
+# ``from .gendf import *``. Kept deliberately narrow: internal helpers and
+# generic data constants (ATOMIC_SYMBOL, MT_TO_REACTION, the ELIS_* helpers,
+# etc.) stay importable via ``openmc.deplete.gendf`` but no longer leak into
+# openmc.deplete, where names like ATOMIC_SYMBOL would shadow openmc.data.
 __all__ = [
     'GENDFLibrary',
-    '_PythonGENDFLibrary',
-    '_CppGENDFLibrary',
     'IsomericBranching',
     'build_runtime_branching',
-    'DecayState',
-    'get_target_name',
-    'get_product_name',
     'detect_energy_structure',
-    'parse_decay_isomeric_levels',
-    'lookup_liso',
-    'elis_match',
-    'ATOMIC_SYMBOL',
-    'MT_TO_REACTION',
-    'REACTION_TO_MT',
-    'ELIS_RTOL',
-    'ELIS_ATOL'
 ]

@@ -20,15 +20,6 @@
 namespace openmc {
 
 //==============================================================================
-// Global variables
-//==============================================================================
-
-namespace data {
-std::unordered_map<int, unique_ptr<GENDFLibrary>> gendf_libraries;
-int n_gendf_libraries {0};
-} // namespace data
-
-//==============================================================================
 // Group-grid alignment (shared by MF=3 and MF=10 lanes)
 //==============================================================================
 

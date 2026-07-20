@@ -421,6 +421,10 @@ class FissionYieldHelper(ABC):
         # The chain order is based on atomic number (H1, H2, H3, ..., He3, He4, ...)
         # which matches how CRAM solver returns concentrations
         self._chain_nuclide_order = [nuc.name for nuc in chain_nuclides]
+        # Precomputed name -> index for O(1) sort-key lookups (avoids O(n^2)
+        # list.index scans in update_tally_nuclides on large chains)
+        self._chain_nuclide_index = {
+            name: i for i, name in enumerate(self._chain_nuclide_order)}
 
         # Get all nuclides with fission yield data
         for nuc in chain_nuclides:
@@ -508,8 +512,8 @@ class FissionYieldHelper(ABC):
         overlap = self._chain_set & set(nuclides)
         # CRITICAL: Sort by chain index, not alphabetically!
         # Chain order matches how CRAM returns concentrations (by atomic number)
-        return sorted(overlap, key=lambda x: self._chain_nuclide_order.index(x)
-                      if x in self._chain_nuclide_order else float('inf'))
+        return sorted(overlap, key=lambda x: self._chain_nuclide_index.get(
+            x, len(self._chain_nuclide_index)))
 
     @classmethod
     def from_operator(cls, operator, **kwargs):

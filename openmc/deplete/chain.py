@@ -121,38 +121,6 @@ REACTIONS = {
 __all__ = ["Chain", "REACTIONS"]
 
 
-def _parse_isomeric_state(nuclide: str) -> tuple:
-    """Parse nuclide into base name and isomeric level.
-
-    Parameters
-    ----------
-    nuclide : str
-        Nuclide name (e.g., 'Hf177', 'Hf177_m1', 'Hf177_m2')
-
-    Returns
-    -------
-    tuple
-        (base_name, isomeric_level) where level is 0 for ground, 1 for m1, etc.
-
-    Examples
-    --------
-    >>> _parse_isomeric_state('Hf177')
-    ('Hf177', 0)
-    >>> _parse_isomeric_state('Hf177_m1')
-    ('Hf177', 1)
-    >>> _parse_isomeric_state('Hf177_m2')
-    ('Hf177', 2)
-    """
-    if '_m' in nuclide:
-        base, suffix = nuclide.rsplit('_m', 1)
-        try:
-            return base, int(suffix)
-        except ValueError:
-            # Malformed suffix, treat as ground state
-            return nuclide, 0
-    return nuclide, 0
-
-
 def _load_isomeric_branching_targets(root):
     """Load isomeric branching targets, LFS values, Q values, and embedded ratios.
 

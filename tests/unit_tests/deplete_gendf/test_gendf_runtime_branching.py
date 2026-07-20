@@ -398,6 +398,9 @@ def test_isomeric_branching_to_from_dict():
     orig = make_isomeric_branching(
         'Ir191', '(n,gamma)', ['Ir192', 'Ir192_m1'],
         [1e5, 1e6, 5e6, 1e7], [[.9, .8, .7, .6], [.1, .2, .3, .4]])
+    orig.lfs_mapping = {'Ir192_m1': 3, 'Ir192_m2': 15}
+    orig.elis_mapping = {'Ir192_m1': {'method': 'elis', 'elis': 56720.0,
+                                      'liso': 1}}
     restored = IsomericBranching.from_dict(orig.to_dict())
 
     np.testing.assert_array_equal(restored.energies, orig.energies)
@@ -407,6 +410,8 @@ def test_isomeric_branching_to_from_dict():
     assert restored.parent_nuclide == orig.parent_nuclide
     assert restored.reaction == orig.reaction
     assert restored.mt == orig.mt
+    assert restored.lfs_mapping == orig.lfs_mapping
+    assert restored.elis_mapping == orig.elis_mapping
 
 
 def test_mt_reaction_roundtrip():

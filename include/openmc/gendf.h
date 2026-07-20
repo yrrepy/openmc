@@ -235,20 +235,6 @@ private:
 };
 
 //==============================================================================
-// Global variables
-//==============================================================================
-
-namespace data {
-
-//! Map of library ID -> GENDFLibrary instance
-extern std::unordered_map<int, unique_ptr<GENDFLibrary>> gendf_libraries;
-
-//! Next available library ID
-extern int n_gendf_libraries;
-
-} // namespace data
-
-//==============================================================================
 // Non-member functions
 //==============================================================================
 

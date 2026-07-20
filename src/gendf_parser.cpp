@@ -32,14 +32,22 @@ namespace openmc {
 std::string trim(const std::string& str)
 {
   auto start = str.begin();
-  while (start != str.end() && std::isspace(*start)) {
+  while (
+    start != str.end() && std::isspace(static_cast<unsigned char>(*start))) {
     ++start;
+  }
+
+  // Empty or all-whitespace input: nothing left to trim (avoids a pre-begin
+  // iterator decrement in the reverse scan below).
+  if (start == str.end()) {
+    return std::string();
   }
 
   auto end = str.end();
   do {
     --end;
-  } while (std::distance(start, end) > 0 && std::isspace(*end));
+  } while (std::distance(start, end) > 0 &&
+           std::isspace(static_cast<unsigned char>(*end)));
 
   return std::string(start, end + 1);
 }
