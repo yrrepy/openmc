@@ -121,8 +121,11 @@ def _clear_gendf_warn_dedup():
     """Reset module-level warn-once stores so warnings are deterministic."""
     import openmc.deplete.decay_elis as de
     import openmc.deplete.gendf as g
+    import openmc.deplete.helpers as h
     g._WARNED_RUNTIME_BRANCHING.clear()
     de._WARNED_ELIS_AMBIGUITY.clear()
+    h._WARNED_ISOMERIC_NORMALIZE.clear()
     yield
     g._WARNED_RUNTIME_BRANCHING.clear()
     de._WARNED_ELIS_AMBIGUITY.clear()
+    h._WARNED_ISOMERIC_NORMALIZE.clear()

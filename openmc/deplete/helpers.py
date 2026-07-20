@@ -1486,6 +1486,18 @@ class AveragedFissionYieldHelper(TalliedFissionYieldHelper):
         """
         return cls(operator.chain.nuclides)
 
+
+# Dedup store for once-per-key isomeric-normalization warnings
+_WARNED_ISOMERIC_NORMALIZE: set = set()
+
+
+def _warn_isomeric_normalize(key, message):
+    """Emit an isomeric-normalization UserWarning once per key."""
+    if key not in _WARNED_ISOMERIC_NORMALIZE:
+        _WARNED_ISOMERIC_NORMALIZE.add(key)
+        warnings.warn(message, UserWarning)
+
+
 class IsomericBranchingHelper:
     """Helper for automatic reaction-rate weighted isomeric branching calculations.
 
@@ -1640,8 +1652,12 @@ class IsomericBranchingHelper:
                     # Chain-embedded ratios
                     data = {
                         'energies': br['energies'],
+                        # Filter identically to branching_ratios so a target
+                        # kept by the chain but missing its ratio row can't
+                        # reach _calculate_weighted and KeyError.
                         'targets': [t for t in br['targets']
-                                    if t in chain_target_set],
+                                    if t in chain_target_set
+                                    and t in br['branching_ratios']],
                         'branching_ratios': {
                             t: br['branching_ratios'][t]
                             for t in br['targets']
@@ -1854,12 +1870,15 @@ class IsomericBranchingHelper:
                 products_str = ", ".join(
                     f"{target}: {ratio:.6f}" for target, ratio in weighted_ratios.items()
                 )
-                warnings.warn(
+                # Dedupe once per (nuclide, reaction): the message embeds
+                # per-material varying values, so the default filter can't
+                # collapse it across a 10k-material run.
+                _warn_isomeric_normalize(
+                    (nuclide, reaction),
                     f"Isomeric branching ratios sum to {total:.6f} for "
                     f"{nuclide} {reaction} (deviates >1% from 1.0). "
                     f"Products before normalization: {products_str}. "
-                    f"Normalizing to preserve probability conservation.",
-                    UserWarning
+                    f"Normalizing to preserve probability conservation."
                 )
             # Normalize
             for target in weighted_ratios:

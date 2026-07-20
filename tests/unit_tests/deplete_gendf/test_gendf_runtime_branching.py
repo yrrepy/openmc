@@ -560,26 +560,34 @@ def test_weighted_conservation():
 
 
 def test_weighted_branching_with_embedded():
-    """weighted_branching_ratios works via the chain-embedded dict path."""
+    """weighted_branching_ratios works via the chain-embedded dict path.
+
+    A chain-kept target whose ratio row was dropped (here ``Ir192_m2``) must
+    be filtered out consistently, not reach ``_calculate_weighted`` and raise
+    an uncaught KeyError.
+    """
     embedded = {
         ('Ir191', '(n,gamma)'): {
             'energies': np.array([1e5, 1e6, 5e6]),
-            'targets': ['Ir192', 'Ir192_m1'],
+            'targets': ['Ir192', 'Ir192_m1', 'Ir192_m2'],
             'branching_ratios': {
                 'Ir192': np.array([0.95, 0.85, 0.75]),
                 'Ir192_m1': np.array([0.05, 0.15, 0.25]),
+                # Ir192_m2 row intentionally absent
             }
         }
     }
     chain = make_mock_chain(
-        {'Ir191': {'(n,gamma)': ['Ir192', 'Ir192_m1']}}, embedded=embedded)
+        {'Ir191': {'(n,gamma)': ['Ir192', 'Ir192_m1', 'Ir192_m2']}},
+        embedded=embedded)
     gendf = make_mock_gendf(branching=_ir191_branching())
     helper = IsomericBranchingHelper(chain, gendf)
 
     result = helper.weighted_branching_ratios(np.ones(NG), ENERGIES)
     assert 'Ir191' in result
-    total = sum(result['Ir191']['(n,gamma)'].values())
-    assert np.isclose(total, 1.0)
+    ratios = result['Ir191']['(n,gamma)']
+    assert 'Ir192_m2' not in ratios
+    assert np.isclose(sum(ratios.values()), 1.0)
 
 
 def test_target_filtering_with_reduced_chain():
@@ -642,11 +650,16 @@ def test_normalize_ratios_returns_empty(ratios):
 
 
 def test_normalize_ratios_warns_on_deviation():
-    """A >1% deviation from 1.0 warns and renormalizes to 1.0."""
+    """A >1% deviation warns once per (nuclide, reaction) and renormalizes."""
     helper = _normalize_helper()
     with pytest.warns(UserWarning, match="deviates"):
         result = helper._normalize_ratios({'A': 0.5, 'B': 0.3}, 'Nuc', '(n,gamma)')
     assert np.isclose(sum(result.values()), 1.0)
+
+    # Same (nuclide, reaction) key is deduped: a second deviating call is silent.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        helper._normalize_ratios({'A': 0.5, 'B': 0.3}, 'Nuc', '(n,gamma)')
 
 
 def test_multiple_materials_same_chain():
