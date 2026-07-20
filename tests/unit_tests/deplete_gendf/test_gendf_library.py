@@ -504,6 +504,36 @@ def test_branching_failure_warns_not_silent():
     assert result is None
 
 
+def test_process_library_surfaces_unexpected_errors():
+    """Unexpected per-nuclide errors raise a summarizing RuntimeError; expected
+    NO_METASTABLE_DECAY_DATA skips are recorded silently (K13/R1-2)."""
+    from openmc.deplete.gendf import _PythonGENDFLibrary
+
+    def _make(nuclides, brancher):
+        lib = _PythonGENDFLibrary.__new__(_PythonGENDFLibrary)
+        lib.available_nuclides = lambda: nuclides
+        lib.get_branching_ratios = brancher
+        return lib
+
+    # An unexpected ValueError must not vanish -- it surfaces by nuclide name.
+    def _bad(nuc, mt):
+        if nuc == 'BadNuc':
+            raise ValueError("corrupted MF=10 data")
+        return None
+    with pytest.raises(RuntimeError, match=r"BadNuc"):
+        _make(['GoodNuc', 'BadNuc'], _bad).process_library_for_branching(
+            mt_list=[102], verbose=False)
+
+    # An expected metastable-decay skip is recorded, not raised.
+    def _skip(nuc, mt):
+        raise ValueError("WARNING: NO_METASTABLE_DECAY_DATA: SkipNuc ...")
+    lib = _make(['SkipNuc'], _skip)
+    result = lib.process_library_for_branching(mt_list=[102], verbose=False)
+    assert result == {}
+    assert [e['type'] for e in lib.processing_errors] == \
+        ['no_metastable_decay_data']
+
+
 def test_full_range_band_unchanged():
     """Full-range MF=10 (e.g. (n,gamma)) keeps its original behavior."""
     lib = make_python_gendf_lib([

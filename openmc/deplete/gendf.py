@@ -2275,6 +2275,7 @@ class _PythonGENDFLibrary:
         all_branching_data = {}
         self._processing_errors = []  # Capture ELIS mismatch errors (missing metastable products)
         self._unmatched_mts = []  # Track reaction TYPES not in chain (nuclide/reaction missing)
+        unexpected_errors = []  # Data-integrity failures that must abort the scan
 
         for idx, nuclide_name in enumerate(available_nuclides, start=1):
             if progress_callback:
@@ -2338,14 +2339,39 @@ class _PythonGENDFLibrary:
                 error_str = str(e)
                 if verbose:
                     print(f"  {nuclide_name}: {e}")
-                # Capture no_metastable_decay_data errors for logging
+                # Classify: NO_METASTABLE_DECAY_DATA is an expected skip on
+                # healthy libraries; every other exception is a data-integrity
+                # failure that must not be swallowed. Record all of them (typed)
+                # so the scan completes, then raise below on the unexpected ones.
                 if 'NO_METASTABLE_DECAY_DATA' in error_str:
-                    self._processing_errors.append({
-                        'nuclide': nuclide_name,
-                        'error': error_str,
-                        'type': 'no_metastable_decay_data'
-                    })
+                    error_type = 'no_metastable_decay_data'
+                else:
+                    error_type = 'unexpected_processing_error'
+                entry = {
+                    'nuclide': nuclide_name,
+                    'error': error_str,
+                    'exception_class': type(e).__name__,
+                    'type': error_type,
+                }
+                self._processing_errors.append(entry)
+                if error_type == 'unexpected_processing_error':
+                    unexpected_errors.append(entry)
                 continue
+
+        # Fail loud on data-integrity errors; expected skips never trigger this.
+        if unexpected_errors:
+            n = len(unexpected_errors)
+            shown = unexpected_errors[:10]
+            lines = [f"  {e['nuclide']}: {e['exception_class']}: {e['error']}"
+                     for e in shown]
+            if n > len(shown):
+                lines.append(f"  ... and {n - len(shown)} more (showing first "
+                             f"{len(shown)})")
+            raise RuntimeError(
+                f"process_library_for_branching encountered {n} unexpected "
+                f"error(s) during isomeric branching extraction:\n"
+                + "\n".join(lines)
+            )
 
         if verbose:
             print(f"\n{'=' * 60}")
