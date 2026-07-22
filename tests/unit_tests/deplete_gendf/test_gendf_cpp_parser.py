@@ -37,6 +37,7 @@ ENERGY_BOUNDS = np.array([1.0, 1.0e3, 1.0e6, 1.0e9])
 # Analytic expectations for the synthetic files below
 MF3_XS = [1.1, 2.2, 3.3]           # MT=102 (n,gamma) group XS
 MF10_XS = [0.15, 0.25, 0.35]       # MT=102 LFS=1 production XS (-> Al28)
+MF10_XS_L0 = [0.11, 0.21, 0.31]    # a distinct LFS=0 production XS
 MF10_IZAP = 13028
 MF10_LFS = 1
 
@@ -45,22 +46,45 @@ MF10_LFS = 1
 _FULL_MF3 = [('1.000000+0', '1.100000+0'), ('1.000000+3', '2.200000+0'),
              ('1.000000+6', '3.300000+0'), ('1.000000+9', '9.900000+1')]
 
+# Full-range MF=10 TAB1 points (3 groups + top-boundary dummy) whose aligned XS
+# are MF10_XS_L0 and MF10_XS respectively.
+_MF10_L0 = [('1.000000+0', '1.100000-1'), ('1.000000+3', '2.100000-1'),
+            ('1.000000+6', '3.100000-1'), ('1.000000+9', '9.900000+1')]
+_MF10_L1 = [('1.000000+0', '1.500000-1'), ('1.000000+3', '2.500000-1'),
+            ('1.000000+6', '3.500000-1'), ('1.000000+9', '9.900000+1')]
 
-def _mf_section(mf, points, *, mat, izap=None, lfs=0, nr=1):
+
+def _mf_section(mf, points, *, mat, mt=102, izap=None, lfs=0, nr=1):
     """ENDF-6 lines for one MF=3 or MF=10 TAB1 section (NP = len(points))."""
     np_ = len(points)
     if mf == 3:
-        head = endf6_line(['0.0', '0.0', 0, 0, nr, np_], mat, 3, 102)
+        head = endf6_line(['0.0', '0.0', 0, 0, nr, np_], mat, 3, mt)
     else:  # MF=10: IZAP at L1, LFS at L2
         head = endf6_line(['-1.305820+7', '-1.305820+7', izap, lfs, nr, np_],
-                          mat, 10, 102)
-    lines = [head, endf6_line([np_, 1, '', '', '', ''], mat, mf, 102)]
+                          mat, 10, mt)
+    lines = [head, endf6_line([np_, 1, '', '', '', ''], mat, mf, mt)]
     flat = [v for pair in points for v in pair]
     for k in range(0, len(flat), 6):
         chunk = list(flat[k:k + 6])
         chunk += [''] * (6 - len(chunk))
-        lines.append(endf6_line(chunk, mat, mf, 102))
+        lines.append(endf6_line(chunk, mat, mf, mt))
     return lines
+
+
+def _write_gendf_mf10(path, mf3, mf10_subs, *, mat=1325):
+    """GENDF file: one MF=3 MT=102 section plus a list of MF=10 subsections.
+
+    ``mf10_subs`` is ``[(mt, points, izap, lfs), ...]``; consecutive entries with
+    the same MT become multiple LFS/IZAP levels under that MT.
+    """
+    lines = [endf6_line(['1.302700+4', '2.675000+1', 0, 0, 0, 7], mat, 1, 451)]
+    lines += [endf6_line(['synthetic', 'test', 'file', '', '', ''], mat, 1, 451)
+              for _ in range(6)]
+    lines += _mf_section(3, mf3, mat=mat)
+    for mt, pts, izap, lfs in mf10_subs:
+        lines += _mf_section(10, pts, mat=mat, mt=mt, izap=izap, lfs=lfs)
+    with open(path, 'w') as f:
+        f.writelines(lines)
 
 
 def _write_gendf(path, *, mf3=None, mf10=None, mat=1325):
@@ -185,6 +209,51 @@ def test_mf10_nr2_production_level(tmp_path):
     lfs, izap, xs = levels[0]
     assert lfs == MF10_LFS
     assert izap == MF10_IZAP
+    np.testing.assert_allclose(xs, MF10_XS)
+
+
+def test_mt5_mf10_skipped_silently(tmp_path, capfd):
+    """MF=10 MT=5 (lumped, multi-product LFS=0) is dropped silently; other MTs
+    are untouched.  MT=5 is not consumed by any depletion pathway and its many
+    LFS=0 products would collide on key 5000, so it is skipped at parse with no
+    IZAP=0 / Z=0 warnings."""
+    gfile = tmp_path / 'Al27g.asc'
+    # MT=5: three LFS=0 products (neutron IZAP=1, residual IZAP=13027, trailing
+    # IZAP=0). MT=102: real LFS=0 and LFS=1 levels.
+    _write_gendf_mf10(gfile, _FULL_MF3, [
+        (5, _MF10_L1, 1, 0), (5, _MF10_L0, 13027, 0), (5, _MF10_L1, 0, 0),
+        (102, _MF10_L0, 13027, 0), (102, _MF10_L1, 13028, 1)])
+
+    lib = lib_gendf.GENDFLibrary(str(tmp_path), ENERGY_BOUNDS, 'test-3g')
+    # First access triggers the load (and would surface any parser warnings).
+    assert lib._get_production_xs('Al27', 5) == []          # MT=5 dropped
+    cap = capfd.readouterr()
+    assert 'WARNING' not in (cap.err + cap.out)             # silent, incl. MT=5
+
+    levels = lib._get_production_xs('Al27', 102)            # MT=102 intact
+    assert [(lfs, izap) for lfs, izap, _ in levels] == [(0, 13027), (1, 13028)]
+    np.testing.assert_allclose(levels[0][2], MF10_XS_L0)
+    np.testing.assert_allclose(levels[1][2], MF10_XS)
+
+
+def test_mf10_key_collision_warns(tmp_path, capfd):
+    """Two MF=10 subsections of one MT sharing an (LFS) key but differing in IZAP
+    warn exactly once; the last subsection wins."""
+    gfile = tmp_path / 'Al27g.asc'
+    # MT=16, two LFS=0 subsections -> both key 16000; IZAP 13027 then 13028.
+    _write_gendf_mf10(gfile, _FULL_MF3, [
+        (16, _MF10_L0, 13027, 0), (16, _MF10_L1, 13028, 0)])
+
+    lib = lib_gendf.GENDFLibrary(str(tmp_path), ENERGY_BOUNDS, 'test-3g')
+    levels = lib._get_production_xs('Al27', 16)             # triggers load
+    cap = capfd.readouterr()
+    flat = ' '.join((cap.err + cap.out).split())            # undo line wrapping
+    assert flat.count('MF=10 store collision') == 1
+    assert 'MT=16 LFS=0: IZAP=13028 overwrites IZAP=13027' in flat
+
+    assert len(levels) == 1                                 # last one wins
+    lfs, izap, xs = levels[0]
+    assert (lfs, izap) == (0, 13028)
     np.testing.assert_allclose(xs, MF10_XS)
 
 

@@ -47,7 +47,8 @@ struct GENDFParseResult {
   std::unordered_map<int, vector<double>>
     energy_data; //!< MT -> energy boundaries
 
-  //! MF=10 production XS: key = MT*1000 + LFS (MT<=891, LFS<=50, no collision)
+  //! MF=10 production XS: key = MT*1000 + LFS. Unique per MT for
+  //! single-product MTs; multi-product MT=5 is skipped at parse.
   std::unordered_map<int, vector<double>> prod_xs_data;
   //! MF=10 energy boundaries: key = MT*1000 + LFS
   std::unordered_map<int, vector<double>> prod_energy_data;

@@ -210,6 +210,32 @@ void store_section_data(const std::string& basename, int mt, vector<double>& xs,
   result.energy_data[mt] = std::move(energies);
 }
 
+//! Store one MF=10 production subsection under key MT*1000+LFS
+//! \param[in] basename Filename for warning messages
+//! \param[in] mt Current MT number
+//! \param[in] lfs Level flag of this subsection
+//! \param[in] izap Product Z*1000+A of this subsection
+//! \param[in,out] xs Production cross-section data (moved out)
+//! \param[in,out] energies Energy boundary data (moved out)
+//! \param[out] result Parse result to store into
+//! Same-(MT,LFS) keys from different products (multi-product MTs) would
+//! overwrite silently; warn when the IZAP differs. Last one wins (unchanged).
+void store_mf10_level(const std::string& basename, int mt, int lfs, int izap,
+  vector<double>&& xs, vector<double>&& energies, GENDFParseResult& result)
+{
+  int key = mt * 1000 + lfs;
+  auto it = result.prod_izap_data.find(key);
+  if (it != result.prod_izap_data.end() && it->second != izap) {
+    result.warnings.push_back(
+      "MF=10 store collision in " + basename + " MT=" + std::to_string(mt) +
+      " LFS=" + std::to_string(lfs) + ": IZAP=" + std::to_string(izap) +
+      " overwrites IZAP=" + std::to_string(it->second));
+  }
+  result.prod_xs_data[key] = std::move(xs);
+  result.prod_energy_data[key] = std::move(energies);
+  result.prod_izap_data[key] = izap;
+}
+
 } // anonymous namespace
 
 //==============================================================================
@@ -310,10 +336,9 @@ GENDFParseResult parse_gendf_validated(
         // Save previous MF=10 subsection
         if (current_mf == 10 && !mf10_current_xs.empty()) {
           if (!mf10_discard) {
-            int key = current_mt * 1000 + mf10_current_lfs;
-            result.prod_xs_data[key] = std::move(mf10_current_xs);
-            result.prod_energy_data[key] = std::move(mf10_current_energies);
-            result.prod_izap_data[key] = mf10_current_izap;
+            store_mf10_level(basename, current_mt, mf10_current_lfs,
+              mf10_current_izap, std::move(mf10_current_xs),
+              std::move(mf10_current_energies), result);
           }
           mf10_current_xs.clear();
           mf10_current_energies.clear();
@@ -440,10 +465,9 @@ GENDFParseResult parse_gendf_validated(
         if (np_result.success && np_result.value > 0) {
           // Save previous subsection
           if (!mf10_current_xs.empty() && !mf10_discard) {
-            int key = current_mt * 1000 + mf10_current_lfs;
-            result.prod_xs_data[key] = std::move(mf10_current_xs);
-            result.prod_energy_data[key] = std::move(mf10_current_energies);
-            result.prod_izap_data[key] = mf10_current_izap;
+            store_mf10_level(basename, current_mt, mf10_current_lfs,
+              mf10_current_izap, std::move(mf10_current_xs),
+              std::move(mf10_current_energies), result);
           }
           mf10_current_xs.clear();
           mf10_current_energies.clear();
@@ -459,10 +483,16 @@ GENDFParseResult parse_gendf_validated(
           mf10_nr_skip =
             nr_result.success ? interp_table_lines(nr_result.value) : 0;
 
-          // Skip IZAP=0 (data quality issue). Enter discard mode so the
-          // subsection's data lines are consumed rather than re-scanned as
-          // potential subsection heads.
-          if (mf10_current_izap == 0) {
+          // MT=5 (lumped (n,anything)) carries many products that all have
+          // LFS=0 — they would collide on the MT*1000+LFS key — and no
+          // depletion pathway consumes MT=5. Expected library structure, not
+          // a data defect: discard silently.
+          if (current_mt == 5) {
+            mf10_discard = true;
+          } else if (mf10_current_izap == 0) {
+            // Skip IZAP=0 (data quality issue). Enter discard mode so the
+            // subsection's data lines are consumed rather than re-scanned as
+            // potential subsection heads.
             result.warnings.push_back(
               "Skipping MF=10 level in " + basename +
               " MT=" + std::to_string(current_mt) +
@@ -530,10 +560,8 @@ GENDFParseResult parse_gendf_validated(
 
   // Save last MF=10 subsection
   if (current_mf == 10 && !mf10_current_xs.empty() && !mf10_discard) {
-    int key = current_mt * 1000 + mf10_current_lfs;
-    result.prod_xs_data[key] = std::move(mf10_current_xs);
-    result.prod_energy_data[key] = std::move(mf10_current_energies);
-    result.prod_izap_data[key] = mf10_current_izap;
+    store_mf10_level(basename, current_mt, mf10_current_lfs, mf10_current_izap,
+      std::move(mf10_current_xs), std::move(mf10_current_energies), result);
   }
 
   infile.close();
