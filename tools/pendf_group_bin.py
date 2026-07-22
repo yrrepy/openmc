@@ -70,12 +70,14 @@ GROUPED_VERSION = 2
 def chain_relevant_mts() -> set[int]:
     """Return the MT numbers depletion activation cares about.
 
-    The union of every ``REACTIONS`` entry's MTs plus MT=4: ``(n,n')`` joins
-    ``REACTIONS`` only on the separate pendf-chain branch, so it is added here
-    explicitly so grouped libraries carry it regardless of branch.
+    The union of every ``REACTIONS`` entry's MTs plus two channels absent from
+    that transmutation-only table: MT=4, because ``(n,n')`` joins ``REACTIONS``
+    only on the separate pendf-chain branch, and MT=18, because fission reaches
+    the collapse via ``REACTION_MT['fission']`` rather than ``REACTIONS``.
     """
     mts = {mt for info in REACTIONS.values() for mt in info.mts}
-    mts.add(4)  # (n,n') joins REACTIONS on the separate pendf-chain branch
+    mts.add(4)   # (n,n') joins REACTIONS on the separate pendf-chain branch
+    mts.add(18)  # fission reaches the collapse via REACTION_MT, not REACTIONS
     return mts
 
 
