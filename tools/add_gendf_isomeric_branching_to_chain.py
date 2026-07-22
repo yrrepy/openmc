@@ -19,6 +19,7 @@ v12 Changes:
 - Always logs single-target cases with reason (GENDF_SINGLE_LFS, NO_DECAY_DATA, etc.)
 - Added --suppress-single-target-yields flag to optionally suppress redundant yields
 - Single-target section in mapping log file
+- --prune-nn-prime-self-loops now prunes exact (n,n') self-loops only (X -> X); metastable-parent de-excitation (X_m1 (n,n') X) is preserved
 
 v11 Changes:
 - Added mapping_mode parameter ('elis' or 'lfs_order')
@@ -255,9 +256,10 @@ def build_parser():
         '--prune-nn-prime-self-loops',
         action='store_true',
         default=False,
-        help="Remove (n,n') reactions that have no isomeric branching (self-loops with no effect). "
-             "These reactions where target=parent and no metastable production add computational "
-             "overhead without affecting depletion results. Default: keep all (n,n') reactions."
+        help="Remove (n,n') reactions that are exact self-loops (target == parent "
+             "nuclide) with no isomeric branching (Bateman diagonal no-ops with no "
+             "effect on depletion results). Metastable-parent de-excitation "
+             "(X_m1 (n,n') X) is always preserved. Default: keep all (n,n') reactions."
     )
 
     parser.add_argument(
@@ -1456,26 +1458,21 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
     if prune_nn_prime_self_loops:
         for nuc_elem in root.findall('nuclide'):
             nuc_name = nuc_elem.get('name')
-            # Get base name (strip _m1, _m2, etc.)
-            base_name = nuc_name.split('_')[0] if '_m' in nuc_name else nuc_name
 
             reactions_to_remove = []
             for rx_elem in nuc_elem.findall('reaction'):
                 rx_type = rx_elem.get('type')
                 target = rx_elem.get('target')
 
-                # Check if this is an (n,n') self-loop without isomeric branching
-                if rx_type == "(n,n')":
-                    # Get target base name
-                    target_base = target.split('_')[0] if target and '_m' in target else target
-
-                    # Check if it's a self-loop (target base matches nuclide base)
-                    if target_base == base_name:
-                        # Check if no isomeric branching element exists
-                        has_branching = (rx_elem.find('isomeric_branching') is not None
-                                         or rx_elem.find('isomeric_yields') is not None)
-                        if not has_branching:
-                            reactions_to_remove.append((rx_elem, rx_type, target))
+                # Exact self-loop only: X -> X. A metastable parent's ground
+                # route (X_m1 -> X) is a real de-excitation transition and
+                # must stay.
+                if rx_type == "(n,n')" and target == nuc_name:
+                    # Check if no isomeric branching element exists
+                    has_branching = (rx_elem.find('isomeric_branching') is not None
+                                     or rx_elem.find('isomeric_yields') is not None)
+                    if not has_branching:
+                        reactions_to_remove.append((rx_elem, rx_type, target))
 
             # Remove the identified reactions
             for rx_elem, rx_type, target in reactions_to_remove:
