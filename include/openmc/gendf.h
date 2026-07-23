@@ -108,7 +108,8 @@ public:
   vector<ProductionLevel> get_production_xs(
     int mt, int n_groups, const vector<double>& library_bounds) const;
 
-  //! Check if MT reaction exists in this material (MF=3)
+  //! Check if MT reaction is served by get_xs (MF=3, or MF=10-only via the
+  //! Sigma-partials fallback)
   bool has_mt(int mt) const;
 
   //! Check if MT has MF=10 production data

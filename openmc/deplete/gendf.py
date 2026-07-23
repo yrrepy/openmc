@@ -1109,8 +1109,12 @@ class _PythonGENDFLibrary:
         # Load material
         material = self._load_material(nuclide_name)
 
-        # Check if reaction is available
+        # Normal path is MF=3; if absent, fall back to Σ(MF=10 partials), the
+        # total for reactions stored MF=10-only (EAF-2010 isomer producers).
         if (3, mt) not in material.section_data:
+            levels = self._production_levels(nuclide_name, mt)
+            if levels:
+                return np.sum([xs for _, _, xs in levels], axis=0)
             raise KeyError(
                 f"Reaction MT={mt} not found for {nuclide_name} in GENDF library. "
                 f"Available reactions: {[mt for mf,mt in material.section_data.keys() if mf==3]}")
@@ -1158,7 +1162,24 @@ class _PythonGENDFLibrary:
                 continue
             result[mt] = self._extract_xs(
                 xs_data, nuclide_name, mt, strict_alignment)
+
+        # MF=10-only fallback: for explicitly requested MTs with no MF=3 section
+        # (EAF-2010 isomer producers), serve Σ(MF=10 partials) as the total.
+        if mts_set is not None:
+            for mt in mts_set:
+                if mt in result:
+                    continue
+                levels = self._production_levels(nuclide_name, mt)
+                if levels:
+                    result[mt] = np.sum([xs for _, _, xs in levels], axis=0)
         return result
+
+    def _production_levels(self, nuclide_name, mt):
+        """Σ-fallback MF=10 levels for a missing MT; [] on any load failure."""
+        try:
+            return self._get_production_xs(nuclide_name, mt)
+        except Exception:
+            return []
 
     def _extract_xs(self, xs_data, nuclide_name, mt, strict_alignment):
         """Extract and align XS from a single MF=3 section. Returns a copy."""

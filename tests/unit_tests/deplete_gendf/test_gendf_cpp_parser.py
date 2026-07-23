@@ -257,6 +257,42 @@ def test_mf10_key_collision_warns(tmp_path, capfd):
     np.testing.assert_allclose(xs, MF10_XS)
 
 
+def test_get_xs_mf10_only_sigma_partials_fallback(tmp_path):
+    """MT with no MF=3 but MF=10 partials: get_xs returns Sigma(levels).
+
+    EAF-2010 stores any reaction whose residual has a tabulated isomeric state
+    as MF=10 per-final-state partials only (no MF=3). Each event yields exactly
+    one final state, so get_xs must serve the elementwise sum of the aligned
+    levels as the total reaction XS -- and match a Python-side Sigma over the
+    independent ``_get_production_xs`` reference bitwise.
+    """
+    from openmc.exceptions import OpenMCError
+
+    gfile = tmp_path / 'Al27g.asc'
+    # MF=3 only for MT=102; MT=16 has two MF=10 levels (LFS 0, 1) and no MF=3.
+    _write_gendf_mf10(gfile, _FULL_MF3, [
+        (16, _MF10_L0, 13026, 0), (16, _MF10_L1, 13026, 1)])
+
+    lib = lib_gendf.GENDFLibrary(str(tmp_path), ENERGY_BOUNDS, 'test-3g')
+
+    # Fallback: get_xs(16) == sum of the two aligned MF=10 partials.
+    xs16 = lib.get_xs('Al27', 16, ENERGY_BOUNDS)
+    expected = np.add(MF10_XS_L0, MF10_XS)
+    np.testing.assert_allclose(xs16, expected)
+
+    # Parity with an independent Sigma over the existing production-xs path
+    # (same aligned vectors, LFS-sorted) -- bitwise identical.
+    ref = np.sum([xs for _, _, xs in lib._get_production_xs('Al27', 16)], axis=0)
+    assert np.array_equal(xs16, ref)
+
+    # MF=3 path untouched: MT=102 still served from MF=3.
+    np.testing.assert_allclose(lib.get_xs('Al27', 102, ENERGY_BOUNDS), MF3_XS)
+
+    # Neither MF=3 nor MF=10 -> unchanged throw (OPENMC_E_UNASSIGNED at C-API).
+    with pytest.raises(OpenMCError):
+        lib.get_xs('Al27', 999, ENERGY_BOUNDS)
+
+
 def test_parser_warnings_surface_to_stderr(tmp_path, capfd):
     """P1-4: parser diagnostics reach the user via warning() (stderr)."""
     lib_dir = tmp_path / 'gendf'

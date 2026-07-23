@@ -181,6 +181,22 @@ vector<double> GENDFMaterial::get_xs(
 {
   auto xs_it = xs_data_.find(mt);
   if (xs_it == xs_data_.end()) {
+    // No MF=3 section for this MT. EAF-2010 stores any reaction whose residual
+    // has a tabulated isomeric state as MF=10 per-final-state partials only
+    // (no MF=3). Each event yields exactly one final state, so the sum over the
+    // aligned MF=10 levels IS the total reaction cross section. Serve it
+    // transparently; fall through to the throw only when neither MF=3 nor MF=10
+    // exists (unchanged behavior -> OPENMC_E_UNASSIGNED at the C-API boundary).
+    if (has_mf10(mt)) {
+      auto levels = get_production_xs(mt, n_groups, library_bounds);
+      vector<double> total(static_cast<size_t>(n_groups), 0.0);
+      for (const auto& level : levels) {
+        for (size_t g = 0; g < total.size(); ++g) {
+          total[g] += level.xs[g];
+        }
+      }
+      return total;
+    }
     throw std::runtime_error("MT=" + std::to_string(mt) +
                              " not found in GENDF material " + nuclide_name_);
   }
@@ -202,7 +218,10 @@ vector<double> GENDFMaterial::get_xs(
 
 bool GENDFMaterial::has_mt(int mt) const
 {
-  return xs_data_.find(mt) != xs_data_.end();
+  // A reaction is served by get_xs when MF=3 exists, OR (the EAF-2010 case)
+  // when only MF=10 per-final-state partials exist and get_xs returns their
+  // sum. Kept consistent with get_xs so has_mt(mt) predicts get_xs success.
+  return xs_data_.find(mt) != xs_data_.end() || has_mf10(mt);
 }
 
 const vector<double>& GENDFMaterial::get_energies(int mt) const

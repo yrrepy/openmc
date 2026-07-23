@@ -29,6 +29,7 @@ v11 Changes:
 """
 
 import argparse
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -40,7 +41,7 @@ import numpy as np
 
 from openmc.deplete import Chain
 from openmc.deplete.gendf import (
-    GENDFLibrary, REACTION_TO_MT
+    GENDFLibrary, REACTION_TO_MT, MT_TO_REACTION, get_product_name
 )
 
 
@@ -281,8 +282,9 @@ def build_parser():
              "energy-dependent ratios as <isomeric_yields> (legacy/informational)."
     )
 
-    parser.add_argument('--audit-emax',             type=float, default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
-    parser.add_argument('--mf10-reject-band-ratio', type=float, default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band ratio has |ratio-1| > X (default: None = audit only, reject nothing). GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
+    parser.add_argument('--audit-emax',               type=float,          default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
+    parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band ratio has |ratio-1| > X (default: None = audit only, reject nothing). GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
+    parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=False, help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: off; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
 
     return parser
 
@@ -1189,10 +1191,234 @@ def _q_str(value):
     return str(round(float(value), 4))
 
 
+def _print_emission_summary(summary, output_file):
+    """Console log section + reconciliation for the MF=10-only emission passes.
+
+    Called after BOTH the ground pre-pass and the metastable-direct post-pass, so
+    every deferred channel has terminated in exactly one counter.
+    """
+    print("\n" + "=" * 60)
+    print("MF=10-ONLY EMISSION (--emit-mf10-only-reactions)")
+    print("=" * 60)
+    print(f"  Emitted ground reactions:        {summary['emitted']:6d}")
+    print(f"    of which ground-only (NS=1):   {summary['emit_ground_only']:6d}")
+    print(f"  Emitted metastable-direct (post):{summary['emitted_metastable_direct']:6d}")
+    print(f"  Skipped (no MT_TO_REACTION):     {summary['emit_skipped_no_name']:6d}")
+    print(f"  Skipped (target not in chain):   {summary['emit_skipped_no_target']:6d}")
+    print(f"  Skipped (multi-metastable):      {summary['emit_skipped_multi_metastable']:6d}")
+    print(f"  Skipped (type already present):  {summary['emit_skipped_exists']:6d}")
+    print(f"  Load errors (endf crashers):     {summary['emit_skipped_load_error']:6d}")
+    examined = (summary['emitted'] + summary['emitted_metastable_direct']
+                + summary['emit_skipped_no_name']
+                + summary['emit_skipped_no_target']
+                + summary['emit_skipped_multi_metastable']
+                + summary['emit_skipped_exists'])
+    print("-" * 60)
+    print(f"  Reconciliation: examined MF=10-only MTs = "
+          f"emitted + skips = {examined}")
+    print(f"    = {summary['emitted']} ground + {summary['emitted_metastable_direct']} meta-direct "
+          f"+ {summary['emit_skipped_no_name']} no-name "
+          f"+ {summary['emit_skipped_no_target']} no-target "
+          f"+ {summary['emit_skipped_multi_metastable']} multi-metastable "
+          f"+ {summary['emit_skipped_exists']} already-present "
+          f"(load-error nuclides not examined)")
+    if summary['load_error_nuclides']:
+        names = ', '.join(n for n, _ in summary['load_error_nuclides'])
+        print(f"  endf-parser crashers ({len(summary['load_error_nuclides'])}): {names}")
+    print(f"  Output chain written:   {output_file}")
+    if summary['emitted_details']:
+        print("\n  Ground-emitted (parent, type, target, Q):")
+        for parent, rtype, target, q in summary['emitted_details']:
+            print(f"    {parent:<10} {rtype:<12} -> {target:<10} Q={q}")
+    if summary['metastable_direct_details']:
+        print("\n  Metastable-direct post-pass (parent, type, target, Q):")
+        for parent, rtype, target, q in summary['metastable_direct_details']:
+            print(f"    {parent:<10} {rtype:<12} -> {target:<10} Q={q}")
+    if summary['skipped_multi_metastable_details']:
+        print("\n  Not emitted -- multi-metastable, no LFS=0 ground (parent, MT, LFS levels):")
+        for parent, mt, lfs_levels in summary['skipped_multi_metastable_details']:
+            print(f"    {parent:<10} MT={mt:<4} LFS={lfs_levels}")
+
+
+def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
+                           verbose=True):
+    """Emit plain <reaction> elements for GENDF MF=10-only channels (D2/D3).
+
+    EAF-2010 stores any reaction whose residual has a tabulated isomer ONLY in
+    MF=8/10 (no MF=3), so ``Chain.from_endf`` never harvested them. For each
+    chain nuclide with a GENDF file, scan its full-parser material for MTs
+    present in MF=10 but absent from MF=3 and append a plain reaction (target =
+    ground residual from IZAP, Q = the LFS=0 subsection's QM in eV). The
+    augmented base chain is written to ``output_base_file``; the caller reloads
+    the Chain from it so Gate 1 (chain object) and the XML writer (tree) stay
+    consistent (D4 single source of truth).
+    """
+    tree = ET.parse(base_chain_file)
+    root = tree.getroot()
+    nuclide_elems = {n.get('name'): n for n in root.findall('nuclide')}
+    chain_names = {nuc.name for nuc in chain.nuclides}   # tool:1272-1273 membership
+    available = lib.available_nuclides_set()
+
+    summary = {
+        'emitted': 0,                       # ground pre-pass emissions
+        'emitted_metastable_direct': 0,     # post-pass emissions (filled later)
+        'emit_skipped_no_name': 0,
+        'emit_skipped_no_target': 0,
+        'emit_skipped_load_error': 0,
+        'emit_ground_only': 0,
+        'emit_skipped_exists': 0,     # idempotency: reaction type already present
+        # metastable-only MF=10 (no LFS=0 subsection) with >1 metastable level:
+        # would need branching between metastables -> not emitted.
+        'emit_skipped_multi_metastable': 0,
+        'emitted_details': [],
+        'metastable_direct_details': [],    # post-pass (parent, type, target, Q)
+        # Single-metastable no-ground channels deferred to the post-pass (D2/D3):
+        # one final state => no branching decoration needed.
+        'metastable_deferred': [],
+        'load_error_nuclides': [],
+        'skipped_no_name_details': [],
+        'skipped_no_target_details': [],
+        'skipped_multi_metastable_details': [],
+    }
+
+    for nuc_name, nuc_elem in nuclide_elems.items():
+        if nuc_name not in available:
+            continue
+        # Full parser needed for MF=10; ~97 of 816 EAF files crash the endf
+        # int_endf('') bug -- absorb, count, and keep going (never abort the run).
+        try:
+            material = lib._load_material(nuc_name, require_full_parser=True)
+        except Exception as exc:
+            summary['emit_skipped_load_error'] += 1
+            summary['load_error_nuclides'].append((nuc_name, type(exc).__name__))
+            continue
+
+        keys = material.section_data.keys()
+        mf3_mts = {mt for (mf, mt) in keys if mf == 3}
+        mf10_mts = {mt for (mf, mt) in keys if mf == 10}
+        existing_types = {rx.get('type') for rx in nuc_elem.findall('reaction')}
+
+        for mt in sorted(mf10_mts - mf3_mts):
+            name = MT_TO_REACTION.get(mt)
+            if name is None:
+                summary['emit_skipped_no_name'] += 1
+                summary['skipped_no_name_details'].append((nuc_name, mt))
+                continue
+            if name in existing_types:   # re-run / patched-chain idempotency
+                summary['emit_skipped_exists'] += 1
+                continue
+
+            levels = material.section_data[10, mt].get('levels', [])
+            valid = [lv for lv in levels if int(lv.get('IZAP', 0)) != 0]
+            if not valid:
+                summary['emit_skipped_no_target'] += 1
+                summary['skipped_no_target_details'].append((nuc_name, mt, None))
+                continue
+
+            ground = next((lv for lv in valid if int(lv.get('LFS', 0)) == 0), None)
+            if ground is None:
+                # Metastable-only MF=10 (no LFS=0 ground subsection; every EAF
+                # case is MT=4 (n,n')->X_m1). A single metastable final state has
+                # NO branching, so decoration is unnecessary AND harmful (a
+                # ground reaction here makes get_branching_ratios raise "no ground
+                # state", which aborts the whole nuclide). Defer to the post-pass,
+                # which emits a plain static-target reaction AFTER the pipeline so
+                # Gate 1 never sees it. >1 metastable would need branching between
+                # metastables -> not emitted.
+                if len(valid) > 1:
+                    summary['emit_skipped_multi_metastable'] += 1
+                    summary['skipped_multi_metastable_details'].append(
+                        (nuc_name, mt, [int(lv.get('LFS', 0)) for lv in valid]))
+                    continue
+                lv = valid[0]
+                summary['metastable_deferred'].append({
+                    'nuclide': nuc_name, 'mt': mt,
+                    'izap': int(lv['IZAP']), 'lfs': int(lv.get('LFS', 0)),
+                    'qi': lv.get('QI', lv.get('QM')),
+                })
+                continue
+            target = get_product_name(int(ground['IZAP']), 0)
+            if target is None or target not in chain_names:
+                summary['emit_skipped_no_target'] += 1
+                summary['skipped_no_target_details'].append((nuc_name, mt, target))
+                continue
+
+            # NS=1 (ground-only) MTs are emitted too; they simply never gain a
+            # branching child later.
+            has_meta = any(int(lv.get('LFS', 0)) != 0 for lv in valid)
+            if not has_meta:
+                summary['emit_ground_only'] += 1
+
+            q_str = _q_str(ground['QM'])
+            rx = ET.SubElement(nuc_elem, 'reaction')
+            rx.set('type', name)
+            rx.set('Q', q_str)
+            rx.set('target', target)
+            existing_types.add(name)
+            summary['emitted'] += 1
+            summary['emitted_details'].append((nuc_name, name, target, q_str))
+
+    tree.write(output_base_file)
+
+    # The summary is NOT printed here: metastable-direct emissions happen in the
+    # post-pass (emit_metastable_direct_postpass), which runs after the branching
+    # pipeline. main() prints the unified summary once both passes are done.
+    return summary
+
+
+def emit_metastable_direct_postpass(root, emit_summary):
+    """Emit plain static-target reactions for single-metastable MF=10-only
+    channels deferred by the pre-pass (D2/D3).
+
+    A metastable-only channel (no LFS=0 subsection) has exactly ONE final state,
+    so it needs no branching decoration. This runs AFTER the branching pipeline
+    and XML decoration but BEFORE the reactions= recount and the final write, so
+    Gate 1 (which sees only the in-memory chain) never encounters these reactions
+    and the "no ground state" cascade cannot fire. Mutates the writer tree
+    ``root`` in place and updates ``emit_summary`` counters; guards (name, target
+    membership, idempotency) mirror the pre-pass but check the tree being
+    mutated so re-runs on already-patched chains stay safe.
+    """
+    nuclide_map = {n.get('name'): n for n in root.findall('nuclide')}
+    chain_names = set(nuclide_map)
+
+    for entry in emit_summary['metastable_deferred']:
+        nuc_elem = nuclide_map.get(entry['nuclide'])
+        if nuc_elem is None:
+            emit_summary['emit_skipped_no_target'] += 1
+            continue
+        name = MT_TO_REACTION.get(entry['mt'])
+        if name is None:
+            emit_summary['emit_skipped_no_name'] += 1
+            continue
+        # Target is the metastable product itself (e.g. In115(n,n')->In115_m1).
+        target = get_product_name(entry['izap'], entry['lfs'])
+        if target is None or target not in chain_names:
+            emit_summary['emit_skipped_no_target'] += 1
+            continue
+        # Idempotency against the WRITER tree at post-pass time.
+        existing = {rx.get('type') for rx in nuc_elem.findall('reaction')}
+        if name in existing:
+            emit_summary['emit_skipped_exists'] += 1
+            continue
+        # Q = the metastable subsection's QI (state-corrected Q, identical to what
+        # a decorated child would carry: Q_meta = Q_ground - (QM - QI) = QI).
+        q_str = _q_str(entry['qi'])
+        rx = ET.SubElement(nuc_elem, 'reaction')
+        rx.set('type', name)
+        rx.set('Q', q_str)
+        rx.set('target', target)
+        emit_summary['emitted_metastable_direct'] += 1
+        emit_summary['metastable_direct_details'].append(
+            (entry['nuclide'], name, target, q_str))
+
+    return emit_summary
+
+
 def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                          chain, verbose=True, prune_nn_prime_self_loops=False,
                          suppress_single_target_yields=False,
-                         mode='flags_only'):
+                         mode='flags_only', mf10_emit_summary=None):
     """Add branching data to chain XML.
 
     Parameters
@@ -1482,6 +1708,14 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     'reaction': rx_type,
                     'target': target
                 })
+
+    # Metastable-direct post-pass: emit single-metastable MF=10-only channels
+    # (e.g. In115(n,n')->In115_m1) deferred by the pre-pass. Runs AFTER decoration
+    # and prune so Gate 1 never sees them (no "no ground state" cascade), and
+    # BEFORE the recount below so their counts are included. A direct X->X_m1 is
+    # not an exact self-loop, so the prune above (already done) leaves it alone.
+    if mf10_emit_summary is not None:
+        emit_metastable_direct_postpass(root, mf10_emit_summary)
 
     # Recount 'reactions' per unfolded pathway to match the PENDF chains: a
     # branched reaction counts once per target (ground + each metastable), not
@@ -2394,6 +2628,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
          renormalization_log_file=None,
          prune_nn_prime_self_loops=False,
          suppress_single_target_yields=False,
+         emit_mf10_only_reactions=False,
          mode='flags_only',
          audit_emax=2.0e7,
          mf10_reject_band_ratio=None):
@@ -2464,6 +2699,22 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     lib = GENDFLibrary(endf_gxs_dir, **lib_kwargs)
     print(f"  Energy structure: {lib.energy_structure}")
     print(f"  Available nuclides: {len(lib.available_nuclides())}")
+
+    # MF=10-only channel emission (opt-in). EAF-2010 stores isomer-daughter
+    # reactions only in MF=8/10 (no MF=3), so Chain.from_endf never harvested
+    # them. The ENTIRE pre-pass is gated on this flag, so a flag-off run is
+    # byte-identical to the unmodified tool.
+    writer_base = base_chain_file
+    emit_summary = None
+    if emit_mf10_only_reactions:
+        print("\nStep 3b: Emitting GENDF MF=10-only reactions "
+              "(EAF isomer-daughter channels)...")
+        writer_base = f"{output_chain_file}.mf10_emitted_base.xml"
+        emit_summary = emit_mf10_only_prepass(
+            lib, chain, base_chain_file, writer_base, verbose=verbose)
+        # D4: reload the Chain from the emitted XML so Gate 1 (chain object) and
+        # the XML writer (tree) both see the new reactions (single source).
+        chain = Chain.from_xml(writer_base)
 
     print("\nStep 4: Extracting MF=10 branching data...")
     branching_data = lib.process_library_for_branching(
@@ -2573,15 +2824,28 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     if prune_nn_prime_self_loops:
         print("  Pruning (n,n') self-loops without isomeric branching...")
     summary = add_branching_to_xml(
-        original_xml_file=base_chain_file,
+        original_xml_file=writer_base,
         branching_data=branching_data,
         output_xml_file=output_chain_file,
         chain=chain,
         verbose=verbose,
         prune_nn_prime_self_loops=prune_nn_prime_self_loops,
         suppress_single_target_yields=suppress_single_target_yields,
-        mode=mode
+        mode=mode,
+        mf10_emit_summary=emit_summary
     )
+
+    # Unified emission summary now that both passes (ground pre + metastable-direct
+    # post, run inside add_branching_to_xml) have completed.
+    if emit_summary is not None and verbose:
+        _print_emission_summary(emit_summary, output_chain_file)
+
+    # Drop the emission pre-pass intermediate now that the writer has read it.
+    if emit_mf10_only_reactions and writer_base != base_chain_file:
+        try:
+            os.remove(writer_base)
+        except OSError:
+            pass
 
     if summary['renormalizations']:
         print(f"\nRenormalized: {len(summary['renormalizations'])}")
@@ -2668,6 +2932,8 @@ if __name__ == '__main__':
         print("Prune (n,n') self-loops: ENABLED")
     if args.suppress_single_target_yields:
         print("Suppress single-target yields: ENABLED")
+    if args.emit_mf10_only_reactions:
+        print("Emit MF=10-only reactions: ENABLED")
     print(f"Output mode:  {args.mode}")
     print(f"Audit emax:   {args.audit_emax:.3e} eV")
     if args.mf10_reject_band_ratio is None:
@@ -2692,6 +2958,7 @@ if __name__ == '__main__':
         isomer_mapping_log_file=log_file,
         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
         suppress_single_target_yields=args.suppress_single_target_yields,
+        emit_mf10_only_reactions=args.emit_mf10_only_reactions,
         mode=args.mode,
         audit_emax=args.audit_emax,
         mf10_reject_band_ratio=args.mf10_reject_band_ratio
