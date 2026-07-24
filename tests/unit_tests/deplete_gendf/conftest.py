@@ -123,11 +123,13 @@ def _clear_gendf_warn_dedup():
     import openmc.deplete.gendf as g
     import openmc.deplete.helpers as h
     g._WARNED_RUNTIME_BRANCHING.clear()
+    g._WARNED_MF10_DUPLICATE_LFS.clear()
     de._WARNED_ELIS_AMBIGUITY.clear()
     h._WARNED_ISOMERIC_NORMALIZE.clear()
     h._WARNED_WEIGHTED_XS.clear()
     yield
     g._WARNED_RUNTIME_BRANCHING.clear()
+    g._WARNED_MF10_DUPLICATE_LFS.clear()
     de._WARNED_ELIS_AMBIGUITY.clear()
     h._WARNED_ISOMERIC_NORMALIZE.clear()
     h._WARNED_WEIGHTED_XS.clear()

@@ -218,18 +218,29 @@ void store_section_data(const std::string& basename, int mt, vector<double>& xs,
 //! \param[in,out] xs Production cross-section data (moved out)
 //! \param[in,out] energies Energy boundary data (moved out)
 //! \param[out] result Parse result to store into
-//! Same-(MT,LFS) keys from different products (multi-product MTs) would
-//! overwrite silently; warn when the IZAP differs. Last one wins (unchanged).
+//! \param[in,out] poisoned Keys dropped for collision, closed to further stores
+//! Reaction+LFS is a complete key, so a repeated key is ambiguous: drop the
+//! already-stored subsection too and refuse every later store to that key.
 void store_mf10_level(const std::string& basename, int mt, int lfs, int izap,
-  vector<double>&& xs, vector<double>&& energies, GENDFParseResult& result)
+  vector<double>&& xs, vector<double>&& energies, GENDFParseResult& result,
+  std::unordered_set<int>& poisoned)
 {
   int key = mt * 1000 + lfs;
+  if (poisoned.count(key) > 0) {
+    return;
+  }
   auto it = result.prod_izap_data.find(key);
-  if (it != result.prod_izap_data.end() && it->second != izap) {
+  if (it != result.prod_izap_data.end()) {
     result.warnings.push_back(
       "MF=10 store collision in " + basename + " MT=" + std::to_string(mt) +
       " LFS=" + std::to_string(lfs) + ": IZAP=" + std::to_string(izap) +
-      " overwrites IZAP=" + std::to_string(it->second));
+      " collides with IZAP=" + std::to_string(it->second) +
+      "; both subsections dropped");
+    result.prod_xs_data.erase(key);
+    result.prod_energy_data.erase(key);
+    result.prod_izap_data.erase(key);
+    poisoned.insert(key);
+    return;
   }
   result.prod_xs_data[key] = std::move(xs);
   result.prod_energy_data[key] = std::move(energies);
@@ -278,8 +289,9 @@ GENDFParseResult parse_gendf_validated(
   vector<double> mf10_current_energies;
   int mf10_n_groups = 0;
   bool mf10_in_data = false;
-  bool mf10_discard = false; // consume but drop subsection (e.g. IZAP=0)
+  bool mf10_discard = false; // consume but drop subsection (e.g. MT=5)
   int mf10_nr_skip = 0;
+  std::unordered_set<int> mf10_poisoned_keys; // dropped for LFS collision
 
   // Extract basename from filename for cleaner warnings
   std::string basename = filename;
@@ -338,7 +350,7 @@ GENDFParseResult parse_gendf_validated(
           if (!mf10_discard) {
             store_mf10_level(basename, current_mt, mf10_current_lfs,
               mf10_current_izap, std::move(mf10_current_xs),
-              std::move(mf10_current_energies), result);
+              std::move(mf10_current_energies), result, mf10_poisoned_keys);
           }
           mf10_current_xs.clear();
           mf10_current_energies.clear();
@@ -467,7 +479,7 @@ GENDFParseResult parse_gendf_validated(
           if (!mf10_current_xs.empty() && !mf10_discard) {
             store_mf10_level(basename, current_mt, mf10_current_lfs,
               mf10_current_izap, std::move(mf10_current_xs),
-              std::move(mf10_current_energies), result);
+              std::move(mf10_current_energies), result, mf10_poisoned_keys);
           }
           mf10_current_xs.clear();
           mf10_current_energies.clear();
@@ -490,17 +502,16 @@ GENDFParseResult parse_gendf_validated(
           if (current_mt == 5) {
             mf10_discard = true;
           } else if (mf10_current_izap == 0) {
-            // Skip IZAP=0 (data quality issue). Enter discard mode so the
-            // subsection's data lines are consumed rather than re-scanned as
-            // potential subsection heads.
+            // Anonymous product: reaction+LFS is still a complete key, so keep
+            // the subsection -- the chain supplies the product identity.
             result.warnings.push_back(
-              "Skipping MF=10 level in " + basename +
+              "Retaining anonymous (IZAP=0) MF=10 level in " + basename +
               " MT=" + std::to_string(current_mt) +
-              " LFS=" + std::to_string(mf10_current_lfs) + ": IZAP=0");
-            mf10_discard = true;
+              " LFS=" + std::to_string(mf10_current_lfs) + ", keyed by LFS");
           }
 
-          if (!mf10_discard && options.validate_za) {
+          // IZAP=0 is reported above; skip the redundant ZA complaint.
+          if (!mf10_discard && mf10_current_izap != 0 && options.validate_za) {
             std::string izap_error;
             if (!validate_za(mf10_current_izap, izap_error)) {
               result.warnings.push_back(
@@ -561,7 +572,8 @@ GENDFParseResult parse_gendf_validated(
   // Save last MF=10 subsection
   if (current_mf == 10 && !mf10_current_xs.empty() && !mf10_discard) {
     store_mf10_level(basename, current_mt, mf10_current_lfs, mf10_current_izap,
-      std::move(mf10_current_xs), std::move(mf10_current_energies), result);
+      std::move(mf10_current_xs), std::move(mf10_current_energies), result,
+      mf10_poisoned_keys);
   }
 
   infile.close();

@@ -360,6 +360,9 @@ class IsomericBranching:
 # Dedup store for once-per-key runtime-branching warnings
 _WARNED_RUNTIME_BRANCHING: set = set()
 
+# Dedup store for once-per-(nuclide, MT) MF=10 duplicate-LFS warnings
+_WARNED_MF10_DUPLICATE_LFS: set = set()
+
 
 def _warn_runtime_branching(key, message):
     """Emit a runtime-branching UserWarning once per key."""
@@ -399,15 +402,44 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
     Returns
     -------
     IsomericBranching or None
-        None if no production levels are available
+        None when no production levels are usable or the requested ground
+        state is absent from the file (runtime branching disabled, warned)
     """
     if not levels:
+        _warn_runtime_branching(
+            ('no_levels', nuclide_name, mt),
+            f"{nuclide_name} MT={mt}: no usable MF=10 production levels; "
+            "runtime isomeric branching is unavailable, falling back to the "
+            "chain's static branching.")
         return None
 
     # NJOY noise can leave tiny negative MF=10 production values; clamp to 0 so
     # they never enter the numerator/denominator (patcher and C++ clamp too).
     lfs_to_xs = {lfs: np.maximum(xs, 0.0) for lfs, izap, xs in levels}
     n_groups = len(energy_bounds) - 1
+
+    # Ground requested but absent from the file: a zeros row would hand 100% of
+    # the reaction rate to the metastable, so disable runtime branching (R1-61).
+    if 0 in lfs_values and 0 not in lfs_to_xs:
+        _warn_runtime_branching(
+            ('ground_missing', nuclide_name, mt),
+            f"{nuclide_name} MT={mt}: chain requested the ground state "
+            "(LFS=0) but the GENDF file has no LFS=0 production level; "
+            "proceeding would send 100% of the reaction rate to the "
+            "metastable, so runtime isomeric branching is disabled for this "
+            "reaction, falling back to the chain's static branching.")
+        return None
+
+    # Anonymous levels are keyed by LFS alone; the chain names the products.
+    used_lfs = set(lfs_values) | ({0} if 0 in lfs_to_xs else set())
+    anonymous = sorted(lfs for lfs, izap, _ in levels
+                       if izap == 0 and lfs in used_lfs)
+    if anonymous:
+        _warn_runtime_branching(
+            ('anonymous_izap', nuclide_name, mt),
+            f"{nuclide_name} MT={mt}: isomeric branching is served by "
+            f"anonymous (IZAP=0) MF=10 level(s) LFS={anonymous}, keyed by LFS "
+            "alone; product identities are taken from the chain.")
 
     prod_xs = []
     for lfs in lfs_values:
@@ -2146,6 +2178,11 @@ class _PythonGENDFLibrary:
         Each xs_array is aligned to the full group grid (threshold
         reactions carry partial-range MF=10 sections).
         """
+        # MT=5 (lumped) carries many products sharing an LFS, so LFS-keyed
+        # retention is meaningless and no depletion pathway consumes it.
+        if mt == 5:
+            return []
+
         mf10_result = self._load_mf10_data(nuclide_name, mt)
         if mf10_result is None:
             return []
@@ -2156,8 +2193,6 @@ class _PythonGENDFLibrary:
             lfs = level['LFS']
             izap = level['IZAP']
             sigma = level['sigma']
-            if izap == 0:
-                continue
             if hasattr(sigma, 'x'):
                 # Energy-aware alignment onto the full group grid
                 # (mirrors the C++ backend, commit 6e66d2e18)
@@ -2173,6 +2208,21 @@ class _PythonGENDFLibrary:
                 n = min(len(raw), self.n_groups)
                 xs[self.n_groups - n:] = raw[:n]
             levels.append((lfs, izap, xs))
+
+        # Reaction+LFS is a complete key, so a repeated LFS is ambiguous: drop
+        # every colliding subsection rather than letting one of them win.
+        seen = [lfs for lfs, _, _ in levels]
+        duplicated = sorted({lfs for lfs in seen if seen.count(lfs) > 1})
+        if duplicated:
+            levels = [lv for lv in levels if lv[0] not in duplicated]
+            key = (nuclide_name, mt)
+            if key not in _WARNED_MF10_DUPLICATE_LFS:
+                _WARNED_MF10_DUPLICATE_LFS.add(key)
+                warnings.warn(
+                    f"{nuclide_name} MT={mt}: MF=10 LFS {duplicated} appear in "
+                    "more than one subsection; all colliding subsections are "
+                    "dropped, so those levels are unavailable for isomeric "
+                    "branching and for cross sections.", UserWarning)
 
         levels.sort(key=lambda x: x[0])
         return levels
@@ -2253,7 +2303,8 @@ class _PythonGENDFLibrary:
         mt_list: Optional[list[int]] = None,
         progress_callback: Optional[callable] = None,
         verbose: bool = False,
-        chain: Optional['Chain'] = None
+        chain: Optional['Chain'] = None,
+        skip_reactions: Optional[set] = None
     ) -> dict[str, dict[str, IsomericBranching]]:
         """Process entire GENDF library for isomeric branching data.
 
@@ -2274,6 +2325,11 @@ class _PythonGENDFLibrary:
             If provided, only process reactions that exist in the chain for
             each nuclide. This ensures consistency between GENDF branching data
             and chain reactions. Unmatched MTs are tracked in `unmatched_mts`.
+        skip_reactions : set of tuple, optional
+            ``(nuclide, reaction)`` pairs to leave unextracted. Used by the
+            patcher for MF=10 sections holding unrepaired anonymous (IZAP=0)
+            subsections: their decoration is pruned anyway, and extracting the
+            named subset alone only raises on the missing ground state.
 
         Returns
         -------
@@ -2330,6 +2386,12 @@ class _PythonGENDFLibrary:
                         continue
 
                     reaction_name = MT_TO_REACTION[mt]
+
+                    # Caller-supplied exclusion: a knowingly unextractable
+                    # section, not an unmatched MT and not an error.
+                    if skip_reactions and (nuclide_name,
+                                           reaction_name) in skip_reactions:
+                        continue
 
                     # Chain-aware filtering: skip if reaction not in chain
                     if chain_reactions is not None:

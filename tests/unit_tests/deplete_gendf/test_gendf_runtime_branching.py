@@ -149,6 +149,23 @@ def test_runtime_branching_both_levels_unchanged():
     np.testing.assert_allclose(br.branching_ratios[1], [0.2, 0.5, 0.0])
 
 
+def test_runtime_branching_anonymous_levels_warn_once():
+    """R1-61: anonymous (IZAP=0) levels give identical BR -- the chain names the
+    products -- but consumption is announced once per (nuclide, mt)."""
+    anon = [(lfs, 0, xs) for lfs, _, xs in GROUND_M1_LEVELS]
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        for _ in range(3):
+            br = build_runtime_branching(
+                anon, ['Xx', 'Xx_m1'], [0, 1], ENERGY_BOUNDS_3G, 'Xx0', 102)
+        msgs = [str(w.message) for w in rec
+                if issubclass(w.category, UserWarning)]
+    np.testing.assert_allclose(br.branching_ratios[0], [0.8, 0.5, 0.0])
+    np.testing.assert_allclose(br.branching_ratios[1], [0.2, 0.5, 0.0])
+    assert len(msgs) == 1
+    assert 'anonymous (IZAP=0)' in msgs[0] and 'LFS=[0, 1]' in msgs[0]
+
+
 def test_runtime_branching_clamps_negative_production():
     """NJOY-noise negative production clamps to 0: no negative ratios, and the
     negative group behaves as zero metastable production."""
@@ -222,10 +239,34 @@ def test_build_runtime_branching_three_level():
 
 
 def test_build_runtime_branching_empty_levels_none():
-    """No production levels -> None."""
-    assert build_runtime_branching(
-        [], ['Ir192', 'Ir192_m1'], [0, 3],
-        np.linspace(1e-5, 2e7, 4), 'Ir191', 102) is None
+    """No production levels -> None, with the consequence stated (not silent)."""
+    with pytest.warns(UserWarning, match='no usable MF=10 production levels'):
+        result = build_runtime_branching(
+            [], ['Ir192', 'Ir192_m1'], [0, 3],
+            np.linspace(1e-5, 2e7, 4), 'Ir191', 102)
+    assert result is None
+
+
+def test_runtime_branching_requested_ground_missing_none():
+    """R1-61: ground requested but absent -> None, never a zeros row.
+
+    Zeroing the ground channel would normalize the metastable to 1.0 and send
+    the whole reaction rate to it (branching inversion), so runtime branching is
+    disabled and the chain's static behavior stands. Warned once per (nuc, mt).
+    """
+    meta_only = [(1, 501, np.array([2.0, 4.0, 0.0]))]
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        for _ in range(3):
+            result = build_runtime_branching(
+                meta_only, ['Xx', 'Xx_m1'], [0, 1],
+                ENERGY_BOUNDS_3G, 'Xx0', 102)
+        msgs = [str(w.message) for w in rec
+                if issubclass(w.category, UserWarning)]
+    assert result is None
+    assert len(msgs) == 1
+    assert 'no LFS=0 production level' in msgs[0]
+    assert 'static branching' in msgs[0]
 
 
 def test_lookup_liso_ambiguous_warns_once(ir192_lookup):

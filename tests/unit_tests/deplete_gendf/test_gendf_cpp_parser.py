@@ -2,10 +2,11 @@
 
 Two independent parser bugs are covered:
 
-* **MF=10 IZAP=0 handling.** A subsection with IZAP=0 (product unspecified — a
-  data quality issue seen in e.g. Al27/Am241 in JEFF-3.3) must be *consumed* by
-  the parser, not skipped at the head line. The old behavior left the
-  subsection's data lines to be re-scanned as potential subsection heads; since
+* **MF=10 IZAP=0 handling.** A subsection with IZAP=0 (product unspecified —
+  seen in e.g. Al27/Am241 in JEFF-3.3) is *retained*, keyed by LFS (R1-61:
+  reaction + LFS is a complete key and the chain names the product), and its
+  data lines must be *consumed*, not skipped at the head line. The old behavior
+  left the data lines to be re-scanned as potential subsection heads; since
   std::stoi() accepted float prefixes ("7.700000+0" -> 7), data lines were
   misread as new heads, producing garbage production levels and/or swallowing
   the real subsections that followed.
@@ -22,12 +23,13 @@ Two independent parser bugs are covered:
 Synthetic GENDF files are built by the shared ``write_synthetic_gendf`` writer.
 """
 
+import re
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from .gendf_testing import endf6_line, write_synthetic_gendf
+from .gendf_testing import Tab1D, endf6_line, write_synthetic_gendf
 
 lib_gendf = pytest.importorskip('openmc.lib.gendf')
 
@@ -38,6 +40,7 @@ ENERGY_BOUNDS = np.array([1.0, 1.0e3, 1.0e6, 1.0e9])
 MF3_XS = [1.1, 2.2, 3.3]           # MT=102 (n,gamma) group XS
 MF10_XS = [0.15, 0.25, 0.35]       # MT=102 LFS=1 production XS (-> Al28)
 MF10_XS_L0 = [0.11, 0.21, 0.31]    # a distinct LFS=0 production XS
+IZAP0_XS = [9.9, 8.8, 7.7]         # 'izap0' variant's anonymous LFS=0 level
 MF10_IZAP = 13028
 MF10_LFS = 1
 
@@ -52,6 +55,11 @@ _MF10_L0 = [('1.000000+0', '1.100000-1'), ('1.000000+3', '2.100000-1'),
             ('1.000000+6', '3.100000-1'), ('1.000000+9', '9.900000+1')]
 _MF10_L1 = [('1.000000+0', '1.500000-1'), ('1.000000+3', '2.500000-1'),
             ('1.000000+6', '3.500000-1'), ('1.000000+9', '9.900000+1')]
+
+# TAB1 points of the shared 'izap0' variant's anonymous (IZAP=0) level, as
+# floats (that tape is written by ``write_synthetic_gendf``, not from the lists
+# above); aligned they give IZAP0_XS.
+_IZAP0_PTS = [(1.0, 9.9), (1.0e3, 8.8), (1.0e6, 7.7), (1.0e9, 99.0)]
 
 
 def _mf_section(mf, points, *, mat, mt=102, izap=None, lfs=0, nr=1):
@@ -118,6 +126,32 @@ def _python_fast_mf3_section(filepath, mt):
     return np.asarray(sigma.x), np.asarray(sigma.y)
 
 
+def _endf_floats(points):
+    """ENDF implicit-exponent TAB1 pairs -> float ``(x, y)`` pairs."""
+    def conv(s):
+        return float(re.sub(r'(?<=\d)([+-])', r'e\1', s))
+    return [(conv(x), conv(y)) for x, y in points]
+
+
+def _python_production_xs(levels, mt=102, nuclide='Al27'):
+    """Python-backend ``_get_production_xs`` over the same MF=10 content.
+
+    ``levels`` is ``[(lfs, izap, [(energy, xs), ...]), ...]``. The synthetic
+    tapes carry no ENDF SEND/FEND terminators, so the Python backend's full
+    ``endf.Material`` parser cannot read them; feeding its MF=10 loader the
+    identical TAB1 points isolates the shared retention/alignment rules, which
+    is exactly what the two backends must agree on.
+    """
+    py = pytest.importorskip('openmc.deplete.gendf')
+    lib = py._PythonGENDFLibrary.__new__(py._PythonGENDFLibrary)
+    lib.energy_bounds = np.asarray(ENERGY_BOUNDS, dtype=float)
+    lib.n_groups = len(ENERGY_BOUNDS) - 1
+    lib._load_mf10_data = lambda nuc, m: ({'levels': [
+        {'LFS': lfs, 'IZAP': izap, 'sigma': Tab1D(*zip(*pts))}
+        for lfs, izap, pts in levels]}, None)
+    return lib._get_production_xs(nuclide, mt)
+
+
 def _python_aligned_xs(energies, xs, bounds):
     """Group-aligned XS from the Python backend's ``_align_to_group_grid``.
 
@@ -133,8 +167,14 @@ def _python_aligned_xs(energies, xs, bounds):
         'parity', strict_alignment=False)
 
 
-def test_izap0_subsection_consumed_not_rescanned(tmp_path):
-    """MF=10 IZAP=0 subsection is consumed, not rescanned as garbage heads."""
+def test_izap0_subsection_retained_and_consumed(tmp_path):
+    """MF=10 IZAP=0 subsection is retained (keyed by LFS) and consumed.
+
+    R1-61: an anonymous product is not a reason to drop the level -- reaction +
+    LFS is a complete key and the chain names the product. The subsection's
+    data lines must still be *consumed*, not re-scanned as potential heads
+    (which produced garbage levels and swallowed the real LFS=1 level).
+    """
     lib_dir = tmp_path / 'gendf'
     lib_dir.mkdir()
     write_synthetic_gendf(lib_dir / 'Al27g.asc', 'izap0')
@@ -142,14 +182,20 @@ def test_izap0_subsection_consumed_not_rescanned(tmp_path):
     lib = lib_gendf.GENDFLibrary(str(lib_dir), ENERGY_BOUNDS, 'test-3g')
     levels = lib._get_production_xs('Al27', 102)
 
-    # Exactly the real subsection survives: the IZAP=0 level is dropped and
-    # its data lines must not be misread as heads (no garbage levels, and the
-    # real LFS=1 subsection after it must not be swallowed).
-    assert len(levels) == 1
-    lfs, izap, xs = levels[0]
-    assert lfs == MF10_LFS
-    assert izap == MF10_IZAP
-    np.testing.assert_allclose(xs, MF10_XS)
+    # Exactly two levels: the anonymous LFS=0 one and the real LFS=1 one. No
+    # garbage heads from re-scanned data lines, nothing swallowed.
+    expected = [(0, 0), (MF10_LFS, MF10_IZAP)]
+    assert [(lfs, izap) for lfs, izap, _ in levels] == expected
+    np.testing.assert_allclose(levels[0][2], IZAP0_XS)
+    np.testing.assert_allclose(levels[1][2], MF10_XS)
+
+    # Python backend parity: same two levels, same aligned values.
+    py_levels = _python_production_xs(
+        [(0, 0, _IZAP0_PTS), (MF10_LFS, MF10_IZAP, _endf_floats(_MF10_L1))])
+    assert [(lfs, izap) for lfs, izap, _ in py_levels] == \
+        [(lfs, izap) for lfs, izap, _ in levels]
+    for (_, _, py_xs), (_, _, cpp_xs) in zip(py_levels, levels):
+        np.testing.assert_allclose(cpp_xs, py_xs)
 
 
 def test_mf3_nr2_xs_and_python_parity(tmp_path):
@@ -235,10 +281,16 @@ def test_mt5_mf10_skipped_silently(tmp_path, capfd):
     np.testing.assert_allclose(levels[0][2], MF10_XS_L0)
     np.testing.assert_allclose(levels[1][2], MF10_XS)
 
+    # Python backend parity: MT=5 also returns [] (early return, no LFS keying).
+    assert _python_production_xs(
+        [(0, 1, _endf_floats(_MF10_L1)), (0, 13027, _endf_floats(_MF10_L0)),
+         (0, 0, _endf_floats(_MF10_L1))], mt=5) == []
 
-def test_mf10_key_collision_warns(tmp_path, capfd):
-    """Two MF=10 subsections of one MT sharing an (LFS) key but differing in IZAP
-    warn exactly once; the last subsection wins."""
+
+def test_mf10_key_collision_drops_both(tmp_path, capfd):
+    """Two MF=10 subsections of one MT sharing an LFS key warn once and are BOTH
+    dropped -- never last-wins, which would silently pick an arbitrary product.
+    Parity with the Python backend's drop-both rule."""
     gfile = tmp_path / 'Al27g.asc'
     # MT=16, two LFS=0 subsections -> both key 16000; IZAP 13027 then 13028.
     _write_gendf_mf10(gfile, _FULL_MF3, [
@@ -249,12 +301,9 @@ def test_mf10_key_collision_warns(tmp_path, capfd):
     cap = capfd.readouterr()
     flat = ' '.join((cap.err + cap.out).split())            # undo line wrapping
     assert flat.count('MF=10 store collision') == 1
-    assert 'MT=16 LFS=0: IZAP=13028 overwrites IZAP=13027' in flat
+    assert 'MT=16 LFS=0: IZAP=13028 collides with IZAP=13027' in flat
 
-    assert len(levels) == 1                                 # last one wins
-    lfs, izap, xs = levels[0]
-    assert (lfs, izap) == (0, 13028)
-    np.testing.assert_allclose(xs, MF10_XS)
+    assert levels == []                                     # both dropped
 
 
 def test_get_xs_mf10_only_sigma_partials_fallback(tmp_path):

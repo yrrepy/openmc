@@ -48,23 +48,53 @@ def _make_lib(mf3=None, mf10=None):
 
 
 def test_mf10_fallback_sums_partials():
-    """get_xs / get_all_xs serve Σ(MF=10 partials); IZAP=0 skipped; MF=3 kept."""
+    """get_xs / get_all_xs serve Σ(MF=10 partials), anonymous levels included.
+
+    R1-61: an IZAP=0 level is retained (keyed by LFS) and therefore contributes
+    to the Σ total -- dropping it used to under-count the reaction XS.
+    """
     lib = _make_lib(
         mf3={102: [0.5, 0.4, 0.3, 0.0]},
         mf10={107: [_level(0, 110240, [1.0, 2.0, 3.0, 0.0]),
                     _level(1, 110240, [0.1, 0.2, 0.3, 0.0]),
-                    _level(0, 0,      [9.0, 9.0, 9.0, 0.0])]})  # IZAP=0 -> skip
+                    _level(2, 0,      [9.0, 9.0, 9.0, 0.0])]})  # IZAP=0 -> kept
 
     res = lib.get_all_xs('X', mts=[102, 107])
     assert set(res) == {102, 107}
     np.testing.assert_array_equal(res[102], [0.5, 0.4, 0.3])   # MF=3 unchanged
-    np.testing.assert_array_equal(res[107], [1.1, 2.2, 3.3])   # Σ MF=10
+    np.testing.assert_array_equal(res[107], [10.1, 11.2, 12.3])  # Σ MF=10
 
-    np.testing.assert_array_equal(lib.get_xs('X', 107), [1.1, 2.2, 3.3])
+    np.testing.assert_array_equal(lib.get_xs('X', 107), [10.1, 11.2, 12.3])
     np.testing.assert_array_equal(lib.get_xs('X', 102), [0.5, 0.4, 0.3])
 
     # mts=None keeps the MF=3-only behavior (no fallback for un-requested MTs)
     assert set(lib.get_all_xs('X')) == {102}
+
+
+def test_mf10_duplicate_lfs_drops_both():
+    """A repeated LFS within one MT is ambiguous: both subsections are dropped
+    (never last-wins) with one warning; unaffected levels survive."""
+    lib = _make_lib(
+        mf3={102: [0.5, 0.4, 0.3, 0.0]},
+        mf10={107: [_level(0, 110240, [1.0, 2.0, 3.0, 0.0]),
+                    _level(0, 110241, [5.0, 5.0, 5.0, 0.0]),   # collides
+                    _level(1, 110240, [0.1, 0.2, 0.3, 0.0])]})
+
+    with pytest.warns(UserWarning, match='more than one subsection'):
+        levels = lib._get_production_xs('X', 107)
+    assert [(lfs, izap) for lfs, izap, _ in levels] == [(1, 110240)]
+    np.testing.assert_array_equal(lib.get_xs('X', 107), [0.1, 0.2, 0.3])
+
+
+def test_mf10_mt5_not_served():
+    """MT=5 (lumped, many products per LFS) is never keyed by LFS, so it has no
+    production levels and no Σ fallback (C++ parity)."""
+    lib = _make_lib(mf3={102: [0.5, 0.4, 0.3, 0.0]},
+                    mf10={5: [_level(0, 1, [1.0, 2.0, 3.0, 0.0]),
+                              _level(0, 0, [9.0, 9.0, 9.0, 0.0])]})
+    assert lib._get_production_xs('X', 5) == []
+    with pytest.raises(KeyError):
+        lib.get_xs('X', 5)
 
 
 def test_mf10_fallback_missing_everywhere():

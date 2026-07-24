@@ -15,6 +15,9 @@ the <isomeric_branching> element) by the first pass. Always start from a clean,
 unpatched chain.
 
 v12 Changes:
+- --reattribute-mf10-noIZAP recovers MF=10 subsections written with IZAP=0
+  (evidence gate C1-C4); OFF or a gate failure prunes the reaction's ENTIRE
+  isomeric decoration, all-or-nothing
 - Added single-target isomeric yields detection and logging
 - Always logs single-target cases with reason (GENDF_SINGLE_LFS, NO_DECAY_DATA, etc.)
 - Added --suppress-single-target-yields flag to optionally suppress redundant yields
@@ -39,7 +42,10 @@ from xml.dom import minidom
 
 import numpy as np
 
+import openmc.data
 from openmc.deplete import Chain
+from openmc.deplete.chain import REACTIONS
+from openmc.deplete.decay_elis import lookup_liso
 from openmc.deplete.gendf import (
     GENDFLibrary, REACTION_TO_MT, MT_TO_REACTION, get_product_name
 )
@@ -60,6 +66,238 @@ SENTINEL_LFS = {
     99: 'ENDF/JEFF convention: isomer of unspecified level',
     40: 'TENDL convention: isomer of unspecified level',
 }
+
+
+# =============================================================================
+# Anonymous (IZAP=0) MF=10 subsections -- R1-61 evidence gate
+# =============================================================================
+
+# A few evaluations (JEFF-3.3 Am241 MT=102, Al27 MT=16/107) tag an MF=10
+# production subsection with IZAP=0, leaving the product nuclide unnamed while
+# the level itself stays keyed by LFS. The residual can be RE-DERIVED from the
+# reaction's deterministic (dA, dZ) shift, but only under the opt-in
+# --reattribute-mf10-noIZAP flag and only when EVERY anonymous subsection of the
+# reaction clears the C1-C4 evidence gate below. Otherwise the reaction's ENTIRE
+# isomeric decoration is pruned and the plain MF=3 route to the default target
+# is kept: decorating the attributed subset alone would hand 100% of the rate to
+# the metastable (the R1-61 inversion).
+
+# MT -> (dA, dZ) residual shift, assembled from the two upstream tables so no
+# reaction map is hand-written here: chain.REACTIONS names each MT and
+# data.DADZ gives that name's shift. MT=5 (lumped) and MT=18 (fission) are
+# absent from REACTIONS, so C1 excludes them by construction.
+MT_TO_DADZ = {mt: openmc.data.DADZ[name]
+              for name, info in REACTIONS.items() for mt in info.mts}
+
+# C4 Q-consistency tolerance; the real JEFF-3.3 cases match ELIS to < 0.1 keV.
+REATTRIB_Q_TOL_EV = 1.0e3
+
+# Sentinel: the MF=10 section could not be read (endf crasher). Distinct from
+# ``None`` (fully attributed) so an unreadable section is never counted as clean.
+MF10_LOAD_ERROR = 'load_error'
+
+
+def _gate_anonymous_level(lib, parent, mt, level, lfs_counts,
+                          q_tol=REATTRIB_Q_TOL_EV):
+    """Evidence gate C1-C4 for ONE anonymous (IZAP=0) MF=10 subsection.
+
+    Returns ``(izap, verdicts)``: the DADZ-derived IZAP when every condition
+    passes (``None`` otherwise), plus the ordered ``(condition, ok, detail)``
+    verdicts for the report. ``lfs_counts`` is the section's LFS histogram (C2).
+    Level identity is NEVER assumed from LFS (EAF-2010 keys Am242m as LFS=1,
+    other libraries as LFS=2) -- C4 matches the real excitation energy.
+    """
+    verdicts = []
+
+    # C1: deterministic-residual depletion reaction (MT=5/18 excluded here).
+    dadz = MT_TO_DADZ.get(mt)
+    verdicts.append(('C1_reaction', dadz is not None,
+                     f"{MT_TO_REACTION.get(mt, '?')} dA,dZ={dadz}" if dadz else
+                     f"MT={mt} is not a deterministic-residual depletion reaction"))
+    if dadz is None:
+        return None, verdicts
+
+    # C2: valid LFS, unique within the section (a repeated LFS is ambiguous).
+    try:
+        lfs = int(level.get('LFS'))
+    except (TypeError, ValueError):
+        lfs = -1
+    n_same = lfs_counts.get(lfs, 0)
+    ok = lfs >= 0 and n_same == 1
+    verdicts.append(('C2_lfs', ok, f"LFS={level.get('LFS')} x{n_same} in section"))
+    if not ok:
+        return None, verdicts
+
+    # C3: the DADZ-derived residual exists in the decay library.
+    d_a, d_z = dadz
+    z_parent, a_parent, _ = openmc.data.zam(parent)
+    z_prod, a_prod = z_parent + d_z, a_parent + d_a
+    izap = z_prod * 1000 + a_prod
+    decay_lookup = getattr(lib, 'decay_lookup', None) or {}
+    ok = z_prod > 0 and a_prod > 0 and (z_prod, a_prod) in decay_lookup
+    verdicts.append(('C3_product', ok, f"Z={z_prod} A={a_prod} IZAP={izap}"))
+    if not ok:
+        return None, verdicts
+
+    # C4: Q consistency. LFS=0 needs QM == QI; LFS>0 needs QM-QI to land on a
+    # decay-library level's ELIS. ELIS lives at patch time only.
+    qm, qi = level.get('QM'), level.get('QI')
+    if qm is None or qi is None:
+        verdicts.append(('C4_q', False, 'QM/QI missing from the MF=10 subsection'))
+        return None, verdicts
+    elfs = float(qm) - float(qi)
+    if lfs == 0:
+        ok = abs(elfs) <= q_tol
+        detail = f"QM-QI={elfs/1e3:.3f} keV (ground, tol {q_tol/1e3:.1f} keV)"
+    else:
+        match = lookup_liso(z_prod, a_prod, elfs, decay_lookup,
+                            rtol=0.0, atol=q_tol)
+        ok = match.get('status') == 'matched'
+        dk_elis = match.get('dk_elis')
+        detail = (f"QM-QI={elfs/1e3:.3f} keV vs ELIS={dk_elis/1e3:.3f} keV "
+                  f"(_m{match.get('liso')})" if ok else
+                  f"QM-QI={elfs/1e3:.3f} keV: {match.get('status')}" +
+                  (f", nearest ELIS={dk_elis/1e3:.3f} keV"
+                   if dk_elis is not None else ""))
+    verdicts.append(('C4_q', ok, detail))
+    return (izap if ok else None), verdicts
+
+
+def classify_mf10_attribution(lib, parent, mt, reattribute=False,
+                              q_tol=REATTRIB_Q_TOL_EV):
+    """Classify -- and optionally repair -- one MF=10 section's IZAP attribution.
+
+    Returns ``None`` when the section is fully attributed (nothing to report),
+    ``MF10_LOAD_ERROR`` when it could not be read at all, else a record whose
+    ``status`` is one of:
+
+    * ``'excluded'``     -- every anonymous level fails C1 (MT=5/18 and friends;
+      these MTs never carry isomeric decoration, so nothing is lost)
+    * ``'reattributed'`` -- ``reattribute`` is on and every anonymous level
+      cleared the gate; the derived IZAP is written straight into the parsed
+      level, so product naming, branching extraction, the emission pre-pass and
+      the consistency audit all see an ordinary attributed subsection
+    * ``'anon_single'``  -- unrecovered, but the section holds a single final
+      state, so there is no branching to decorate either way
+    * ``'pruned'``       -- flag off, or at least one anonymous level failed the
+      gate; ALL-OR-NOTHING, so no level of the section is repaired
+    """
+    try:
+        mf10_result = lib._load_mf10_data(parent, mt)
+    except Exception:
+        return MF10_LOAD_ERROR
+    if mf10_result is None:
+        return None
+    levels = mf10_result[0].get('levels', []) or []
+    anonymous = [lv for lv in levels if int(lv.get('IZAP', 0) or 0) == 0]
+    if not anonymous:
+        return None
+
+    lfs_counts = Counter(int(lv.get('LFS', 0) or 0) for lv in levels)
+    recovered, failures = [], []
+    for lv in anonymous:
+        izap, verdicts = _gate_anonymous_level(lib, parent, mt, lv, lfs_counts,
+                                               q_tol=q_tol)
+        (failures if izap is None else recovered).append((lv, izap, verdicts))
+
+    record = {
+        'parent': parent, 'mt': mt, 'reaction': MT_TO_REACTION.get(mt),
+        'n_levels': len(levels), 'n_anonymous': len(anonymous),
+        'single_level': len(levels) == 1,
+        'recovered': [{'lfs': int(lv.get('LFS', 0) or 0), 'izap': izap,
+                       'evidence': verdicts[-1][2]}
+                      for lv, izap, verdicts in recovered],
+        'failed': [{'lfs': lv.get('LFS'),
+                    'condition': next(v[0] for v in verdicts if not v[1]),
+                    'detail': next(v[2] for v in verdicts if not v[1])}
+                   for lv, _izap, verdicts in failures],
+    }
+
+    if not failures and reattribute:
+        for lv, izap, _verdicts in recovered:
+            lv['IZAP'] = izap
+        record['status'] = 'reattributed'
+        record['reason'] = None
+        return record
+
+    conditions = {f['condition'] for f in record['failed']}
+    record['reason'] = sorted(conditions)[0] if conditions else 'flag_off'
+    if conditions == {'C1_reaction'}:
+        # Not a depletion channel at all (MT=5/18): reported, never decorated.
+        record['status'] = 'excluded'
+    elif record['single_level']:
+        # One final state -- there is no branching to prune either way.
+        record['status'] = 'anon_single'
+    else:
+        record['status'] = 'pruned'
+    return record
+
+
+def scan_mf10_attribution(lib, chain, reattribute=False,
+                          q_tol=REATTRIB_Q_TOL_EV):
+    """Gate every MF=10 section of every chain nuclide for anonymous levels.
+
+    Must run BEFORE the emission pre-pass and the branching extraction so a
+    repaired IZAP is visible to both. Returns ``(records, pruned, counts)``:
+    the per-section records that carry anonymous levels, the
+    ``{(parent, reaction_name)}`` set whose isomeric decoration must be pruned,
+    and the classification counters.
+    """
+    available = lib.available_nuclides_set()
+    counts = Counter()
+    records = []
+    pruned = set()
+
+    for parent in sorted({nuc.name for nuc in chain.nuclides} & set(available)):
+        # Full parser needed for MF=10; the endf int_endf('') bug crashes ~97 of
+        # the 816 EAF files -- absorb, count, and keep going (as the emission
+        # pre-pass does), never abort the run.
+        try:
+            material = lib._load_material(parent, require_full_parser=True)
+        except Exception:
+            counts['load_error'] += 1
+            continue
+        for mt in sorted(mt for (mf, mt) in material.section_data if mf == 10):
+            record = classify_mf10_attribution(lib, parent, mt,
+                                               reattribute=reattribute,
+                                               q_tol=q_tol)
+            if record is MF10_LOAD_ERROR:
+                counts['load_error'] += 1
+                continue
+            if record is None:
+                counts['attributed'] += 1
+                continue
+            records.append(record)
+            counts[record['status']] += 1
+            counts['anonymous_levels'] += record['n_anonymous']
+            if record['status'] == 'pruned' and record['reaction']:
+                pruned.add((parent, record['reaction']))
+
+    return records, pruned, counts
+
+
+def unrepaired_anonymous_mts(records):
+    """``{(parent, mt)}`` of scanned sections whose IZAP=0 levels stay unnamed.
+
+    Everything the scan recorded except the repaired ones. The emission passes
+    consult this: a section with an unrepaired anonymous level may not yield a
+    pathway of its own, since the levels it CAN name are only a subset of the
+    real final states (R1-61 all-or-nothing).
+    """
+    return {(r['parent'], r['mt']) for r in records
+            if r['status'] != 'reattributed'}
+
+
+def prune_unattributed_decoration(branching_data, pruned):
+    """Drop the isomeric decoration of every reaction flagged by the scan.
+
+    All-or-nothing (R1-61): the chain keeps its plain MF=3-backed reaction to
+    the default target. Applies to both writer modes, since ``flags_only`` and
+    ``embedded`` are both written from ``branching_data``.
+    """
+    for parent, reaction_name in pruned:
+        branching_data.get(parent, {}).pop(reaction_name, None)
+    return {p: rxns for p, rxns in branching_data.items() if rxns}
 
 
 # =============================================================================
@@ -285,6 +523,7 @@ def build_parser():
     parser.add_argument('--audit-emax',               type=float,          default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
     parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band ratio has |ratio-1| > X (default: None = audit only, reject nothing). GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
     parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=False, help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: off; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
+    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=False, help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: off. OFF, or ANY anonymous subsection failing the gate, prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
 
     return parser
 
@@ -501,8 +740,10 @@ def _audit_reaction_gendf(lib, parent, mt, emax=2.0e7):
 
     part_sum = np.zeros(n_groups)
     meta_partials = []              # (lfs, per-group array) for non-ground
+    n_anonymous = 0                 # IZAP=0: no product, excluded from partials
     for level in mf10_data.get('levels', []):
         if int(level.get('IZAP', 0)) == 0:
+            n_anonymous += 1
             continue
         try:
             pg = np.asarray(lib._extract_xs({'sigma': level['sigma']}, parent,
@@ -549,6 +790,11 @@ def _audit_reaction_gendf(lib, parent, mt, emax=2.0e7):
                ('intermediate', f_in), ('fast', f_fa)) if flag]
     notes = (f"partials nonzero vs zero total in {', '.join(flagged)}"
              if flagged else '')
+    # Anonymous levels are missing from Sum(partials), so say so rather than let
+    # the resulting deficit read as an MF=10-vs-MF=3 inconsistency.
+    if n_anonymous:
+        anon_note = f"{n_anonymous} anonymous (IZAP=0) level(s) not in partials"
+        notes = f"{notes}; {anon_note}" if notes else anon_note
 
     # BR-spread is measured WITHIN the worst-deviating defined band (max
     # |ratio - 1|) -- where the MF10-vs-MF3 anomaly lives -- so it reports
@@ -574,7 +820,8 @@ def _audit_reaction_gendf(lib, parent, mt, emax=2.0e7):
         sum_partials=sum_at, total=total_at,
         integral_ratio=ratio, ratio_thermal=r_th, ratio_epithermal=r_ep,
         ratio_intermediate=r_in, ratio_fast=r_fa, br_spread=br_spread,
-        br_spread_band=br_spread_band, notes=notes)
+        br_spread_band=br_spread_band, anonymous_levels=n_anonymous,
+        notes=notes)
 
 
 def run_mf10_consistency_audit(lib, branching_data, emax=2.0e7,
@@ -1191,6 +1438,96 @@ def _q_str(value):
     return str(round(float(value), 4))
 
 
+def _attribution_line(record):
+    """One compact per-reaction line for the IZAP=0 classification report."""
+    head = (f"  {record['status'].upper():<14} {record['parent']:<10} "
+            f"{record['reaction'] or '?':<12} MT={record['mt']:<4} "
+            f"{record['n_anonymous']}/{record['n_levels']} anonymous")
+    if record['status'] == 'reattributed':
+        body = "; ".join(f"LFS={r['lfs']}->IZAP={r['izap']} [{r['evidence']}]"
+                         for r in record['recovered'])
+    elif record['failed']:
+        body = "; ".join(f"LFS={f['lfs']} {f['condition']} FAILED: {f['detail']}"
+                         for f in record['failed'])
+    elif record['status'] == 'anon_single':
+        body = "single final state: no isomeric decoration either way"
+    else:
+        body = "flag off (--reattribute-mf10-noIZAP recovers it)"
+    return f"{head}  {body}"
+
+
+def _print_attribution_summary(records, counts, reattribute):
+    """Loud console block for the anonymous (IZAP=0) MF=10 classification.
+
+    Printed whether or not --reattribute-mf10-noIZAP is on, so a silently lost
+    isomeric decoration is impossible. Excluded rows (MT=5/18 -- never decorated)
+    are counted only; the per-reaction lines cover the decoration-relevant ones.
+    """
+    if not records:
+        print("  No anonymous (IZAP=0) MF=10 subsections found.")
+        return
+    bar = "!" * 70
+    print("\n" + bar)
+    print(f"WARNING: {len(records)} MF=10 section(s) carry anonymous (IZAP=0) "
+          f"subsections ({counts['anonymous_levels']} level(s))")
+    print(bar)
+    print(f"  Fully attributed sections:           {counts['attributed']:6d}")
+    print(f"  Re-attributed (gate passed):         {counts['reattributed']:6d}")
+    print(f"  Pruned (no isomeric decoration):     {counts['pruned']:6d}")
+    print(f"  Excluded (MT=5/18, never decorated): {counts['excluded']:6d}")
+    print(f"  Anonymous single-level sections:     {counts['anon_single']:6d}")
+    if counts['load_error']:
+        print(f"  Load errors (endf crashers):         {counts['load_error']:6d}")
+    if not reattribute and counts['pruned']:
+        print("  Re-attribution is OFF: each pruned reaction keeps its plain "
+              "MF=3 route to the")
+        print("  default target and loses ALL isomeric branching "
+              "(--reattribute-mf10-noIZAP).")
+    for record in sorted(records, key=lambda r: (r['parent'], r['mt'])):
+        if record['status'] != 'excluded':
+            print(_attribution_line(record))
+    print(bar)
+
+
+def _write_attribution_section(f, records, counts, reattribute):
+    """ANONYMOUS (IZAP=0) MF=10 SUBSECTIONS section of the mapping log."""
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("ANONYMOUS (IZAP=0) MF=10 SUBSECTIONS\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("An MF=10 subsection written with IZAP=0 names no product nuclide, "
+            "yet the level stays keyed by LFS. --reattribute-mf10-noIZAP "
+            "re-derives the residual from the\n")
+    f.write("reaction's deterministic (dA, dZ) shift under a four-part "
+            "evidence gate: C1 deterministic-residual depletion MT, C2 valid "
+            "and section-unique LFS, C3 derived product present in the\n")
+    f.write("decay library, C4 Q consistency (QM == QI for LFS=0; QM-QI equal "
+            f"to a decay level's ELIS within {REATTRIB_Q_TOL_EV/1e3:.1f} keV "
+            "for LFS>0 -- level identity comes from ELIS, never from an "
+            "LFS<->m-number\n")
+    f.write("assumption). With the flag OFF, or when ANY anonymous subsection "
+            "of a reaction fails the gate, that reaction's ENTIRE isomeric "
+            "decoration is pruned (all-or-nothing) and the plain\n")
+    f.write("MF=3 route to the default target is kept: decorating the "
+            "attributed subset alone would hand 100% of the reaction rate to "
+            "the metastable.\n")
+    f.write("Note: --suppress-single-target-yields classifications can flip "
+            "single-target to two-target on a re-attributed reaction; that is "
+            "expected.\n\n")
+    f.write(f"Re-attribution: {'ON' if reattribute else 'OFF'}\n")
+    f.write(f"  Fully attributed sections:           {counts['attributed']:6d}\n")
+    f.write(f"  Re-attributed (gate passed):         {counts['reattributed']:6d}\n")
+    f.write(f"  Pruned (no isomeric decoration):     {counts['pruned']:6d}\n")
+    f.write(f"  Excluded (MT=5/18, never decorated): {counts['excluded']:6d}\n")
+    f.write(f"  Anonymous single-level sections:     {counts['anon_single']:6d}\n")
+    f.write(f"  Anonymous levels seen:               {counts['anonymous_levels']:6d}\n")
+    f.write(f"  Load errors (endf crashers):         {counts['load_error']:6d}\n\n")
+    if not records:
+        f.write("No anonymous (IZAP=0) MF=10 subsections found.\n")
+        return
+    for record in sorted(records, key=lambda r: (r['parent'], r['mt'])):
+        f.write(_attribution_line(record) + "\n")
+
+
 def _print_emission_summary(summary, output_file):
     """Console log section + reconciliation for the MF=10-only emission passes.
 
@@ -1206,12 +1543,15 @@ def _print_emission_summary(summary, output_file):
     print(f"  Skipped (no MT_TO_REACTION):     {summary['emit_skipped_no_name']:6d}")
     print(f"  Skipped (target not in chain):   {summary['emit_skipped_no_target']:6d}")
     print(f"  Skipped (multi-metastable):      {summary['emit_skipped_multi_metastable']:6d}")
+    print(f"  Skipped (unrepaired IZAP=0):     {summary['emit_skipped_anonymous']:6d}")
     print(f"  Skipped (type already present):  {summary['emit_skipped_exists']:6d}")
     print(f"  Load errors (endf crashers):     {summary['emit_skipped_load_error']:6d}")
+    print(f"  Anonymous (IZAP=0) levels left:  {summary['emit_anonymous_levels']:6d}")
     examined = (summary['emitted'] + summary['emitted_metastable_direct']
                 + summary['emit_skipped_no_name']
                 + summary['emit_skipped_no_target']
                 + summary['emit_skipped_multi_metastable']
+                + summary['emit_skipped_anonymous']
                 + summary['emit_skipped_exists'])
     print("-" * 60)
     print(f"  Reconciliation: examined MF=10-only MTs = "
@@ -1220,6 +1560,7 @@ def _print_emission_summary(summary, output_file):
           f"+ {summary['emit_skipped_no_name']} no-name "
           f"+ {summary['emit_skipped_no_target']} no-target "
           f"+ {summary['emit_skipped_multi_metastable']} multi-metastable "
+          f"+ {summary['emit_skipped_anonymous']} unrepaired-IZAP=0 "
           f"+ {summary['emit_skipped_exists']} already-present "
           f"(load-error nuclides not examined)")
     if summary['load_error_nuclides']:
@@ -1238,10 +1579,16 @@ def _print_emission_summary(summary, output_file):
         print("\n  Not emitted -- multi-metastable, no LFS=0 ground (parent, MT, LFS levels):")
         for parent, mt, lfs_levels in summary['skipped_multi_metastable_details']:
             print(f"    {parent:<10} MT={mt:<4} LFS={lfs_levels}")
+    if summary['skipped_anonymous_details']:
+        print("\n  Not emitted -- unrepaired anonymous (IZAP=0) level, ground "
+              "unnamed (parent, MT):")
+        for parent, mt in summary['skipped_anonymous_details']:
+            print(f"    {parent:<10} MT={mt:<4}  "
+                  "(--reattribute-mf10-noIZAP recovers it)")
 
 
 def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
-                           verbose=True):
+                           verbose=True, unrepaired_anonymous=None):
     """Emit plain <reaction> elements for GENDF MF=10-only channels (D2/D3).
 
     EAF-2010 stores any reaction whose residual has a tabulated isomer ONLY in
@@ -1252,7 +1599,12 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
     augmented base chain is written to ``output_base_file``; the caller reloads
     the Chain from it so Gate 1 (chain object) and the XML writer (tree) stay
     consistent (D4 single source of truth).
+
+    ``unrepaired_anonymous`` is the scan's ``{(parent, mt)}`` set of sections
+    whose IZAP=0 levels stay unnamed (R1-61); those sections never reach the
+    metastable-direct deferral.
     """
+    unrepaired = unrepaired_anonymous or set()
     tree = ET.parse(base_chain_file)
     root = tree.getroot()
     nuclide_elems = {n.get('name'): n for n in root.findall('nuclide')}
@@ -1270,6 +1622,15 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
         # metastable-only MF=10 (no LFS=0 subsection) with >1 metastable level:
         # would need branching between metastables -> not emitted.
         'emit_skipped_multi_metastable': 0,
+        # Metastable-only channels whose section ALSO carries an unrepaired
+        # anonymous level: the ground is unnamed, not absent, so a static
+        # metastable emission would hand it 100% of the rate (R1-61).
+        'emit_skipped_anonymous': 0,
+        # Anonymous (IZAP=0) levels still unnamed at this point: the
+        # re-attribution pass either recovered them (flag on + gate passed, so
+        # they never reach here) or left them excluded. Counted, never silent.
+        'emit_anonymous_levels': 0,
+        'anonymous_details': [],
         'emitted_details': [],
         'metastable_direct_details': [],    # post-pass (parent, type, target, Q)
         # Single-metastable no-ground channels deferred to the post-pass (D2/D3):
@@ -1279,6 +1640,7 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
         'skipped_no_name_details': [],
         'skipped_no_target_details': [],
         'skipped_multi_metastable_details': [],
+        'skipped_anonymous_details': [],
     }
 
     for nuc_name, nuc_elem in nuclide_elems.items():
@@ -1310,6 +1672,10 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
 
             levels = material.section_data[10, mt].get('levels', [])
             valid = [lv for lv in levels if int(lv.get('IZAP', 0)) != 0]
+            if len(valid) != len(levels):
+                n_anon = len(levels) - len(valid)
+                summary['emit_anonymous_levels'] += n_anon
+                summary['anonymous_details'].append((nuc_name, mt, n_anon))
             if not valid:
                 summary['emit_skipped_no_target'] += 1
                 summary['skipped_no_target_details'].append((nuc_name, mt, None))
@@ -1325,6 +1691,17 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
                 # which emits a plain static-target reaction AFTER the pipeline so
                 # Gate 1 never sees it. >1 metastable would need branching between
                 # metastables -> not emitted.
+                #
+                # R1-61 all-or-nothing: with an unrepaired anonymous level in
+                # the section the LFS=0 ground is unnamed rather than absent,
+                # so `valid` is a metastable-only SUBSET of the real final
+                # states. Emitting it as a plain static target would give the
+                # metastable 100% of the rate -- the inversion this guards.
+                # Checked first: it is the reason that survives re-attribution.
+                if (nuc_name, mt) in unrepaired:
+                    summary['emit_skipped_anonymous'] += 1
+                    summary['skipped_anonymous_details'].append((nuc_name, mt))
+                    continue
                 if len(valid) > 1:
                     summary['emit_skipped_multi_metastable'] += 1
                     summary['skipped_multi_metastable_details'].append(
@@ -1621,10 +1998,13 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 # target/Q are dropped from the <reaction> element (below).
                 iso_elem = ET.SubElement(rx_elem, 'isomeric_branching')
                 iso_elem.set('targets', ' '.join(products))
-                # Write LFS values from branching.lfs_mapping
-                lfs_values = [0]  # ground state always LFS=0
+                # Write LFS values from branching.lfs_mapping. Slot 0 is read
+                # from the mapping too: the chain-membership filter can promote
+                # a metastable into it, and a hardcoded 0 would mislabel it.
+                lfs_map = branching.lfs_mapping or {}
+                lfs_values = [lfs_map.get(products[0], 0)]
                 for p in products[1:]:
-                    lfs = branching.lfs_mapping.get(p) if branching.lfs_mapping else None
+                    lfs = lfs_map.get(p)
                     if lfs is None:
                         raise ValueError(
                             f"No LFS mapping for product {p} of "
@@ -1903,7 +2283,9 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                              duplicate_mapping_errors=None, lfs_order_dropped=None,
                              lfs_order_orphan_dk=None, single_target_cases=None,
                              lfs_sentinels=None, audit_rows=None,
-                             rejected_rows=None):
+                             rejected_rows=None, attribution_records=None,
+                             attribution_counts=None,
+                             reattribute_mf10_noizap=False):
     """Write comprehensive isomer mapping log."""
     if elis_errors is None:
         elis_errors = []
@@ -2425,6 +2807,11 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         # LFS SENTINEL VALUES section (report-only safeguard)
         _write_lfs_sentinel_section(f, lfs_sentinels)
 
+        # ANONYMOUS (IZAP=0) MF=10 classification (R1-61)
+        _write_attribution_section(f, attribution_records or [],
+                                   Counter(attribution_counts or {}),
+                                   reattribute_mf10_noizap)
+
     print(f"Isomer mapping log written to: {log_file}")
 
 
@@ -2629,6 +3016,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
          prune_nn_prime_self_loops=False,
          suppress_single_target_yields=False,
          emit_mf10_only_reactions=False,
+         reattribute_mf10_noizap=False,
          mode='flags_only',
          audit_emax=2.0e7,
          mf10_reject_band_ratio=None):
@@ -2655,6 +3043,10 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         In LFS-order mode: used for ELIS reference warnings only.
     elis_atol : float
         Absolute tolerance in eV (default 0.0)
+    reattribute_mf10_noizap : bool
+        Recover MF=10 subsections written with IZAP=0 when the C1-C4 evidence
+        gate passes. Default False; OFF (or a gate failure) prunes the whole
+        reaction's isomeric decoration.
     """
     # Validate required parameters
     if decay_file is None:
@@ -2700,6 +3092,23 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     print(f"  Energy structure: {lib.energy_structure}")
     print(f"  Available nuclides: {len(lib.available_nuclides())}")
 
+    # Step 3a: anonymous (IZAP=0) MF=10 classification. Runs BEFORE the emission
+    # pre-pass and the branching extraction so a recovered IZAP -- written into
+    # the cached parsed section -- is visible to product naming, the emission
+    # pass, the branching extraction and the consistency audit alike.
+    print("\nStep 3a: Classifying anonymous (IZAP=0) MF=10 subsections...")
+    if reattribute_mf10_noizap:
+        print("  Re-attribution ENABLED (evidence gate C1-C4, Q tolerance "
+              f"{REATTRIB_Q_TOL_EV/1e3:.1f} keV)")
+    else:
+        print("  Re-attribution OFF: affected reactions lose ALL isomeric "
+              "decoration (--reattribute-mf10-noIZAP)")
+    attrib_records, attrib_pruned, attrib_counts = scan_mf10_attribution(
+        lib, chain, reattribute=reattribute_mf10_noizap)
+    _print_attribution_summary(attrib_records, attrib_counts,
+                               reattribute_mf10_noizap)
+    attrib_anonymous = unrepaired_anonymous_mts(attrib_records)
+
     # MF=10-only channel emission (opt-in). EAF-2010 stores isomer-daughter
     # reactions only in MF=8/10 (no MF=3), so Chain.from_endf never harvested
     # them. The ENTIRE pre-pass is gated on this flag, so a flag-off run is
@@ -2711,15 +3120,32 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
               "(EAF isomer-daughter channels)...")
         writer_base = f"{output_chain_file}.mf10_emitted_base.xml"
         emit_summary = emit_mf10_only_prepass(
-            lib, chain, base_chain_file, writer_base, verbose=verbose)
+            lib, chain, base_chain_file, writer_base, verbose=verbose,
+            unrepaired_anonymous=attrib_anonymous)
         # D4: reload the Chain from the emitted XML so Gate 1 (chain object) and
         # the XML writer (tree) both see the new reactions (single source).
         chain = Chain.from_xml(writer_base)
 
     print("\nStep 4: Extracting MF=10 branching data...")
+    # Pruned reactions are excluded from extraction outright: their named levels
+    # are only a subset of the real final states, so building branching from
+    # them either raises ("no ground state") or yields the inverted subset.
     branching_data = lib.process_library_for_branching(
-        mt_list=mt_list, verbose=verbose, chain=chain
+        mt_list=mt_list, verbose=verbose, chain=chain,
+        skip_reactions=attrib_pruned
     )
+
+    # All-or-nothing prune (R1-61): a reaction with an unrecovered anonymous
+    # subsection keeps its plain MF=3 route and loses its isomeric decoration
+    # entirely -- decorating the attributed subset alone would invert the
+    # branching. Belt-and-braces after the extraction skip, and the point where
+    # every downstream count, the mapping log and the output XML see the
+    # reduced set (as the band-reject does).
+    if attrib_pruned:
+        branching_data = prune_unattributed_decoration(branching_data,
+                                                       attrib_pruned)
+        print(f"  Pruned {len(attrib_pruned)} reaction(s) with unrecovered "
+              "anonymous (IZAP=0) MF=10 subsections (excluded from extraction)")
 
     # Capture errors
     elis_errors = []
@@ -2898,7 +3324,10 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
                                 lfs_order_orphan_dk=lfs_order_orphan_dk,
                                 single_target_cases=summary.get('single_target_cases', []),
                                 lfs_sentinels=lfs_sentinels,
-                                audit_rows=audit_rows, rejected_rows=rejected_rows)
+                                audit_rows=audit_rows, rejected_rows=rejected_rows,
+                                attribution_records=attrib_records,
+                                attribution_counts=attrib_counts,
+                                reattribute_mf10_noizap=reattribute_mf10_noizap)
 
     return chain
 
@@ -2934,6 +3363,8 @@ if __name__ == '__main__':
         print("Suppress single-target yields: ENABLED")
     if args.emit_mf10_only_reactions:
         print("Emit MF=10-only reactions: ENABLED")
+    if args.reattribute_mf10_noIZAP:
+        print("Re-attribute MF=10 IZAP=0 subsections: ENABLED")
     print(f"Output mode:  {args.mode}")
     print(f"Audit emax:   {args.audit_emax:.3e} eV")
     if args.mf10_reject_band_ratio is None:
@@ -2959,6 +3390,7 @@ if __name__ == '__main__':
         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
         suppress_single_target_yields=args.suppress_single_target_yields,
         emit_mf10_only_reactions=args.emit_mf10_only_reactions,
+        reattribute_mf10_noizap=args.reattribute_mf10_noIZAP,
         mode=args.mode,
         audit_emax=args.audit_emax,
         mf10_reject_band_ratio=args.mf10_reject_band_ratio
