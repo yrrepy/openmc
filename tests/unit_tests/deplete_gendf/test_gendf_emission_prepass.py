@@ -393,7 +393,7 @@ def test_emit_prepass_skips_unrepaired_anonymous(tmp_path, reattribute,
 
 
 def test_isomeric_flags_take_slot0_lfs_from_mapping(tmp_path):
-    """R1-49: a metastable promoted into slot 0 keeps its real LFS."""
+    """R1-49: a metastable promoted into slot 0 keeps its real LFS and Q."""
     chain = openmc.deplete.Chain()
     ir = openmc.deplete.Nuclide("Ir191")
     ir.add_reaction("(n,gamma)", "Ir192_m1", Q=6198000.0, branching_ratio=1.0)
@@ -408,7 +408,11 @@ def test_isomeric_flags_take_slot0_lfs_from_mapping(tmp_path):
         products=["Ir192", "Ir192_m1", "Ir192_m2"],
         branching_ratios=np.array([[0.7, 0.6], [0.2, 0.25], [0.1, 0.15]]),
         parent_nuclide="Ir191", reaction="(n,gamma)", mt=102,
-        lfs_mapping={"Ir192": 0, "Ir192_m1": 3, "Ir192_m2": 15})}}
+        lfs_mapping={"Ir192": 0, "Ir192_m1": 3, "Ir192_m2": 15},
+        elis_mapping={"Ir192_m1": {"method": "elis", "elis": 56720.0,
+                                   "liso": 1},
+                      "Ir192_m2": {"method": "elis", "elis": 168140.0,
+                                   "liso": 2}})}}
 
     patched = tmp_path / "ir_patched.xml"
     tool.add_branching_to_xml(str(base), data, str(patched), chain,
@@ -416,3 +420,5 @@ def test_isomeric_flags_take_slot0_lfs_from_mapping(tmp_path):
     iso = _reaction_elem(patched, "Ir191", "(n,gamma)").find("isomeric_branching")
     assert iso.get("targets") == "Ir192_m1 Ir192_m2"
     assert iso.get("gendf_lfs") == "3 15"     # not "0 15"
+    # Slot 0 is a promoted metastable: it pays its own ELFS, not the ground Q.
+    assert iso.get("Q").split() == ["6141280.0", "6029860.0"]

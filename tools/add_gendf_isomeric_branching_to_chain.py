@@ -2012,18 +2012,29 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     lfs_values.append(lfs)
                 iso_elem.set('gendf_lfs', ' '.join(str(v) for v in lfs_values))
 
-                # Per-pathway Q parallel-list (WORK ITEM 2). The ground
-                # (products[0], LFS=0) keeps the base reaction's scalar Q (= QM);
-                # each metastable costs its excitation energy, so
+                # Per-pathway Q parallel-list (WORK ITEM 2). A true ground slot
+                # (LFS=0) keeps the base reaction's scalar Q (= QM); every
+                # metastable costs its excitation energy, so
                 #   Q_meta = Q_ground - ELFS,  ELFS = QM - QI,
                 # taken from the SAME MF=10 the branching was derived from
                 # (branching.elis_mapping[p]['elis']) -- no Q value is invented.
                 # A metastable with no ELFS available (e.g. lfs_order mode)
-                # replicates the ground Q and is counted for the report.
+                # replicates the ground Q and is counted for the report. Slot 0
+                # gets the same treatment when the chain-membership filter
+                # promoted a metastable into it (LFS > 0).
                 scalar_q = rx_elem.get('Q')
                 gq = float(scalar_q) if scalar_q is not None else 0.0
                 q_values = [scalar_q if scalar_q is not None else '0.0']
                 elis_map = getattr(branching, 'elis_mapping', None) or {}
+                if lfs_values[0]:
+                    info = (elis_map.get(products[0])
+                            if isinstance(elis_map, dict) else None)
+                    elfs = info.get('elis') if isinstance(info, dict) else None
+                    if elfs is not None:
+                        q_values[0] = _q_str(gq - float(elfs))
+                        summary['q_from_elfs'] += 1
+                    else:
+                        summary['q_replicated'] += 1
                 for p in products[1:]:
                     info = elis_map.get(p) if isinstance(elis_map, dict) else None
                     elfs = info.get('elis') if isinstance(info, dict) else None
