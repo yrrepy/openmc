@@ -136,7 +136,7 @@ def build_parser():
     parser.add_argument('-a', '--atol',             type=float,                                   default=0.0,    help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
     parser.add_argument('--audit-emax',             type=float,                                   default=2.0e7,  help='Cap the MF=10-vs-MF=3 audit at E <= this many eV (default: 2.0e7 = application group cap; MF=10 partials legitimately stop near 30 MeV while MF=3 runs to 200 MeV)')
     parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help="Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (self-loop-ground reactions are EXEMPT -- a metastable-only (n,n') has dev pinned at 1.0) (default: None = audit only, reject nothing)")
-    parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has ratio-1 > X (over-summing ONLY; under-summing never rejects -- the collapse silence-fill and Class-4 policy own it) (default: None = off; None-ratio bands never trigger)')
+    parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has ratio-1 > X (over-summing ONLY; under-summing never rejects -- the collapse silence-fill and Class-4 policy own it) (self-loop-ground reactions are EXEMPT -- their ground route is a depletion-matrix no-op) (default: None = off; None-ratio bands never trigger)')
     parser.add_argument('-v', '--verbose',          action='store_true',                          default=True,   help='Enable verbose output (default: True)')
     parser.add_argument('-q', '--quiet',            action='store_true',                          default=False,  help='Disable verbose output')
     parser.add_argument('--prune-nn-prime-self-loops', action='store_true',                       default=False,  help="Remove (n,n') reactions with no isomeric branching whose target is EXACTLY the parent -- ground-parent self-loops that are an exact no-op in the depletion matrix. A metastable parent's (n,n') to ground is real isomer burnup and is KEPT. Default: keep all (n,n') reactions.")
@@ -893,14 +893,12 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                     else:
                         fired.append('worst_dev')
                 if band_fired and self_loop:
-                    if not fired:
-                        # The exemption actually spares a rejection that the
-                        # band criterion would otherwise have fired: mark the
-                        # audit row and count it. (A self-loop's worst_dev is
-                        # exempted above, so it never fills `fired` here.)
-                        band_reject_exempt += 1
-                        _append_note(audit,
-                                     'self-loop ground: band-reject exempt')
+                    # The exemption spares a rejection that the band criterion
+                    # would otherwise have fired: mark the audit row and count
+                    # it. `fired` is necessarily empty here -- a self-loop's
+                    # worst_dev is exempted above, so it never fills `fired`.
+                    band_reject_exempt += 1
+                    _append_note(audit, 'self-loop ground: band-reject exempt')
                 else:
                     fired.extend(band_fired)
 
@@ -1243,7 +1241,7 @@ def print_stats(stats, mode):
     if mode == 'elis':
         print(f"                                   ELIS matched: {stats['matched']:5d}")
     else:
-        print(f"                              LFS-order mapped: {stats['matched']:5d}")
+        print(f"                               LFS-order mapped: {stats['matched']:5d}")
     if stats['matched_rejected']:
         print(f"         matched but band-rejected (left stock): {stats['matched_rejected']:5d}")
     if stats['rtol_exceeded']:
@@ -1256,8 +1254,8 @@ def print_stats(stats, mode):
         print(f"                    Duplicate mappings resolved: {stats['duplicate_resolved']:5d} ({stats['duplicate_discarded']} LFS discarded)")
     if stats['lfs_order_dropped']:
         print(f"                 LFS dropped (exceeds DK count): {stats['lfs_order_dropped']:5d}")
-    print(f"                        Products not in chain: {stats['products_not_in_chain']:5d}")
-    print(f"                      Reactions added to chain: {stats['reactions_added']:5d}")
+    print(f"                          Products not in chain: {stats['products_not_in_chain']:5d}")
+    print(f"                       Reactions added to chain: {stats['reactions_added']:5d}")
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
     print(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}")
     print(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}")
@@ -1790,7 +1788,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         if mode == 'elis':
             f.write(f"                                   ELIS matched: {stats['matched']:5d}\n")
         else:
-            f.write(f"                              LFS-order mapped: {stats['matched']:5d}\n")
+            f.write(f"                               LFS-order mapped: {stats['matched']:5d}\n")
         if stats['matched_rejected']:
             f.write(f"         matched but band-rejected (left stock): {stats['matched_rejected']:5d}\n")
         if stats['rtol_exceeded']:
@@ -1805,7 +1803,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             f.write(f"                 LFS dropped (exceeds DK count): {stats['lfs_order_dropped']:5d}\n")
         f.write(f"                          Products not in chain: {stats['products_not_in_chain']:5d}\n")
         f.write(f"                       Reactions added to chain: {stats['reactions_added']:5d}\n")
-        f.write(f"                     Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
+        f.write(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
         f.write(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}\n")
         f.write(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}\n")
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
