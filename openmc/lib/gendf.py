@@ -504,9 +504,16 @@ class GENDFLibrary:
         # C++ backend returns production XS already aligned to the full
         # group grid; the BR computation is shared with the Python backend
         levels = self._get_production_xs(nuclide, mt)
+        # The rate XS feeds the missing-ground repair only: get_xs serves the
+        # MF=3 total, or Sigma(MF=10) for an MF=10-only reaction. Taking the
+        # remainder against the same array the rate uses is what makes the
+        # repair self-consistent, and is what the Python backend now does too.
+        total_xs = None
+        if levels and 0 in lfs_values and 0 not in {lfs for lfs, _, _ in levels}:
+            total_xs = self.get_xs(nuclide, mt)
         return build_runtime_branching(
             levels, target_names, lfs_values, self.energy_bounds,
-            nuclide, mt)
+            nuclide, mt, total_xs=total_xs)
 
     def __repr__(self):
         return (f"GENDFLibrary(lib_id={self._lib_id}, "

@@ -33,7 +33,7 @@ from openmc.deplete.chain import Chain
 from openmc.deplete.decay_elis import lookup_liso
 from openmc.deplete.gendf import (
     IsomericBranching, REACTION_TO_MT, MT_TO_REACTION,
-    _PythonGENDFLibrary, build_runtime_branching)
+    _PythonGENDFLibrary, _WARNED_RUNTIME_BRANCHING, build_runtime_branching)
 from openmc.deplete.helpers import (
     IsomericBranchingHelper, DirectReactionRateHelper,
     FluxCollapseHelper, GENDFFluxCollapseHelper)
@@ -248,7 +248,7 @@ def test_build_runtime_branching_empty_levels_none():
 
 
 def test_runtime_branching_requested_ground_missing_none():
-    """R1-61: ground requested but absent -> None, never a zeros row.
+    """R1-61: ground absent and no rate XS -> None, never a zeros row.
 
     Zeroing the ground channel would normalize the metastable to 1.0 and send
     the whole reaction rate to it (branching inversion), so runtime branching is
@@ -267,6 +267,43 @@ def test_runtime_branching_requested_ground_missing_none():
     assert len(msgs) == 1
     assert 'no LFS=0 production level' in msgs[0]
     assert 'static branching' in msgs[0]
+
+
+def test_runtime_branching_ground_repaired_from_total():
+    """Policy 3(a): the missing ground is the clamped remainder of the rate XS.
+
+    The file carries m1 AND m2 but the chain requests only ground + m1, so the
+    remainder subtracts EVERY file metastable (ground = total - m1 - m2, the
+    patcher convention) while the denominator stays requested-only -- m2's yield
+    is reattributed onto the tracked pair. Group 1 has sigma_m1 (4.0) > total
+    (3.0), so the remainder clamps to 0. Warned once per (nuc, mt).
+    """
+    file_levels = [(1, 501, np.array([2.0, 4.0, 0.0])),
+                   (2, 501, np.array([1.0, 0.0, 1.0]))]
+    total_xs = np.array([8.0, 3.0, 5.0])
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        for _ in range(3):
+            br = build_runtime_branching(
+                file_levels, ['Xx', 'Xx_m1'], [0, 1],
+                ENERGY_BOUNDS_3G, 'Xx0', 102, total_xs=total_xs)
+        msgs = [str(w.message) for w in rec
+                if issubclass(w.category, UserWarning)]
+    # ground = [8-2-1, max(0, 3-4-0), 5-0-1] = [5, 0, 4]; denominator = ground+m1
+    np.testing.assert_allclose(br.branching_ratios[0], [5 / 7, 0.0, 1.0])
+    np.testing.assert_allclose(br.branching_ratios[1], [2 / 7, 1.0, 0.0])
+    assert len(msgs) == 1
+    assert 'max(0, sigma_total - sum sigma_MF10_m)' in msgs[0]
+    assert ('ground_missing_repaired', 'Xx0', 102) in _WARNED_RUNTIME_BRANCHING
+
+    # A present ground ignores total_xs entirely (normal path unchanged).
+    plain = build_runtime_branching(
+        GROUND_M1_LEVELS, ['Xx', 'Xx_m1'], [0, 1], ENERGY_BOUNDS_3G, 'Yy', 102)
+    repaired_arg = build_runtime_branching(
+        GROUND_M1_LEVELS, ['Xx', 'Xx_m1'], [0, 1], ENERGY_BOUNDS_3G, 'Yy', 102,
+        total_xs=total_xs)
+    np.testing.assert_array_equal(plain.branching_ratios,
+                                  repaired_arg.branching_ratios)
 
 
 def test_lookup_liso_ambiguous_warns_once(ir192_lookup):
@@ -441,6 +478,56 @@ def test_c_api_get_production_xs_signature():
     params = list(inspect.signature(lib.GENDFLibrary._get_production_xs).parameters)
     assert 'nuclide' in params
     assert 'mt' in params
+
+
+def test_backend_agreement_on_repaired_ground(tmp_path):
+    """Both backends synthesize the same ground for a ground-absent MF=10.
+
+    The lanes differ only in what they hand ``build_runtime_branching`` as the
+    rate cross section; both now pass their own ``get_xs``, so on one file the
+    repaired branching ratios must be bit-identical. C++ reads the tape, Python
+    is fed the same MF=3 / MF=10 content (its full parser cannot read a tape
+    with no SEND/FEND terminators).
+    """
+    from types import SimpleNamespace
+
+    lib_gendf = pytest.importorskip('openmc.lib.gendf')
+    from .gendf_testing import Tab1D, write_synthetic_gendf
+
+    bounds = np.array([1.0, 1.0e3, 1.0e6, 1.0e9])
+    grid = bounds                              # NP=4: 3 groups + top dummy
+    mf3_y = np.array([1.1, 2.2, 3.3, 99.0])
+    mf10_y = np.array([0.15, 0.25, 0.35, 99.0])
+    targets, lfs_values = ['Al28', 'Al28_m1'], [0, 1]
+
+    lib_dir = tmp_path / 'gendf'
+    lib_dir.mkdir()
+    write_synthetic_gendf(lib_dir / 'Al27g.asc', 'ground_absent')
+    cpp = lib_gendf.GENDFLibrary(str(lib_dir), bounds, 'test-3g')
+
+    py = _PythonGENDFLibrary.__new__(_PythonGENDFLibrary)
+    py.energy_bounds = bounds
+    py.n_groups = len(bounds) - 1
+    py.energy_structure = 'test-3g'
+    py._energy_validated = True
+    py._load_material = lambda nuc, require_full_parser=False: SimpleNamespace(
+        section_data={(3, 102): {'sigma': Tab1D(grid, mf3_y)}})
+    py._load_mf10_data = lambda nuc, mt: (
+        ({'levels': [{'LFS': 1, 'IZAP': 13028, 'sigma': Tab1D(grid, mf10_y)}]},
+         None) if mt == 102 else None)
+
+    with pytest.warns(UserWarning, match='no LFS=0 production level'):
+        cpp_br = cpp.get_branching_ratios('Al27', 102, target_names=targets,
+                                          lfs_values=lfs_values)
+    py_br = py.get_branching_ratios('Al27', 102, target_names=targets,
+                                    lfs_values=lfs_values)
+
+    assert cpp_br.products == py_br.products == targets
+    np.testing.assert_array_equal(cpp_br.branching_ratios,
+                                  py_br.branching_ratios)
+    # ground = MF=3 total - the isomer partial, per group
+    np.testing.assert_allclose(py_br.branching_ratios[1],
+                               mf10_y[:3] / mf3_y[:3])
 
 
 # ============================================================================

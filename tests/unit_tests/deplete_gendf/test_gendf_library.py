@@ -36,6 +36,7 @@ from .gendf_testing import (
     CCFE709_BOUNDS,
     CCFE709_NGROUPS,
     Tab1D,
+    make_isomeric_branching,
     make_python_gendf_lib,
     threshold_level,
 )
@@ -543,6 +544,42 @@ def test_process_library_surfaces_unexpected_errors():
     assert result == {}
     assert [e['type'] for e in lib.processing_errors] == \
         ['no_metastable_decay_data']
+
+
+def test_process_library_isolates_failures_per_mt():
+    """One poisoned MT must not cost the nuclide its other channels.
+
+    MT=4 is processed first, so before per-MT isolation its failure discarded
+    every later channel of the nuclide (the In113/In115 drop).
+    """
+    from openmc.deplete.gendf import _PythonGENDFLibrary
+
+    def _make(poison):
+        lib = _PythonGENDFLibrary.__new__(_PythonGENDFLibrary)
+        lib.available_nuclides = lambda: ['Ag109']
+        lib.get_branching_ratios = lambda nuc, mt: (
+            poison() if mt == 4 else
+            make_isomeric_branching(nuc, '(n,gamma)', ['Ag110', 'Ag110_m1'],
+                                    [1.0], [[.7], [.3]]))
+        return lib
+
+    def _expected():
+        raise ValueError("WARNING: NO_METASTABLE_DECAY_DATA: Ag109 ...")
+
+    lib = _make(_expected)
+    result = lib.process_library_for_branching(mt_list=[4, 102], verbose=False)
+    assert list(result['Ag109']) == ['(n,gamma)']
+    err = lib.processing_errors[0]
+    assert (err['mt'], err['reaction'], err['type']) == \
+        (4, "(n,n')", 'no_metastable_decay_data')
+
+    # An unexpected per-MT failure still aborts, and renders with its MT.
+    def _unexpected():
+        raise ValueError("poisoned channel")
+
+    with pytest.raises(RuntimeError, match=r"Ag109 MT=4: ValueError"):
+        _make(_unexpected).process_library_for_branching(
+            mt_list=[4, 102], verbose=False)
 
 
 def test_full_range_band_unchanged():

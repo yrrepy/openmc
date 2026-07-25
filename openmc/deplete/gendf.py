@@ -372,12 +372,13 @@ def _warn_runtime_branching(key, message):
 
 
 def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
-                            nuclide_name, mt):
+                            nuclide_name, mt, total_xs=None):
     """Build runtime-mode IsomericBranching from aligned production XS.
 
     Shared by the Python and C++ backends: both fetch per-level MF=10
-    production XS aligned to the full group grid and feed it here, so the
-    branching-ratio computation cannot diverge between backends.
+    production XS aligned to the full group grid and the reaction's rate cross
+    section from ``get_xs``, and feed both here, so the branching-ratio
+    computation cannot diverge between backends.
 
     The denominator sums production XS over the chain-requested LFS levels only
     (plus the file's ground when not requested), so yield to any untracked file
@@ -398,12 +399,20 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
         Parent nuclide name
     mt : int
         ENDF MT number
+    total_xs : numpy.ndarray, optional
+        The reaction's rate cross section (MF=3 total, or Sigma(MF=10) for
+        MF=10-only reactions), per group. Used only to synthesize a missing
+        requested ground row as the clamped remainder (policy 3(a));
+        self-consistent because the remainder is taken against the same array
+        the rate uses, so BR*rate reproduces the per-state MF=10 XS exactly and
+        inversion cannot occur.
 
     Returns
     -------
     IsomericBranching or None
         None when no production levels are usable or the requested ground
-        state is absent from the file (runtime branching disabled, warned)
+        state is absent from the file and no rate cross section is available to
+        repair it (runtime branching disabled, warned)
     """
     if not levels:
         _warn_runtime_branching(
@@ -418,17 +427,35 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
     lfs_to_xs = {lfs: np.maximum(xs, 0.0) for lfs, izap, xs in levels}
     n_groups = len(energy_bounds) - 1
 
-    # Ground requested but absent from the file: a zeros row would hand 100% of
-    # the reaction rate to the metastable, so disable runtime branching (R1-61).
+    # Ground requested but absent from the file. A radioactive-products-only
+    # MF=10 omits a (quasi-)stable ground, so when the rate cross section is
+    # available the ground channel is its clamped remainder (policy 3(a));
+    # without it a zeros row would hand 100% of the rate to the metastable, so
+    # runtime branching is disabled instead (R1-61).
     if 0 in lfs_values and 0 not in lfs_to_xs:
+        if total_xs is None:
+            _warn_runtime_branching(
+                ('ground_missing', nuclide_name, mt),
+                f"{nuclide_name} MT={mt}: chain requested the ground state "
+                "(LFS=0) but the GENDF file has no LFS=0 production level; "
+                "proceeding would send 100% of the reaction rate to the "
+                "metastable, so runtime isomeric branching is disabled for this "
+                "reaction, falling back to the chain's static branching.")
+            return None
+        # Every metastable in the FILE is subtracted, not only the requested
+        # ones: yield to untracked levels is reattributed onto the tracked
+        # isomers (the patcher convention), never left in the ground channel.
+        file_meta = [xs for lfs, xs in lfs_to_xs.items() if lfs != 0]
+        remainder = np.asarray(total_xs, dtype=float)
+        if file_meta:
+            remainder = remainder - np.sum(file_meta, axis=0)
+        lfs_to_xs[0] = np.maximum(remainder, 0.0)
         _warn_runtime_branching(
-            ('ground_missing', nuclide_name, mt),
-            f"{nuclide_name} MT={mt}: chain requested the ground state "
-            "(LFS=0) but the GENDF file has no LFS=0 production level; "
-            "proceeding would send 100% of the reaction rate to the "
-            "metastable, so runtime isomeric branching is disabled for this "
-            "reaction, falling back to the chain's static branching.")
-        return None
+            ('ground_missing_repaired', nuclide_name, mt),
+            f"{nuclide_name} MT={mt}: the GENDF file has no LFS=0 production "
+            "level (radioactive-products-only MF=10), so the requested ground "
+            "state is synthesized from the reaction's rate cross section as "
+            "max(0, sigma_total - sum sigma_MF10_m).")
 
     # Anonymous levels are keyed by LFS alone; the chain names the products.
     used_lfs = set(lfs_values) | ({0} if 0 in lfs_to_xs else set())
@@ -1206,6 +1233,18 @@ class _PythonGENDFLibrary:
                     result[mt] = np.sum([xs for _, _, xs in levels], axis=0)
         return result
 
+    def _rate_total_xs(self, nuclide_name, mt):
+        """The reaction's rate XS (MF=3 total, else Σ(MF=10)); None on failure.
+
+        Deliberately get_xs(): the missing-ground remainder must be taken
+        against the very array the rate machinery serves, so the repair stays
+        self-consistent and matches the C++ backend on the same file.
+        """
+        try:
+            return self.get_xs(nuclide_name, mt, strict_alignment=False)
+        except Exception:
+            return None
+
     def _production_levels(self, nuclide_name, mt):
         """Σ-fallback MF=10 levels for a missing MT; [] on any load failure."""
         try:
@@ -1427,7 +1466,7 @@ class _PythonGENDFLibrary:
             List of metastable level dicts from _categorize_mf10_levels()
         qm_section : float or None
             Section-level QM value
-        ground_data : dict or None
+        ground_data : Tabulated1D or _RemainderXS or None
             Ground state data for context in duplicate detection
         nuclide_name : str
             Parent nuclide name
@@ -1511,9 +1550,11 @@ class _PythonGENDFLibrary:
                 a = keeper_meta['a']
                 dk_elis = keeper_result['dk_elis']
 
-                # Collect ALL GENDF LFS levels for this reaction
+                # Collect ALL GENDF LFS levels for this reaction. A synthesized
+                # ground is not a file level, so it must not appear here.
                 gendf_all_lfs = []
-                if ground_data is not None:
+                if ground_data is not None and \
+                        not isinstance(ground_data, self._RemainderXS):
                     gendf_all_lfs.append({'lfs': 0, 'elis': 0.0})
                 for meta_item in all_meta_levels:
                     qm = meta_item['level'].get('QM', qm_section)
@@ -1900,8 +1941,9 @@ class _PythonGENDFLibrary:
 
         Parameters
         ----------
-        ground_data : Tabulated1D
-            Ground state cross-section data
+        ground_data : Tabulated1D or _RemainderXS or None
+            Ground state cross-section data (file section or the synthesized
+            MF=3 remainder from :meth:`_synthesize_ground_from_mf3`)
         ground_product : str
             Ground state product name (e.g., 'Ir192')
         mapped_meta_levels : list
@@ -1916,17 +1958,20 @@ class _PythonGENDFLibrary:
         Returns
         -------
         IsomericBranching or None
-            Branching data, or None if no valid energy points
+            Branching data, or None if no valid energy points, no ground state
+            (the caller repairs a repairable ground before this point), or a
+            synthesized ground left as the only product
         """
-        # Validate ground state exists (required for branching ratio calculation)
+        # A ground state is required for the ratios; the ground-absent MF=10
+        # pattern is repaired (or classified as a skip) by the caller.
         if ground_data is None:
-            meta_products_str = ', '.join(name for _, name, _, _ in mapped_meta_levels)
-            raise ValueError(
-                f"MF=10 data for {nuclide_name} MT={mt} has metastable state(s) "
-                f"({meta_products_str}) but no ground state (LFS=0). This indicates "
-                "corrupted GENDF data - isomeric branching requires both ground "
-                "and metastable cross-sections."
-            )
+            return None
+
+        # Synthesized ground + no surviving metastable = a one-product
+        # decoration: no branching information, and its presence would keep an
+        # (n,n') self-loop alive through the pruner's has_branching test.
+        if isinstance(ground_data, self._RemainderXS) and not mapped_meta_levels:
+            return None
 
         # Use union of energy grids from ground + ALL metastable states
         all_energy_sets = [set(ground_data.x)]
@@ -2051,12 +2096,15 @@ class _PythonGENDFLibrary:
         Returns
         -------
         tuple or None
-            (ground_data, ground_product, all_meta_levels, base_nuclide)
-            if metastable levels exist, None if only ground state
+            (ground_data, ground_product, all_meta_levels, base_nuclide,
+            n_anonymous) if metastable levels exist, None if only ground state.
+            ``n_anonymous`` counts the dropped IZAP=0 levels, so callers can
+            tell an absent ground from an unnamed one (R1-61).
         """
         ground_data = None
         ground_product = None
         all_meta_levels = []
+        n_anonymous = 0
 
         for level in mf10_data['levels']:
             lfs = level['LFS']
@@ -2065,6 +2113,7 @@ class _PythonGENDFLibrary:
 
             # Validate IZAP
             if izap == 0:
+                n_anonymous += 1
                 warnings.warn(
                     f"Skipping MF=10 level in {nuclide_name} MT={mt}: "
                     f"Invalid IZAP={izap} (product not specified in GENDF file). "
@@ -2112,7 +2161,120 @@ class _PythonGENDFLibrary:
         # Determine base nuclide name
         base_nuclide = ground_product if ground_product else all_meta_levels[0]['base_product']
 
-        return (ground_data, ground_product, all_meta_levels, base_nuclide)
+        return (ground_data, ground_product, all_meta_levels, base_nuclide,
+                n_anonymous)
+
+    def _record_unmatched_mt(self, nuclide_name, mt, reaction_name, reason):
+        """Record a classified (nuclide, MT) skip in the unmatched-MT bookkeeping."""
+        if not hasattr(self, '_unmatched_mts'):
+            self._unmatched_mts = []
+        self._unmatched_mts.append({
+            'nuclide': nuclide_name,
+            'mt': mt,
+            'reaction': reaction_name,
+            'reason': reason,
+        })
+
+    @dataclass
+    class _RemainderXS:
+        """Bare (x, y) container for the synthesized ground level.
+
+        Intentionally NOT a Tabulated1D: the remainder is histogram group data
+        and must never be lin-lin callable. Consumers touch only ``.x``/``.y``,
+        and the type doubles as the "this ground is synthesized" marker.
+        """
+
+        x: np.ndarray
+        y: np.ndarray
+
+    def _synthesize_ground_from_mf3(self, all_meta_levels, nuclide_name, mt,
+                                    n_anonymous):
+        """Synthesize the absent ground level as the clamped MF=3 remainder.
+
+        A radioactive-products-only MF=10 omits a (quasi-)stable ground state
+        (e.g. JEFF-4.0 In115 MT=4 stores only In115_m1). MF=3 carries the
+        reaction total, so ground = max(0, sigma_MF3 - sum sigma_MF10_m)
+        per energy point (policy 3(a)). Patcher lane only: the decoration is
+        written solely against a true MF=3 section, so an MF=10-only reaction
+        stays a classified skip here (the runtime lane unifies on get_xs).
+
+        Returns
+        -------
+        tuple or None
+            (ground_data, ground_product), or None when unrepairable (any
+            anonymous level, no true MF=3 section, or metastables from more
+            than one product IZAP); the skip is classified in ``unmatched_mts``.
+        """
+        reaction_name = MT_TO_REACTION.get(mt, f'MT{mt}')
+
+        # An anonymous (IZAP=0) level means the ground may be UNNAMED rather
+        # than absent, so the named levels are a subset of the real final
+        # states: repairing would decorate that subset and invert the branching
+        # (R1-61 all-or-nothing). Checked first -- it outranks the other
+        # reasons.
+        if n_anonymous:
+            self._record_unmatched_mt(nuclide_name, mt, reaction_name,
+                                      'mf10_anonymous_levels')
+            return None
+
+        izaps = {meta['izap'] for meta in all_meta_levels}
+        if len(izaps) != 1:
+            self._record_unmatched_mt(nuclide_name, mt, reaction_name,
+                                      'mf10_ambiguous_izap')
+            return None
+        ground_product = get_product_name(izaps.pop(), 0)
+
+        # get_xs() serves Sigma(MF=10) when MF=3 is absent, which would make the
+        # remainder identically zero -- test the section itself.
+        material = self._load_material(nuclide_name, require_full_parser=True)
+        mf3_section = material.section_data.get((3, mt))
+        mf3_sigma = mf3_section.get('sigma') if mf3_section else None
+        if mf3_sigma is None or not hasattr(mf3_sigma, 'x'):
+            self._record_unmatched_mt(nuclide_name, mt, reaction_name,
+                                      'mf10_metastable_only_no_mf3')
+            return None
+
+        meta_lookups = [dict(zip(meta['sigma'].x, meta['sigma'].y))
+                        for meta in all_meta_levels]
+        mf3_x = np.asarray(mf3_sigma.x, dtype=float)
+        mf3_y = np.asarray(mf3_sigma.y, dtype=float)
+        energies = sorted(set(mf3_x.tolist()).union(*meta_lookups))
+        # INT=1 group data: on [x[i-1], x[i]) the total is y[i-1]. An exact
+        # dict lookup would return 0 at a metastable grid point the MF=3 grid
+        # lacks -> a silent BR_m = 1.0 there.
+        idx = np.searchsorted(mf3_x, energies, side='right')
+        inside = (idx > 0) & (idx < len(mf3_x))
+        mf3_at = np.where(inside, mf3_y[np.clip(idx - 1, 0, None)], 0.0)
+        remainder = [
+            max(0.0, total
+                - sum(max(0.0, lookup.get(e, 0.0)) for lookup in meta_lookups))
+            for e, total in zip(energies, mf3_at)
+        ]
+
+        return (self._RemainderXS(np.array(energies), np.array(remainder)),
+                ground_product)
+
+    def _record_ground_repair(self, nuclide_name, mt, reaction_name,
+                              ground_product, all_meta_levels):
+        """Record a synthesized-ground repair and warn once per (nuclide, MT)."""
+        if not hasattr(self, '_ground_repaired'):
+            self._ground_repaired = []
+        self._ground_repaired.append({
+            'nuclide': nuclide_name,
+            'parent': nuclide_name,
+            'mt': mt,
+            'reaction': reaction_name,
+            'ground_product': ground_product,
+            'metastable_lfs': [meta['lfs'] for meta in all_meta_levels],
+        })
+        # Shared warn-once store, own key prefix: a patch-then-run process must
+        # see both the patcher message and the later runtime one.
+        _warn_runtime_branching(
+            ('patcher_ground_repaired', nuclide_name, mt),
+            f"{nuclide_name} MT={mt}: MF=10 has metastable level(s) but no "
+            "LFS=0 subsection (radioactive-products-only file); the ground "
+            f"channel {ground_product} is synthesized from the MF=3 total as "
+            "max(0, sigma_MF3 - sum sigma_MF10_m).")
 
     def _load_mf10_data(
         self,
@@ -2260,9 +2422,14 @@ class _PythonGENDFLibrary:
                 raise ValueError("lfs_values required with target_names")
 
             levels = self._get_production_xs(nuclide_name, mt)
+            # The rate XS only feeds the missing-ground repair, so fetch it
+            # lazily and leave every other reaction's path untouched.
+            total_xs = None
+            if levels and 0 in lfs_values and 0 not in {lfs for lfs, _, _ in levels}:
+                total_xs = self._rate_total_xs(nuclide_name, mt)
             return build_runtime_branching(
                 levels, target_names, lfs_values, self.energy_bounds,
-                nuclide_name, mt)
+                nuclide_name, mt, total_xs=total_xs)
 
         # Patcher mode — ELIS/LFS-order mapping (requires decay file)
         if self.decay_lookup is None:
@@ -2279,7 +2446,19 @@ class _PythonGENDFLibrary:
         levels_result = self._categorize_mf10_levels(mf10_data, nuclide_name, mt)
         if levels_result is None:
             return None
-        ground_data, ground_product, all_meta_levels, base_nuclide = levels_result
+        (ground_data, ground_product, all_meta_levels, base_nuclide,
+         n_anonymous) = levels_result
+
+        # Ground absent with metastables present is a legitimate evaluator
+        # pattern (stable ground in a radioactive-products-only file), repaired
+        # from MF=3 before the normal mapping/decoration path runs.
+        ground_synthesized = ground_data is None
+        if ground_synthesized:
+            repaired = self._synthesize_ground_from_mf3(
+                all_meta_levels, nuclide_name, mt, n_anonymous)
+            if repaired is None:
+                return None
+            ground_data, ground_product = repaired
 
         reaction_name = MT_TO_REACTION.get(mt, f'MT{mt}')
 
@@ -2293,10 +2472,15 @@ class _PythonGENDFLibrary:
                 all_meta_levels, qm_section, nuclide_name, reaction_name, mt, base_nuclide
             )
 
-        return self._build_branching_result(
+        result = self._build_branching_result(
             ground_data, ground_product, mapped_meta_levels,
             lfs_mapping, nuclide_name, mt
         )
+        # Only a decoration that actually ships counts as a repair.
+        if ground_synthesized and result is not None:
+            self._record_ground_repair(nuclide_name, mt, reaction_name,
+                                       ground_product, all_meta_levels)
+        return result
 
     def process_library_for_branching(
         self,
@@ -2328,8 +2512,9 @@ class _PythonGENDFLibrary:
         skip_reactions : set of tuple, optional
             ``(nuclide, reaction)`` pairs to leave unextracted. Used by the
             patcher for MF=10 sections holding unrepaired anonymous (IZAP=0)
-            subsections: their decoration is pruned anyway, and extracting the
-            named subset alone only raises on the missing ground state.
+            subsections: their decoration is pruned anyway, and the named
+            levels are only a subset of the real final states, so extracting
+            them would invert the branching (R1-61).
 
         Returns
         -------
@@ -2367,7 +2552,30 @@ class _PythonGENDFLibrary:
         all_branching_data = {}
         self._processing_errors = []  # Capture ELIS mismatch errors (missing metastable products)
         self._unmatched_mts = []  # Track reaction TYPES not in chain (nuclide/reaction missing)
+        self._ground_repaired = []  # Reactions whose ground was synthesized from MF=3
         unexpected_errors = []  # Data-integrity failures that must abort the scan
+
+        def _record_failure(nuclide_name, exc, **where):
+            """Classify a failure, record it, and flag the unexpected ones."""
+            error_str = str(exc)
+            # NO_METASTABLE_DECAY_DATA is an expected skip on healthy libraries;
+            # every other exception is a data-integrity failure that must not be
+            # swallowed. Record all of them (typed) so the scan completes, then
+            # raise below on the unexpected ones.
+            if 'NO_METASTABLE_DECAY_DATA' in error_str:
+                error_type = 'no_metastable_decay_data'
+            else:
+                error_type = 'unexpected_processing_error'
+            entry = {
+                'nuclide': nuclide_name,
+                **where,
+                'error': error_str,
+                'exception_class': type(exc).__name__,
+                'type': error_type,
+            }
+            self._processing_errors.append(entry)
+            if error_type == 'unexpected_processing_error':
+                unexpected_errors.append(entry)
 
         for idx, nuclide_name in enumerate(available_nuclides, start=1):
             if progress_callback:
@@ -2387,77 +2595,74 @@ class _PythonGENDFLibrary:
 
                     reaction_name = MT_TO_REACTION[mt]
 
-                    # Caller-supplied exclusion: a knowingly unextractable
-                    # section, not an unmatched MT and not an error.
-                    if skip_reactions and (nuclide_name,
-                                           reaction_name) in skip_reactions:
-                        continue
-
-                    # Chain-aware filtering: skip if reaction not in chain
-                    if chain_reactions is not None:
-                        if not self._reaction_exists_in_chain(
-                            nuclide_name, reaction_name, chain_reactions
-                        ):
-                            # Track unmatched MT for logging
-                            self._unmatched_mts.append({
-                                'nuclide': nuclide_name,
-                                'mt': mt,
-                                'reaction': reaction_name,
-                                'reason': 'not_in_chain'
-                            })
+                    # Per-MT isolation: one surprising channel must never cost
+                    # the nuclide its other channels.
+                    try:
+                        # Caller-supplied exclusion: a knowingly unextractable
+                        # section, not an unmatched MT and not an error.
+                        if skip_reactions and (nuclide_name,
+                                               reaction_name) in skip_reactions:
                             continue
 
-                    branching = self.get_branching_ratios(nuclide_name, mt)
+                        # Chain-aware filtering: skip if reaction not in chain
+                        if chain_reactions is not None:
+                            if not self._reaction_exists_in_chain(
+                                nuclide_name, reaction_name, chain_reactions
+                            ):
+                                # Track unmatched MT for logging
+                                self._unmatched_mts.append({
+                                    'nuclide': nuclide_name,
+                                    'mt': mt,
+                                    'reaction': reaction_name,
+                                    'reason': 'not_in_chain'
+                                })
+                                continue
 
-                    if branching:
-                        temp_reactions[reaction_name] = branching
-                        has_branching = True
+                        branching = self.get_branching_ratios(nuclide_name, mt)
+
+                        if branching:
+                            temp_reactions[reaction_name] = branching
+                            has_branching = True
+                            if verbose:
+                                n_energies = len(branching.energies)
+                                # Determine mapping method for logging
+                                method_tag = ""
+                                if branching.elis_mapping:
+                                    methods = set(m.get('method', 'unknown')
+                                                  for m in branching.elis_mapping.values())
+                                    if methods == {'elis'}:
+                                        method_tag = " [ELIS]"
+                                print(f"  {nuclide_name} {reaction_name}: "
+                                      f"{n_energies} energy points{method_tag}")
+                                print(f"    Products: {branching.products}")
+                    except Exception as e:
                         if verbose:
-                            n_energies = len(branching.energies)
-                            # Determine mapping method for logging
-                            method_tag = ""
-                            if branching.elis_mapping:
-                                methods = set(m.get('method', 'unknown')
-                                              for m in branching.elis_mapping.values())
-                                if methods == {'elis'}:
-                                    method_tag = " [ELIS]"
-                            print(f"  {nuclide_name} {reaction_name}: "
-                                  f"{n_energies} energy points{method_tag}")
-                            print(f"    Products: {branching.products}")
+                            print(f"  {nuclide_name} MT={mt}: {e}")
+                        _record_failure(nuclide_name, e, mt=mt,
+                                        reaction=reaction_name)
+                        continue
 
                 # Only add to result if at least one branching reaction found
                 if has_branching:
                     all_branching_data[nuclide_name] = temp_reactions
 
             except Exception as e:
-                error_str = str(e)
+                # Defensive net: all known raise sites are inside the per-MT
+                # try; retained for future edits / iterator failures.
                 if verbose:
                     print(f"  {nuclide_name}: {e}")
-                # Classify: NO_METASTABLE_DECAY_DATA is an expected skip on
-                # healthy libraries; every other exception is a data-integrity
-                # failure that must not be swallowed. Record all of them (typed)
-                # so the scan completes, then raise below on the unexpected ones.
-                if 'NO_METASTABLE_DECAY_DATA' in error_str:
-                    error_type = 'no_metastable_decay_data'
-                else:
-                    error_type = 'unexpected_processing_error'
-                entry = {
-                    'nuclide': nuclide_name,
-                    'error': error_str,
-                    'exception_class': type(e).__name__,
-                    'type': error_type,
-                }
-                self._processing_errors.append(entry)
-                if error_type == 'unexpected_processing_error':
-                    unexpected_errors.append(entry)
+                _record_failure(nuclide_name, e)
                 continue
 
         # Fail loud on data-integrity errors; expected skips never trigger this.
         if unexpected_errors:
             n = len(unexpected_errors)
             shown = unexpected_errors[:10]
-            lines = [f"  {e['nuclide']}: {e['exception_class']}: {e['error']}"
-                     for e in shown]
+            lines = [
+                f"  {e['nuclide']}"
+                + (f" MT={e['mt']}" if 'mt' in e else "")
+                + f": {e['exception_class']}: {e['error']}"
+                for e in shown]
             if n > len(shown):
                 lines.append(f"  ... and {n - len(shown)} more (showing first "
                              f"{len(shown)})")
@@ -2505,8 +2710,22 @@ class _PythonGENDFLibrary:
         -------
         list of dict
             Each dict contains 'nuclide', 'mt', 'reaction', and 'reason'.
+            Ground-absent MF=10 skips carry 'mf10_anonymous_levels',
+            'mf10_metastable_only_no_mf3' or 'mf10_ambiguous_izap'.
         """
         return getattr(self, '_unmatched_mts', [])
+
+    @property
+    def ground_repaired(self) -> list:
+        """Reactions whose absent ground level was synthesized from MF=3.
+
+        Returns
+        -------
+        list of dict
+            Each dict contains 'nuclide'/'parent', 'mt', 'reaction',
+            'ground_product' and 'metastable_lfs'.
+        """
+        return getattr(self, '_ground_repaired', [])
 
     def _build_chain_reaction_lookup(self, chain) -> dict[str, set]:
         """Build lookup dict mapping nuclide names to their reaction types.

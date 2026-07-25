@@ -1,15 +1,20 @@
-"""MF=10-only Σ-fallback in the Python GENDF backend (M2).
+"""MF=3 / MF=10 interaction in the Python GENDF backend.
 
-EAF-2010 stores isomer-producing reactions (e.g. Al27(n,a), (n,2n)) with no
-MF=3 section -- only MF=10 per-final-state partials. ``get_xs`` / ``get_all_xs``
-fall back to Σ(MF=10 partials) as the total for requested MTs missing from
-MF=3. Synthetic MF=3 + MF=10 sections on a 3-group grid; no real data files.
+Two shapes, both with synthetic sections on a 3-group grid (no data files):
+
+* MF=10-only Σ-fallback (M2): EAF-2010 stores isomer-producing reactions (e.g.
+  Al27(n,a), (n,2n)) with no MF=3 section -- only MF=10 per-final-state
+  partials, so ``get_xs`` / ``get_all_xs`` serve Σ(MF=10 partials) as the total.
+* Ground-absent MF=10 repair (policy 3(a)): a radioactive-products-only file
+  omits a (quasi-)stable ground (e.g. JEFF-4.0 In115 MT=4), so the patcher
+  synthesizes it from the MF=3 total as the clamped remainder.
 """
 import types
 
 import numpy as np
 import pytest
 
+from openmc.deplete.decay_elis import ELIS_ATOL, ELIS_RTOL, DecayState
 from openmc.deplete.gendf import _PythonGENDFLibrary
 
 from .gendf_testing import Tab1D
@@ -22,16 +27,18 @@ def _mf3(y):
     return {'sigma': Tab1D(BOUNDS, np.asarray(y, dtype=float))}
 
 
-def _level(lfs, izap, y):
-    """One full-range MF=10 level on the 3-group grid."""
-    return {'LFS': lfs, 'IZAP': izap, 'sigma': Tab1D(BOUNDS, np.asarray(y, float))}
+def _level(lfs, izap, y, **qs):
+    """One full-range MF=10 level on the 3-group grid (``QM``/``QI`` optional)."""
+    return {'LFS': lfs, 'IZAP': izap,
+            'sigma': Tab1D(BOUNDS, np.asarray(y, float)), **qs}
 
 
-def _make_lib(mf3=None, mf10=None):
+def _make_lib(mf3=None, mf10=None, decay_lookup=None):
     """Bare ``_PythonGENDFLibrary`` with stubbed ``_load_material`` / MF=10 loader.
 
     ``mf3``  : ``{mt: y}`` MF=3 sections present on the material.
     ``mf10`` : ``{mt: [levels]}`` MF=10 levels keyed by MT (``None`` otherwise).
+    ``decay_lookup`` : enables the patcher (ELIS-mapping) lane.
     """
     lib = _PythonGENDFLibrary.__new__(_PythonGENDFLibrary)
     lib.energy_bounds = BOUNDS
@@ -44,6 +51,13 @@ def _make_lib(mf3=None, mf10=None):
     mf10 = mf10 or {}
     lib._load_mf10_data = lambda nuc, mt: \
         (({'levels': mf10[mt]}, None) if mt in mf10 else None)
+    lib.decay_lookup = decay_lookup
+    lib._mapping_mode = 'elis'
+    lib._elis_rtol = ELIS_RTOL
+    lib._elis_atol = ELIS_ATOL
+    lib._skip_zero_elis_metastables = True
+    lib._processing_errors = []
+    lib._ground_repaired = []
     return lib
 
 
@@ -117,3 +131,85 @@ def test_mf10_fallback_load_failure_degrades():
     assert set(lib.get_all_xs('X', mts=[102, 107])) == {102}   # 107 omitted
     with pytest.raises(KeyError):
         lib.get_xs('X', 107)
+
+
+# =============================================================================
+# Ground-absent MF=10 -> clamped MF=3 remainder (policy 3(a), patcher lane)
+# =============================================================================
+
+# In115 MT=4 shape: MF=10 carries only the isomer (ground In115 is stable).
+IN115_DECAY = {(49, 115): [DecayState(z=49, a=115, elis=0.0, liso=0),
+                           DecayState(z=49, a=115, elis=336244.0, liso=1)]}
+IN115_META = _level(1, 49115, [0.25, 0.5, 0.0, 0.0], QM=0.0, QI=-336240.0)
+
+
+def test_ground_absent_repaired_from_mf3():
+    """Metastable-only MF=10 + a true MF=3: ground = clamped MF=3 remainder.
+
+    Group 1 has sigma_meta (0.5) > sigma_MF3 (0.2), so the remainder clamps to 0
+    and the isomer takes the whole channel -- never a negative ground ratio.
+    """
+    lib = _make_lib(mf3={4: [1.0, 0.2, 0.5, 0.0]}, mf10={4: [IN115_META]},
+                    decay_lookup=IN115_DECAY)
+
+    with pytest.warns(UserWarning, match='synthesized from the MF=3 total'):
+        br = lib.get_branching_ratios('In115', 4)
+
+    assert br.products == ['In115', 'In115_m1']
+    assert br.lfs_mapping == {'In115_m1': 1}
+    np.testing.assert_allclose(br.branching_ratios[0], [0.75, 0.0, 1.0])
+    np.testing.assert_allclose(br.branching_ratios[1], [0.25, 1.0, 0.0])
+    assert [(r['nuclide'], r['mt'], r['ground_product'])
+            for r in lib.ground_repaired] == [('In115', 4, 'In115')]
+
+
+def test_ground_remainder_uses_histogram_left_value():
+    """A metastable point off the MF=3 grid takes the enclosing group's total.
+
+    An exact-match lookup returned 0 there, making the remainder 0 and handing
+    the isomer a silent BR = 1.0 at that energy.
+    """
+    off_grid = {'LFS': 1, 'IZAP': 49115, 'QM': 0.0, 'QI': -336240.0,
+                'sigma': Tab1D(np.array([1.0, 500.0, 1e3, 1e6, 1e9]),
+                               np.array([0.25, 0.25, 0.5, 0.0, 0.0]))}
+    lib = _make_lib(mf3={4: [1.0, 0.2, 0.5, 0.0]}, mf10={4: [off_grid]},
+                    decay_lookup=IN115_DECAY)
+
+    with pytest.warns(UserWarning, match='synthesized from the MF=3 total'):
+        br = lib.get_branching_ratios('In115', 4)
+
+    # 500 eV sits in the first MF=3 group (total 1.0): ground = 1.0 - 0.25.
+    assert list(br.energies) == [1.0, 500.0, 1e3, 1e6]
+    np.testing.assert_allclose(br.branching_ratios[1],
+                               [0.25, 0.25, 1.0, 0.0])
+
+
+def test_ground_absent_unrepairable_is_classified_skip():
+    """Anonymous levels, no MF=3, or several IZAPs: None + a recorded reason."""
+    lib = _make_lib(mf10={4: [IN115_META]}, decay_lookup=IN115_DECAY)
+    assert lib.get_branching_ratios('In115', 4) is None
+
+    ambiguous = _make_lib(
+        mf3={4: [1.0, 0.2, 0.5, 0.0]},
+        mf10={4: [IN115_META, _level(1, 49113, [0.1, 0.1, 0.0, 0.0])]},
+        decay_lookup=IN115_DECAY)
+    assert ambiguous.get_branching_ratios('In115', 4) is None
+
+    # R1-61: with an anonymous (IZAP=0) level the ground may be UNNAMED rather
+    # than absent, so the named levels are a subset -- repairing would decorate
+    # that subset and invert the branching. Declines even though MF=3 is there.
+    anonymous = _make_lib(
+        mf3={4: [1.0, 0.2, 0.5, 0.0]},
+        mf10={4: [_level(0, 0, [0.5, 0.1, 0.3, 0.0]), IN115_META]},
+        decay_lookup=IN115_DECAY)
+    with pytest.warns(UserWarning, match='Invalid IZAP=0'):
+        assert anonymous.get_branching_ratios('In115', 4) is None
+
+    assert [u['reason'] for u in lib.unmatched_mts] == \
+        ['mf10_metastable_only_no_mf3']
+    assert [u['reason'] for u in ambiguous.unmatched_mts] == \
+        ['mf10_ambiguous_izap']
+    assert [u['reason'] for u in anonymous.unmatched_mts] == \
+        ['mf10_anonymous_levels']
+    assert (lib.ground_repaired == [] and ambiguous.ground_repaired == []
+            and anonymous.ground_repaired == [])

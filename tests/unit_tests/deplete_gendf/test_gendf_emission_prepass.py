@@ -280,8 +280,9 @@ def test_izap0_reattribution_off_prunes_whole_decoration(tmp_path, capsys,
     assert "WARNING" in out and "PRUNED" in out and "Am241" in out
 
     # Real extraction: the mixed shape (attributed metastable, anonymous ground)
-    # raises "no ground state" unless the pruned set is excluded up front, and
-    # the collect-and-raise policy would then kill the run before the prune.
+    # is a metastable-only SUBSET of the real final states, so it is excluded up
+    # front by the pruned set; the anonymous-levels guard declines the ground
+    # repair for the same reason, and nothing is decorated either way.
     data = lib.process_library_for_branching(mt_list=[102], chain=chain,
                                              skip_reactions=pruned)
     data = tool.prune_unattributed_decoration(data, pruned)
