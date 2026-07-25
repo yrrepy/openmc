@@ -516,11 +516,14 @@ def test_backend_agreement_on_repaired_ground(tmp_path):
         ({'levels': [{'LFS': 1, 'IZAP': 13028, 'sigma': Tab1D(grid, mf10_y)}]},
          None) if mt == 102 else None)
 
+    # The warn-once keys carry the library's identity -- the C++ lane its path,
+    # the path-less Python stub its counter fallback -- so both lanes warn.
     with pytest.warns(UserWarning, match='no LFS=0 production level'):
         cpp_br = cpp.get_branching_ratios('Al27', 102, target_names=targets,
                                           lfs_values=lfs_values)
-    py_br = py.get_branching_ratios('Al27', 102, target_names=targets,
-                                    lfs_values=lfs_values)
+    with pytest.warns(UserWarning, match='no LFS=0 production level'):
+        py_br = py.get_branching_ratios('Al27', 102, target_names=targets,
+                                        lfs_values=lfs_values)
 
     assert cpp_br.products == py_br.products == targets
     np.testing.assert_array_equal(cpp_br.branching_ratios,

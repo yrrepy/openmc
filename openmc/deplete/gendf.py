@@ -18,12 +18,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 from dataclasses import dataclass
+import itertools
 import warnings
 
 import numpy as np
 import endf
 
 from openmc.checkvalue import check_type, check_value, PathLike
+from openmc.exceptions import OpenMCError
 from openmc.mgxs import GROUP_STRUCTURES
 from openmc.deplete.chain import REACTIONS
 
@@ -363,6 +365,28 @@ _WARNED_RUNTIME_BRANCHING: set = set()
 # Dedup store for once-per-(nuclide, MT) MF=10 duplicate-LFS warnings
 _WARNED_MF10_DUPLICATE_LFS: set = set()
 
+# Warn-once identities for libraries with no path (stubs, in-memory doubles);
+# a monotonic counter, mirroring src/gendf.cpp's g_next_lib_id
+_ANONYMOUS_LIBRARY_IDS = itertools.count()
+
+
+def _library_warn_key(library):
+    """Stable warn-once identity for a library: its path, else a counter.
+
+    Deliberately not ``id()``: CPython reuses an address after GC, so a later
+    library inherits a freed one's key and loses its warning. Keying on the path
+    also collapses the fresh-library-per-call pattern in
+    :mod:`openmc.deplete.microxs` to a single warning, while two libraries with
+    different paths always both warn.
+    """
+    key = getattr(library, '_warn_key', None)
+    if key is None:
+        path = getattr(library, 'library_path', None)
+        key = (str(path) if path is not None
+               else f"anonymous#{next(_ANONYMOUS_LIBRARY_IDS)}")
+        library._warn_key = key
+    return key
+
 
 def _warn_runtime_branching(key, message):
     """Emit a runtime-branching UserWarning once per key."""
@@ -372,7 +396,7 @@ def _warn_runtime_branching(key, message):
 
 
 def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
-                            nuclide_name, mt, total_xs=None):
+                            nuclide_name, mt, total_xs=None, library_key=None):
     """Build runtime-mode IsomericBranching from aligned production XS.
 
     Shared by the Python and C++ backends: both fetch per-level MF=10
@@ -402,10 +426,22 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
     total_xs : numpy.ndarray, optional
         The reaction's rate cross section (MF=3 total, or Sigma(MF=10) for
         MF=10-only reactions), per group. Used only to synthesize a missing
-        requested ground row as the clamped remainder (policy 3(a));
-        self-consistent because the remainder is taken against the same array
-        the rate uses, so BR*rate reproduces the per-state MF=10 XS exactly and
-        inversion cannot occur.
+        requested ground row as the clamped remainder (policy 3(a)): the
+        remainder is taken against the same array the rate uses, so BR*rate
+        reproduces the per-state MF=10 XS exactly -- and inversion cannot occur
+        -- under two conditions: (1) the requested LFS set covers every
+        metastable level present in the file (an unrequested level's yield is
+        reattributed onto the tracked isomers, inflating them), and (2) no
+        group clamps (Sigma sigma_MF10_m <= total_xs everywhere). A clamped
+        group gives the metastables 100% of that group's rate. When MF=3 is
+        absent, ``get_xs`` serves Sigma(MF=10) and the remainder is zero in
+        EVERY group: the ground gets no cross section at all and the whole
+        reaction rate branches to the metastable level(s) (warned distinctly).
+    library_key : hashable, optional
+        Stable identity of the calling library -- its path, see
+        :func:`_library_warn_key` -- folded into the warn-once dedup keys so a
+        second, different library in the same process still warns. None (direct
+        helper calls) keeps the plain (kind, nuclide, mt) key.
 
     Returns
     -------
@@ -414,9 +450,13 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
         state is absent from the file and no rate cross section is available to
         repair it (runtime branching disabled, warned)
     """
+    def _key(kind):
+        return ((kind, nuclide_name, mt) if library_key is None
+                else (kind, nuclide_name, mt, library_key))
+
     if not levels:
         _warn_runtime_branching(
-            ('no_levels', nuclide_name, mt),
+            _key('no_levels'),
             f"{nuclide_name} MT={mt}: no usable MF=10 production levels; "
             "runtime isomeric branching is unavailable, falling back to the "
             "chain's static branching.")
@@ -435,7 +475,7 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
     if 0 in lfs_values and 0 not in lfs_to_xs:
         if total_xs is None:
             _warn_runtime_branching(
-                ('ground_missing', nuclide_name, mt),
+                _key('ground_missing'),
                 f"{nuclide_name} MT={mt}: chain requested the ground state "
                 "(LFS=0) but the GENDF file has no LFS=0 production level; "
                 "proceeding would send 100% of the reaction rate to the "
@@ -449,13 +489,36 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
         remainder = np.asarray(total_xs, dtype=float)
         if file_meta:
             remainder = remainder - np.sum(file_meta, axis=0)
-        lfs_to_xs[0] = np.maximum(remainder, 0.0)
-        _warn_runtime_branching(
-            ('ground_missing_repaired', nuclide_name, mt),
-            f"{nuclide_name} MT={mt}: the GENDF file has no LFS=0 production "
-            "level (radioactive-products-only MF=10), so the requested ground "
-            "state is synthesized from the reaction's rate cross section as "
-            "max(0, sigma_total - sum sigma_MF10_m).")
+        ground_row = np.maximum(remainder, 0.0)
+        lfs_to_xs[0] = ground_row
+        n_clamped = int(np.count_nonzero(np.asarray(remainder) < 0))
+        clamp_note = (
+            f"; remainder clamped to zero in {n_clamped} of "
+            f"{ground_row.size} groups (Sigma sigma_MF10_m exceeds the "
+            "rate cross section there; metastables receive 100% in those "
+            "groups)" if n_clamped else "")
+        if np.all(ground_row == 0):
+            # Two data shapes reach an all-zero remainder, so the message states
+            # the observable and names both: no MF=3 (get_xs serves Sigma(MF=10),
+            # zero by construction), or an MF=3 that under-sums its partials.
+            _warn_runtime_branching(
+                _key('ground_missing_zero_remainder'),
+                f"{nuclide_name} MT={mt}: the GENDF file has no LFS=0 "
+                "production level, and the reaction's rate cross section is at "
+                "or below the sum of its MF=10 metastable levels in EVERY "
+                "group, so the synthesized ground receives ZERO cross section "
+                "and 100% of the reaction rate branches to the metastable "
+                "level(s). Typical of MF=10-only reactions where get_xs serves "
+                "Sigma(MF=10); also occurs when a present MF=3 under-sums its "
+                f"MF=10 partials{clamp_note}.")
+        else:
+            _warn_runtime_branching(
+                _key('ground_missing_repaired'),
+                f"{nuclide_name} MT={mt}: the GENDF file has no LFS=0 "
+                "production level (radioactive-products-only MF=10), so the "
+                "requested ground state is synthesized from the reaction's "
+                "rate cross section as "
+                f"max(0, sigma_total - sum sigma_MF10_m){clamp_note}.")
 
     # Anonymous levels are keyed by LFS alone; the chain names the products.
     used_lfs = set(lfs_values) | ({0} if 0 in lfs_to_xs else set())
@@ -463,7 +526,7 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
                        if izap == 0 and lfs in used_lfs)
     if anonymous:
         _warn_runtime_branching(
-            ('anonymous_izap', nuclide_name, mt),
+            _key('anonymous_izap'),
             f"{nuclide_name} MT={mt}: isomeric branching is served by "
             f"anonymous (IZAP=0) MF=10 level(s) LFS={anonymous}, keyed by LFS "
             "alone; product identities are taken from the chain.")
@@ -476,7 +539,7 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
             # Chain requested a level the GENDF file lacks -> BR=0. Warn once.
             prod_xs.append(np.zeros(n_groups))
             _warn_runtime_branching(
-                ('lfs_missing', nuclide_name, mt),
+                _key('lfs_missing'),
                 f"{nuclide_name} MT={mt}: chain requested LFS={lfs} but the "
                 "GENDF file has no such production level; its branching ratio "
                 "is set to 0.")
@@ -493,7 +556,7 @@ def build_runtime_branching(levels, target_names, lfs_values, energy_bounds,
             total = total + lfs_to_xs[0]
         else:
             _warn_runtime_branching(
-                ('no_ground', nuclide_name, mt),
+                _key('no_ground'),
                 f"{nuclide_name} MT={mt}: no ground-state (LFS=0) production in "
                 "the GENDF file and none requested; branching ratios normalize "
                 "over metastables only and may not reflect absolute yields.")
@@ -659,6 +722,13 @@ class _PythonGENDFLibrary:
         # Cache for loaded ENDF materials
         # Key: nuclide name (OpenMC format), Value: endf.Material object OR dict
         self._material_cache = {}
+
+        # Negative cache for files that failed to parse, keyed by
+        # (nuclide, require_full_parser): the fast MF=3 scanner and the full
+        # endf parser are different code paths, so a full-parser crash must not
+        # condemn the fast read (and vice versa). Values are the failure message;
+        # every hit raises a fresh RuntimeError, never a stored exception object.
+        self._material_load_failures = {}
 
         # Processing errors list for tracking ELIS mismatches, missing metastables, etc.
         self._processing_errors = []
@@ -983,17 +1053,26 @@ class _PythonGENDFLibrary:
                 # Name was corrected, use the correct name going forward
                 nuclide_name = correct_name
 
-        # Check cache first
-        # For require_full_parser, we need to check if cached material has full data
-        cache_key = nuclide_name
+        # Positive cache first: a cached full endf.Material satisfies BOTH
+        # request kinds, so it must outrank a stale fast-parse failure marker
+        # left by an earlier attempt on the same file.
         if nuclide_name in self._material_cache:
             cached = self._material_cache[nuclide_name]
-            # If we need full parser but cached is from fast parser, reload
-            if require_full_parser and not isinstance(cached, endf.Material):
-                # Need to reload with full parser
-                pass
-            else:
+            # A fast-parser dict cannot serve a full-parser request; reload.
+            if not (require_full_parser
+                    and not isinstance(cached, endf.Material)):
                 return cached
+
+        # A parse that already failed is not retried: per-MT isolation would
+        # otherwise re-parse a crasher file once per chain MT. Only the message
+        # is stored -- re-raising one exception object would append propagation
+        # frames on every retry and pin the parser stack for the library's life.
+        if not hasattr(self, '_material_load_failures'):
+            self._material_load_failures = {}
+        failed = self._material_load_failures.get(
+            (nuclide_name, require_full_parser))
+        if failed is not None:
+            raise RuntimeError(failed)
 
         # Resolve the file from the exact-name index built by _build_file_index
         filepath = None
@@ -1044,9 +1123,11 @@ class _PythonGENDFLibrary:
                 material = _FastMaterial(section_data)
 
         except Exception as e:
-            raise RuntimeError(
+            message = (
                 f"Failed to load GENDF file for {nuclide_name}: {filepath}\n"
                 f"Error: {e}")
+            self._material_load_failures[nuclide_name, require_full_parser] = message
+            raise RuntimeError(message)
 
 
         # Cache and return
@@ -1242,7 +1323,12 @@ class _PythonGENDFLibrary:
         """
         try:
             return self.get_xs(nuclide_name, mt, strict_alignment=False)
-        except Exception:
+        except (KeyError, ValueError, OpenMCError) as exc:
+            _warn_runtime_branching(
+                ('rate_xs_unavailable', nuclide_name, mt,
+                 _library_warn_key(self)),
+                f"{nuclide_name} MT={mt}: could not obtain the rate cross "
+                f"section ({exc!r}); runtime ground repair unavailable.")
             return None
 
     def _production_levels(self, nuclide_name, mt):
@@ -2175,17 +2261,20 @@ class _PythonGENDFLibrary:
             'reason': reason,
         })
 
-    @dataclass
+    @dataclass(eq=False)
     class _RemainderXS:
         """Bare (x, y) container for the synthesized ground level.
 
         Intentionally NOT a Tabulated1D: the remainder is histogram group data
         and must never be lin-lin callable. Consumers touch only ``.x``/``.y``,
         and the type doubles as the "this ground is synthesized" marker.
+        ``eq=False``: numpy fields make a generated ``__eq__`` raise.
         """
 
         x: np.ndarray
         y: np.ndarray
+        n_clamped: int = 0   # union-grid points where the raw remainder was < 0
+        n_points: int = 0    # union-grid points total
 
     def _synthesize_ground_from_mf3(self, all_meta_levels, nuclide_name, mt,
                                     n_anonymous):
@@ -2245,18 +2334,21 @@ class _PythonGENDFLibrary:
         idx = np.searchsorted(mf3_x, energies, side='right')
         inside = (idx > 0) & (idx < len(mf3_x))
         mf3_at = np.where(inside, mf3_y[np.clip(idx - 1, 0, None)], 0.0)
-        remainder = [
-            max(0.0, total
-                - sum(max(0.0, lookup.get(e, 0.0)) for lookup in meta_lookups))
+        raw = [
+            total - sum(max(0.0, lookup.get(e, 0.0)) for lookup in meta_lookups)
             for e, total in zip(energies, mf3_at)
         ]
+        remainder = [max(0.0, r) for r in raw]
+        n_clamped = sum(1 for r in raw if r < 0.0)
 
-        return (self._RemainderXS(np.array(energies), np.array(remainder)),
+        return (self._RemainderXS(np.array(energies), np.array(remainder),
+                                  n_clamped, len(energies)),
                 ground_product)
 
     def _record_ground_repair(self, nuclide_name, mt, reaction_name,
-                              ground_product, all_meta_levels):
-        """Record a synthesized-ground repair and warn once per (nuclide, MT)."""
+                              ground_product, all_meta_levels,
+                              clamped_points=0, total_points=0):
+        """Record a synthesized-ground repair; warns once per (nuclide, MT, library)."""
         if not hasattr(self, '_ground_repaired'):
             self._ground_repaired = []
         self._ground_repaired.append({
@@ -2266,15 +2358,24 @@ class _PythonGENDFLibrary:
             'reaction': reaction_name,
             'ground_product': ground_product,
             'metastable_lfs': [meta['lfs'] for meta in all_meta_levels],
+            'clamped_points': clamped_points,
+            'total_points': total_points,
         })
+        clamp_note = (
+            f"; remainder clamped to zero in {clamped_points} of "
+            f"{total_points} points (sum sigma_MF10_m exceeds the MF=3 total "
+            "there; metastables receive 100% at those points)"
+            if clamped_points else "")
         # Shared warn-once store, own key prefix: a patch-then-run process must
-        # see both the patcher message and the later runtime one.
+        # see both the patcher message and the later runtime one. The library's
+        # path is in the key so a second library still warns.
         _warn_runtime_branching(
-            ('patcher_ground_repaired', nuclide_name, mt),
+            ('patcher_ground_repaired', nuclide_name, mt,
+             _library_warn_key(self)),
             f"{nuclide_name} MT={mt}: MF=10 has metastable level(s) but no "
             "LFS=0 subsection (radioactive-products-only file); the ground "
             f"channel {ground_product} is synthesized from the MF=3 total as "
-            "max(0, sigma_MF3 - sum sigma_MF10_m).")
+            f"max(0, sigma_MF3 - sum sigma_MF10_m){clamp_note}.")
 
     def _load_mf10_data(
         self,
@@ -2415,6 +2516,20 @@ class _PythonGENDFLibrary:
             Product names from chain (runtime mode)
         lfs_values : list of int, optional
             LFS values from chain (runtime mode)
+
+        Returns
+        -------
+        IsomericBranching or None
+            None when the reaction has no MF=10 data, no usable levels, or an
+            absent ground state that could not be repaired or whose products
+            did not survive mapping.
+
+        Notes
+        -----
+        Patcher mode has side effects: an absent ground level may be
+        synthesized from the MF=3 remainder (recorded in ``ground_repaired``
+        and warned once), and every classified skip is recorded in
+        ``unmatched_mts``.
         """
         # Runtime mode — no decay file needed
         if target_names is not None:
@@ -2429,7 +2544,8 @@ class _PythonGENDFLibrary:
                 total_xs = self._rate_total_xs(nuclide_name, mt)
             return build_runtime_branching(
                 levels, target_names, lfs_values, self.energy_bounds,
-                nuclide_name, mt, total_xs=total_xs)
+                nuclide_name, mt, total_xs=total_xs,
+                library_key=_library_warn_key(self))
 
         # Patcher mode — ELIS/LFS-order mapping (requires decay file)
         if self.decay_lookup is None:
@@ -2459,6 +2575,7 @@ class _PythonGENDFLibrary:
             if repaired is None:
                 return None
             ground_data, ground_product = repaired
+            synthesized_ground = ground_data
 
         reaction_name = MT_TO_REACTION.get(mt, f'MT{mt}')
 
@@ -2476,10 +2593,21 @@ class _PythonGENDFLibrary:
             ground_data, ground_product, mapped_meta_levels,
             lfs_mapping, nuclide_name, mt
         )
-        # Only a decoration that actually ships counts as a repair.
-        if ground_synthesized and result is not None:
-            self._record_ground_repair(nuclide_name, mt, reaction_name,
-                                       ground_product, all_meta_levels)
+        # Only a decoration that actually ships counts as a repair; a synthesis
+        # that lost every metastable at mapping is a classified skip, not a
+        # silent nothing. The other None -- no union-grid point with positive
+        # total XS -- keeps its own loud warning and is NOT a mapping loss, so
+        # it records nothing here.
+        if ground_synthesized:
+            if result is not None:
+                self._record_ground_repair(
+                    nuclide_name, mt, reaction_name, ground_product,
+                    all_meta_levels, synthesized_ground.n_clamped,
+                    synthesized_ground.n_points)
+            elif not mapped_meta_levels:
+                self._record_unmatched_mt(
+                    nuclide_name, mt, reaction_name,
+                    'ground_absent_all_metastables_unmapped')
         return result
 
     def process_library_for_branching(
@@ -2494,6 +2622,10 @@ class _PythonGENDFLibrary:
 
         Scans all nuclides in the library and extracts energy-dependent
         branching ratios for specified reactions that have MF=10 data.
+        Extraction is isolated per (nuclide, MT): one surprising channel costs
+        that channel only, never the nuclide's other reactions. Data-integrity
+        failures are collected and raised together at the end of the scan.
+        Resets ``ground_repaired``, ``unmatched_mts`` and ``processing_errors``.
 
         Parameters
         ----------
@@ -2657,18 +2789,32 @@ class _PythonGENDFLibrary:
         # Fail loud on data-integrity errors; expected skips never trigger this.
         if unexpected_errors:
             n = len(unexpected_errors)
-            shown = unexpected_errors[:10]
-            lines = [
-                f"  {e['nuclide']}"
-                + (f" MT={e['mt']}" if 'mt' in e else "")
-                + f": {e['exception_class']}: {e['error']}"
-                for e in shown]
-            if n > len(shown):
-                lines.append(f"  ... and {n - len(shown)} more (showing first "
-                             f"{len(shown)})")
+            # Entries are per-(nuclide, MT); the window is grouped by NUCLIDE so
+            # one flooding nuclide cannot hide the other 3780 failures.
+            by_nuclide = {}
+            for e in unexpected_errors:
+                by_nuclide.setdefault(e['nuclide'], []).append(e)
+            shown = list(by_nuclide.items())[:10]
+            lines = []
+            for nuc, entries in shown:
+                first = entries[0]
+                # One indented line per nuclide: a multi-line exception message
+                # would otherwise push the trailer onto an unindented line.
+                text = str(first['error']).splitlines() or ['']
+                head = text[0] + ('...' if len(text) > 1 else '')
+                lines.append(
+                    f"  {nuc}"
+                    + (f" MT={first['mt']}" if 'mt' in first else "")
+                    + f": {first['exception_class']}: {head}"
+                    + (f" [+{len(entries) - 1} more error(s)]"
+                       if len(entries) > 1 else ""))
+            if len(by_nuclide) > len(shown):
+                lines.append(f"  ... and {len(by_nuclide) - len(shown)} more "
+                             "nuclide(s)")
             raise RuntimeError(
                 f"process_library_for_branching encountered {n} unexpected "
-                "error(s) during isomeric branching extraction:\n"
+                f"error(s) across {len(by_nuclide)} nuclide(s) during isomeric "
+                "branching extraction:\n"
                 + "\n".join(lines)
             )
 
@@ -2682,13 +2828,24 @@ class _PythonGENDFLibrary:
 
     @property
     def processing_errors(self) -> list:
-        """Get ELIS mismatch errors from last process_library_for_branching() call.
+        """Get processing errors from last process_library_for_branching() call.
 
         Returns
         -------
         list of dict
-            Each dict contains 'nuclide', 'error' (full error message), and 'type'
-            ('elis_mismatch' for ELIS matching failures).
+            Heterogeneous entries from two recorders, so always use ``.get()``:
+
+            - mapping errors (:meth:`_record_processing_error`): 'type'
+              ('elis_tol_exceeded', 'no_metastable_decay_data',
+              'zero_elis_metastables', 'duplicate_mapping',
+              'lfs_order_dropped', 'lfs_order_orphan_dk', ...), 'nuclide',
+              'parent', 'reaction', 'mt', plus error-specific fields. No
+              'exception_class'.
+            - scan failures (``_record_failure``): 'nuclide', 'error' (the
+              exception's message), 'exception_class', 'type'
+              ('no_metastable_decay_data' or 'unexpected_processing_error'),
+              and 'mt'/'reaction' only when the failure happened inside the
+              per-MT loop (the outer defensive net records neither).
         """
         return getattr(self, '_processing_errors', [])
 
@@ -2711,7 +2868,9 @@ class _PythonGENDFLibrary:
         list of dict
             Each dict contains 'nuclide', 'mt', 'reaction', and 'reason'.
             Ground-absent MF=10 skips carry 'mf10_anonymous_levels',
-            'mf10_metastable_only_no_mf3' or 'mf10_ambiguous_izap'.
+            'mf10_metastable_only_no_mf3', 'mf10_ambiguous_izap' or
+            'ground_absent_all_metastables_unmapped' (ground synthesized, but
+            no metastable survived ELIS/decay-data mapping).
         """
         return getattr(self, '_unmatched_mts', [])
 
@@ -2723,7 +2882,9 @@ class _PythonGENDFLibrary:
         -------
         list of dict
             Each dict contains 'nuclide'/'parent', 'mt', 'reaction',
-            'ground_product' and 'metastable_lfs'.
+            'ground_product', 'metastable_lfs', and the clamp counters
+            'clamped_points' / 'total_points' (union-grid points where the raw
+            remainder went negative, out of the total).
         """
         return getattr(self, '_ground_repaired', [])
 

@@ -521,7 +521,7 @@ def build_parser():
     )
 
     parser.add_argument('--audit-emax',               type=float,          default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
-    parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band ratio has |ratio-1| > X (default: None = audit only, reject nothing). GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
+    parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band has ratio-1 > X, over-summing ONLY; under-summing never rejects (it is the radioactive-products-only MF=10 signature: an absent stable ground or anonymous levels missing from the partials). Default: None = audit only, reject nothing. GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
     parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=False, help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: off; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
     parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=False, help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: off. OFF, or ANY anonymous subsection failing the gate, prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
 
@@ -585,12 +585,20 @@ _BAND_EPITHERMAL_HI = 1.0e5
 _BAND_INTERMEDIATE_HI = 1.0e6
 
 # ``unmatched_mts`` reasons meaning "MF=10 had metastables but no usable ground"
-# (policy 3(a) declined). Explicit membership, not a prefix test: a future
-# 'mf10_*' reason must not silently join the GROUND-ABSENT report.
+# (policy 3(a) declined, or repaired and then lost at mapping). Explicit
+# membership, not a prefix test: a future 'mf10_*' reason must not silently join
+# the GROUND-ABSENT report.
 GROUND_ABSENT_SKIP_REASONS = {
     'mf10_anonymous_levels',
     'mf10_metastable_only_no_mf3',
     'mf10_ambiguous_izap',
+    'ground_absent_all_metastables_unmapped',
+}
+
+# Readable labels for the GROUND-ABSENT report; anything else prints verbatim.
+GROUND_ABSENT_SKIP_LABELS = {
+    'ground_absent_all_metastables_unmapped':
+        'ground synthesized, but no metastable survived mapping',
 }
 
 
@@ -806,7 +814,8 @@ def _audit_reaction_gendf(lib, parent, mt, emax=2.0e7, ground_repaired=False):
         notes = f"{notes}; {anon_note}" if notes else anon_note
     # A repaired reaction has no MF=10 ground at all -- Sum(partials) is the
     # metastables alone, so the MF=3 deficit is the synthesized ground, by
-    # construction, not an MF=10-vs-MF=3 inconsistency.
+    # construction, not an MF=10-vs-MF=3 inconsistency. Informational only: the
+    # one-sided reject gate already ignores every deficit.
     if ground_repaired:
         repair_note = ("ground synthesized from MF=3: partials are metastables "
                        "only")
@@ -848,13 +857,14 @@ def run_mf10_consistency_audit(lib, branching_data, emax=2.0e7,
     exact set that would receive an ``<isomeric_branching>`` child. Every one is
     run through :func:`_audit_reaction_gendf` (always -- the table is
     always-on). When ``reject_band_ratio`` is set, a reaction whose
-    ``|band ratio - 1|`` exceeds it on ANY defined band is REJECTED (returned so
+    ``band ratio - 1`` exceeds it on ANY defined band is REJECTED (returned so
     the caller can leave it stock), UNLESS it is a self-loop-ground reaction
-    (exempt -- see :func:`_self_loop_ground_gendf`) or one whose ground was
-    synthesized from MF=3 (exempt: its partials are metastables only, so the
-    band deficit is the synthesized ground). Rejection is OFF by default;
-    band-ratio deviations are harmless if common-mode on the GENDF ratio path
-    (see the module note and the ``BR-spread`` column).
+    (exempt -- see :func:`_self_loop_ground_gendf`). The test is ONE-SIDED
+    (over-summing only): under-summing is the radioactive-products-only MF=10
+    signature -- an absent stable ground, or anonymous levels missing from the
+    partials -- and never rejects. Rejection is OFF by default; band-ratio
+    deviations are harmless if common-mode on the GENDF ratio path (see the
+    module note and the ``BR-spread`` column).
 
     Returns ``(audit_rows, offender_count, clean_count, rejected_rows,
     exempt_count)``.
@@ -890,14 +900,13 @@ def run_mf10_consistency_audit(lib, branching_data, emax=2.0e7,
                               ('ratio_intermediate', 'intermediate'),
                               ('ratio_fast', 'fast')):
                 r = audit.get(key)
-                if r is not None and abs(r - 1.0) > reject_band_ratio:
+                if r is not None and (r - 1.0) > reject_band_ratio:
                     band_fired.append(f'band_ratio:{band}')
             if not band_fired:
                 continue
-            if is_repaired or _self_loop_ground_gendf(parent, branching):
+            if _self_loop_ground_gendf(parent, branching):
                 exempt += 1
-                marker = ('synthesized ground: band-reject exempt' if is_repaired
-                          else 'self-loop ground: band-reject exempt')
+                marker = 'self-loop ground: band-reject exempt'
                 row['notes'] = (f"{row['notes']}; {marker}"
                                 if row['notes'] else marker)
                 continue
@@ -1819,7 +1828,8 @@ def emit_metastable_direct_postpass(root, emit_summary):
 def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                          chain, verbose=True, prune_nn_prime_self_loops=False,
                          suppress_single_target_yields=False,
-                         mode='flags_only', mf10_emit_summary=None):
+                         mode='flags_only', mf10_emit_summary=None,
+                         repaired_keys=None):
     """Add branching data to chain XML.
 
     Parameters
@@ -1843,13 +1853,22 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         If True, suppress redundant single-target isomeric yields where
         the single target equals the original reaction target and all
         branching ratios are 1.0. Default is False (keep all).
+    repaired_keys : dict, optional
+        ``{(parent, reaction_type): ground_product}`` for reactions whose ground
+        level was synthesized from the MF=3 remainder. The decoration is dropped
+        only when the chain-membership filter leaves the synthesized GROUND as
+        the sole survivor (a self-loop no-op carrying no branching information);
+        a surviving metastable keeps its one-product decoration, which is
+        informative. Non-repaired reactions are unaffected.
 
     Returns
     -------
     dict
-        Summary with keys: 'added', 'skipped', 'errors', 'skipped_details',
+        Summary with keys: 'added', 'added_keys' (the (nuclide, reaction_type)
+        pairs actually written), 'skipped', 'errors', 'skipped_details',
         'elis_mappings', 'renormalizations', 'nuclides_with_branching_added',
-        'nn_prime_self_loops_pruned', 'single_target_cases', 'single_target_suppressed'
+        'nn_prime_self_loops_pruned', 'single_target_cases',
+        'single_target_suppressed', 'repaired_dropped_no_metastable'
     """
     tree = ET.parse(original_xml_file)
     root = tree.getroot()
@@ -1857,6 +1876,8 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 
     summary = {
         'added': 0, 'skipped': 0, 'errors': [], 'skipped_details': [],
+        'added_keys': set(),  # (nuclide, reaction_type) actually written
+        'repaired_dropped_no_metastable': 0,
         'elis_mappings': [], 'renormalizations': [],
         'nuclides_with_branching_added': set(),
         'nn_prime_self_loops_pruned': [],  # Track pruned (n,n') self-loops
@@ -1907,6 +1928,23 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 summary['skipped_details'].append({
                     'nuclide': nuclide_name, 'reaction': reaction_type,
                     'mt': branching.mt, 'missing_with_lfs': missing_with_lfs
+                })
+                continue
+
+            # A synthesized ground left alone carries no branching at all --
+            # writing it would ship a ground-only self-loop no-op that the
+            # pruner then has to keep. A surviving METASTABLE is informative
+            # (100% of the channel to the isomer), so that decoration ships.
+            ground_product = (repaired_keys or {}).get(
+                (nuclide_name, reaction_type))
+            if ground_product is not None and (not valid_products
+                                               or valid_products == [ground_product]):
+                summary['repaired_dropped_no_metastable'] += 1
+                summary['skipped'] += 1
+                summary['skipped_details'].append({
+                    'nuclide': nuclide_name, 'reaction': reaction_type,
+                    'mt': branching.mt, 'ground_product': ground_product,
+                    'reason': 'repaired_ground_only_survivor',
                 })
                 continue
 
@@ -2093,6 +2131,7 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 ratios_elem.text = '\n' + '\n'.join(ratios_lines) + '\n        '
 
             summary['added'] += 1
+            summary['added_keys'].add((nuclide_name, reaction_type))
             summary['nuclides_with_branching_added'].add(nuclide_name)
 
     # Prune (n,n') self-loops without isomeric branching if requested
@@ -2285,8 +2324,9 @@ def _write_rejected_section(f, rejected, reject_band_ratio):
         return
     f.write(f"Threshold: --mf10-reject-band-ratio = {reject_band_ratio:.3e}\n")
     f.write("Criterion: a reaction is left stock (no <isomeric_branching> child) "
-            "when any DEFINED lethargy band ratio has |ratio-1| exceeding the "
-            "threshold, EXCEPT self-loop-ground reactions (exempt).\n")
+            "when any DEFINED lethargy band has ratio-1 exceeding the threshold "
+            "(over-summing ONLY; under-summing never rejects), EXCEPT "
+            "self-loop-ground reactions (exempt).\n")
     f.write("Consequence: the base reaction keeps its scalar target/Q; the MF=3 "
             "total routes to the ground target and isomeric branching is "
             "discarded.\n")
@@ -2445,27 +2485,42 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         if audit_rows is not None and stats is not None:
             f.write(f"                          MF=10 audit offenders: {stats.get('audit_offenders', 0):5d}\n")
             f.write(f"                                 MF=10 rejected: {stats.get('mf10_rejected', 0):5d}\n")
-            f.write(f"          Band-reject exempt (self-loop/repair): {stats.get('band_reject_exempt', 0):5d}\n")
+            f.write(f"          Band-reject exempt (self-loop ground): {stats.get('band_reject_exempt', 0):5d}\n")
         ground_repaired = stats.get('ground_repaired', []) if stats else []
         ground_absent_skipped = stats.get('ground_absent_skipped', []) if stats else []
+        ground_repaired_dropped = (stats.get('ground_repaired_dropped', [])
+                                   if stats else [])
         if ground_repaired:
             f.write(f"                   Ground synthesized from MF=3: {len(ground_repaired):5d}\n")
+        if ground_repaired_dropped:
+            f.write(f"        Ground synthesized, decoration dropped: {len(ground_repaired_dropped):5d}\n")
         if ground_absent_skipped:
-            f.write(f"                    Ground absent, unrepairable: {len(ground_absent_skipped):5d}\n")
+            # Not "unrepairable": the set also holds repaired-then-unmapped ones.
+            f.write(f"                   Ground absent, not decorated: {len(ground_absent_skipped):5d}\n")
         f.write("\n")
 
         # Policy 3(a): metastable-only MF=10 (stable ground omitted by the
         # evaluator) with a true MF=3 total -> ground = clamped remainder.
-        if ground_repaired or ground_absent_skipped:
+        if ground_repaired or ground_absent_skipped or ground_repaired_dropped:
             f.write("GROUND-ABSENT MF=10 (radioactive-products-only files)\n")
             f.write("-" * 93 + "\n")
             for rec in ground_repaired:
+                clamped = rec.get('clamped_points', 0)
+                clamp = (f" [clamped {clamped}/{rec.get('total_points', 0)} pts]"
+                         if clamped else "")
                 f.write(f"  REPAIRED  {rec['nuclide']:<10} {rec['reaction']:<12} "
                         f"MT={rec['mt']:<4} ground {rec['ground_product']} = "
-                        f"max(0, MF3 - sum MF10 LFS{rec['metastable_lfs']})\n")
+                        f"max(0, MF3 - sum MF10 LFS{rec['metastable_lfs']})"
+                        f"{clamp}\n")
+            for rec in ground_repaired_dropped:
+                f.write(f"  DROPPED   {rec['nuclide']:<10} {rec['reaction']:<12} "
+                        f"MT={rec['mt']:<4} ground {rec['ground_product']} "
+                        "synthesized, but it was the only product left in the "
+                        "chain; decoration not written\n")
             for rec in ground_absent_skipped:
+                label = GROUND_ABSENT_SKIP_LABELS.get(rec['reason'])
                 f.write(f"  SKIPPED   {rec['nuclide']:<10} {rec['reaction']:<12} "
-                        f"MT={rec['mt']:<4} {rec['reason']}\n")
+                        f"MT={rec['mt']:<4} {label or rec['reason']}\n")
             f.write("\n")
 
         # Column descriptions
@@ -3229,9 +3284,9 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     if mf10_reject_band_ratio is None:
         print("  Audit: detection + logging only (no rejection)")
     else:
-        print(f"  Audit rejection: |band ratio - 1| > "
-              f"{mf10_reject_band_ratio:.3e} -> reaction left stock "
-              "(self-loop-ground exempt)")
+        print(f"  Audit rejection: band ratio - 1 > "
+              f"{mf10_reject_band_ratio:.3e} (over-summing only) -> reaction "
+              "left stock (self-loop-ground exempt)")
     (audit_rows, audit_offenders, audit_clean, rejected_rows,
      band_reject_exempt) = run_mf10_consistency_audit(
         lib, branching_data, emax=audit_emax,
@@ -3247,23 +3302,22 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     # Policy 3(a) repairs: a radioactive-products-only MF=10 (metastable levels,
     # no LFS=0) gets its ground channel synthesized from the MF=3 total. Listed
     # per reaction -- it is a data-shape decision worth eyeballing. Snapshotted
-    # HERE, after the R1-61 prune and the Step-4b rejection and filtered to what
-    # survived, so no summary line claims a repair the output chain never got.
+    # HERE, after the R1-61 prune and the Step-4b rejection; the writer can drop
+    # a decoration too (chain-membership filter, single-target suppression), so
+    # this list is filtered AGAIN against what add_branching_to_xml actually
+    # wrote before anything reports it.
     ground_repaired = [r for r in lib.ground_repaired
                        if r['reaction'] in branching_data.get(r['nuclide'], {})]
     ground_absent_skipped = [u for u in lib.unmatched_mts
                              if u['reason'] in GROUND_ABSENT_SKIP_REASONS]
-    if ground_repaired:
-        print(f"  Ground synthesized from MF=3 remainder: {len(ground_repaired)}")
-        for rec in ground_repaired:
-            print(f"    {rec['nuclide']} {rec['reaction']} (MT={rec['mt']}): "
-                  f"{rec['ground_product']} = max(0, MF3 - sum MF10 LFS"
-                  f"{rec['metastable_lfs']})")
     if ground_absent_skipped:
-        print(f"  Ground absent and unrepairable: {len(ground_absent_skipped)}")
+        # "not decorated", not "unrepairable": the set also holds reactions whose
+        # ground WAS synthesized and then lost every metastable at mapping.
+        print(f"  Ground absent, not decorated: {len(ground_absent_skipped)}")
         for rec in ground_absent_skipped:
+            label = GROUND_ABSENT_SKIP_LABELS.get(rec['reason'], rec['reason'])
             print(f"    {rec['nuclide']} {rec['reaction']} (MT={rec['mt']}): "
-                  f"{rec['reason']}")
+                  f"{label}")
 
     # Calculate counts for summary
     # branching_data structure: {nuclide: {reaction_name: IsomericBranching}}
@@ -3308,7 +3362,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         print(f"                    Duplicate mappings resolved: {dup_mappings:5d} ({dup_discarded} LFS discarded)")
     print(f"                          MF=10 audit offenders: {audit_offenders:5d}")
     print(f"                                 MF=10 rejected: {len(rejected_rows):5d}")
-    print(f"          Band-reject exempt (self-loop/repair): {band_reject_exempt:5d}")
+    print(f"          Band-reject exempt (self-loop ground): {band_reject_exempt:5d}")
 
     # Report-only LFS sentinel scan (see SENTINEL_LFS): flag products/partials
     # whose GENDF MF=10 LFS is a library "unspecified level" sentinel (99 / 40)
@@ -3335,8 +3389,35 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         prune_nn_prime_self_loops=prune_nn_prime_self_loops,
         suppress_single_target_yields=suppress_single_target_yields,
         mode=mode,
-        mf10_emit_summary=emit_summary
+        mf10_emit_summary=emit_summary,
+        repaired_keys={(r['nuclide'], r['reaction']): r['ground_product']
+                       for r in ground_repaired}
     )
+
+    # Only decorations the writer actually shipped count as repairs.
+    ground_repaired = [r for r in ground_repaired
+                       if (r['nuclide'], r['reaction']) in summary['added_keys']]
+    if ground_repaired:
+        print(f"\n  Ground synthesized from MF=3 remainder: {len(ground_repaired)}")
+        for rec in ground_repaired:
+            clamped = rec.get('clamped_points', 0)
+            clamp = (f" [clamped {clamped}/{rec.get('total_points', 0)} pts]"
+                     if clamped else "")
+            print(f"    {rec['nuclide']} {rec['reaction']} (MT={rec['mt']}): "
+                  f"{rec['ground_product']} = max(0, MF3 - sum MF10 LFS"
+                  f"{rec['metastable_lfs']}){clamp}")
+    # A repair the writer threw away is reported with its identity, here and in
+    # the mapping log -- a bare counter cannot be chased back to a reaction.
+    ground_repaired_dropped = [
+        d for d in summary['skipped_details']
+        if d.get('reason') == 'repaired_ground_only_survivor']
+    if summary['repaired_dropped_no_metastable']:
+        print("  Repaired reactions dropped (no metastable in the chain): "
+              f"{summary['repaired_dropped_no_metastable']}")
+        for rec in ground_repaired_dropped:
+            print(f"    {rec['nuclide']} {rec['reaction']} (MT={rec['mt']}): "
+                  f"synthesized ground {rec['ground_product']} was the only "
+                  "product left in the chain")
 
     # Unified emission summary now that both passes (ground pre + metastable-direct
     # post, run inside add_branching_to_xml) have completed.
@@ -3395,6 +3476,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             'band_reject_exempt': band_reject_exempt,
             'ground_repaired': ground_repaired,
             'ground_absent_skipped': ground_absent_skipped,
+            'ground_repaired_dropped': ground_repaired_dropped,
         }
         write_isomer_mapping_log(summary['elis_mappings'], isomer_mapping_log_file,
                                 stats=stats, elis_errors=elis_errors,
@@ -3449,7 +3531,7 @@ if __name__ == '__main__':
     if args.mf10_reject_band_ratio is None:
         print("MF=10 reject: off (audit only)")
     else:
-        print(f"MF=10 reject: |band ratio - 1| > {args.mf10_reject_band_ratio}")
+        print(f"MF=10 reject: band ratio - 1 > {args.mf10_reject_band_ratio}")
     print(f"\nInput chain:  {config['base_chain']}")
     print(f"Output chain: {output_chain}")
     print(f"Mapping log:  {log_file}")

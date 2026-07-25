@@ -146,8 +146,10 @@ IN115_META = _level(1, 49115, [0.25, 0.5, 0.0, 0.0], QM=0.0, QI=-336240.0)
 def test_ground_absent_repaired_from_mf3():
     """Metastable-only MF=10 + a true MF=3: ground = clamped MF=3 remainder.
 
-    Group 1 has sigma_meta (0.5) > sigma_MF3 (0.2), so the remainder clamps to 0
-    and the isomer takes the whole channel -- never a negative ground ratio.
+    Group 1 has sigma_meta (0.5) > sigma_MF3 (0.2), so the isomer takes the
+    whole channel there. The ratios alone cannot show the clamp (a negative
+    ground is re-clamped downstream in ``_build_branching_result``); the repair
+    record's clamped-point count is what makes it observable.
     """
     lib = _make_lib(mf3={4: [1.0, 0.2, 0.5, 0.0]}, mf10={4: [IN115_META]},
                     decay_lookup=IN115_DECAY)
@@ -161,6 +163,8 @@ def test_ground_absent_repaired_from_mf3():
     np.testing.assert_allclose(br.branching_ratios[1], [0.25, 1.0, 0.0])
     assert [(r['nuclide'], r['mt'], r['ground_product'])
             for r in lib.ground_repaired] == [('In115', 4, 'In115')]
+    rec = lib.ground_repaired[0]
+    assert (rec['clamped_points'], rec['total_points']) == (1, 4)
 
 
 def test_ground_remainder_uses_histogram_left_value():

@@ -128,6 +128,8 @@ class GENDFLibrary:
     ----------
     _lib_id : int
         C API library instance ID
+    library_path : str
+        Path the library was loaded from (its warn-once identity)
     _energy_bounds : np.ndarray
         Energy boundaries array
 
@@ -174,6 +176,10 @@ class GENDFLibrary:
         # Convert inputs
         self._energy_bounds = np.asarray(energy_bounds, dtype=np.float64)
         self._energy_structure = energy_structure_name
+        # Kept as a str: it is the stable warn-once identity of the library
+        # (openmc.deplete.gendf._library_warn_key), which _lib_id is not --
+        # callers build a fresh library per call from the same path.
+        self.library_path = str(library_path)
         n_bounds = len(self._energy_bounds)
 
         # Prepare C arrays
@@ -499,7 +505,9 @@ class GENDFLibrary:
         if lfs_values is None:
             raise ValueError("lfs_values required with target_names")
 
-        from openmc.deplete.gendf import build_runtime_branching
+        from openmc.deplete.gendf import (build_runtime_branching,
+                                          _library_warn_key,
+                                          _warn_runtime_branching)
 
         # C++ backend returns production XS already aligned to the full
         # group grid; the BR computation is shared with the Python backend
@@ -508,12 +516,22 @@ class GENDFLibrary:
         # MF=3 total, or Sigma(MF=10) for an MF=10-only reaction. Taking the
         # remainder against the same array the rate uses is what makes the
         # repair self-consistent, and is what the Python backend now does too.
+        # A failed fetch degrades to no-repair here exactly as it does in the
+        # Python lane, instead of raising out of the public API.
         total_xs = None
         if levels and 0 in lfs_values and 0 not in {lfs for lfs, _, _ in levels}:
-            total_xs = self.get_xs(nuclide, mt)
+            try:
+                total_xs = self.get_xs(nuclide, mt)
+            except (KeyError, ValueError, OpenMCError) as exc:
+                _warn_runtime_branching(
+                    ('rate_xs_unavailable', nuclide, mt,
+                     _library_warn_key(self)),
+                    f"{nuclide} MT={mt}: could not obtain the rate cross "
+                    f"section ({exc!r}); runtime ground repair unavailable.")
         return build_runtime_branching(
             levels, target_names, lfs_values, self.energy_bounds,
-            nuclide, mt, total_xs=total_xs)
+            nuclide, mt, total_xs=total_xs,
+            library_key=_library_warn_key(self))
 
     def __repr__(self):
         return (f"GENDFLibrary(lib_id={self._lib_id}, "
