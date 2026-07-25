@@ -22,6 +22,7 @@ sys.path.insert(0, str(_TOOLS))
 
 from add_pendf_isomeric_branching_to_chain import (  # noqa: E402
     _classify_metastables, map_library, decorate_chain, _audit_reaction,
+    _self_loop_ground,
 )
 
 
@@ -60,14 +61,18 @@ class _FakeSource:
     present these back the pointwise consistency audit. Reactions/partials
     without arrays make ``total_xs``/``pathway_xs`` raise, so the audit becomes a
     no-op for them -- keeping the array-free legacy tests unchanged.
+
+    ``elis`` maps a nuclide to its own MF=1/451 excitation energy [eV]; an
+    unlisted nuclide reports ``None`` (the "source has no ELIS" case).
     """
 
     kind = "fake"
     library = "synthetic"
     mapping = "elis"
 
-    def __init__(self, data):
+    def __init__(self, data, elis=None):
         self._data = data
+        self._elis = elis or {}
         self.nuclides = sorted(data)
 
     def reactions(self, nuclide):
@@ -87,6 +92,9 @@ class _FakeSource:
                             np.asarray(p["xs"], float))
                 break
         raise KeyError(f"{nuclide} MT={mt} LFS={lfs} has no partial array.")
+
+    def nuclide_elis(self, nuclide):
+        return self._elis.get(nuclide)
 
     def close(self):
         pass
@@ -815,6 +823,70 @@ def test_synthesized_nn_prime_metastable_parent_not_exempt():
     assert "In115_m1" not in branching                     # rejected -> stock
 
 
+def test_synthesized_nn_prime_metastable_parent_targets_true_ground(tmp_path):
+    # In115_m1 (n,n') with NO base-chain (n,n'): the synthesized ground is the
+    # super-elastic de-excitation to the TRUE ground (In115) with Q = +ELIS from
+    # the source, never the In115_m1 -> In115_m1 self-transition. The audit
+    # agrees -- such a reaction is never self-loop-exempt, so it stays
+    # rejectable.
+    rxn = dict(qm=0.0, qi=336000.0, partials=[
+        dict(lfs=1, izap=49115, qi=0.0, qm=0.0, elfs=336000.0)])
+    source = _FakeSource({"In115_m1": {4: rxn}}, elis={"In115_m1": 336000.0})
+    decay = {(49, 115): [
+        DecayState(49, 115, 0.0, 0, half_life=None),
+        DecayState(49, 115, 336000.0, 1, half_life=1.6e14)]}
+    chain = _chain_with(["In115", "In115_m1"])             # no base (n,n')
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0)
+    assert _self_loop_ground("In115_m1", "(n,n')", rxn["partials"],
+                             chain) is False              # rejectable, not exempt
+
+    added = decorate_chain(chain, branching, stats)
+    assert added == 1
+    rxns = {rx.type: (rx.target, rx.Q, rx.pendf_lfs)
+            for rx in chain["In115_m1"].reactions}
+    assert rxns["(n,n')"] == ("In115", 336000.0, 0)        # m -> g, Q = +ELIS
+    assert rxns["(n,n')_m1"][0] == "In115_m1"
+    assert stats["mg_ground_synthesized"] == 1
+    assert stats["mg_ground_skipped"] == 0
+
+    stats["reactions_added"] = added
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "Synthesized m->g (n,n') grounds:     1" in text
+    assert "Skipped m->g (n,n') (no ELIS/ground):     0" in text
+    assert "synthesized m->g (n,n') ground: -> In115, Q=+336000.0 eV" in text
+
+
+@pytest.mark.parametrize("elis, names, note", [
+    (None, ["In115", "In115_m1"], "parent MF=1/451 ELIS absent or 0"),
+    ({"In115_m1": 0.0}, ["In115", "In115_m1"], "ELIS absent or 0"),
+    ({"In115_m1": 336000.0}, ["In115_m1"], "ground In115 not in chain"),
+])
+def test_synthesized_nn_prime_metastable_parent_skipped(elis, names, note):
+    # No usable ELIS on the parent (absent, or a broken ELIS=0 header), or no
+    # true ground in the chain: the m->g (n,n') ground is NOT synthesized (a Q=0
+    # self-transition placeholder would be fabricated data) -- the reaction is
+    # left stock, counted and noted.
+    rxn = dict(qm=0.0, qi=336000.0, partials=[
+        dict(lfs=1, izap=49115, qi=0.0, qm=0.0, elfs=336000.0)])
+    source = _FakeSource({"In115_m1": {4: rxn}}, elis=elis)
+    decay = {(49, 115): [
+        DecayState(49, 115, 0.0, 0, half_life=None),
+        DecayState(49, 115, 336000.0, 1, half_life=1.6e14)]}
+    chain = _chain_with(names)                             # no base (n,n')
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0)
+    added = decorate_chain(chain, branching, stats)
+    assert added == 0
+    assert {rx.type for rx in chain["In115_m1"].reactions} == set()
+    assert stats["mg_ground_synthesized"] == 0
+    assert stats["mg_ground_skipped"] == 1
+    assert note in stats["isomer_mappings"][0]["notes"]
+
+
 def test_self_loop_ground_rtol_reject_exempt():
     # In113 (n,n') carries NO LFS=0 partial (a stable ground product) and its m1
     # partial only switches on above the metastable threshold, so below it the
@@ -983,7 +1055,8 @@ def test_asc_mf10_without_mf3_not_decorable(tmp_path, monkeypatch):
     import openmc.data.pendf as pendf_mod
 
     ev = types.SimpleNamespace(
-        target=dict(atomic_number=49, mass_number=115, isomeric_state=0),
+        target=dict(atomic_number=49, mass_number=115, isomeric_state=0,
+                    excitation_energy=0.0),
         section={
             (3, 102): _mf3_text(49115, 6784720.0, 6784720.0),
             (10, 102): _mf10_text(49115, [

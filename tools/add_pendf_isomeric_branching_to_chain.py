@@ -200,7 +200,9 @@ def _self_loop_ground(parent, r_name, partials, chain):
     falls back to the base chain's existing target for this reaction on
     ``parent``, and failing that to what :func:`decorate_chain` would
     SYNTHESIZE for the missing base reaction -- ``(n,n')`` with target ==
-    parent. Without that last step the audit and the decoration would disagree
+    parent on a GROUND-state parent (a METASTABLE parent's synthesized ground is
+    the true ground, ``In115_m1 -> In115``, with Q = +ELIS(parent)).
+    Without that last step the audit and the decoration would disagree
     about what a self-loop is for exactly the reactions the decoration
     synthesizes. The match must be EXACT: for a metastable parent (e.g.
     ``In115_m1 (n,n') -> In115`` ground) the ground route is a real
@@ -220,10 +222,11 @@ def _self_loop_ground(parent, r_name, partials, chain):
                          if rx.type == r_name), None)
         if existing is not None:
             return existing.target == parent
-    # No base-chain entry either: decorate_chain synthesizes this reaction's
-    # ground as target == parent for "(n,n')", so a GROUND-state parent's ground
-    # route really is the diagonal no-op the exemption is about. A metastable
-    # parent's (n,n') to ground is isomer burnup, never a self-loop.
+    # No base-chain entry either: decorate_chain synthesizes a GROUND-state
+    # parent's "(n,n')" ground as target == parent, so its ground route really is
+    # the diagonal no-op the exemption is about. A metastable parent's (n,n') to
+    # ground is isomer burnup (synthesized as parent -> true ground), never a
+    # self-loop.
     return r_name == "(n,n')" and not _ISOMER_SUFFIX.search(parent)
 
 
@@ -281,6 +284,16 @@ class _H5Source:
         """(energy, xs) of one MF=10 isomeric-production partial."""
         return self._lib.pathway_xs(nuclide, mt, lfs, izap)
 
+    def nuclide_elis(self, nuclide):
+        """Target excitation energy [eV] (MF=1/451 ELIS), or ``None``.
+
+        Stored per nuclide group by the h5 builder (``openmc/data/pendf.py``:
+        ``nuc.attrs['ELIS'] = ev.target['excitation_energy']``); ``None`` only on
+        a file written before that attr existed.
+        """
+        attrs = self._lib._groups[nuclide].attrs
+        return float(attrs['ELIS']) if 'ELIS' in attrs else None
+
     def close(self):
         self._lib.close()
 
@@ -313,6 +326,7 @@ class _AscSource:
         self.mapping = None
         self._data = {}
         self._tapes = {}                 # GNDS name -> tape path
+        self._elis = {}                  # GNDS name -> MF=1/451 ELIS [eV]
         self._xs_cache_name = None       # single-nuclide (energy, xs) cache
         self._xs_cache = None
         self.mf10_without_mf3 = []       # excluded, undecorable tape sections
@@ -354,6 +368,9 @@ class _AscSource:
                                      partials=partials)
             self._data[name] = reactions
             self._tapes[name] = tape
+            # The target's own MF=1/451 excitation energy (ELIS, eV); ``None``
+            # when the header lacks the record -- never guessed downstream.
+            self._elis[name] = ev.target.get('excitation_energy')
         self.nuclides = sorted(self._data)
 
     def _record_mf10_without_mf3(self, ev, name, mt):
@@ -428,6 +445,15 @@ class _AscSource:
             raise KeyError(f"{nuclide!r} MT={mt} has no MF=3 total.")
         return rx['total']
 
+    def nuclide_elis(self, nuclide):
+        """Target excitation energy [eV] (MF=1/451 ELIS), or ``None``.
+
+        Read off the tape's own MF=1/451 header at discovery time
+        (``Evaluation.target['excitation_energy']``) -- the same record the h5
+        builder stores as the nuclide group's ``ELIS`` attr.
+        """
+        return self._elis.get(nuclide)
+
     def pathway_xs(self, nuclide, mt, lfs, izap=None):
         """(energy, xs) of one MF=10 isomeric-production partial."""
         rx = self._load_xs(nuclide).get(mt)
@@ -460,6 +486,25 @@ def open_pendf_source(path, library=None):
     if path.is_file():
         return _H5Source(path)
     raise FileNotFoundError(str(path))
+
+
+def _nuclide_elis(source, nuclide):
+    """``nuclide``'s own excitation energy [eV] from the source, or ``None``.
+
+    Both adapters serve the target's MF=1/451 ELIS record (h5: the nuclide
+    group's ``ELIS`` attr; ASC: ``Evaluation.target['excitation_energy']``); an
+    adapter without the accessor, a file predating the attr, or a lookup failure
+    yields ``None``, which callers must treat as "unknown" and never guess
+    around -- :func:`decorate_chain` leaves the reaction stock instead.
+    """
+    getter = getattr(source, 'nuclide_elis', None)
+    if getter is None:
+        return None
+    try:
+        elis = getter(nuclide)
+    except Exception:
+        return None
+    return None if elis is None else float(elis)
 
 
 def _pendf_source_label(path) -> str:
@@ -628,13 +673,15 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
         notes=notes)
 
 
-def _append_note(audit, marker):
-    """Append ``marker`` to an audit row's ``notes`` (semicolon-separated).
+def _append_note(row, marker):
+    """Append ``marker`` to a log row's ``notes`` (semicolon-separated).
 
-    Append-only: the notes field is the audit table's last column, so extra
-    markers never disturb the column layout of the rows before it.
+    Serves both the audit rows and the per-parent mapping rows (which carry no
+    ``notes`` key until one is needed). Append-only: the notes field is the last
+    column of either table, so extra markers never disturb the column layout of
+    the rows before it.
     """
-    audit['notes'] = f"{audit['notes']}; {marker}" if audit['notes'] else marker
+    row['notes'] = f"{row['notes']}; {marker}" if row.get('notes') else marker
 
 
 # =============================================================================
@@ -735,9 +782,9 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     """Map every PENDF nuclide's MF=10 metastable partials against the chain.
 
     Returns ``(branching, stats)`` where ``branching`` is
-    ``{parent: {r_name: {'mt', 'ground', 'metastables'}}}`` restricted to the
-    matched-and-in-chain pathways, and ``stats`` carries the counters and the
-    per-parent log records.
+    ``{parent: {r_name: {'mt', 'ground', 'metastables', 'parent_elis'}}}``
+    restricted to the matched-and-in-chain pathways, and ``stats`` carries the
+    counters and the per-parent log records.
 
     Every reaction carrying >=1 metastable pathway is run through the pointwise
     MF=10-vs-MF=3 consistency audit (:func:`_audit_reaction`, capped at
@@ -815,6 +862,11 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
             continue
         z, a, _ = zam(parent)
         parent_in_chain = parent in chain_names
+        # The parent's OWN excitation energy (MF=1/451 ELIS, eV), carried on
+        # every branching record: decorate_chain needs it as the Q of a
+        # synthesized metastable-parent (n,n') ground (In115_m1 -> In115), and
+        # source data is the only admissible origin for it.
+        parent_elis = _nuclide_elis(source, parent)
 
         for mt, rxinfo in sorted(reactions.items()):
             r_name = _MT_TO_NAME.get(mt)
@@ -1038,7 +1090,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                 ground = next((p for p in partials if p['lfs'] == 0), None)
                 branching[parent][r_name] = dict(
                     mt=mt, ground=ground, qm=rxinfo['qm'], qi=rxinfo['qi'],
-                    metastables=mapped)
+                    metastables=mapped, parent_elis=parent_elis)
             elif not mapped:
                 # MF=10 metastables present but none mapped into the chain:
                 # the base reaction is left stock.
@@ -1103,14 +1155,40 @@ def _half_life(chain, name):
 # Chain decoration -- work at the Chain-object level (never raw XML)
 # =============================================================================
 
-def decorate_chain(chain, branching):
+def _note_mg_ground(stats, parent, r_name, marker, skipped=False):
+    """Count + log one metastable-parent ``(n,n')`` ground synthesis or skip.
+
+    The counters (``mg_ground_synthesized`` / ``mg_ground_skipped``) print
+    unconditionally in the console and log summary blocks; the marker is
+    appended to every mapping-log row of ``parent``'s reaction ``r_name``, so a
+    synthesized -- or refused -- m->g ground is visible in the Notes column next
+    to the pathways it belongs to, not only in the summary. No-op when
+    :func:`decorate_chain` is called without a ``stats`` sink.
+    """
+    if stats is None:
+        return
+    key = 'mg_ground_skipped' if skipped else 'mg_ground_synthesized'
+    stats[key] = stats.get(key, 0) + 1
+    for row in stats.get('isomer_mappings', []):
+        if row.get('parent') == parent and row.get('reaction') == r_name:
+            _append_note(row, marker)
+
+
+def decorate_chain(chain, branching, stats=None):
     """Add ground + qualified metastable ReactionTuples to the chain in place.
 
     Every tuple carries a ``pendf_lfs`` (ground = 0, metastable = tape LFS) so
     the Phase-1 refold writer folds the group into an ``<isomeric_branching>``
     element instead of falling back to stock reaction elements. Returns the
     number of reactions synthesized for MTs absent from the base chain.
+
+    ``stats`` (the :func:`map_library` dict) is an optional sink for the
+    metastable-parent ``(n,n')`` ground bookkeeping -- see
+    :func:`_note_mg_ground`.
     """
+    if stats is not None:
+        stats.setdefault('mg_ground_synthesized', 0)
+        stats.setdefault('mg_ground_skipped', 0)
     reactions_added = 0
     for parent, reactions in branching.items():
         nuc = chain[parent]
@@ -1127,7 +1205,40 @@ def decorate_chain(chain, branching):
                                        1.0, 0)
             else:
                 # MT absent from base chain -- synthesize the ground pathway.
-                if r_name == "(n,n')":
+                if r_name == "(n,n')" and _ISOMER_SUFFIX.search(parent):
+                    # METASTABLE parent: the LFS=0 route is super-elastic
+                    # de-excitation to the TRUE ground (In115_m1 -> In115), a
+                    # real off-diagonal isomer-burnup transition -- NOT the
+                    # self-transition ``target == parent`` would encode. Q is
+                    # the parent isomer's own excitation energy (+ELIS, eV,
+                    # exothermic), which is also the convention the base chains
+                    # carry for their stock m->g (n,n') rows (e.g. Co58_m1 ->
+                    # Co58, Q = +24950.03 eV). The audit agrees: such a reaction
+                    # is never self-loop-exempt (see _self_loop_ground).
+                    # ELIS is SOURCE data, never guessed: with no usable ELIS on
+                    # the parent, or with its ground absent from the chain,
+                    # nothing is synthesized -- the reaction is left stock and
+                    # the skip is counted and noted in the mapping log. A
+                    # metastable parent tabulated with ELIS = 0 is a broken
+                    # MF=1/451 header, not a zero-energy isomer, and counts as
+                    # unusable (mirroring the decay side's zero_elis policy) --
+                    # Q = 0 here would silently reinstate the self-transition
+                    # no-op this branch exists to remove.
+                    target = _ISOMER_SUFFIX.sub('', parent)
+                    elis = info.get('parent_elis')
+                    if not elis or target not in chain.nuclide_dict:
+                        reason = ('parent MF=1/451 ELIS absent or 0' if not elis
+                                  else f'ground {target} not in chain')
+                        _note_mg_ground(
+                            stats, parent, r_name,
+                            f"m->g (n,n') left stock: {reason}", skipped=True)
+                        continue
+                    ground = ReactionTuple(r_name, target, float(elis), 1.0, 0)
+                    _note_mg_ground(
+                        stats, parent, r_name,
+                        f"synthesized m->g (n,n') ground: -> {target}, "
+                        f"Q=+{float(elis):.1f} eV")
+                elif r_name == "(n,n')":
                     ground = ReactionTuple(r_name, parent, 0.0, 1.0, 0)
                 else:
                     daughter = _ground_product(z, a, r_name)
@@ -1256,6 +1367,8 @@ def print_stats(stats, mode):
         print(f"                 LFS dropped (exceeds DK count): {stats['lfs_order_dropped']:5d}")
     print(f"                          Products not in chain: {stats['products_not_in_chain']:5d}")
     print(f"                       Reactions added to chain: {stats['reactions_added']:5d}")
+    print(f"                Synthesized m->g (n,n') grounds: {stats.get('mg_ground_synthesized', 0):5d}")
+    print(f"           Skipped m->g (n,n') (no ELIS/ground): {stats.get('mg_ground_skipped', 0):5d}")
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
     print(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}")
     print(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}")
@@ -1803,6 +1916,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             f.write(f"                 LFS dropped (exceeds DK count): {stats['lfs_order_dropped']:5d}\n")
         f.write(f"                          Products not in chain: {stats['products_not_in_chain']:5d}\n")
         f.write(f"                       Reactions added to chain: {stats['reactions_added']:5d}\n")
+        f.write(f"                Synthesized m->g (n,n') grounds: {stats.get('mg_ground_synthesized', 0):5d}\n")
+        f.write(f"           Skipped m->g (n,n') (no ELIS/ground): {stats.get('mg_ground_skipped', 0):5d}\n")
         f.write(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
         f.write(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}\n")
         f.write(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}\n")
@@ -1962,7 +2077,7 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
         reject_band_ratio=reject_band_ratio)
 
     print("\nStep 5: Decorating chain...")
-    reactions_added = decorate_chain(chain, branching)
+    reactions_added = decorate_chain(chain, branching, stats)
     stats['reactions_added'] = reactions_added
 
     # Optionally prune stock (n,n') ground self-loops (target == parent). Runs
