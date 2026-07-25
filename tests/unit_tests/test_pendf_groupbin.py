@@ -408,18 +408,20 @@ def _run_main(monkeypatch, src, out, *extra):
     pgb.main()
 
 
-def test_cli_refuses_existing_out(tmp_path, monkeypatch):
-    """An existing --out is refused without --force and overwritten with it."""
+def test_cli_overwrites_existing_out(tmp_path, monkeypatch):
+    """An existing --out is overwritten by default; --force is a kept no-op."""
     src = tmp_path / "pointwise.h5"
     out = tmp_path / "grouped.h5"
     _make_pointwise_h5(src)
     out.write_bytes(b"stale")  # pre-existing output
 
-    with pytest.raises(SystemExit):
-        _run_main(monkeypatch, src, out)
-    assert out.read_bytes() == b"stale"  # untouched by the refusal
+    _run_main(monkeypatch, src, out)
+    with h5py.File(out, "r") as f:
+        assert f.attrs["format"] == pgb.GROUPED_FORMAT
 
-    # --force lets it overwrite; the file is now a valid grouped library.
+    # --force still parses (older commands and scripts pass it) and does the
+    # same thing the default now does.
+    out.write_bytes(b"stale")
     _run_main(monkeypatch, src, out, "--force")
     with h5py.File(out, "r") as f:
         assert f.attrs["format"] == pgb.GROUPED_FORMAT

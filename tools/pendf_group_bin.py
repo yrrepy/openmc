@@ -70,14 +70,17 @@ GROUPED_VERSION = 2
 def chain_relevant_mts() -> set[int]:
     """Return the MT numbers depletion activation cares about.
 
-    The union of every ``REACTIONS`` entry's MTs plus two channels absent from
-    that transmutation-only table: MT=4, because ``(n,n')`` joins ``REACTIONS``
-    only on the separate pendf-chain branch, and MT=18, because fission reaches
-    the collapse via ``REACTION_MT['fission']`` rather than ``REACTIONS``.
+    The union of every ``REACTIONS`` entry's MTs, plus an explicit MT=4 and
+    MT=18. MT=4 already IS in ``REACTIONS`` here (the ``(n,n')`` entry); MT=18
+    is not, because fission reaches the collapse via ``REACTION_MT['fission']``
+    rather than that transmutation-only table.
     """
     mts = {mt for info in REACTIONS.values() for mt in info.mts}
-    mts.add(4)   # (n,n') joins REACTIONS on the separate pendf-chain branch
-    mts.add(18)  # fission reaches the collapse via REACTION_MT, not REACTIONS
+    # Belt-and-braces backstops, so the whitelist can never silently lose either
+    # channel if REACTIONS changes: MT=18's omission was a real production bug
+    # (zero fission rows in every grouped library, fixed @5fe7be4c6).
+    mts.add(4)
+    mts.add(18)
     return mts
 
 
@@ -314,16 +317,11 @@ def main():
     parser.add_argument('--mts',      type=int,   default=None, nargs='+', help='Explicit MT override list (default: chain-relevant MTs)')
     parser.add_argument('--nuclides', type=str,   default=None, nargs='+', help='Subset of nuclides to bin (default: all)')
     parser.add_argument('--no-fill',  action='store_true',            help='Skip the build-time silence-fill bake (source-faithful escape hatch, for debugging)')
-    parser.add_argument('--force',    action='store_true',            help='Overwrite --out if it already exists (default: refuse)')
+    parser.add_argument('--force',    action='store_true',            help='No-op: an existing --out is now overwritten by default (flag kept so older commands keep working)')
     parser.add_argument('--log-file', type=Path,  default=None,       help='Write a warning-summary log (counts + top-10 partials-vs-total offenders) here')
     args = parser.parse_args()
 
     edges = _resolve_edges(args.edges, args.groups)
-
-    # Refuse to silently truncate an existing output unless --force is given.
-    if args.out.exists() and not args.force:
-        parser.error(
-            f'output file {args.out} already exists; pass --force to overwrite')
 
     # Validate any requested nuclide subset against the source up front, so a
     # typo fails with one clear message -- naming every unknown entry -- before
@@ -338,9 +336,10 @@ def main():
                 f'--nuclides not found in {args.pendf_in}: '
                 f'{", ".join(unknown)} (valid examples: {examples})')
 
-    # A bad output path (missing/unwritable directory, permission denied) should
-    # fail with a one-line message here, not an h5py traceback from inside the
-    # binning loop.
+    # An existing --out is overwritten (no confirmation, no flag needed); this
+    # probe truncates it here and turns a bad output path (missing/unwritable
+    # directory, permission denied) into a one-line message rather than an h5py
+    # traceback from inside the binning loop.
     try:
         with h5py.File(args.out, 'w'):
             pass
