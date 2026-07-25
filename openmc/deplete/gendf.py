@@ -298,10 +298,15 @@ class IsomericBranching:
           (positional mapping based on sorted LFS values)
         - 'elis': Excitation energy in eV (from GENDF QM-QI calculation)
         - 'liso': Isomeric state number (1 for _m1(m), 2 for _m2(n), etc.)
+        - 'qm', 'qi': the level's MF=10 Q pair in eV (ELIS = QM - QI). The chain
+          patcher writes the per-pathway Q straight from these: QI for a
+          metastable slot, QM for the LFS=0 slot. ``qm`` is None when the file
+          gives no QM (then ELIS is None too).
         - For 'lfs_order' mode, additional fields: 'lfs' (original LFS value),
           'position' (sorted position), 'elis_ref_status' ('ok', 'mismatch', or
           'wrong_liso' indicating ELIS check result for reference)
-        Example: {'Ir192_m1': {'method': 'elis', 'elis': 56720.0, 'liso': 1}}
+        Example: {'Ir192_m1': {'method': 'elis', 'elis': 56720.0, 'liso': 1,
+        'qm': 6198000.0, 'qi': 6141280.0}}
 
     """
     energies: np.ndarray
@@ -1737,6 +1742,11 @@ class _PythonGENDFLibrary:
             )
 
             if result is not None:
+                # Keep the level's MF=10 Q pair alongside its ELIS: the patcher
+                # writes the per-pathway Q from QI/QM directly (ELIS = QM - QI).
+                level = meta['level']
+                result[3]['qm'] = level.get('QM', qm_section)
+                result[3]['qi'] = level.get('QI', 0.0)
                 mapped_meta_levels.append(result)
                 lfs_mapping[result[1]] = lfs  # result[1] is mapped_name
 
@@ -1988,6 +1998,8 @@ class _PythonGENDFLibrary:
                 'liso': liso,
                 'position': position,
                 'elis': gendf_elis,
+                'qm': qm,          # MF=10 Q pair; the patcher writes the
+                'qi': qi,          # per-pathway Q from it (ELIS = QM - QI)
                 'gendf_elis': gendf_elis,
                 'dk_elis': dk_elis,
                 'dk_half_life': dk_half_life,

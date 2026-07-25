@@ -411,9 +411,11 @@ def test_isomeric_flags_take_slot0_lfs_from_mapping(tmp_path):
         parent_nuclide="Ir191", reaction="(n,gamma)", mt=102,
         lfs_mapping={"Ir192": 0, "Ir192_m1": 3, "Ir192_m2": 15},
         elis_mapping={"Ir192_m1": {"method": "elis", "elis": 56720.0,
-                                   "liso": 1},
+                                   "liso": 1, "qm": 6198000.0,
+                                   "qi": 6141280.0},
                       "Ir192_m2": {"method": "elis", "elis": 168140.0,
-                                   "liso": 2}})}}
+                                   "liso": 2, "qm": 6198000.0,
+                                   "qi": 6029860.0}})}}
 
     patched = tmp_path / "ir_patched.xml"
     tool.add_branching_to_xml(str(base), data, str(patched), chain,
@@ -421,5 +423,64 @@ def test_isomeric_flags_take_slot0_lfs_from_mapping(tmp_path):
     iso = _reaction_elem(patched, "Ir191", "(n,gamma)").find("isomeric_branching")
     assert iso.get("targets") == "Ir192_m1 Ir192_m2"
     assert iso.get("gendf_lfs") == "3 15"     # not "0 15"
-    # Slot 0 is a promoted metastable: it pays its own ELFS, not the ground Q.
+    # Slot 0 is a promoted metastable: it takes its own level's QI (== QM-ELFS),
+    # not the ground Q -- the same uniform rule as every other metastable slot.
     assert iso.get("Q").split() == ["6141280.0", "6029860.0"]
+
+
+class _Sigma:
+    """Minimal (x, y) stand-in for an MF=10 level cross section."""
+
+    def __init__(self, y):
+        self.x = np.array([1.0e6, 1.4e7])
+        self.y = np.array(y, dtype=float)
+
+
+def test_pathway_q_mt4_uses_qm_qi_not_double_subtraction(tmp_path):
+    """G1: MT=4 pathway Q comes from the MF=10 QM/QI pair, end to end.
+
+    The chain's scalar Q for (n,n') is QI(MF=3) = -E(level 1), NOT QM, so the
+    old ``Q_scalar - ELFS`` fold charged the level energy twice (-2*E) and left
+    the ground slot at -E. QM/QI-sourced: ground = QM = 0, metastable = its QI.
+    """
+    chain = openmc.deplete.Chain()
+    ind = openmc.deplete.Nuclide("In115")
+    ind.add_reaction("(n,n')", "In115", Q=-336240.0, branching_ratio=1.0)
+    chain.add_nuclide(ind)
+    chain.add_nuclide(openmc.deplete.Nuclide("In115_m1"))
+    base = tmp_path / "in_chain.xml"
+    chain.export_to_xml(str(base))
+
+    sections = {"In115": {
+        (3, 4): {"sigma": None},
+        (10, 4): {"levels": [
+            dict(_level(0, 49115, 0.0, 0.0), sigma=_Sigma([0.9, 0.8])),
+            dict(_level(1, 49115, 0.0, -336244.0),
+                 sigma=_Sigma([0.1, 0.2]))]}}}
+    decay = {(49, 115): [DecayState(z=49, a=115, elis=0.0, liso=0),
+                         DecayState(z=49, a=115, elis=336244.0, liso=1,
+                                    half_life=16149.6)]}
+    lib = _ToyLib(sections, decay)
+
+    data = lib.process_library_for_branching(mt_list=[4], chain=chain)
+    # The extractor carries the level's Q pair through to the patcher.
+    info = data["In115"]["(n,n')"].elis_mapping["In115_m1"]
+    assert (info["qm"], info["qi"], info["elis"]) == (0.0, -336244.0, 336244.0)
+
+    patched = tmp_path / "in_patched.xml"
+    summary = tool.add_branching_to_xml(str(base), data, str(patched), chain,
+                                        verbose=False,
+                                        prune_nn_prime_self_loops=True)
+
+    # Decorated (n,n') survives the self-loop prune and carries both slots.
+    iso = _reaction_elem(patched, "In115", "(n,n')").find("isomeric_branching")
+    assert iso.get("targets") == "In115 In115_m1"
+    assert iso.get("gendf_lfs") == "0 1"
+    # Ground slot = QM (0), metastable slot = QI: -E(m1) ONCE, not twice.
+    assert iso.get("Q").split() == ["0.0", "-336244.0"]
+
+    # Loudly reported against what the legacy fold would have written.
+    [rec] = summary["pathway_q_corrections"]
+    assert rec["source"] == ["QM", "QI"]
+    assert rec["q_legacy"] == ["-336240.0", "-672484.0"]
+    assert summary["q_from_mf10"] == 2 and summary["q_replicated"] == 0

@@ -1868,7 +1868,8 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         pairs actually written), 'skipped', 'errors', 'skipped_details',
         'elis_mappings', 'renormalizations', 'nuclides_with_branching_added',
         'nn_prime_self_loops_pruned', 'single_target_cases',
-        'single_target_suppressed', 'repaired_dropped_no_metastable'
+        'single_target_suppressed', 'repaired_dropped_no_metastable',
+        'pathway_q_corrections'
     """
     tree = ET.parse(original_xml_file)
     root = tree.getroot()
@@ -1883,8 +1884,9 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'nn_prime_self_loops_pruned': [],  # Track pruned (n,n') self-loops
         'single_target_cases': [],  # Track all single-target cases
         'single_target_suppressed': 0,  # Count of suppressed single-target cases
-        'q_from_elfs': 0,   # metastable Q values derived as Q_ground - ELFS
-        'q_replicated': 0,  # metastable Q values replicated (no ELFS available)
+        'q_from_mf10': 0,   # pathway Q slots taken from the MF=10 QM/QI pair
+        'q_replicated': 0,  # pathway Q slots replicated (no QM/QI available)
+        'pathway_q_corrections': [],  # slots that differ from the legacy fold
     }
 
     nuclide_map = {nuc.get('name'): nuc for nuc in root.findall('nuclide')}
@@ -2074,39 +2076,64 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                     lfs_values.append(lfs)
                 iso_elem.set('gendf_lfs', ' '.join(str(v) for v in lfs_values))
 
-                # Per-pathway Q parallel-list (WORK ITEM 2). A true ground slot
-                # (LFS=0) keeps the base reaction's scalar Q (= QM); every
-                # metastable costs its excitation energy, so
-                #   Q_meta = Q_ground - ELFS,  ELFS = QM - QI,
-                # taken from the SAME MF=10 the branching was derived from
-                # (branching.elis_mapping[p]['elis']) -- no Q value is invented.
-                # A metastable with no ELFS available (e.g. lfs_order mode)
-                # replicates the ground Q and is counted for the report. Slot 0
-                # gets the same treatment when the chain-membership filter
-                # promoted a metastable into it (LFS > 0).
+                # Per-pathway Q parallel-list. Every slot takes the Q of ITS OWN
+                # MF=10 level, straight from the section the branching came
+                # from: a metastable slot gets that level's QI, the LFS=0 slot
+                # gets QM (equivalently Q_i = QM - ELFS_i, ELFS = QM - QI). QM
+                # is a property of the MF=10 section, so a true ground slot --
+                # which has no elis entry of its own -- reads it off any mapped
+                # level. Deriving Q from QM/QI instead of the old
+                # ``Q_chain - ELFS`` matters for MT=4: the chain's scalar Q is
+                # QI(MF=3) = -E(level), not QM, so that subtraction charged the
+                # level energy twice. Nothing is invented: a slot with no MF=10
+                # Q pair (e.g. lfs_order mode with no QM) replicates the scalar
+                # Q and is counted for the report. The reaction's own scalar Q
+                # is untouched here (it is popped with the target below).
                 scalar_q = rx_elem.get('Q')
+                q_default = scalar_q if scalar_q is not None else '0.0'
                 gq = float(scalar_q) if scalar_q is not None else 0.0
-                q_values = [scalar_q if scalar_q is not None else '0.0']
                 elis_map = getattr(branching, 'elis_mapping', None) or {}
-                if lfs_values[0]:
-                    info = (elis_map.get(products[0])
-                            if isinstance(elis_map, dict) else None)
-                    elfs = info.get('elis') if isinstance(info, dict) else None
-                    if elfs is not None:
-                        q_values[0] = _q_str(gq - float(elfs))
-                        summary['q_from_elfs'] += 1
+                if not isinstance(elis_map, dict):
+                    elis_map = {}
+                section_qm = next(
+                    (i['qm'] for i in elis_map.values()
+                     if isinstance(i, dict) and i.get('qm') is not None), None)
+
+                q_values, q_legacy, q_sources = [], [], []
+                for slot, (p, lfs) in enumerate(zip(products, lfs_values)):
+                    info = elis_map.get(p)
+                    info = info if isinstance(info, dict) else {}
+                    elfs = info.get('elis')
+
+                    # What the pre-fix fold wrote -- reported, never written.
+                    q_legacy.append(_q_str(gq - float(elfs))
+                                    if elfs is not None and (slot or lfs)
+                                    else q_default)
+
+                    if lfs:
+                        qi, qm = info.get('qi'), info.get('qm')
+                        q_new = None if (qi is None or qm is None) else qi
+                        source = 'QI'
                     else:
+                        q_new = section_qm
+                        source = 'QM'
+                    if q_new is None:
+                        q_values.append(q_default)
+                        q_sources.append('scalar')
                         summary['q_replicated'] += 1
-                for p in products[1:]:
-                    info = elis_map.get(p) if isinstance(elis_map, dict) else None
-                    elfs = info.get('elis') if isinstance(info, dict) else None
-                    if elfs is not None:
-                        q_values.append(_q_str(gq - float(elfs)))
-                        summary['q_from_elfs'] += 1
                     else:
-                        q_values.append(scalar_q if scalar_q is not None else '0.0')
-                        summary['q_replicated'] += 1
+                        q_values.append(_q_str(q_new))
+                        q_sources.append(source)
+                        summary['q_from_mf10'] += 1
                 iso_elem.set('Q', ' '.join(q_values))
+
+                if q_values != q_legacy:
+                    summary['pathway_q_corrections'].append({
+                        'nuclide': nuclide_name, 'reaction': reaction_type,
+                        'mt': branching.mt, 'targets': list(products),
+                        'lfs': list(lfs_values), 'q': q_values,
+                        'source': q_sources, 'q_legacy': q_legacy,
+                    })
 
                 # Fold: drop the scalar target/Q now that the child carries the
                 # full per-pathway lists. Unbranched reactions are untouched.
@@ -2497,6 +2524,9 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         if ground_absent_skipped:
             # Not "unrepairable": the set also holds repaired-then-unmapped ones.
             f.write(f"                   Ground absent, not decorated: {len(ground_absent_skipped):5d}\n")
+        pathway_q = stats.get('pathway_q_corrections', []) if stats else []
+        if pathway_q:
+            f.write(f"                      Pathway-Q QM/QI-corrected: {len(pathway_q):5d}\n")
         f.write("\n")
 
         # Policy 3(a): metastable-only MF=10 (stable ground omitted by the
@@ -2521,6 +2551,30 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                 label = GROUND_ABSENT_SKIP_LABELS.get(rec['reason'])
                 f.write(f"  SKIPPED   {rec['nuclide']:<10} {rec['reaction']:<12} "
                         f"MT={rec['mt']:<4} {label or rec['reason']}\n")
+            f.write("\n")
+
+        # Per-pathway Q now read off the MF=10 QM/QI pair instead of being
+        # derived as (chain scalar Q - ELFS), which double-charged the level
+        # energy for MT=4. Every slot whose written value differs from that
+        # legacy arithmetic is listed.
+        if pathway_q:
+            f.write("PATHWAY-Q (QM/QI-SOURCED)\n")
+            f.write("-" * 93 + "\n")
+            f.write("Convention: pathway Q = MF=10 QI of that level; the LFS=0 slot = QM;\n")
+            f.write("the reaction's scalar Q is untouched. Listed below: reactions whose\n")
+            f.write("written per-slot Q differs from the legacy fold (Q_scalar - ELFS).\n")
+            f.write("The (n,n') rows are the MT=4 double-subtraction fix -- there the chain's\n")
+            f.write("scalar Q is QI(MF=3) = -E(level 1), not QM, so subtracting ELFS charged\n")
+            f.write("the level energy twice (and left the ground slot at -E(level 1)).\n")
+            f.write("\n")
+            for rec in pathway_q:
+                slots = "  ".join(
+                    f"{t}[LFS={l}] {q} ({s}, was {old})"
+                    for t, l, q, s, old in zip(rec['targets'], rec['lfs'],
+                                               rec['q'], rec['source'],
+                                               rec['q_legacy']))
+                f.write(f"  {rec['nuclide']:<10} {rec['reaction']:<12} "
+                        f"MT={rec['mt']:<4} {slots}\n")
             f.write("\n")
 
         # Column descriptions
@@ -3437,6 +3491,11 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     if summary['nn_prime_self_loops_pruned']:
         print(f"Pruned (n,n') self-loops: {len(summary['nn_prime_self_loops_pruned'])}")
 
+    if summary['pathway_q_corrections']:
+        print(f"Pathway-Q QM/QI-sourced: {len(summary['pathway_q_corrections'])} "
+              "reactions corrected vs legacy fold (MT=4 double-subtraction); "
+              "see PATHWAY-Q section of the mapping log")
+
     # Single-target summary (always printed if any exist)
     if summary['single_target_cases']:
         cases = summary['single_target_cases']
@@ -3477,6 +3536,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             'ground_repaired': ground_repaired,
             'ground_absent_skipped': ground_absent_skipped,
             'ground_repaired_dropped': ground_repaired_dropped,
+            'pathway_q_corrections': summary['pathway_q_corrections'],
         }
         write_isomer_mapping_log(summary['elis_mappings'], isomer_mapping_log_file,
                                 stats=stats, elis_errors=elis_errors,
