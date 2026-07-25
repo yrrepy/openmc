@@ -886,3 +886,119 @@ def test_band_ratio_rejection_one_sided():
                              reject_rtol=None, reject_band_ratio=0.3)
     assert stats_o["rejected_count"] == 1            # over-summing rejected
     assert "thermal" in stats_o["rejected"][0]["criterion"]
+
+
+# ---------------------------------------------------------------------------
+# ASC tape source: MF=10 sections with no MF=3 sibling are not decorable
+# ---------------------------------------------------------------------------
+
+def _endf_field(value):
+    """Format a value as an 11-character ENDF-6 record field."""
+    return f"{value:>11.4E}" if isinstance(value, float) else f"{value:>11d}"
+
+
+def _tab1_lines(c1, c2, l1, l2, pairs):
+    """TAB1 record lines for one lin-lin (INT=2) region (NJOY PENDF convention)."""
+    lines = [_endf_field(c1) + _endf_field(c2) + _endf_field(l1)
+             + _endf_field(l2) + _endf_field(1) + _endf_field(len(pairs)),
+             _endf_field(len(pairs)) + _endf_field(2)]      # NBT, INT=lin-lin
+    row = ""
+    for i, (x, y) in enumerate(pairs):
+        row += _endf_field(float(x)) + _endf_field(float(y))
+        if (i + 1) % 3 == 0:
+            lines.append(row)
+            row = ""
+    if row:
+        lines.append(row)
+    return lines
+
+
+_TAPE_GRID = [(1.0e-5, 4.0), (1.0e6, 4.0)]
+
+
+def _mf3_text(za, qm, qi):
+    head = (_endf_field(float(za)) + _endf_field(114.0) + _endf_field(0)
+            + _endf_field(0) + _endf_field(0) + _endf_field(0))
+    return "\n".join([head] + _tab1_lines(qm, qi, 0, 0, _TAPE_GRID)) + "\n"
+
+
+def _mf10_text(za, subs):
+    """Synthetic MF=10 section; ``subs`` are ``(QM, QI, IZAP, LFS)`` tuples."""
+    lines = [_endf_field(float(za)) + _endf_field(114.0) + _endf_field(0)
+             + _endf_field(0) + _endf_field(len(subs)) + _endf_field(0)]
+    for qm, qi, izap, lfs in subs:
+        lines += _tab1_lines(qm, qi, izap, lfs, _TAPE_GRID)
+    return "\n".join(lines) + "\n"
+
+
+def test_asc_mf10_without_mf3_not_decorable(tmp_path, monkeypatch):
+    # A tape whose In115 carries a normal MT=102 (MF=3 + MF=10) alongside a
+    # metastable-bearing MT=28 with MF=10 but NO MF=3 -- the JEFF-4.0 W/Ta/Cr
+    # class. Every collapse source form drops an MF=3-less MT, so it must not
+    # become a chain reaction; it is excluded before any counting and reported
+    # instead.
+    import types
+
+    import add_pendf_isomeric_branching_to_chain as patcher
+    import openmc.data.endf as endf_mod
+    import openmc.data.pendf as pendf_mod
+
+    ev = types.SimpleNamespace(
+        target=dict(atomic_number=49, mass_number=115, isomeric_state=0),
+        section={
+            (3, 102): _mf3_text(49115, 6784720.0, 6784720.0),
+            (10, 102): _mf10_text(49115, [
+                (6784720.0, 6784720.0, 49116, 0),
+                (6784720.0, 6657450.0, 49116, 1),
+                (6784720.0, 6495060.0, 49116, 4)]),
+            # (n,np) -> In114/In114_m1, MF=10 only: not a decoration candidate.
+            (10, 28): _mf10_text(49115, [(0.0, 0.0, 49114, 0),
+                                         (0.0, -190000.0, 49114, 1)]),
+        })
+    tape = tmp_path / "n-In115.pendf"
+    tape.write_text("")
+    monkeypatch.setattr(pendf_mod, "_discover_pendf_files",
+                        lambda d: [(tape, None)])
+    monkeypatch.setattr(endf_mod, "Evaluation", lambda f: ev)
+    monkeypatch.setattr(patcher, "tape_identity", lambda p: "synthetic-tape")
+
+    source = patcher._AscSource(tmp_path)
+    assert sorted(source.reactions("In115")) == [102]      # MT=28 excluded
+
+    chain = _chain_with(["In115", "In114", "In114_m1", "In116", "In116_m1",
+                         "In116_m2"],
+                        reactions={"In115": [("(n,gamma)", "In116", 6784720.0)]})
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0)
+    added = decorate_chain(chain, branching)
+    stats["reactions_added"] = added
+
+    # The MF=10-only MT is neither decorated nor added to the chain...
+    assert "(n,np)" not in branching["In115"]
+    assert not any(rx.type.startswith("(n,np)") for rx in chain["In115"].reactions)
+    # ...while the normal MT=102 still decorates.
+    rxns = {rx.type: rx.target for rx in chain["In115"].reactions}
+    assert rxns["(n,gamma)_m1"] == "In116_m1"
+    assert rxns["(n,gamma)_m2"] == "In116_m2"
+
+    # Counted and described, but never mixed into the candidate stats: only the
+    # two MT=102 metastables are LFS found, and the excluded LFS=0 partial of
+    # MT=28 does not register as ground-only.
+    assert stats["mf10_without_mf3"] == 1
+    assert stats["total_lfs"] == 2
+    assert stats["ground_only"] == 0
+    assert stats["metastable_only"] == 0
+    rec = stats["mf10_without_mf3_list"][0]
+    assert (rec["parent"], rec["mt"], rec["reaction"]) == ("In115", 28, "(n,np)")
+    assert rec["lfs"] == [0, 1] and rec["products"] == ["In114"]
+    assert rec["metastable"] is True
+
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "MF=10 without MF=3 (not decorable):     1" in text
+    section = text.split("MF=10 WITHOUT MF=3 (NOT DECORABLE)", 1)[1]
+    assert "In115" in section and "(n,np)" in section and "In114" in section

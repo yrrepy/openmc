@@ -291,6 +291,11 @@ class _AscSource:
     Reuses the MF=8/10 metadata extraction primitives from
     ``openmc.data.pendf`` (``_discover_pendf_files``, ``_iter_mf10_partials``)
     rather than duplicating the ENDF-6 record parsing. No HDF5 is written.
+
+    An MF=10 section with no MF=3 sibling is EXCLUDED from :meth:`reactions`
+    (see :meth:`_record_mf10_without_mf3`) and booked in ``mf10_without_mf3``
+    for the log, so a tape-sourced run enumerates exactly the reactions an
+    h5-sourced run does.
     """
 
     kind = 'asc'
@@ -310,6 +315,7 @@ class _AscSource:
         self._tapes = {}                 # GNDS name -> tape path
         self._xs_cache_name = None       # single-nuclide (energy, xs) cache
         self._xs_cache = None
+        self.mf10_without_mf3 = []       # excluded, undecorable tape sections
         for tape, _implied in _discover_pendf_files(Path(path)):
             try:
                 ev = Evaluation(tape)
@@ -323,12 +329,21 @@ class _AscSource:
             reactions = {}
             mf10_mts = {mt for (mf, mt) in ev.section if mf == 10}
             for mt in sorted(mf10_mts):
-                if (3, mt) in ev.section:
-                    fo = io.StringIO(ev.section[3, mt])
-                    get_head_record(fo)
-                    (qm, qi, _l1, _lr), _tab = get_tab1_record(fo)
-                else:
-                    qm = qi = 0.0
+                # A chain may only carry reactions the library SOURCE FORMS can
+                # serve: an MF=10 section with no MF=3 sibling is dropped by all
+                # of them (the h5 build warns and stores nothing;
+                # PendfTapeLibrary mirrors it), so decorating one would put a
+                # chain row that collapses to a silent zero. Excluded here --
+                # before any candidate enumeration or stats counting -- so a
+                # tape-built chain is identical to an h5-built one. Serving
+                # these instead would mean synthesizing the total from
+                # Sum(MF=10) at BUILD time: deferred, not done here.
+                if (3, mt) not in ev.section:
+                    self._record_mf10_without_mf3(ev, name, mt)
+                    continue
+                fo = io.StringIO(ev.section[3, mt])
+                get_head_record(fo)
+                (qm, qi, _l1, _lr), _tab = get_tab1_record(fo)
                 partials = []
                 for pqm, pqi, izap, lfs, _ptab in _iter_mf10_partials(
                         ev, mt, name):
@@ -340,6 +355,29 @@ class _AscSource:
             self._data[name] = reactions
             self._tapes[name] = tape
         self.nuclides = sorted(self._data)
+
+    def _record_mf10_without_mf3(self, ev, name, mt):
+        """Book one excluded MF=10-without-MF=3 section for the mapping log.
+
+        Only NAMED transmutation MTs are recorded: MT=5 (lumped residual) and
+        MT=18 (fission) have no entry in ``_MT_TO_NAME``, were never decoration
+        candidates, and stay silent exactly as before. Products come from the
+        partials' IZAP (ground base names -- the LFS->LISO isomer mapping is not
+        run for a section that is being discarded).
+        """
+        r_name = _MT_TO_NAME.get(mt)
+        if r_name is None:
+            return
+        from openmc.data.pendf import _iter_mf10_partials
+        lfs, products = [], []
+        for _pqm, _pqi, izap, plfs, _ptab in _iter_mf10_partials(ev, mt, name):
+            lfs.append(int(plfs))
+            product = _safe_gnds_name(int(izap) // 1000, int(izap) % 1000)
+            if product not in products:
+                products.append(product)
+        self.mf10_without_mf3.append(dict(
+            parent=name, mt=mt, reaction=r_name, lfs=lfs, products=products,
+            metastable=any(v != 0 for v in lfs)))
 
     def reactions(self, nuclide):
         return self._data[nuclide]
@@ -730,9 +768,19 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     ``stats['metastable_only']`` and, when auditable, marked
     ``metastable-only MF=10 (no LFS=0)`` in its audit row's ``notes``. Purely a
     report: no rejection or decoration decision depends on it.
+
+    Sections the SOURCE excluded as undecorable -- an MF=10 with no MF=3 sibling,
+    visible only to the ASC-tape adapter -- are carried through to
+    ``stats['mf10_without_mf3']`` / ``['mf10_without_mf3_list']`` for the console
+    and log so the class stays greppable; they never reach the counters above.
     """
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
+
+    # Tape sections the source excluded as undecorable (MF=10 with no MF=3).
+    # Only an ASC-tape source can see this class -- an h5 library cannot carry
+    # it -- so an h5 run legitimately reports zero.
+    mf10_without_mf3 = list(getattr(source, 'mf10_without_mf3', []))
 
     isomer_mappings = []          # matched-in-chain rows (per-parent tables)
     elis_errors = []              # rtol_exceeded / no_dk / zero_elis
@@ -1003,6 +1051,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         lfs_order_dropped=counts['lfs_order_dropped'],
         ground_only=ground_only,
         metastable_only=metastable_only,
+        mf10_without_mf3=len(mf10_without_mf3),
+        mf10_without_mf3_list=mf10_without_mf3,
         isomer_mappings=isomer_mappings,
         elis_errors=elis_errors,
         products_not_in_chain_errors=products_not_in_chain,
@@ -1191,6 +1241,7 @@ def print_stats(stats, mode):
     print(f"                      Reactions added to chain: {stats['reactions_added']:5d}")
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
     print(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}")
+    print(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}")
     print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
     print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
@@ -1617,6 +1668,48 @@ def _write_lfs_sentinel_section(f, sentinels):
                 f"{s.get('method', ''):<10}  {s.get('outcome', ''):<44}\n")
 
 
+def _write_mf10_without_mf3_section(f, records):
+    """MF=10 WITHOUT MF=3 section: tape sections excluded as not decorable.
+
+    Only the ASC-tape source can observe this class (an h5 library stores no
+    such MT at all), so an h5-sourced run always reports none -- that asymmetry
+    is the point of the remedy, not a gap. Listed unconditionally, like the
+    other audit sections, so the exclusion is greppable rather than silent.
+    """
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("MF=10 WITHOUT MF=3 (NOT DECORABLE)\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("Tape sections carrying MF=10 isomeric production for an MT with "
+            "NO MF=3 total. Every PENDF library source form the collapse can "
+            "read -- pointwise HDF5,\n")
+    f.write("grouped HDF5, and the ASC-tape adapter -- drops such an MT (a "
+            "total is never synthesized from the partials), so a chain "
+            "reaction decorated from one would\n")
+    f.write("collapse to a silent zero row. They are therefore excluded from "
+            "the decoration candidates BEFORE any counting above, making a "
+            "tape-sourced run identical to an\n")
+    f.write("h5-sourced one. Only NAMED transmutation MTs are listed: MT=5 "
+            "(lumped residual) and MT=18 (fission) map to no chain reaction "
+            "and were never candidates.\n\n")
+    if not records:
+        f.write("No MF=10 sections without an MF=3 total "
+                "(an HDF5 source can never carry any).\n")
+        return
+    meta = sum(1 for r in records if r.get('metastable'))
+    f.write(f"Total sections excluded: {len(records)}  "
+            f"(metastable-bearing: {meta})\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':<16}  "
+              f"{'Product(s)':<28}  {'Metastable':<10}")
+    sep = "-" * len(header)
+    f.write(header + "\n" + sep + "\n")
+    for r in sorted(records, key=lambda x: (x['parent'], x['mt'])):
+        lfs = ", ".join(str(v) for v in r.get('lfs', []))
+        products = ", ".join(r.get('products', []))
+        f.write(f"{r['parent']:<12}  {r['mt']:>5}  {r['reaction']:<12}  "
+                f"{lfs:<16}  {products:<28}  "
+                f"{'yes' if r.get('metastable') else 'no':<10}\n")
+
+
 def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
     """Write the comprehensive PENDF isomer mapping log."""
     isomer_mappings = stats['isomer_mappings']
@@ -1694,6 +1787,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                       Reactions added to chain: {stats['reactions_added']:5d}\n")
         f.write(f"                     Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
         f.write(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}\n")
+        f.write(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}\n")
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
@@ -1785,6 +1879,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             stats.get('reject_band_ratio'))
         _write_absent_decay_section(f, stats.get('absent_by_status', {}))
         _write_lfs_sentinel_section(f, stats.get('lfs_sentinels', []))
+        _write_mf10_without_mf3_section(
+            f, stats.get('mf10_without_mf3_list', []))
 
     print(f"Isomer mapping log written to: {log_file}")
 
