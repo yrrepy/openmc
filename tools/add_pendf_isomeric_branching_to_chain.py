@@ -156,6 +156,20 @@ for _name, _info in REACTIONS.items():
 _ISOMER_SUFFIX = re.compile(r'_m\d+$')
 
 
+def _safe_gnds_name(z, a, liso=0):
+    """GNDS name for ``(z, a, liso)``, or a ``Z<z>-A<a>`` placeholder off-table.
+
+    ``gnds_name`` raises ``KeyError`` for a Z absent from ``ATOMIC_SYMBOL``
+    (a corrupt IZAP record, Z > 118). Every caller here is building a LOG or
+    WARNING record, where one malformed tape record must not abort a
+    whole-library run; the placeholder can never match a chain nuclide, so such
+    a record is reported rather than silently mapped.
+    """
+    if z not in ATOMIC_SYMBOL:
+        return f"Z{z}-A{a}" if liso == 0 else f"Z{z}-A{a}_m{liso}"
+    return gnds_name(z, a, liso)
+
+
 def _ground_product(z, a, r_name):
     """Return the DADZ ground-state product GNDS name for reaction ``r_name``.
 
@@ -184,10 +198,15 @@ def _self_loop_ground(parent, r_name, partials, chain):
     The ground product name is taken from the LFS=0 partial's IZAP
     (``gnds_name(z, a, 0)``); when the reaction carries no LFS=0 partial, it
     falls back to the base chain's existing target for this reaction on
-    ``parent``. The match must be EXACT: for a metastable parent (e.g.
+    ``parent``, and failing that to what :func:`decorate_chain` would
+    SYNTHESIZE for the missing base reaction -- ``(n,n')`` with target ==
+    parent. Without that last step the audit and the decoration would disagree
+    about what a self-loop is for exactly the reactions the decoration
+    synthesizes. The match must be EXACT: for a metastable parent (e.g.
     ``In115_m1 (n,n') -> In115`` ground) the ground route is a real
     isomer-burnup transition, NOT a self-loop, so ``parent`` never equals the
-    ground name and the reaction stays rejectable.
+    ground name and the reaction stays rejectable -- including in the
+    synthesized case, which is why the fallback requires a ground-state parent.
     """
     ground = next((p for p in partials if p['lfs'] == 0), None)
     if ground is not None:
@@ -201,7 +220,11 @@ def _self_loop_ground(parent, r_name, partials, chain):
                          if rx.type == r_name), None)
         if existing is not None:
             return existing.target == parent
-    return False
+    # No base-chain entry either: decorate_chain synthesizes this reaction's
+    # ground as target == parent for "(n,n')", so a GROUND-state parent's ground
+    # route really is the diagonal no-op the exemption is about. A metastable
+    # parent's (n,n') to ground is isomer burnup, never a self-loop.
+    return r_name == "(n,n')" and not _ISOMER_SUFFIX.search(parent)
 
 
 # =============================================================================
@@ -567,6 +590,15 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
         notes=notes)
 
 
+def _append_note(audit, marker):
+    """Append ``marker`` to an audit row's ``notes`` (semicolon-separated).
+
+    Append-only: the notes field is the audit table's last column, so extra
+    markers never disturb the column layout of the rows before it.
+    """
+    audit['notes'] = f"{audit['notes']}; {marker}" if audit['notes'] else marker
+
+
 # =============================================================================
 # Mapping core -- classify each MF=10 metastable partial of a reaction
 # =============================================================================
@@ -618,7 +650,7 @@ def _classify_metastables(parent, mt, r_name, metastables, decay_lookup,
                        dk_elis=res.get('dk_elis'))
         elif status == 'matched':
             liso = res['liso']
-            product = gnds_name(z, a, liso)
+            product = _safe_gnds_name(z, a, liso)
             rec.update(liso=liso, product=product, dk_elis=res['dk_elis'])
             rec['bucket'] = ('matched' if product in chain_names
                              else 'product_not_in_chain')
@@ -691,6 +723,13 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     fired on the band criterion alone, the audit row's ``notes`` gains a
     ``self-loop ground: band-reject exempt`` marker and ``stats`` counts it in
     ``band_reject_exempt``.
+
+    Metastable-only observability: a reaction whose MF=10 carries >=1 metastable
+    partial but NO LFS=0 (the In113/In115 MT=4 class -- a stable ground product
+    means the evaluation legitimately tabulates no ground partial) is counted in
+    ``stats['metastable_only']`` and, when auditable, marked
+    ``metastable-only MF=10 (no LFS=0)`` in its audit row's ``notes``. Purely a
+    report: no rejection or decoration decision depends on it.
     """
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
@@ -713,6 +752,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     total_lfs = 0
     counts = Counter()
     ground_only = 0
+    metastable_only = 0           # MF=10 with metastable partial(s) but no LFS=0
 
     for parent in source.nuclides:
         try:
@@ -738,6 +778,16 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
 
             total_lfs += len(metastables)
 
+            # Metastable-only MF=10: >=1 metastable partial but NO LFS=0 -- the
+            # In113/In115 MT=4 class, where the ground product is stable so the
+            # evaluation legitimately tabulates no ground partial. Observability
+            # only (no decision depends on it): counted for every candidate
+            # reaction here, and marked on the audit row below so the class is
+            # greppable in the log instead of surfacing only when a gate fires.
+            metastable_only_rxn = not any(p['lfs'] == 0 for p in partials)
+            if metastable_only_rxn:
+                metastable_only += 1
+
             # Pointwise MF=10-vs-MF=3 consistency audit. Always runs (the
             # decoration candidates are exactly the reactions with >=1
             # metastable pathway); rejection is a separate, opt-in gate below.
@@ -745,6 +795,9 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                                     emax=audit_emax)
             reject_this = False
             if audit is not None:
+                if metastable_only_rxn:
+                    _append_note(audit, 'metastable-only MF=10 (no LFS=0)')
+
                 # Rejection gates: worst-dev rtol OR any defined band ratio.
                 fired = []
                 if reject_rtol is not None and audit['worst_dev'] > reject_rtol:
@@ -780,9 +833,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                         # audit row and count it. (If worst_dev also fired the
                         # reaction is rejected anyway, so nothing is spared.)
                         band_reject_exempt += 1
-                        marker = 'self-loop ground: band-reject exempt'
-                        audit['notes'] = (f"{audit['notes']}; {marker}"
-                                          if audit['notes'] else marker)
+                        _append_note(audit,
+                                     'self-loop ground: band-reject exempt')
                 else:
                     fired.extend(band_fired)
 
@@ -861,7 +913,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                     products_not_in_chain.append(dict(
                         type='no_metastable_decay_data', parent=parent, mt=mt,
                         reaction=r_name, lfs=rec['lfs'], elis=rec['elfs'],
-                        base_nuclide=gnds_name(rec['z'], rec['a'], 0),
+                        base_nuclide=_safe_gnds_name(rec['z'], rec['a']),
                         target_z=rec['z'], target_a=rec['a'],
                         product=rec['product'], liso=rec.get('liso'),
                         note='Product not in chain'))
@@ -872,19 +924,19 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                         reaction=r_name, lfs=rec['lfs'], elis=rec['elfs'],
                         dk_elis=rec['dk_elis'], liso=rec.get('liso'),
                         diff_percent=rec.get('diff_pct', 0.0),
-                        base_nuclide=gnds_name(rec['z'], rec['a'], 0),
+                        base_nuclide=_safe_gnds_name(rec['z'], rec['a']),
                         target_z=rec['z'], target_a=rec['a'], omitted=True))
                 elif bucket == 'zero_elis':
                     nuclides_with_branching.add(parent)
                     elis_errors.append(dict(
                         type='zero_elis_metastables', parent=parent, mt=mt,
                         reaction=r_name, lfs=rec['lfs'], elis=rec['elfs'],
-                        base_nuclide=gnds_name(rec['z'], rec['a'], 0),
+                        base_nuclide=_safe_gnds_name(rec['z'], rec['a']),
                         target_z=rec['z'], target_a=rec['a'],
                         skipped_states=rec.get('skipped_states', [])))
                 elif bucket == 'no_dk':
                     nuclides_with_branching.add(parent)
-                    base_nuc = gnds_name(rec['z'], rec['a'], 0)
+                    base_nuc = _safe_gnds_name(rec['z'], rec['a'])
                     # Status (no_decay_data / no_metastables / no_match) is a
                     # property of (Z, A) + decay library, so one base name maps
                     # to one status regardless of which reaction surfaced it.
@@ -904,7 +956,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                         dk_meta_count=None))
 
             for liso, dups in dup_by_liso.items():
-                base_nuc = gnds_name(dups[0]['z'], dups[0]['a'], 0)
+                base_nuc = _safe_gnds_name(dups[0]['z'], dups[0]['a'])
                 duplicate_errors.append(dict(
                     nuclide=parent, reaction=r_name, mt=mt, liso=liso,
                     base_nuclide=base_nuc, kept_lfs=dups[0].get('kept_lfs'),
@@ -950,6 +1002,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         duplicate_resolved=len(duplicate_errors),
         lfs_order_dropped=counts['lfs_order_dropped'],
         ground_only=ground_only,
+        metastable_only=metastable_only,
         isomer_mappings=isomer_mappings,
         elis_errors=elis_errors,
         products_not_in_chain_errors=products_not_in_chain,
@@ -1137,6 +1190,7 @@ def print_stats(stats, mode):
     print(f"                        Products not in chain: {stats['products_not_in_chain']:5d}")
     print(f"                      Reactions added to chain: {stats['reactions_added']:5d}")
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
+    print(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}")
     print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
     print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
@@ -1639,6 +1693,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                          Products not in chain: {stats['products_not_in_chain']:5d}\n")
         f.write(f"                       Reactions added to chain: {stats['reactions_added']:5d}\n")
         f.write(f"                     Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
+        f.write(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}\n")
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")

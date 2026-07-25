@@ -759,6 +759,97 @@ def test_metastable_parent_ground_not_exempt():
     assert "In115_m1" not in branching               # rejected -> not decorated
 
 
+def test_synthesized_nn_prime_ground_parent_exempt():
+    # (n,n') on a GROUND-state parent with NO LFS=0 partial and NO base-chain
+    # (n,n'): decorate_chain synthesizes the ground as target == parent, so the
+    # audit must agree it is a self-loop and exempt the OVER-summing fast band.
+    # (Before this, _self_loop_ground returned False for exactly the reactions
+    # the decoration synthesizes -- audit and decoration disagreed.)
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]
+    meta = [0.0, 0.0, 0.0, 0.0, 0.0, 60.0, 75.0, 90.0]     # 1.5x total (fast, over)
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=1, izap=49113, qi=-391700.0, qm=0.0, elfs=391700.0,
+             energy=grid, xs=meta)])
+    source = _FakeSource({"In113": {4: rxn}})
+    decay = {(49, 113): [
+        DecayState(49, 113, 0.0, 0, half_life=None),
+        DecayState(49, 113, 391700.0, 1, half_life=6000.0)]}
+    chain = _chain_with(["In113", "In113_m1"])             # no base (n,n')
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0,
+                                   reject_rtol=None, reject_band_ratio=0.3)
+    assert stats["rejected_count"] == 0                    # exempted
+    assert stats["band_reject_exempt"] == 1
+    assert "In113" in branching                            # decorated, not stock
+
+    decorate_chain(chain, branching)
+    rxns = {rx.type: rx.target for rx in chain["In113"].reactions}
+    assert rxns["(n,n')"] == "In113"                       # the synthesized ground
+    assert rxns["(n,n')_m1"] == "In113_m1"
+
+
+def test_synthesized_nn_prime_metastable_parent_not_exempt():
+    # Same shape on a METASTABLE parent (In115_m1): its (n,n') ground route is
+    # real isomer burnup, never a self-loop, so the over-summing fast band still
+    # rejects even though the base chain carries no (n,n') either.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [0.0, 0.0, 0.0, 0.0, 0.0, 40.0, 50.0, 60.0]
+    meta = [0.0, 0.0, 0.0, 0.0, 0.0, 60.0, 75.0, 90.0]     # 1.5x total (fast, over)
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=1, izap=49115, qi=-336000.0, qm=0.0, elfs=336000.0,
+             energy=grid, xs=meta)])
+    source = _FakeSource({"In115_m1": {4: rxn}})
+    decay = {(49, 115): [
+        DecayState(49, 115, 0.0, 0, half_life=None),
+        DecayState(49, 115, 336000.0, 1, half_life=1.6e14)]}
+    chain = _chain_with(["In115", "In115_m1"])             # no base (n,n')
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0,
+                                   reject_rtol=None, reject_band_ratio=0.3)
+    assert stats["rejected_count"] == 1                    # no exemption
+    assert stats["band_reject_exempt"] == 0
+    assert stats["rejected"][0]["parent"] == "In115_m1"
+    assert "In115_m1" not in branching                     # rejected -> stock
+
+
+# ---------------------------------------------------------------------------
+# Metastable-only MF=10 observability (no LFS=0 partial)
+# ---------------------------------------------------------------------------
+
+def test_metastable_only_marked_and_counted(tmp_path):
+    # MF=10 carrying a metastable partial but NO LFS=0 -- the In113/In115 MT=4
+    # class, where a stable ground product means the evaluation legitimately
+    # tabulates no ground partial. Observability only: the reaction still
+    # decorates, but its audit row is marked and the summary block counts it.
+    grid = [1.0, 2.0, 3.0]
+    rxn = dict(qm=6784720.0, qi=6784720.0, energy=grid, xs=[10.0, 20.0, 30.0],
+               partials=[
+                   dict(lfs=1, izap=49116, qi=6657450.0, qm=6784720.0,
+                        elfs=127270.0, energy=grid, xs=[3.0, 6.0, 9.0])])
+    source = _FakeSource({"In115": {102: rxn}})
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", 6784720.0)]})
+    branching, stats = map_library(source, chain, _decay_lookup(), "elis",
+                                   0.50, 0.0, reject_band_ratio=0.3)
+    assert stats["metastable_only"] == 1
+    assert stats["ground_only"] == 0                 # the opposite class
+    assert stats["rejected_count"] == 0              # marker changes no decision
+    assert "In115" in branching
+
+    off = stats["audit_offenders_list"][0]           # partials trail the total
+    assert "metastable-only MF=10 (no LFS=0)" in off["notes"]
+
+    stats["reactions_added"] = 0
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "Metastable-only MF=10 reactions:     1" in text
+    audit_section = text.split("MF=10 CONSISTENCY AUDIT", 1)[1]
+    assert "metastable-only MF=10 (no LFS=0)" in audit_section
+
+
 def test_band_ratio_rejection_one_sided():
     # One-sided band rejection at threshold 0.3: an UNDER-summing band (ratio ~0,
     # |r-1| = 1) never rejects (deep silence is the collapse silence-fill's job);
