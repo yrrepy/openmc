@@ -135,7 +135,7 @@ def build_parser():
     parser.add_argument('-r', '--rtol',             type=float,                                   default=0.50,   help='Relative tolerance for ELIS matching (default: 0.50 = 50%%)')
     parser.add_argument('-a', '--atol',             type=float,                                   default=0.0,    help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
     parser.add_argument('--audit-emax',             type=float,                                   default=2.0e7,  help='Cap the MF=10-vs-MF=3 audit at E <= this many eV (default: 2.0e7 = application group cap; MF=10 partials legitimately stop near 30 MeV while MF=3 runs to 200 MeV)')
-    parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help='Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (default: None = audit only, reject nothing)')
+    parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help="Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (self-loop-ground reactions are EXEMPT -- a metastable-only (n,n') has dev pinned at 1.0) (default: None = audit only, reject nothing)")
     parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has ratio-1 > X (over-summing ONLY; under-summing never rejects -- the collapse silence-fill and Class-4 policy own it) (default: None = off; None-ratio bands never trigger)')
     parser.add_argument('-v', '--verbose',          action='store_true',                          default=True,   help='Enable verbose output (default: True)')
     parser.add_argument('-q', '--quiet',            action='store_true',                          default=False,  help='Disable verbose output')
@@ -722,7 +722,7 @@ def _classify_lfs_order(parent, mt, r_name, metastables, decay_lookup,
         if position > dk_meta:
             rec.update(bucket='lfs_order_dropped', liso=position)
         else:
-            product = gnds_name(zp, ap, position)
+            product = _safe_gnds_name(zp, ap, position)
             rec.update(liso=position, product=product)
             rec['bucket'] = ('matched' if product in chain_names
                              else 'product_not_in_chain')
@@ -753,14 +753,17 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
       Class-4 source-faithful by policy).
 
     Self-loop-ground exemption: a reaction whose GROUND product is the parent
-    itself (see :func:`_self_loop_ground`) is EXEMPT from the band-ratio gate --
-    its ground pathway is a transmutation-matrix self-loop no-op, so partial-sum
+    itself (see :func:`_self_loop_ground`) is EXEMPT from BOTH gates -- its
+    ground pathway is a transmutation-matrix self-loop no-op, so partial-sum
     incompleteness cannot affect the chain and rejecting would only destroy
-    valid metastable isomer production. The ``worst_dev`` rtol gate still
-    applies. When the exemption suppresses a rejection that would otherwise have
-    fired on the band criterion alone, the audit row's ``notes`` gains a
-    ``self-loop ground: band-reject exempt`` marker and ``stats`` counts it in
-    ``band_reject_exempt``.
+    valid metastable isomer production. The rtol gate needs the exemption most:
+    a metastable-only self-loop (the In113/In115 ``(n,n')`` class) has NO ground
+    partial to cover the energies below its metastable threshold, so
+    ``worst_dev`` is pinned at exactly 1.0 there and ANY ``reject_rtol`` below
+    1.0 would reject the whole class and destroy its m1 branching. A suppressed
+    rejection marks the audit row's ``notes`` (``self-loop ground: rtol exempt``
+    / ``self-loop ground: band-reject exempt``) and is counted in
+    ``stats['rtol_reject_exempt']`` / ``stats['band_reject_exempt']``.
 
     Metastable-only observability: a reaction whose MF=10 carries >=1 metastable
     partial but NO LFS=0 (the In113/In115 MT=4 class -- a stable ground product
@@ -794,6 +797,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     audit_clean = 0               # auditable reactions within CONSISTENCY_RTOL
     rejected = []                 # audit-rejected (left stock) when flag set
     band_reject_exempt = 0        # self-loop-ground reactions spared band reject
+    rtol_reject_exempt = 0        # self-loop-ground reactions spared rtol reject
     absent_status = {}            # base GNDS name -> lookup_liso status (no_dk)
 
     nuclides_with_branching = set()
@@ -847,9 +851,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                     _append_note(audit, 'metastable-only MF=10 (no LFS=0)')
 
                 # Rejection gates: worst-dev rtol OR any defined band ratio.
-                fired = []
-                if reject_rtol is not None and audit['worst_dev'] > reject_rtol:
-                    fired.append('worst_dev')
+                rtol_fired = (reject_rtol is not None
+                              and audit['worst_dev'] > reject_rtol)
                 band_fired = []
                 if reject_band_ratio is not None:
                     for key, band in (('ratio_thermal', 'thermal'),
@@ -867,19 +870,34 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
 
                 # Self-loop-ground exemption: when the reaction's ground pathway
                 # returns to the parent itself, its ground route is a
-                # transmutation-matrix no-op, so band-ratio incompleteness
+                # transmutation-matrix no-op, so partial-sum incompleteness
                 # cannot affect the chain -- only the metastable partials carry
-                # real isomer production. Suppress the band gate (the worst_dev
-                # gate is unaffected). A metastable parent's ground route
-                # (e.g. In115_m1 -> In115) is a real transition, NOT a
-                # self-loop, and stays rejectable (see _self_loop_ground).
-                if band_fired and _self_loop_ground(parent, r_name, partials,
-                                                    chain):
+                # real isomer production. Both gates are suppressed. The rtol
+                # gate matters here because a metastable-only self-loop has no
+                # ground partial below its metastable threshold, pinning
+                # worst_dev at exactly 1.0, so ANY reject_rtol < 1.0 would take
+                # out the whole In113/In115 (n,n') class. A metastable parent's
+                # ground route (e.g. In115_m1 -> In115) is a real transition,
+                # NOT a self-loop, and stays rejectable (see _self_loop_ground).
+                # Evaluated at most once per reaction, and only if a gate fired.
+                self_loop = False
+                if rtol_fired or band_fired:
+                    self_loop = _self_loop_ground(parent, r_name, partials,
+                                                  chain)
+
+                fired = []
+                if rtol_fired:
+                    if self_loop:
+                        rtol_reject_exempt += 1
+                        _append_note(audit, 'self-loop ground: rtol exempt')
+                    else:
+                        fired.append('worst_dev')
+                if band_fired and self_loop:
                     if not fired:
                         # The exemption actually spares a rejection that the
                         # band criterion would otherwise have fired: mark the
-                        # audit row and count it. (If worst_dev also fired the
-                        # reaction is rejected anyway, so nothing is spared.)
+                        # audit row and count it. (A self-loop's worst_dev is
+                        # exempted above, so it never fills `fired` here.)
                         band_reject_exempt += 1
                         _append_note(audit,
                                      'self-loop ground: band-reject exempt')
@@ -1068,6 +1086,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         rejected_count=len(rejected),
         rejected=rejected,
         band_reject_exempt=band_reject_exempt,
+        rtol_reject_exempt=rtol_reject_exempt,
         lfs_sentinels=lfs_sentinels,
         lfs_sentinel_count=len(lfs_sentinels),
         absent_by_status=absent_by_status,
@@ -1245,6 +1264,7 @@ def print_stats(stats, mode):
     print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
     print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
+    print(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}")
     print(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}")
     print(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}")
 
@@ -1791,6 +1811,7 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
+        f.write(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}\n")
         if stats.get('nn_prime_prune_enabled'):
             f.write(f"                       Pruned (n,n') self-loops: {stats.get('nn_prime_pruned_count', 0):5d}\n")
         f.write(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}\n")

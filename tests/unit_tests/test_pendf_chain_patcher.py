@@ -414,6 +414,10 @@ def test_rejection_leaves_offender_stock(tmp_path):
     assert stats["audit_offenders"] == 1
     assert stats["rejected"][0]["parent"] == "In115"
     assert stats["rejected"][0]["threshold"] == 0.05
+    # (n,gamma) ground product In116 != parent: no self-loop, so the rtol gate
+    # is NOT exempted and it alone carries the rejection.
+    assert "worst_dev" in stats["rejected"][0]["criterion"]
+    assert stats["rtol_reject_exempt"] == 0
     assert "In115" not in branching                  # rejected -> not decorated
     assert "In113" in branching                      # clean -> decorated
 
@@ -809,6 +813,41 @@ def test_synthesized_nn_prime_metastable_parent_not_exempt():
     assert stats["band_reject_exempt"] == 0
     assert stats["rejected"][0]["parent"] == "In115_m1"
     assert "In115_m1" not in branching                     # rejected -> stock
+
+
+def test_self_loop_ground_rtol_reject_exempt():
+    # In113 (n,n') carries NO LFS=0 partial (a stable ground product) and its m1
+    # partial only switches on above the metastable threshold, so below it the
+    # partials are silent under a live MF=3 total and worst_dev is pinned at
+    # exactly 1.0. ANY reject_rtol < 1.0 would therefore reject the whole
+    # In113/In115 (n,n') class and destroy its m1 branching -- the self-loop
+    # exemption covers the rtol gate too. Band gate off here to isolate it.
+    grid = [0.01, 0.1, 1.0, 100.0, 1.0e4, 1.0e5, 1.0e6, 1.0e7]
+    total = [10.0] * 8
+    meta = [0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0]    # silent -> dev 1.0
+    rxn = dict(qm=0.0, qi=0.0, energy=grid, xs=total, partials=[
+        dict(lfs=1, izap=49113, qi=-391700.0, qm=0.0, elfs=391700.0,
+             energy=grid, xs=meta)])
+    source = _FakeSource({"In113": {4: rxn}})
+    decay = {(49, 113): [
+        DecayState(49, 113, 0.0, 0, half_life=None),
+        DecayState(49, 113, 391700.0, 1, half_life=6000.0)]}
+    chain = _chain_with(["In113", "In113_m1"],
+                        reactions={"In113": [("(n,n')", "In113", 0.0)]})
+    assert _audit_reaction(source, "In113", 4,
+                           rxn["partials"])["worst_dev"] == pytest.approx(1.0)
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0,
+                                   reject_rtol=0.5, reject_band_ratio=None)
+    assert stats["rejected_count"] == 0              # exempted -> not rejected
+    assert stats["rtol_reject_exempt"] == 1
+    assert stats["band_reject_exempt"] == 0          # band gate off
+    assert "In113" in branching                      # decorated, not stock
+
+    off = stats["audit_offenders_list"][0]
+    assert "self-loop ground: rtol exempt" in off["notes"]
+
+    decorate_chain(chain, branching)
+    assert "(n,n')_m1" in {rx.type for rx in chain["In113"].reactions}
 
 
 # ---------------------------------------------------------------------------
