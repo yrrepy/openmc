@@ -298,15 +298,26 @@ class IsomericBranching:
           (positional mapping based on sorted LFS values)
         - 'elis': Excitation energy in eV (from GENDF QM-QI calculation)
         - 'liso': Isomeric state number (1 for _m1(m), 2 for _m2(n), etc.)
-        - 'qm', 'qi': the level's MF=10 Q pair in eV (ELIS = QM - QI). The chain
-          patcher writes the per-pathway Q straight from these: QI for a
-          metastable slot, QM for the LFS=0 slot. ``qm`` is None when the file
-          gives no QM (then ELIS is None too).
+        - 'qm', 'qi': that LEVEL's own MF=10 Q pair in eV (ELIS = QM - QI), read
+          off its TAB1 head. The chain patcher writes the per-pathway Q straight
+          from these: QI for a metastable slot. Both are always present in
+          'elis' mode (ELIS is computed from them, and a level with no ELIS
+          never maps); in 'lfs_order' mode they are carried verbatim and may be
+          None if a stand-in parser omits them.
         - For 'lfs_order' mode, additional fields: 'lfs' (original LFS value),
           'position' (sorted position), 'elis_ref_status' ('ok', 'mismatch', or
           'wrong_liso' indicating ELIS check result for reference)
         Example: {'Ir192_m1': {'method': 'elis', 'elis': 56720.0, 'liso': 1,
         'qm': 6198000.0, 'qi': 6141280.0}}
+    ground_qm : float, optional
+        QM of the section's OWN LFS=0 subsection, in eV -- the Q the patcher
+        writes into the ground (LFS=0) pathway slot. QM is per-subsection, not
+        per-section: evaluations do disagree between the ground and metastable
+        subsections of one MT (EAF-2010 metastable-parent MT=4 puts +E(parent)
+        on LFS=0 and 0.0 on the metastable levels), so a sibling's QM is not a
+        substitute. None when the section has no LFS=0 subsection at all (the
+        ground was synthesized from the MF=3 remainder, or the file is
+        metastable-only); the patcher then falls back to a mapped level's QM.
 
     """
     energies: np.ndarray
@@ -317,6 +328,7 @@ class IsomericBranching:
     mt: int
     lfs_mapping: Optional[dict[str, int]] = None
     elis_mapping: Optional[dict[str, dict[str, Any]]] = None
+    ground_qm: Optional[float] = None
 
 
     def to_dict(self) -> dict:
@@ -335,7 +347,8 @@ class IsomericBranching:
             'reaction': self.reaction,
             'mt': self.mt,
             'lfs_mapping': self.lfs_mapping,
-            'elis_mapping': self.elis_mapping
+            'elis_mapping': self.elis_mapping,
+            'ground_qm': self.ground_qm
         }
 
     @classmethod
@@ -360,7 +373,8 @@ class IsomericBranching:
             reaction=data['reaction'],
             mt=data['mt'],
             lfs_mapping=data.get('lfs_mapping'),
-            elis_mapping=data.get('elis_mapping')
+            elis_mapping=data.get('elis_mapping'),
+            ground_qm=data.get('ground_qm')
         )
 
 
@@ -1542,7 +1556,6 @@ class _PythonGENDFLibrary:
     def _map_via_elis(
         self,
         all_meta_levels: list,
-        qm_section,
         ground_data,
         nuclide_name: str,
         reaction_name: str,
@@ -1555,8 +1568,6 @@ class _PythonGENDFLibrary:
         ----------
         all_meta_levels : list
             List of metastable level dicts from _categorize_mf10_levels()
-        qm_section : float or None
-            Section-level QM value
         ground_data : Tabulated1D or _RemainderXS or None
             Ground state data for context in duplicate detection
         nuclide_name : str
@@ -1584,8 +1595,8 @@ class _PythonGENDFLibrary:
         for meta in all_meta_levels:
             level = meta['level']
 
-            # Calculate ELIS from QM and QI
-            qm = level.get('QM', qm_section)
+            # Calculate ELIS from this level's own QM/QI TAB1 head
+            qm = level.get('QM')
             qi = level.get('QI', 0.0)
 
             if qm is None:
@@ -1648,7 +1659,7 @@ class _PythonGENDFLibrary:
                         not isinstance(ground_data, self._RemainderXS):
                     gendf_all_lfs.append({'lfs': 0, 'elis': 0.0})
                 for meta_item in all_meta_levels:
-                    qm = meta_item['level'].get('QM', qm_section)
+                    qm = meta_item['level'].get('QM')
                     qi = meta_item['level'].get('QI', 0.0)
                     meta_elis = (qm - qi) if qm is not None else None
                     gendf_all_lfs.append({
@@ -1745,7 +1756,7 @@ class _PythonGENDFLibrary:
                 # Keep the level's MF=10 Q pair alongside its ELIS: the patcher
                 # writes the per-pathway Q from QI/QM directly (ELIS = QM - QI).
                 level = meta['level']
-                result[3]['qm'] = level.get('QM', qm_section)
+                result[3]['qm'] = level.get('QM')
                 result[3]['qi'] = level.get('QI', 0.0)
                 mapped_meta_levels.append(result)
                 lfs_mapping[result[1]] = lfs  # result[1] is mapped_name
@@ -1878,7 +1889,6 @@ class _PythonGENDFLibrary:
     def _map_via_lfs_order(
         self,
         all_meta_levels: list,
-        qm_section,
         nuclide_name: str,
         reaction_name: str,
         mt: int,
@@ -1890,8 +1900,6 @@ class _PythonGENDFLibrary:
         ----------
         all_meta_levels : list
             List of metastable level dicts from _categorize_mf10_levels()
-        qm_section : float or None
-            Section-level QM value
         nuclide_name : str
             Parent nuclide name
         reaction_name : str
@@ -1927,7 +1935,7 @@ class _PythonGENDFLibrary:
             level = meta['level']
 
             # Calculate GENDF ELIS for reference logging
-            qm = level.get('QM', qm_section)
+            qm = level.get('QM')
             qi = level.get('QI', 0.0)
             gendf_elis = (qm - qi) if qm is not None else None
 
@@ -2033,7 +2041,8 @@ class _PythonGENDFLibrary:
         mapped_meta_levels: list,
         lfs_mapping: dict,
         nuclide_name: str,
-        mt: int
+        mt: int,
+        ground_qm=None
     ) -> Optional[IsomericBranching]:
         """Build IsomericBranching result from ground and mapped metastable data.
 
@@ -2052,6 +2061,9 @@ class _PythonGENDFLibrary:
             Parent nuclide name (for warnings)
         mt : int
             ENDF MT number
+        ground_qm : float or None
+            QM of the LFS=0 subsection itself; None when the ground was
+            synthesized (no such subsection exists)
 
         Returns
         -------
@@ -2171,7 +2183,8 @@ class _PythonGENDFLibrary:
             reaction=reaction_name,
             mt=mt,
             lfs_mapping=lfs_mapping,
-            elis_mapping=elis_mapping if elis_mapping else None
+            elis_mapping=elis_mapping if elis_mapping else None,
+            ground_qm=ground_qm
         )
 
     def _categorize_mf10_levels(
@@ -2194,13 +2207,17 @@ class _PythonGENDFLibrary:
         Returns
         -------
         tuple or None
-            (ground_data, ground_product, all_meta_levels, base_nuclide,
-            n_anonymous) if metastable levels exist, None if only ground state.
-            ``n_anonymous`` counts the dropped IZAP=0 levels, so callers can
-            tell an absent ground from an unnamed one (R1-61).
+            (ground_data, ground_product, ground_qm, all_meta_levels,
+            base_nuclide, n_anonymous) if metastable levels exist, None if only
+            ground state. ``ground_qm`` is the LFS=0 subsection's OWN QM (None
+            if there is no LFS=0 subsection) -- QM is a per-subsection TAB1
+            head, not a section constant, so a metastable's QM cannot stand in
+            for it. ``n_anonymous`` counts the dropped IZAP=0 levels, so callers
+            can tell an absent ground from an unnamed one (R1-61).
         """
         ground_data = None
         ground_product = None
+        ground_qm = None
         all_meta_levels = []
         n_anonymous = 0
 
@@ -2238,6 +2255,7 @@ class _PythonGENDFLibrary:
             if lfs == 0:
                 ground_data = sigma
                 ground_product = base_product
+                ground_qm = level.get('QM')
             else:
                 all_meta_levels.append({
                     'lfs': lfs,
@@ -2259,8 +2277,8 @@ class _PythonGENDFLibrary:
         # Determine base nuclide name
         base_nuclide = ground_product if ground_product else all_meta_levels[0]['base_product']
 
-        return (ground_data, ground_product, all_meta_levels, base_nuclide,
-                n_anonymous)
+        return (ground_data, ground_product, ground_qm, all_meta_levels,
+                base_nuclide, n_anonymous)
 
     def _record_unmatched_mt(self, nuclide_name, mt, reaction_name, reason):
         """Record a classified (nuclide, MT) skip in the unmatched-MT bookkeeping."""
@@ -2407,7 +2425,9 @@ class _PythonGENDFLibrary:
         -------
         tuple or None
             (mf10_data dict, qm_section float or None) if MF=10 exists,
-            None if no MF=10 data for this reaction
+            None if no MF=10 data for this reaction. ENDF-6 puts QM on every
+            subsection's TAB1 head and never at section level, so ``qm_section``
+            is None for endf-parsed data; callers read QM per level.
         """
         # Load material with full parser (required for MF=10 data)
         material = self._load_material(nuclide_name, require_full_parser=True)
@@ -2418,11 +2438,7 @@ class _PythonGENDFLibrary:
 
         mf10_data = material.section_data[10, mt]
 
-        # Get QM from the MF=10 section data (Q-value for reaction)
-        # Note: In ENDF-6 format, QM may be at section level or in first level
-        qm_section = mf10_data.get('QM', None)
-
-        return (mf10_data, qm_section)
+        return (mf10_data, mf10_data.get('QM'))
 
     def available_reactions(self, nuclide_name: str) -> list[int]:
         """Get list of available reaction MT numbers for a nuclide.
@@ -2569,12 +2585,14 @@ class _PythonGENDFLibrary:
         mf10_result = self._load_mf10_data(nuclide_name, mt)
         if mf10_result is None:
             return None
-        mf10_data, qm_section = mf10_result
+        # QM lives on each subsection's TAB1 head, never at section level, so
+        # the second element is discarded here and read per level instead.
+        mf10_data, _ = mf10_result
 
         levels_result = self._categorize_mf10_levels(mf10_data, nuclide_name, mt)
         if levels_result is None:
             return None
-        (ground_data, ground_product, all_meta_levels, base_nuclide,
+        (ground_data, ground_product, ground_qm, all_meta_levels, base_nuclide,
          n_anonymous) = levels_result
 
         # Ground absent with metastables present is a legitimate evaluator
@@ -2593,17 +2611,17 @@ class _PythonGENDFLibrary:
 
         if self._mapping_mode == 'elis':
             mapped_meta_levels, lfs_mapping = self._map_via_elis(
-                all_meta_levels, qm_section, ground_data,
+                all_meta_levels, ground_data,
                 nuclide_name, reaction_name, mt, base_nuclide
             )
         elif self._mapping_mode == 'lfs_order':
             mapped_meta_levels, lfs_mapping = self._map_via_lfs_order(
-                all_meta_levels, qm_section, nuclide_name, reaction_name, mt, base_nuclide
+                all_meta_levels, nuclide_name, reaction_name, mt, base_nuclide
             )
 
         result = self._build_branching_result(
             ground_data, ground_product, mapped_meta_levels,
-            lfs_mapping, nuclide_name, mt
+            lfs_mapping, nuclide_name, mt, ground_qm=ground_qm
         )
         # Only a decoration that actually ships counts as a repair; a synthesis
         # that lost every metastable at mapping is a classified skip, not a

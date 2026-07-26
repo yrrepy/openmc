@@ -258,13 +258,17 @@ class Nuclide:
             # apart from an explicit "0.0". In the folded isomeric-branching
             # form a BRANCHED reaction carries neither ``target`` nor ``Q`` on
             # the <reaction> element -- both live on the <isomeric_branching>
-            # child's ground (first) entry -- so fall back to that child to keep
-            # the in-memory ReactionTuple's legacy fields populated. This is
-            # behaviour-preserving: form_rxn_matrix uses ``.target`` as the
-            # single-target fallback (and _build_isomeric_families_cache treats
-            # ``.target`` as the ground pathway), while ``.Q`` feeds heating; in
-            # both the value must equal the ground pathway's, exactly as the old
-            # top-level attributes did.
+            # child's first (slot-0) entry -- so fall back to that child to keep
+            # the in-memory ReactionTuple's legacy fields populated. ``.target``
+            # is the ground pathway as before (form_rxn_matrix's single-target
+            # fallback, _build_isomeric_families_cache's ground). ``.Q`` is the
+            # slot-0 PATHWAY Q, which since 48bf86e24 comes from the MF=10
+            # QM/QI of that pathway's own level and so need NOT equal the old
+            # top-level attribute (it differs for 124 JEFF-4.0 / 53 ENDF/B-8.1
+            # reactions, by design -- the old value double-charged the level
+            # energy for MT=4). Its only numeric consumer is the fission-gated
+            # heating vector (helpers.py), which a decorated reaction never
+            # reaches; everywhere else Q is merely copied.
             Q_text = get_text(reaction_elem, "Q")
 
             # If the type is not fission, get target and Q value, otherwise

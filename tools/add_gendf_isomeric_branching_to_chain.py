@@ -8,10 +8,13 @@ Supports two mapping modes:
 
 IMPORTANT: decay_file is REQUIRED for both modes (for count validation and logging).
 
-IMPORTANT: the input base_chain MUST be an UNPATCHED chain. Re-running this
-patcher on an already-patched chain silently zeroes every isomeric-pathway Q
-value, because the ground-state Q it derives them from was consumed (moved onto
-the <isomeric_branching> element) by the first pass. Always start from a clean,
+IMPORTANT: the input base_chain MUST be an UNPATCHED chain. A rerun's output
+chain and mapping log are unsupported: the first pass consumes the scalar Q
+(moving it onto the <isomeric_branching> element), so the rerun's ledger
+reconstructs a legacy value from nothing and reports phantom corrections. Since
+48bf86e24 the pathway Q values themselves are stable across a rerun (they come
+from the file's QM/QI, not from the consumed scalar; measured 0/3833 changed) --
+only slots that fell back to the scalar Q would zero. Always start from a clean,
 unpatched chain.
 
 v12 Changes:
@@ -91,6 +94,16 @@ MT_TO_DADZ = {mt: openmc.data.DADZ[name]
 
 # C4 Q-consistency tolerance; the real JEFF-3.3 cases match ELIS to < 0.1 keV.
 REATTRIB_Q_TOL_EV = 1.0e3
+
+# Pathway-Q sanity gate (eV, absolute): how far a non-MT=4 section's own ground
+# QM may sit from the chain's scalar Q before the file value is refused and the
+# whole reaction keeps the chain-anchored legacy arithmetic. 1 eV separates the
+# populations cleanly: benign file jitter on agreeing sections is <= 0.31 eV
+# after 4-dp rounding, the smallest genuine divergence is Am241 (n,gamma) at
+# 3 350 eV (where the chain scalar is 344x closer to AME than the file), and the
+# corrupt ENDF/B-8.1 (n,alpha) sections are 7.9-12.0 MeV out. Sub-eV agreement is
+# not luck: both numbers descend from the same mass evaluation.
+PATHWAY_Q_CHAIN_TOL = 1.0
 
 # Sentinel: the MF=10 section could not be read (endf crasher). Distinct from
 # ``None`` (fully attributed) so an unreadable section is never counted as clean.
@@ -447,10 +460,12 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description='GENDF Isomeric Branching Chain Patcher v12\n\n'
                     'Adds energy-dependent isomeric branching from GENDF MF=10 data to OpenMC chains.\n\n'
-                    'IMPORTANT: the input base_chain must be an UNPATCHED chain. Re-running this '
-                    'patcher on an already-patched chain silently zeroes every isomeric-pathway Q '
-                    'value (the ground-state Q it derives them from was consumed by the first pass). '
-                    'Always start from a clean, unpatched chain.',
+                    'IMPORTANT: the input base_chain must be an UNPATCHED chain. A rerun on an '
+                    'already-patched chain produces an unsupported output chain and ledger: the '
+                    'scalar Q it reconstructs the legacy comparison from was consumed by the first '
+                    'pass, so the ledger reports phantom corrections. The pathway Q values are now '
+                    'stable across a rerun (sourced from the file QM/QI); only scalar-Q fallback '
+                    'slots would zero. Always start from a clean, unpatched chain.',
         epilog=epilog,
         formatter_class=CustomFormatter
     )
@@ -1459,15 +1474,30 @@ def _determine_single_target_reason(branching, valid_products, missing_products,
 # =============================================================================
 
 def _q_str(value):
-    """Format a Q value (eV) for the chain XML, killing float-subtraction noise.
+    """Format a Q value (eV) for the chain XML at 4 dp.
 
-    Q_meta is computed as ``Q_ground - ELFS`` (a float subtraction), which can
-    leave e.g. ``-13286354.999999998``; rounding to 4 dp restores the clean
-    ``-13286355.0`` while preserving genuine sub-eV level energies. Q is a
+    Values come straight off the MF=10 QM/QI heads (or, in the ELIS fallback,
+    from ``Q_ground - ELFS``, a float subtraction that can leave e.g.
+    ``-13286354.999999998``). Rounding to 4 dp normalises both -- the clean
+    ``-13286355.0`` -- while preserving genuine sub-eV level energies. Q is a
     heating quantity (never enters the transmutation matrix), so this precision
     is ample.
     """
     return str(round(float(value), 4))
+
+
+def _q_lists_differ(new, old):
+    """True if two Q token lists differ NUMERICALLY (not just in formatting).
+
+    Both sides are produced by ``_q_str`` or copied verbatim from the chain's
+    scalar Q attribute, so the same value can reach them in two spellings
+    (``1e5`` vs ``100000.0``) and fabricate a correction row. Non-numeric
+    tokens (a malformed chain Q) fall back to the string compare.
+    """
+    try:
+        return [float(v) for v in new] != [float(v) for v in old]
+    except ValueError:
+        return list(new) != list(old)
 
 
 def _attribution_line(record):
@@ -1869,7 +1899,9 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'elis_mappings', 'renormalizations', 'nuclides_with_branching_added',
         'nn_prime_self_loops_pruned', 'single_target_cases',
         'single_target_suppressed', 'repaired_dropped_no_metastable',
-        'pathway_q_corrections'
+        'pathway_q_corrections', 'pathway_q_qm_disagreements',
+        'pathway_q_rejected', 'q_from_mf10', 'q_from_elis', 'q_replicated',
+        'q_chain_anchored'
     """
     tree = ET.parse(original_xml_file)
     root = tree.getroot()
@@ -1885,8 +1917,12 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'single_target_cases': [],  # Track all single-target cases
         'single_target_suppressed': 0,  # Count of suppressed single-target cases
         'q_from_mf10': 0,   # pathway Q slots taken from the MF=10 QM/QI pair
-        'q_replicated': 0,  # pathway Q slots replicated (no QM/QI available)
+        'q_from_elis': 0,   # ... from the legacy gq - ELIS (no QM/QI pair)
+        'q_replicated': 0,  # pathway Q slots replicated (no QM/QI, no ELIS)
+        'q_chain_anchored': 0,  # ... kept legacy because the gate refused
         'pathway_q_corrections': [],  # slots that differ from the legacy fold
+        'pathway_q_qm_disagreements': [],  # non-uniform QM within one section
+        'pathway_q_rejected': [],  # reactions whose file QM failed the gate
     }
 
     nuclide_map = {nuc.get('name'): nuc for nuc in root.findall('nuclide')}
@@ -2004,6 +2040,11 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 # Check if redundant (single target == original reaction target)
                 is_redundant = (single_product == original_target) and all_ratios_are_one
 
+                # A KEPT single-GROUND decoration has no elis entry for its one
+                # slot, so it is written from the LFS=0 subsection's own QM like
+                # any other ground slot (0.0 for MT=4); only a section with no
+                # QM anywhere would replicate the scalar Q there. Canonical runs
+                # suppress these cases outright, so none of them ship.
                 # Decide action based on flag (DEFAULT: KEEP)
                 if suppress_single_target_yields and is_redundant:
                     action = "suppressed"
@@ -2077,29 +2118,57 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 iso_elem.set('gendf_lfs', ' '.join(str(v) for v in lfs_values))
 
                 # Per-pathway Q parallel-list. Every slot takes the Q of ITS OWN
-                # MF=10 level, straight from the section the branching came
-                # from: a metastable slot gets that level's QI, the LFS=0 slot
-                # gets QM (equivalently Q_i = QM - ELFS_i, ELFS = QM - QI). QM
-                # is a property of the MF=10 section, so a true ground slot --
-                # which has no elis entry of its own -- reads it off any mapped
-                # level. Deriving Q from QM/QI instead of the old
-                # ``Q_chain - ELFS`` matters for MT=4: the chain's scalar Q is
-                # QI(MF=3) = -E(level), not QM, so that subtraction charged the
-                # level energy twice. Nothing is invented: a slot with no MF=10
-                # Q pair (e.g. lfs_order mode with no QM) replicates the scalar
-                # Q and is counted for the report. The reaction's own scalar Q
-                # is untouched here (it is popped with the target below).
+                # MF=10 subsection: a metastable slot gets that level's QI, the
+                # LFS=0 slot gets the LFS=0 subsection's own QM. QM is a
+                # per-subsection TAB1 head, NOT a section constant -- evaluations
+                # do disagree between the ground and metastable subsections of
+                # one MT (EAF-2010 metastable-parent MT=4: +E(parent) on LFS=0,
+                # 0.0 on the metastable levels; ENDF/B-8.1 Ta180_m1: eV-level
+                # spreads), so a sibling's QM is only a fallback for a
+                # SYNTHESIZED ground, where no LFS=0 subsection exists at all.
+                # Deriving Q from QM/QI instead of the old ``Q_chain - ELFS``
+                # matters for MT=4: the chain's scalar Q is QI(MF=3) =
+                # -E(level), not QM, so that subtraction charged the level
+                # energy twice. Nothing is invented: a slot with neither a Q
+                # pair nor an ELIS replicates the scalar Q and is counted and
+                # reported. The reaction's own scalar Q is untouched here (it is
+                # popped with the target below).
                 scalar_q = rx_elem.get('Q')
                 q_default = scalar_q if scalar_q is not None else '0.0'
                 gq = float(scalar_q) if scalar_q is not None else 0.0
                 elis_map = getattr(branching, 'elis_mapping', None) or {}
                 if not isinstance(elis_map, dict):
                     elis_map = {}
-                section_qm = next(
-                    (i['qm'] for i in elis_map.values()
-                     if isinstance(i, dict) and i.get('qm') is not None), None)
+                # Sibling QM: elis_map holds mapped METASTABLES only, so this is
+                # never the ground's own value -- synthesized-ground fallback.
+                meta_qms = [i['qm'] for i in elis_map.values()
+                            if isinstance(i, dict) and i.get('qm') is not None]
+                section_qm = meta_qms[0] if meta_qms else None
+                ground_qm = getattr(branching, 'ground_qm', None)
+
+                # Sanity gate: file values are adopted only where the file's own
+                # ground QM corroborates the chain's scalar Q. The chain scalar
+                # is AME/evaluation-derived and usually the more accurate of the
+                # two, while nothing validates an absolute QM -- ENDF/B-8.1 ships
+                # (n,alpha) sections wrong by up to 12 MeV, sign included. The
+                # legacy fold consumed only the QM-QI DIFFERENCE and so was
+                # immune to that; transcribing absolutes is not. When the two
+                # disagree beyond PATHWAY_Q_CHAIN_TOL the whole reaction reverts
+                # to the chain-anchored legacy arithmetic (all slots, so the
+                # written offsets stay mutually consistent) and the refused file
+                # values are ledgered. MT=4 is exempt by construction: there the
+                # scalar Q is QI(MF=3) = -E(level), a different quantity than QM
+                # (0.0 for every ground-parent MT=4 section, 424/424), so
+                # "disagreement" is the very defect being fixed. A reaction with
+                # no scalar Q has nothing to check against and keeps the file.
+                file_ground_qm = ground_qm if ground_qm is not None else section_qm
+                q_chain_reject = (
+                    branching.mt != 4 and scalar_q is not None
+                    and file_ground_qm is not None
+                    and abs(file_ground_qm - gq) > PATHWAY_Q_CHAIN_TOL)
 
                 q_values, q_legacy, q_sources = [], [], []
+                q_refused = []  # file values the gate threw away (ledger only)
                 for slot, (p, lfs) in enumerate(zip(products, lfs_values)):
                     info = elis_map.get(p)
                     info = info if isinstance(info, dict) else {}
@@ -2112,22 +2181,72 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 
                     if lfs:
                         qi, qm = info.get('qi'), info.get('qm')
-                        q_new = None if (qi is None or qm is None) else qi
-                        source = 'QI'
+                        if qi is not None and qm is not None:
+                            q_new, source = qi, 'QI'
+                        elif elfs is not None:
+                            # No Q pair (pre-48bf86e24 serialized input): keep
+                            # the computable legacy correction rather than
+                            # dropping to the undifferentiated scalar.
+                            q_new, source = gq - float(elfs), 'ELIS'
+                        else:
+                            q_new, source = None, 'QI'
                     else:
-                        q_new = section_qm
+                        # True ground slot: its own subsection's QM, else (only
+                        # for a synthesized ground) a sibling's.
+                        q_new = ground_qm if ground_qm is not None else section_qm
                         source = 'QM'
-                    if q_new is None:
+                    if q_chain_reject:
+                        # Whole-reaction revert: every slot keeps the legacy
+                        # chain-anchored value, so the ground and metastable
+                        # offsets stay mutually consistent (a half-reverted
+                        # reaction would mix two energy zeros). The file value
+                        # is carried to the ledger and nowhere else ('n/a' =
+                        # that slot had no file value to refuse).
+                        q_refused.append('n/a' if q_new is None
+                                         else _q_str(q_new))
+                        q_values.append(q_legacy[slot])
+                        q_sources.append('chain')
+                        summary['q_chain_anchored'] += 1
+                    elif q_new is None:
                         q_values.append(q_default)
                         q_sources.append('scalar')
                         summary['q_replicated'] += 1
                     else:
                         q_values.append(_q_str(q_new))
                         q_sources.append(source)
-                        summary['q_from_mf10'] += 1
+                        summary['q_from_elis' if source == 'ELIS'
+                                else 'q_from_mf10'] += 1
                 iso_elem.set('Q', ' '.join(q_values))
 
-                if q_values != q_legacy:
+                if q_chain_reject:
+                    summary['pathway_q_rejected'].append({
+                        'nuclide': nuclide_name, 'reaction': reaction_type,
+                        'mt': branching.mt, 'targets': list(products),
+                        'lfs': list(lfs_values), 'file_ground_qm': file_ground_qm,
+                        'chain_q': gq, 'delta': file_ground_qm - gq,
+                        'q_file': q_refused, 'q_kept': list(q_values),
+                    })
+
+                # Intra-section QM disagreement: the ground slot's value is only
+                # as trustworthy as the section is uniform. Record when the
+                # mapped levels disagree among themselves, or when the sibling
+                # fallback would have written something else than the LFS=0 QM.
+                # Recorded independently of the gate -- it describes the FILE,
+                # not what was written.
+                distinct_meta_qms = sorted(set(meta_qms))
+                if len(distinct_meta_qms) > 1 or (
+                        ground_qm is not None and section_qm is not None
+                        and ground_qm != section_qm):
+                    summary['pathway_q_qm_disagreements'].append({
+                        'nuclide': nuclide_name, 'reaction': reaction_type,
+                        'mt': branching.mt, 'ground_qm': ground_qm,
+                        'meta_qms': distinct_meta_qms,
+                    })
+
+                # A gate-rejected reaction wrote q_legacy verbatim, so this is
+                # False there by construction: nothing changed, nothing to
+                # correct -- it is listed in the REJECTED section instead.
+                if _q_lists_differ(q_values, q_legacy):
                     summary['pathway_q_corrections'].append({
                         'nuclide': nuclide_name, 'reaction': reaction_type,
                         'mt': branching.mt, 'targets': list(products),
@@ -2525,8 +2644,24 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
             # Not "unrepairable": the set also holds repaired-then-unmapped ones.
             f.write(f"                   Ground absent, not decorated: {len(ground_absent_skipped):5d}\n")
         pathway_q = stats.get('pathway_q_corrections', []) if stats else []
+        qm_disagree = (stats.get('pathway_q_qm_disagreements', [])
+                       if stats else [])
+        q_rejected = stats.get('pathway_q_rejected', []) if stats else []
         if pathway_q:
             f.write(f"                      Pathway-Q QM/QI-corrected: {len(pathway_q):5d}\n")
+        if q_rejected:
+            f.write(f"         Pathway-Q file QM rejected (reactions): {len(q_rejected):5d}\n")
+        if stats is not None:
+            # Both counters always: a fallback-heavy run must be visible here,
+            # not only by its absence from the corrections list.
+            f.write(f"               Pathway-Q slots from MF=10 QM/QI: {stats.get('q_from_mf10', 0):5d}\n")
+            if stats.get('q_from_elis'):
+                f.write(f"           Pathway-Q slots from ELIS arithmetic: {stats['q_from_elis']:5d}\n")
+            if stats.get('q_chain_anchored'):
+                f.write(f"          Pathway-Q slots chain-anchored (gate): {stats['q_chain_anchored']:5d}\n")
+            f.write(f"          Pathway-Q slots replicated (scalar Q): {stats.get('q_replicated', 0):5d}\n")
+        if qm_disagree:
+            f.write(f"             Pathway-Q QM disagreement sections: {len(qm_disagree):5d}\n")
         f.write("\n")
 
         # Policy 3(a): metastable-only MF=10 (stable ground omitted by the
@@ -2560,12 +2695,21 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         if pathway_q:
             f.write("PATHWAY-Q (QM/QI-SOURCED)\n")
             f.write("-" * 93 + "\n")
-            f.write("Convention: pathway Q = MF=10 QI of that level; the LFS=0 slot = QM;\n")
-            f.write("the reaction's scalar Q is untouched. Listed below: reactions whose\n")
-            f.write("written per-slot Q differs from the legacy fold (Q_scalar - ELFS).\n")
+            f.write("Convention: pathway Q = MF=10 QI of that level; the LFS=0 slot = the\n")
+            f.write("LFS=0 subsection's own QM; the reaction's scalar Q is untouched. Listed\n")
+            f.write("below: reactions whose written per-slot Q differs from the legacy fold\n")
+            f.write("(Q_scalar - ELFS). This re-sourcing applies to EVERY MT, not only MT=4.\n")
             f.write("The (n,n') rows are the MT=4 double-subtraction fix -- there the chain's\n")
             f.write("scalar Q is QI(MF=3) = -E(level 1), not QM, so subtracting ELFS charged\n")
-            f.write("the level energy twice (and left the ground slot at -E(level 1)).\n")
+            f.write("the level energy twice (and left the ground slot at -E(level 1)). Every\n")
+            f.write("other row is ordinary re-sourcing of a ground or metastable slot, where\n")
+            f.write("the file's QM/QI simply differs from the chain's scalar Q.\n")
+            f.write("Sources: QM/QI = the level's own MF=10 pair; ELIS = legacy Q_scalar -\n")
+            f.write("ELFS (no Q pair in the input); scalar = the chain Q replicated.\n")
+            f.write("File values are adopted only where they are consistent with the chain:\n")
+            f.write("outside MT=4 the file's ground QM must match the chain's scalar Q to\n")
+            f.write(f"within {_q_str(PATHWAY_Q_CHAIN_TOL)} eV, or the whole reaction keeps the legacy values --\n")
+            f.write("see PATHWAY-Q FILE-QM REJECTED below for the reactions that failed that.\n")
             f.write("\n")
             for rec in pathway_q:
                 slots = "  ".join(
@@ -2575,6 +2719,60 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                                                rec['q_legacy']))
                 f.write(f"  {rec['nuclide']:<10} {rec['reaction']:<12} "
                         f"MT={rec['mt']:<4} {slots}\n")
+            f.write("\n")
+
+        # The sanity gate's ledger. A rejected reaction is INVISIBLE in the
+        # section above (it writes the legacy values verbatim, so it is not a
+        # "correction"), which is exactly why the refused file values have to be
+        # printed here -- otherwise a 12 MeV file defect would leave no trace.
+        if q_rejected:
+            f.write("PATHWAY-Q FILE-QM REJECTED (chain-anchored values retained)\n")
+            f.write("-" * 93 + "\n")
+            f.write("Sanity gate: for a non-MT=4 reaction that has a scalar Q in the chain, the\n")
+            f.write(f"file's own ground QM must agree with that scalar to within {_q_str(PATHWAY_Q_CHAIN_TOL)} eV\n")
+            f.write("(PATHWAY_Q_CHAIN_TOL) before ANY of the reaction's per-slot file values\n")
+            f.write("are adopted. The chain scalar is AME/evaluation-derived; an absolute\n")
+            f.write("MF=10 QM is unvalidated and can be badly wrong (ENDF/B-8.1 (n,alpha):\n")
+            f.write("7.9-12.0 MeV out, sign included). On failure the WHOLE reaction keeps the\n")
+            f.write("legacy fold (Q_scalar - ELFS), which consumed only the QM-QI difference\n")
+            f.write("and is immune to an absolute-scale error; the refused file values are\n")
+            f.write("listed here and written nowhere. MT=4 is exempt -- there the scalar Q is\n")
+            f.write("QI(MF=3) = -E(level), not QM, so the mismatch IS the defect being fixed.\n")
+            f.write("\n")
+            for rec in q_rejected:
+                delta = _q_str(rec['delta'])
+                delta = f"+{delta}" if rec['delta'] >= 0 else delta
+                slots = "  ".join(
+                    f"{t}[LFS={l}]={qf} (kept {qk})"
+                    for t, l, qf, qk in zip(rec['targets'], rec['lfs'],
+                                            rec['q_file'], rec['q_kept']))
+                f.write(f"  {rec['nuclide']:<10} {rec['reaction']:<12} "
+                        f"MT={rec['mt']:<4} file QM={_q_str(rec['file_ground_qm'])} "
+                        f"vs chain Q={_q_str(rec['chain_q'])} (delta {delta})  "
+                        f"refused: {slots}\n")
+            f.write("\n")
+
+        # QM is per-subsection: where the subsections of one MT disagree, the
+        # ground slot's value depends on WHICH subsection it came from, so the
+        # section is listed for inspection (the written value is always the
+        # LFS=0 subsection's own QM, or a mapped level's for a synthesized
+        # ground).
+        if qm_disagree:
+            f.write("PATHWAY-Q INTRA-SECTION QM DISAGREEMENT\n")
+            f.write("-" * 93 + "\n")
+            f.write("MF=10 subsections of one MT carrying different QM values. 'ground QM' is\n")
+            f.write("the LFS=0 subsection's own (n/a = no LFS=0 subsection; the ground was\n")
+            f.write("synthesized and the first metastable QM below was used instead). This\n")
+            f.write("describes the FILE; a section listed here may also have been refused\n")
+            f.write("outright by the sanity gate, in which case none of its QM was written.\n")
+            f.write("\n")
+            for rec in qm_disagree:
+                gqm = ('n/a' if rec['ground_qm'] is None
+                       else _q_str(rec['ground_qm']))
+                metas = ", ".join(_q_str(q) for q in rec['meta_qms']) or 'none'
+                f.write(f"  {rec['nuclide']:<10} {rec['reaction']:<12} "
+                        f"MT={rec['mt']:<4} ground QM={gqm}  "
+                        f"metastable QM={metas}\n")
             f.write("\n")
 
         # Column descriptions
@@ -3493,8 +3691,32 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
 
     if summary['pathway_q_corrections']:
         print(f"Pathway-Q QM/QI-sourced: {len(summary['pathway_q_corrections'])} "
-              "reactions corrected vs legacy fold (MT=4 double-subtraction); "
-              "see PATHWAY-Q section of the mapping log")
+              "reactions differ from the legacy fold ((n,n') rows = the MT=4 "
+              "double-subtraction fix; all other rows = ground-slot/metastable "
+              "re-sourcing where the file's QM/QI differs from the chain "
+              "scalar, adopted only where the file's ground QM corroborates "
+              "that scalar); see PATHWAY-Q section of the mapping log")
+
+    if summary['pathway_q_rejected']:
+        print(f"WARNING: {len(summary['pathway_q_rejected'])} reaction(s) had a "
+              f"file ground QM more than {_q_str(PATHWAY_Q_CHAIN_TOL)} eV from "
+              "the chain's scalar Q; their file values were REFUSED and the "
+              "chain-anchored legacy values kept "
+              f"({summary['q_chain_anchored']} slot(s)); see PATHWAY-Q FILE-QM "
+              "REJECTED in the mapping log")
+
+    if summary['q_replicated']:
+        print(f"WARNING: {summary['q_replicated']} pathway-Q slot(s) had no "
+              "MF=10 Q data and replicated the chain's scalar Q "
+              f"({summary['q_from_mf10']} slots came from MF=10 QM/QI"
+              + (f", {summary['q_from_elis']} from ELIS arithmetic"
+                 if summary['q_from_elis'] else "") + ")")
+
+    if summary['pathway_q_qm_disagreements']:
+        print(f"Pathway-Q QM disagreement: "
+              f"{len(summary['pathway_q_qm_disagreements'])} section(s) whose "
+              "MF=10 subsections carry different QM values; see PATHWAY-Q "
+              "INTRA-SECTION QM DISAGREEMENT in the mapping log")
 
     # Single-target summary (always printed if any exist)
     if summary['single_target_cases']:
@@ -3537,6 +3759,12 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             'ground_absent_skipped': ground_absent_skipped,
             'ground_repaired_dropped': ground_repaired_dropped,
             'pathway_q_corrections': summary['pathway_q_corrections'],
+            'pathway_q_qm_disagreements': summary['pathway_q_qm_disagreements'],
+            'pathway_q_rejected': summary['pathway_q_rejected'],
+            'q_from_mf10': summary['q_from_mf10'],
+            'q_from_elis': summary['q_from_elis'],
+            'q_replicated': summary['q_replicated'],
+            'q_chain_anchored': summary['q_chain_anchored'],
         }
         write_isomer_mapping_log(summary['elis_mappings'], isomer_mapping_log_file,
                                 stats=stats, elis_errors=elis_errors,

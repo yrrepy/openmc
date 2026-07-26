@@ -484,3 +484,182 @@ def test_pathway_q_mt4_uses_qm_qi_not_double_subtraction(tmp_path):
     assert rec["source"] == ["QM", "QI"]
     assert rec["q_legacy"] == ["-336240.0", "-672484.0"]
     assert summary["q_from_mf10"] == 2 and summary["q_replicated"] == 0
+    # Uniform section (both subsections QM=0): nothing to disagree about.
+    assert summary["pathway_q_qm_disagreements"] == []
+    # A3: MT=4 is exempt from the file-QM sanity gate, and load-bearingly so --
+    # QM (0.0) sits 336 keV from the chain's scalar Q here, which at any other
+    # MT would refuse the file outright. That gap IS the double-subtraction
+    # defect, not evidence against the file.
+    assert summary["pathway_q_rejected"] == []
+
+
+def test_ground_slot_q_uses_lfs0_subsection_own_qm(tmp_path):
+    """A2: the LFS=0 slot takes its OWN subsection's QM, not a sibling's.
+
+    EAF-2010 shape (metastable-parent MT=4, verified on Eu152_m1): the LFS=0
+    subsection carries QM = +E(parent) while every metastable subsection carries
+    QM = 0.0. Reading QM off a mapped metastable -- the only entries the patcher
+    sees in ``elis_mapping`` -- writes 0.0 into the ground slot and loses the
+    45.6 keV.
+    """
+    e_parent = 45599.9          # Eu152 m1 level energy, on the LFS=0 head
+    qi_m2 = -102260.0           # m2 subsection QI, m1-relative (EAF convention)
+
+    chain = openmc.deplete.Chain()
+    eu = openmc.deplete.Nuclide("Eu152_m1")
+    eu.add_reaction("(n,n')", "Eu152", Q=45600.0, branching_ratio=1.0)
+    chain.add_nuclide(eu)
+    for name in ("Eu152", "Eu152_m2"):
+        chain.add_nuclide(openmc.deplete.Nuclide(name))
+    base = tmp_path / "eu_chain.xml"
+    chain.export_to_xml(str(base))
+
+    sections = {"Eu152_m1": {
+        (3, 4): {"sigma": None},
+        (10, 4): {"levels": [
+            dict(_level(0, 63152, e_parent, e_parent), sigma=_Sigma([0.7, 0.6])),
+            dict(_level(1, 63152, 0.0, qi_m2), sigma=_Sigma([0.3, 0.4]))]}}}
+    decay = {(63, 152): [DecayState(z=63, a=152, elis=0.0, liso=0),
+                         DecayState(z=63, a=152, elis=-qi_m2, liso=2,
+                                    half_life=5670.0)]}
+    lib = _ToyLib(sections, decay)
+
+    data = lib.process_library_for_branching(mt_list=[4], chain=chain)
+    branching = data["Eu152_m1"]["(n,n')"]
+    assert branching.ground_qm == e_parent          # carried off the LFS=0 head
+    assert branching.elis_mapping["Eu152_m2"]["qm"] == 0.0
+
+    patched = tmp_path / "eu_patched.xml"
+    summary = tool.add_branching_to_xml(str(base), data, str(patched), chain,
+                                        verbose=False)
+
+    iso = _reaction_elem(patched, "Eu152_m1", "(n,n')").find("isomeric_branching")
+    assert iso.get("targets") == "Eu152 Eu152_m2"
+    # Ground = the LFS=0 subsection's QM (NOT the metastable's 0.0);
+    # metastable = its own QI.
+    assert iso.get("Q").split() == ["45599.9", "-102260.0"]
+
+    [rec] = summary["pathway_q_corrections"]
+    assert rec["source"] == ["QM", "QI"]
+    assert rec["q_legacy"] == ["45600.0", "-56660.0"]
+
+    # The non-uniform section is recorded and reported.
+    [dis] = summary["pathway_q_qm_disagreements"]
+    assert (dis["nuclide"], dis["mt"]) == ("Eu152_m1", 4)
+    assert (dis["ground_qm"], dis["meta_qms"]) == (e_parent, [0.0])
+    # A3: MT=4, so the sanity gate never runs and the EAF metastable-parent
+    # improvement above is kept whatever the chain scalar says.
+    assert summary["pathway_q_rejected"] == []
+
+
+def test_slot_q_falls_back_to_legacy_elis_arithmetic(tmp_path):
+    """B1: an entry with ELIS but no QM/QI keeps ``Q_scalar - ELFS``.
+
+    Pre-48bf86e24 serialized ``elis_mapping`` dicts have no Q pair; dropping to
+    the undifferentiated scalar Q there would regress 9fae73feb.
+    """
+    chain = openmc.deplete.Chain()
+    ir = openmc.deplete.Nuclide("Ir191")
+    ir.add_reaction("(n,gamma)", "Ir192", Q=6198000.0, branching_ratio=1.0)
+    chain.add_nuclide(ir)
+    for name in ("Ir192", "Ir192_m1"):
+        chain.add_nuclide(openmc.deplete.Nuclide(name))
+    base = tmp_path / "ir_legacy_chain.xml"
+    chain.export_to_xml(str(base))
+
+    data = {"Ir191": {"(n,gamma)": IsomericBranching(
+        energies=np.array([1.0, 1.0e7]),
+        products=["Ir192", "Ir192_m1"],
+        branching_ratios=np.array([[0.8, 0.7], [0.2, 0.3]]),
+        parent_nuclide="Ir191", reaction="(n,gamma)", mt=102,
+        lfs_mapping={"Ir192": 0, "Ir192_m1": 3},
+        elis_mapping={"Ir192_m1": {"method": "elis", "elis": 56720.0,
+                                   "liso": 1}})}}      # no 'qm'/'qi'
+
+    patched = tmp_path / "ir_legacy_patched.xml"
+    summary = tool.add_branching_to_xml(str(base), data, str(patched), chain,
+                                        verbose=False)
+
+    iso = _reaction_elem(patched, "Ir191", "(n,gamma)").find("isomeric_branching")
+    # Metastable slot = 6198000 - 56720; ground slot has neither Q pair nor
+    # ELIS (no ground_qm either) and replicates the scalar.
+    assert iso.get("Q").split() == ["6198000.0", "6141280.0"]
+    assert summary["q_from_elis"] == 1 and summary["q_replicated"] == 1
+    assert summary["q_from_mf10"] == 0
+    # Identical to the legacy fold, so nothing is ledgered as a correction.
+    assert summary["pathway_q_corrections"] == []
+
+
+# JEFF-4.0 Am241(n,gamma), the A3 reference case: the file's ground QM sits
+# 3 350 eV above the chain's scalar Q, and the chain is the accurate one (9.8 eV
+# from AME Sn(Am242) = 5 537 640.17, vs the file's 3 359.8 -- 344x closer).
+_AM241_CHAIN_Q = 5537650.0
+_AM242M_ELIS_J40 = 48063.0      # QM - QI of the mapped LFS=2 level
+
+
+@pytest.mark.parametrize("qm_offset, rejected", [(3350.0, True), (0.3, False)])
+def test_pathway_q_file_qm_gated_against_chain_scalar(tmp_path, qm_offset,
+                                                      rejected):
+    """A3: outside MT=4 a file QM is adopted only if it matches the chain Q.
+
+    Both parametrisations are measured JEFF-4.0/ENDF-B-8.1 magnitudes: 3 350 eV
+    is Am241(n,gamma)'s real divergence (refused), 0.3 eV is the benign
+    post-rounding jitter seen on agreeing sections such as ENDF/B-8.1
+    In115(n,gamma) (adopted). On refusal the WHOLE reaction reverts, so the
+    ground and metastable slots keep a common energy zero.
+    """
+    file_qm = _AM241_CHAIN_Q + qm_offset
+    qi_meta = file_qm - _AM242M_ELIS_J40  # ELIS is a difference: gate-invariant
+
+    chain = openmc.deplete.Chain()
+    am = openmc.deplete.Nuclide("Am241")
+    am.add_reaction("(n,gamma)", "Am242", Q=_AM241_CHAIN_Q, branching_ratio=1.0)
+    chain.add_nuclide(am)
+    for name in ("Am242", "Am242_m1"):
+        chain.add_nuclide(openmc.deplete.Nuclide(name))
+    base = tmp_path / "am_chain.xml"
+    chain.export_to_xml(str(base))
+
+    sections = {"Am241": {
+        (3, 102): {"sigma": None},
+        (10, 102): {"levels": [
+            dict(_level(0, 95242, file_qm, file_qm), sigma=_Sigma([0.9, 0.6])),
+            dict(_level(2, 95242, file_qm, qi_meta),
+                 sigma=_Sigma([0.1, 0.4]))]}}}
+    decay = {(95, 242): [DecayState(z=95, a=242, elis=0.0, liso=0),
+                         DecayState(z=95, a=242, elis=_AM242M_ELIS_J40, liso=1,
+                                    half_life=4907.0)]}
+    lib = _ToyLib(sections, decay)
+
+    data = lib.process_library_for_branching(mt_list=[102], chain=chain)
+    assert data["Am241"]["(n,gamma)"].ground_qm == file_qm
+
+    patched = tmp_path / "am_patched.xml"
+    summary = tool.add_branching_to_xml(str(base), data, str(patched), chain,
+                                        verbose=False)
+    written = _reaction_elem(patched, "Am241",
+                             "(n,gamma)").find("isomeric_branching").get("Q")
+    legacy = ["5537650.0", "5489587.0"]
+
+    if rejected:
+        # Every slot chain-anchored -- exactly what the pre-48bf86e24 fold wrote.
+        assert written.split() == legacy
+        [rec] = summary["pathway_q_rejected"]
+        assert rec["nuclide"] == "Am241" and rec["reaction"] == "(n,gamma)"
+        assert rec["mt"] == 102 and rec["file_ground_qm"] == file_qm
+        assert rec["chain_q"] == _AM241_CHAIN_Q
+        assert rec["delta"] == pytest.approx(3350.0)
+        assert rec["q_file"] == ["5541000.0", "5492937.0"]   # ledgered, unwritten
+        assert rec["q_kept"] == legacy
+        # Nothing moved against the legacy fold, so this is not a "correction":
+        # the REJECTED ledger is the only trace, which is why it must exist.
+        assert summary["pathway_q_corrections"] == []
+        assert summary["q_chain_anchored"] == 2
+        assert summary["q_from_mf10"] == summary["q_replicated"] == 0
+    else:
+        # Sub-eV file rounding is inside the gate: the file values are adopted.
+        assert written.split() == ["5537650.3", "5489587.3"]
+        assert summary["pathway_q_rejected"] == []
+        [rec] = summary["pathway_q_corrections"]
+        assert rec["source"] == ["QM", "QI"] and rec["q_legacy"] == legacy
+        assert summary["q_from_mf10"] == 2 and summary["q_chain_anchored"] == 0
