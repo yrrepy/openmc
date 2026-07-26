@@ -66,6 +66,10 @@ __all__ = ['PendfLibrary', 'GroupedPendfLibrary', 'PendfTapeLibrary',
 # the isomer<->LFS product mapping lives on the depletion chain, not baked here.
 # Files written by older OpenMC carried baked ``product``/``mapping`` attrs; the
 # reader accepts them and ignores those attrs (see :class:`PendfLibrary`).
+# The MF=10-without-MF=3 totals (root ``mf10_only_totals`` census, per-reaction
+# ``total_source='sum-mf10'``) are additive within version 2: the stored value is
+# a valid reaction total either way, so a reader that predates the stamp consumes
+# it safely and no version bump is warranted.
 _FORMAT_VERSION = 2
 
 # MF=3 reactions retained only when ``keep_extra_mts=True``: resonance
@@ -374,7 +378,42 @@ def _dedupe_mf10_partials(partials, source_name, name, mt):
     return unique
 
 
-def _write_mf10_partials(mtg, ev, mt, name, path):
+def _synthesize_mf10_total(unique):
+    """Synthesize a reaction total from its MF=10 partials alone.
+
+    Used for an MF=10 section that has **no MF=3 sibling**: each event of the
+    reaction ends in exactly one final state, so the sum over the (aligned)
+    MF=10 partials *is* the reaction total. ``unique`` is the deduplicated
+    ``(QM, QI, IZAP, LFS, tab)`` sequence from :func:`_dedupe_mf10_partials`.
+
+    Returns ``(energy, xs, QM, QI)``: the union of every partial's energy grid,
+    the pointwise sum of the partials interpolated onto it with zero fill
+    outside their own range (exact -- every partial is lin-lin, see
+    :func:`_check_lin_lin`), and the section-sourced Q values. QM is the
+    partials' shared section QM; QI is the LFS=0 partial's QI when the section
+    has one (ELFS = 0 there, so QI == QM) and QM otherwise -- **no Q value is
+    ever fabricated**, there being no MF=3 HEAD to read them from.
+
+    Shared verbatim by the HDF5 build (:meth:`PendfLibrary.from_endf_directory`)
+    and :meth:`PendfTapeLibrary._load`, so a synthesized total is bit-identical
+    between the two source forms.
+    """
+    grids = [np.asarray(ptab.x, dtype=np.float64)
+             for _pqm, _pqi, _izap, _lfs, ptab in unique]
+    energy = np.unique(np.concatenate(grids))
+    xs = np.zeros_like(energy)
+    for _pqm, _pqi, _izap, _lfs, ptab in unique:
+        xs = xs + np.interp(energy, np.asarray(ptab.x, dtype=np.float64),
+                            np.asarray(ptab.y, dtype=np.float64),
+                            left=0.0, right=0.0)
+
+    qm = float(unique[0][0])
+    qi = next((float(pqi) for _pqm, pqi, _izap, lfs, _pt in unique if lfs == 0),
+              qm)
+    return energy, xs, qm, qi
+
+
+def _write_mf10_partials(mtg, ev, mt, name, path, unique=None):
     """Write a reaction's MF=10 isomeric production partials as ``LFS`` subgroups.
 
     Each MF=10 partial for reaction ``mt`` is stored as a subgroup of ``mtg``
@@ -385,14 +424,21 @@ def _write_mf10_partials(mtg, ev, mt, name, path):
     distinct IZAP -- different product nuclides, as in lumped TENDL MT=5 -- is
     disambiguated as ``LFS{lfs}_ZAP{izap}``. A true ``(IZAP, LFS)`` duplicate
     warns and is skipped.
-    """
-    partials = list(_iter_mf10_partials(ev, mt, name))
-    if not partials:
-        return
 
-    # Drop true (IZAP, LFS) duplicates, keeping the first occurrence (shared with
-    # the ASC tape adapter so the two see identical partials).
-    unique = _dedupe_mf10_partials(partials, path.name, name, mt)
+    ``unique`` optionally supplies the already parsed and deduplicated partials
+    (the :func:`_dedupe_mf10_partials` output), so a caller that needed them
+    first -- the MF=10-without-MF=3 branch, which synthesizes the reaction total
+    from them -- neither re-parses the section nor re-emits its duplicate
+    warnings. Omit it to parse and deduplicate here.
+    """
+    if unique is None:
+        partials = list(_iter_mf10_partials(ev, mt, name))
+        if not partials:
+            return
+
+        # Drop true (IZAP, LFS) duplicates, keeping the first occurrence (shared
+        # with the ASC tape adapter so the two see identical partials).
+        unique = _dedupe_mf10_partials(partials, path.name, name, mt)
 
     # An LFS carried by more than one product nuclide must be disambiguated by
     # IZAP in the subgroup name; a unique LFS keeps the plain ``LFS{lfs}`` name.
@@ -592,6 +638,14 @@ class PendfLibrary:
         Tape-derived provenance identity of the source directory (root
         ``source_identity`` attr), or ``None`` for a file written before this
         attr was added. Used by the chain provenance-stamp check.
+    mf10_only_totals : int or None
+        Number of reactions stored with a total synthesized from their MF=10
+        partials because they have no MF=3 section (root ``mf10_only_totals``
+        attr, stamped ``total_source='sum-mf10'`` on each such reaction group).
+        ``None`` -- for a file predating the feature, built with it disabled, or
+        a directory in which any file lacks the attribute -- means the library
+        cannot serve that class at all, which is distinct from a count of 0
+        (nothing in the source tapes needed it).
 
     """
 
@@ -612,6 +666,10 @@ class PendfLibrary:
         self.temperature = None
         self.mapping = None
         self.source_identity = None
+        # Summed over the files of a directory library; ``None`` as soon as one
+        # file lacks the attr -- that file cannot serve the MF=10-only class, so
+        # neither can the library as a whole.
+        self.mf10_only_totals = 0
         for p in paths:
             f = h5py.File(p, 'r')
             self._files.append(f)
@@ -634,6 +692,10 @@ class PendfLibrary:
             # only -- product naming is now chain-sourced), else ``None``.
             mapping = _attr_str(f.attrs, 'mapping') if 'mapping' in f.attrs \
                 else None
+            if 'mf10_only_totals' not in f.attrs:
+                self.mf10_only_totals = None
+            elif self.mf10_only_totals is not None:
+                self.mf10_only_totals += int(f.attrs['mf10_only_totals'])
             if self.temperature is None:
                 self.library = library
                 self.temperature = temperature
@@ -710,7 +772,7 @@ class PendfLibrary:
         return matches[0]
 
     def reactions(self, nuclide):
-        """Return the MTs with MF=3 cross sections for a nuclide.
+        """Return the MTs with a stored total cross section for a nuclide.
 
         Parameters
         ----------
@@ -720,7 +782,10 @@ class PendfLibrary:
         Returns
         -------
         list of int
-            Sorted reaction MT numbers.
+            Sorted reaction MT numbers. These are the MF=3 reactions plus any
+            reaction stored with a total synthesized from its MF=10 partials
+            (stamped ``total_source='sum-mf10'``; see
+            :meth:`from_endf_directory`).
 
         """
         return sorted(int(k[2:]) for k in self._nuclide(nuclide)
@@ -750,7 +815,11 @@ class PendfLibrary:
                       for k in rx if k.startswith('LFS'))
 
     def xs(self, nuclide, mt):
-        """Return the MF=3 cross section for a reaction.
+        """Return the stored total cross section for a reaction.
+
+        The reaction's MF=3 cross section, or -- for a reaction stored without
+        an MF=3 section (group attr ``total_source='sum-mf10'``) -- the total
+        the builder synthesized as the sum of its MF=10 partials.
 
         Parameters
         ----------
@@ -860,7 +929,7 @@ class PendfLibrary:
 
     @staticmethod
     def from_endf_directory(pendf_dir, out, library=None, temperature=None,
-                            keep_extra_mts=False):
+                            keep_extra_mts=False, mf10_only_totals=True):
         """Preprocess a directory of PENDF files into an HDF5 library.
 
         Nuclide identity (Z, A, isomeric state) is always taken from the
@@ -873,6 +942,11 @@ class PendfLibrary:
         the depletion chain (built with
         ``tools/add_pendf_isomeric_branching_to_chain.py``), which is where the
         collapse sources isomeric row names from.
+
+        A reaction whose MF=10 section has **no MF=3 sibling** is stored with
+        its total synthesized from the partials (``mf10_only_totals``, on by
+        default), stamped ``total_source='sum-mf10'`` on the reaction group and
+        counted in the ``mf10_only_totals`` root attribute.
 
         Parameters
         ----------
@@ -892,6 +966,18 @@ class PendfLibrary:
             Retain non-activation MF=3 reactions (particle production, HEATR
             heating/damage, average secondary quantities, resonance
             parameters). Default is ``False``.
+        mf10_only_totals : bool
+            Store a reaction whose MF=10 section has no MF=3 sibling, using the
+            union-grid sum of its MF=10 partials as the reaction total (each
+            event ends in exactly one final state, so the sum *is* the total).
+            The reaction group is stamped ``total_source='sum-mf10'`` and the
+            root ``mf10_only_totals`` attribute records how many such reactions
+            the file carries (written even when 0). MT=5 (lumped channel) and
+            MT=18 (sub-actinide fission placeholders) are never stored this way
+            -- they only warn, as they always did. Default is ``True``; ``False``
+            restores the pre-feature build, in which every MF=10 section without
+            an MF=3 sibling warns and is dropped and no root attribute is
+            written.
 
         Returns
         -------
@@ -908,6 +994,7 @@ class PendfLibrary:
         lib_temperature = temperature
         n_converted = 0
         n_skipped = 0
+        n_mf10_only_totals = 0
 
         # Convert into a temporary file in the destination directory and
         # atomically replace ``out`` only on success, so an unparseable file
@@ -921,6 +1008,7 @@ class PendfLibrary:
                 for path, implied_liso in entries:
                     name = None
                     created_here = False
+                    mf10_only_here = 0
                     try:
                         ev = Evaluation(path)
                         Z = ev.target['atomic_number']
@@ -973,16 +1061,40 @@ class PendfLibrary:
                             # MF=10 isomeric production partials for this reaction
                             _write_mf10_partials(mtg, ev, mt, name, path)
 
-                        # MF=10 partials are written only alongside their MF=3
-                        # sibling (loop above). Warn about any MF=10 reaction
-                        # with no MF=3 section so the silent drop is visible; a
-                        # total is not synthesized from the partials (that would
-                        # invent data the format requires from MF=3).
+                        # An MF=10 section with no MF=3 sibling carries partials
+                        # the loop above cannot reach. Unless disabled, such a
+                        # reaction is stored with its total SYNTHESIZED from the
+                        # partials (each event ends in exactly one final state,
+                        # so their sum is the total) and stamped
+                        # ``total_source='sum-mf10'``. MT=5 (lumped channel,
+                        # never consumed by chain/collapse) and MT=18 (JEFF-4.0
+                        # sub-actinide fission placeholders, which the grouped
+                        # binner's whitelist would carry into every grouped
+                        # library) stay excluded and only warn.
                         mf3_mts = {mt for (mf, mt) in ev.section if mf == 3}
                         mf10_mts = {mt for (mf, mt) in ev.section if mf == 10}
                         for mt in sorted(mf10_mts - mf3_mts):
-                            warn(f"{path.name}: {name} MF=10 MT={mt} has no "
-                                 f"MF=3 section; isomeric partials dropped.")
+                            if not mf10_only_totals or mt in (5, 18):
+                                warn(f"{path.name}: {name} MF=10 MT={mt} has no "
+                                     f"MF=3 section; isomeric partials dropped.")
+                                continue
+                            unique = _dedupe_mf10_partials(
+                                list(_iter_mf10_partials(ev, mt, name)),
+                                path.name, name, mt)
+                            if not unique:
+                                warn(f"{path.name}: {name} MF=10 MT={mt} has no "
+                                     f"MF=3 section and no usable partial; "
+                                     f"nothing stored.")
+                                continue
+                            energy, xs, QM, QI = _synthesize_mf10_total(unique)
+                            mtg = nuc.create_group(f'MT{mt}')
+                            mtg.attrs['QM'] = QM
+                            mtg.attrs['QI'] = QI
+                            mtg.attrs['total_source'] = np.bytes_('sum-mf10')
+                            _write_xy(mtg, energy, xs)
+                            _write_mf10_partials(mtg, ev, mt, name, path,
+                                                 unique=unique)
+                            mf10_only_here += 1
 
                         # Advisory guard: warn if this tape declares MF=9-backed
                         # isomeric production (MF=8 LMF=9) that this MF=10-only
@@ -997,6 +1109,10 @@ class PendfLibrary:
                         _write_urr_ptables(nuc, ev, name, path)
 
                         n_converted += 1
+                        # Counted only once the nuclide is committed: a failure
+                        # above deletes its group, and the census must match
+                        # what the file actually carries.
+                        n_mf10_only_totals += mf10_only_here
                     except _TemperatureMismatchError:
                         # Library-level inconsistency, not a bad file: abort
                         # (the temp-file cleanup leaves no partial output).
@@ -1022,6 +1138,13 @@ class PendfLibrary:
                 h5.attrs['source_path'] = np.bytes_(str(pendf_dir))
                 h5.attrs['created'] = np.bytes_(date.today().isoformat())
                 h5.attrs['openmc_version'] = np.bytes_(openmc.__version__)
+                # Census of the MF=10-without-MF=3 reactions stored with a
+                # synthesized total. Written whenever the feature is enabled --
+                # even as 0 -- so its PRESENCE marks a file that can serve that
+                # class at all; a file built with ``mf10_only_totals=False``
+                # omits it and is otherwise identical to a pre-feature build.
+                if mf10_only_totals:
+                    h5.attrs['mf10_only_totals'] = int(n_mf10_only_totals)
                 # Tape-derived provenance identity (distinct from the
                 # user-supplied ``library`` label): the source directory's TPID /
                 # MF=1/451 identity, used by the chain provenance-stamp check.
@@ -1274,7 +1397,8 @@ class PendfTapeLibrary:
     pointwise :class:`PendfLibrary` built from the same tapes by
     :meth:`PendfLibrary.from_endf_directory` with default options: it applies the
     identical MF=3 extra-MT filtering, ``lin-lin`` check, MF=10 duplicate-partial
-    drop and MF=10-without-MF=3 exclusion, and returns the same float64 arrays
+    drop and MF=10-without-MF=3 handling (a named MT gets the same synthesized
+    total, MT=5/MT=18 are excluded alike), and returns the same float64 arrays
     (the source tapes are parsed the same way, so the group averages match to the
     bit).
 
@@ -1315,6 +1439,12 @@ class PendfTapeLibrary:
         heating/damage, average secondary quantities, resonance parameters).
         The default ``False`` matches the default HDF5 build, so the two collapse
         bit-identically.
+    mf10_only_totals : bool
+        Serve a reaction whose MF=10 section has no MF=3 sibling with a total
+        synthesized from its MF=10 partials, exactly as the HDF5 build stores it
+        (:meth:`PendfLibrary.from_endf_directory`). The default ``True`` matches
+        that build's default, so the two stay bit-identical; ``False`` restores
+        the pre-feature contract in which such a section is dropped entirely.
 
     Attributes
     ----------
@@ -1330,6 +1460,13 @@ class PendfTapeLibrary:
     source_identity : str or None
         Tape-derived provenance identity of the directory
         (:func:`tape_identity`), or ``None`` if none could be read.
+    mf10_only_totals : bool
+        Whether MF=10-without-MF=3 reactions are served with a synthesized
+        total. The tape analog of the HDF5 root ``mf10_only_totals`` census: the
+        adapter synthesizes lazily, per nuclide, so it carries the *mode* rather
+        than a count (``False`` is the analog of the attribute being absent from
+        an h5). Each such reaction is stamped ``total_source='sum-mf10'`` in the
+        in-memory reaction record, mirroring the h5 group attribute.
 
     """
 
@@ -1338,7 +1475,7 @@ class PendfTapeLibrary:
     is_tape_source = True
 
     def __init__(self, path, library=None, temperature=None,
-                 keep_extra_mts=False):
+                 keep_extra_mts=False, mf10_only_totals=True):
         self._path = Path(path)
         if not self._path.exists():
             raise FileNotFoundError(
@@ -1352,6 +1489,7 @@ class PendfTapeLibrary:
                 f"No recognizable PENDF tapes found in {self._path}.")
 
         self._keep_extra_mts = bool(keep_extra_mts)
+        self.mf10_only_totals = bool(mf10_only_totals)
         self._tapes: dict[str, Path] = {}
         # One-nuclide (energy, xs) cache; see _load.
         self._cache_name = None
@@ -1410,18 +1548,22 @@ class PendfTapeLibrary:
         Returns ``{mt: {'xs': (energy, xs), 'partials': {(lfs, izap): (energy,
         xs)}}}`` for the requested nuclide, cached one nuclide at a time (a
         second access to the same nuclide never re-parses; touching a different
-        nuclide evicts the previous one).
+        nuclide evicts the previous one). A reaction whose total was synthesized
+        from its MF=10 partials additionally carries ``'total_source':
+        'sum-mf10'``, the in-memory twin of the h5 group attribute.
 
         Applies the identical structural rules as
         :meth:`PendfLibrary.from_endf_directory`, in the identical
         ``sorted(ev.section)`` order: an MF=3 reaction in :data:`_EXTRA_MTS` is
         dropped unless ``keep_extra_mts``; every retained MF=3 TAB1 is lin-lin
-        checked; MF=10 partials are attached only to their MF=3 sibling (an MF=10
-        MT with no MF=3 section is dropped, exactly as the h5 build stores none),
-        with true ``(IZAP, LFS)`` duplicates removed via
-        :func:`_dedupe_mf10_partials`. Arrays are returned as float64, matching
-        the ``_write_xy`` dtype the h5 round-trips, so the two collapse to the
-        bit.
+        checked; MF=10 partials are attached to their MF=3 sibling, with true
+        ``(IZAP, LFS)`` duplicates removed via :func:`_dedupe_mf10_partials`. An
+        MF=10 section with no MF=3 sibling is served with the union-grid sum of
+        its partials as the total (:func:`_synthesize_mf10_total`, exactly what
+        the h5 build stores) unless ``mf10_only_totals`` is ``False``; MT=5 and
+        MT=18 are dropped either way, as in the h5 build. Arrays are returned as
+        float64, matching the ``_write_xy`` dtype the h5 round-trips, so the two
+        collapse to the bit.
         """
         if self._cache_name == nuclide:
             return self._cache
@@ -1459,19 +1601,49 @@ class PendfTapeLibrary:
                     np.asarray(ptab.y, dtype=np.float64))
             reactions[mt] = dict(xs=xs, partials=partials)
 
+        # MF=10 sections with no MF=3 sibling: same rule as the h5 build --
+        # MT=5/MT=18 dropped (lumped channel / fission placeholders), every other
+        # MT served with the total synthesized from its own partials.
+        if self.mf10_only_totals:
+            mf3_mts = {mt for (mf, mt) in ev.section if mf == 3}
+            mf10_mts = {mt for (mf, mt) in ev.section if mf == 10}
+            for mt in sorted(mf10_mts - mf3_mts):
+                if mt in (5, 18):
+                    continue
+                unique = _dedupe_mf10_partials(
+                    list(_iter_mf10_partials(ev, mt, name)), path.name, name, mt)
+                if not unique:
+                    continue
+                energy, xs, _qm, _qi = _synthesize_mf10_total(unique)
+                partials = {}
+                for _pqm, _pqi, izap, lfs, ptab in unique:
+                    partials[(int(lfs), int(izap))] = (
+                        np.asarray(ptab.x, dtype=np.float64),
+                        np.asarray(ptab.y, dtype=np.float64))
+                reactions[mt] = dict(xs=(energy, xs), partials=partials,
+                                     total_source='sum-mf10')
+
         self._cache_name = nuclide
         self._cache = reactions
         return reactions
 
     def reactions(self, nuclide):
-        """Return the sorted MTs with MF=3 cross sections for a nuclide."""
+        """Return the sorted MTs with a total cross section for a nuclide.
+
+        MF=3 reactions plus, when ``mf10_only_totals`` is set, the reactions
+        whose total is synthesized from their MF=10 partials.
+        """
         return sorted(self._load(nuclide))
 
     def xs(self, nuclide, mt):
-        """Return ``(energy, xs)`` of the MF=3 cross section (eV, barn)."""
+        """Return ``(energy, xs)`` of the total cross section (eV, barn).
+
+        The MF=3 cross section, or the sum of the reaction's MF=10 partials for
+        a reaction that has no MF=3 section (see :meth:`_load`).
+        """
         rx = self._load(nuclide).get(mt)
         if rx is None:
-            raise KeyError(f"Nuclide {nuclide!r} has no MF=3 reaction MT={mt}.")
+            raise KeyError(f"Nuclide {nuclide!r} has no reaction MT={mt}.")
         return rx['xs']
 
     def pathways(self, nuclide, mt):

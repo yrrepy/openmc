@@ -1309,6 +1309,98 @@ def _silence_fill_ground(
                         ground0_range=ground0_range)
 
 
+def _balance_remainder(total, sum_meta) -> tuple[np.ndarray, int]:
+    """Ground remainder ``max(0, total - sum_meta)`` and its clamped-point count.
+
+    Shared by the pointwise (union-grid) and grouped (group-wise) ground-by-
+    balance paths so both clamp and count identically. The count is of points
+    where the raw remainder was strictly negative -- source data whose
+    metastable partials over-sum their MF=3 total there.
+    """
+    raw = np.asarray(total, dtype=float) - np.asarray(sum_meta, dtype=float)
+    return np.maximum(raw, 0.0), int(np.count_nonzero(raw < 0.0))
+
+
+def _balance_ground(
+    pathways_fn,
+    pathway_xs_fn,
+    nuc: str,
+    mt: int,
+    energy3: np.ndarray,
+    xs3: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Pointwise ground-by-balance: ``max(0, total - Sigma(metastable partials))``.
+
+    For a reaction whose MF=10 carries only isomeric (``LFS > 0``) partials while
+    an MF=3 total exists, the ground production is not tabulated anywhere but is
+    implied: each event yields exactly one final state, so whatever the total
+    does not deposit in a metastable level is ground production. Evaluated on the
+    union of the MF=3 grid and every partial grid (partials interpolated with
+    zero-fill outside their own range, exact because partials are lin-lin at
+    ingest), then clamped pointwise at zero.
+
+    **Every** library metastable partial is subtracted, not only the chain-
+    demanded ones: yield to an untracked level must not be reattributed to the
+    ground channel (GENDF ``d010d2618`` convention, and consistent with the
+    collapse's "library extras are ignored silently" demand rule).
+
+    This is NOT :func:`_silence_fill_ground`: that fill needs the LFS=0 partial's
+    own energy range as its domain (absent here, by definition) and is gated on
+    the branching being *silent*, which a live metastable (In115 ``(n,n')``,
+    BR 0.1565) is not. Only the union-grid arithmetic is shared.
+
+    Parameters
+    ----------
+    pathways_fn : callable
+        ``pathways(nuclide, mt) -> [(lfs, izap), ...]`` (pointwise library).
+    pathway_xs_fn : callable
+        ``pathway_xs(nuclide, mt, lfs, izap) -> (energy, xs)`` (pointwise).
+    nuc : str
+        Nuclide GNDS name.
+    mt : int
+        Reaction MT number.
+    energy3, xs3 : numpy.ndarray
+        MF=3 total energy grid and cross section.
+
+    Returns
+    -------
+    tuple
+        ``(e, ground, n_clamped)``: the union grid clipped to the MF=3 domain,
+        the clamped ground remainder on it (ready for :func:`_group_average`),
+        and the number of grid points where the raw remainder was negative.
+    """
+    energy3 = np.asarray(energy3, dtype=float)
+    xs3 = np.asarray(xs3, dtype=float)
+
+    grids = [energy3]
+    partials = []
+    for lfs, izap in pathways_fn(nuc, mt):
+        if lfs <= 0:
+            continue     # the caller's trigger guarantees no LFS=0 partial
+        pe, pxs = pathway_xs_fn(nuc, mt, lfs, izap)
+        pe = np.asarray(pe, dtype=float)
+        pxs = np.asarray(pxs, dtype=float)
+        partials.append((pe, pxs))
+        grids.append(pe)
+
+    # In-domain only: ``np.interp`` edge-clamps outside the MF=3 grid, so a
+    # metastable partial tabulated past ``energy3[-1]`` (or below its first
+    # point) would otherwise fabricate ground production outside the
+    # evaluation's own domain. Clip the union grid to the MF=3 range first --
+    # the same in-domain discipline :func:`_silence_fill_ground` applies. The
+    # MF=3 endpoints are always retained (``energy3`` is itself in ``grids``),
+    # so a fully in-domain reaction is unaffected.
+    e = np.unique(np.concatenate(grids))
+    e = e[(e >= energy3[0]) & (e <= energy3[-1])]
+    total = np.interp(e, energy3, xs3)
+    sum_meta = np.zeros_like(e)
+    for pe, pxs in partials:
+        sum_meta = sum_meta + np.interp(e, pe, pxs, left=0.0, right=0.0)
+
+    ground, n_clamped = _balance_remainder(total, sum_meta)
+    return e, ground, n_clamped
+
+
 def _normalize_partial_binding(partial_binding):
     """Normalize ``partial_binding`` to ``False``, ``True``, or a set of pairs.
 
@@ -1411,14 +1503,17 @@ def _build_xs_table_pendf(
     bound to its library partial; ``LFS`` the library carries but the chain does
     not demand are ignored silently (the chain is the source of truth). When a
     demanded ``LFS`` is *missing* from the library the reaction falls back to the
-    MF=3 total and is collected into one summary warning per build -- except the
-    **self-loop ground waiver**: if the only missing demanded ``LFS`` is the ground
-    and that ground reaction is a self-loop (target == parent, e.g. In115
-    ``(n,n')``), the base row is staged from the MF=3 total and the demanded
-    metastable rows from their partials with no warning, since such tapes define no
-    LFS=0 partial and the self-loop base is a transmutation-matrix no-op. A chain
-    whose *qualified* reactions carry ``pendf_lfs=None`` (built without LFS
-    recording) is a hard error (see :func:`_chain_lfs_reactions`).
+    MF=3 total and is collected into one summary warning per build -- except
+    **ground-by-balance**: if the ONLY missing demanded ``LFS`` is the ground
+    (``missing == {0}``, the JEFF In113/In115 ``(n,n')`` class and every
+    radioactive-products-only evaluation), the ground row is served implicitly as
+    ``max(0, MF=3 total - Sigma(ALL library metastable partials))`` (see
+    :func:`_balance_ground`) and the demanded metastable rows come from their
+    partials as usual. That is a complete, self-consistent emission -- rows sum to
+    the total -- so it is not a chain<->library disagreement; it is reported in a
+    separate informational summary with the clamp count. A chain whose *qualified*
+    reactions carry ``pendf_lfs=None`` (built without LFS recording) is a hard
+    error (see :func:`_chain_lfs_reactions`).
 
     The result's ``reactions`` axis is the expanded list: for each base reaction
     in input order, the base name first then its ``_m{n}`` variants in ascending
@@ -1497,6 +1592,15 @@ def _build_xs_table_pendf(
     # the MF=3 total was staged instead of pathway rows. Collected across the whole
     # build so the disagreement is reported once, not once per reaction.
     mismatched: list[tuple[str, str, set[int], set[int]]] = []
+
+    # (nuclide, base reaction, clamped points, total points, unit) for reactions
+    # whose demanded ground pathway was served by balance (the library carries
+    # every demanded metastable partial but no LFS=0 one). Reported once per
+    # build as an informational summary -- these emissions are complete, not a
+    # mismatch. The unit is 'pts' when the remainder was taken pointwise on the
+    # union grid and 'groups' when it was taken group-wise, so the count in the
+    # message always says what it counts.
+    balanced: list[tuple[str, str, int, int, str]] = []
 
     # (nuclide, base reaction) for qualified reactions whose GROUPED ground still
     # carries the thermal placeholder (some group silent while the total is
@@ -1643,35 +1747,36 @@ def _build_xs_table_pendf(
             library_lfs = {lfs for lfs, _izap in pathway_list}
             missing = demanded_lfs - library_lfs
 
-            # Self-loop ground waiver: JEFF In113/In115-style (n,n') tapes carry no
-            # LFS=0 MF=10 partial (only the metastable), yet the folded chain always
-            # lists a ground member. When the ONLY demanded LFS the library lacks is
-            # the ground AND that ground reaction is a self-loop (target == parent),
-            # waive it: the self-loop base row is a transmutation-matrix no-op (loss
-            # and gain both land on the diagonal), and the tape defines no ground
-            # partial, so stage the base row from the MF=3 total and the demanded
-            # metastable rows from their partials. This restores In113m/In115m
-            # (n,n') production that a blanket fallback-to-total would kill.
+            # Ground-by-balance: the library carries every demanded metastable
+            # partial but NO LFS=0 one (JEFF In113/In115-style (n,n') tapes, and
+            # any radioactive-products-only evaluation, tabulate only the isomeric
+            # levels), while the chain's fold demands a ground member. The ground
+            # production is then implied rather than absent -- each event yields
+            # exactly one final state -- so serve it as the remainder
+            # ``max(0, total - Sigma(ALL library metastable partials))`` below.
+            # The trigger is the EXACT match ``missing == {0}``: if a metastable is
+            # missing too (``missing`` a strict superset), the chain and library
+            # genuinely disagree and the reaction takes the MF=3-total fallback.
+            # A synthesized-total MF=10-only reaction balances to an identically
+            # zero ground (its total IS the partial sum), which is correct.
             ground_rx = lfs_reactions.get(0)
-            self_loop_waiver = (missing == {0} and ground_rx is not None
-                                and ground_rx.target == nuc)
+            balance_served = missing == {0} and ground_rx is not None
 
-            if missing and not self_loop_waiver:
+            if missing and not balance_served:
                 # A demanded LFS is missing from the library and this is not the
-                # self-loop ground case (a metastable is missing, or a non-self-loop
-                # ground is missing): fall back to the MF=3 total and collect one
-                # honest summary warning naming both LFS sets.
+                # ground-by-balance case (a metastable is missing, with or without
+                # the ground): fall back to the MF=3 total and collect one honest
+                # summary warning naming both LFS sets.
                 mismatched.append((nuc, name, demanded_lfs, library_lfs))
                 stage(nuc_idx, base_idx, name, total_g)
                 continue
 
             # Emit exactly the demanded pathways: select the library partials whose
-            # LFS the chain demands (extras dropped), skipping the ground when the
-            # self-loop waiver is in effect (its base row comes from the MF=3 total
-            # below, since the library has no LFS=0 partial).
+            # LFS the chain demands (extras dropped). Under ``balance_served`` the
+            # library carries no LFS=0 partial by construction, so the ground is
+            # never among these; its row is appended from the balance below.
             emit_pairs = [(lfs, izap) for lfs, izap in pathway_list
-                          if lfs in demanded_lfs
-                          and not (self_loop_waiver and lfs == 0)]
+                          if lfs in demanded_lfs]
             bound = [lfs_reactions[lfs] for lfs, _izap in emit_pairs]
 
             # A lumped reaction (e.g. MT=5 (n,misc)) can carry MF=10 partials for
@@ -1693,11 +1798,6 @@ def _build_xs_table_pendf(
                         f'multi-product lumped channels (e.g. MT=5 (n,misc)) are '
                         f'not supported as collapse rows.')
 
-            if self_loop_waiver:
-                # Self-loop base row from the MF=3 total (the tape has no LFS=0
-                # partial for it).
-                stage(nuc_idx, base_idx, name, total_g)
-
             # One row per demanded product, valued from its MF=10 partial (never a
             # branching ratio). The build-time patcher audit is the authoritative
             # partials-vs-total consistency diagnosis, so no runtime check here.
@@ -1711,12 +1811,14 @@ def _build_xs_table_pendf(
 
             # In-domain silence-fill (pointwise) / placeholder detection
             # (grouped) of the ground pathway. Only on the qualified path with a
-            # demanded ground plus >=1 demanded metastable; the self-loop waiver
-            # already staged its base row from the MF=3 total (no LFS=0 partial),
-            # so it is excluded. missing is empty here (a demanded-LFS-missing
-            # reaction fell back to the total above), so a demanded ground means
-            # the library carries an LFS=0 partial.
-            if (not self_loop_waiver and 0 in demanded_lfs
+            # demanded ground plus >=1 demanded metastable; a balance-served
+            # ground is EXCLUDED -- it is already a remainder, so filling it
+            # would apply the same subtraction twice (and it has no LFS=0 partial
+            # to supply the fill's domain anyway). ``missing`` is empty here
+            # unless balance-served (a demanded-LFS-missing reaction fell back to
+            # the total above), so a demanded ground means the library carries an
+            # LFS=0 partial.
+            if (not balance_served and 0 in demanded_lfs
                     and any(lfs > 0 for lfs in demanded_lfs)):
                 if grouped:
                     # Grouped libraries are not filled at collapse time. Detect a
@@ -1741,6 +1843,36 @@ def _build_xs_table_pendf(
                                     fill.e_dom, fill.ground_dom, energies)
                                 break
 
+            # Ground-by-balance row (trigger above): the demanded ground has no
+            # MF=10 partial, so its row is the clamped remainder of the MF=3
+            # total over ALL library metastable partials -- pointwise on the
+            # union grid, group-wise for a grouped library (which carries no
+            # pointwise data to rebin). It then joins the demanded metastables as
+            # an ordinary pathway row: staged even when identically zero, exactly
+            # like a partial.
+            if balance_served:
+                if not pathway_list:
+                    # No MF=10 partials at all: nothing to subtract, so the
+                    # remainder IS the MF=3 total, used verbatim (no union-grid
+                    # round trip) to keep the row bit-identical to the total.
+                    ground_g, n_clamped = total_g, 0
+                    n_pts, n_unit = len(total_g), 'groups'
+                elif grouped:
+                    sum_meta_g = np.zeros(n_groups)
+                    for lfs, izap in pathway_list:
+                        sum_meta_g = sum_meta_g + pathway_xs_fn(nuc, mt, lfs,
+                                                                izap)
+                    ground_g, n_clamped = _balance_remainder(total_g, sum_meta_g)
+                    n_pts, n_unit = n_groups, 'groups'
+                else:
+                    e_b, ground_b, n_clamped = _balance_ground(
+                        pathways_fn, pathway_xs_fn, nuc, mt, energy, xs)
+                    ground_g = _group_average(e_b, ground_b, energies)
+                    n_pts, n_unit = len(e_b), 'pts'
+                balanced.append((nuc, name, n_clamped, n_pts, n_unit))
+                bound.append(ground_rx)
+                partial_g.append(ground_g)
+
             # Emit ground first, then ascending isomer order; the row name is the
             # bound chain reaction's type (ground keeps the base name R).
             for rx, xs_g in sorted(
@@ -1763,6 +1895,23 @@ def _build_xs_table_pendf(
              'reactions. The chain and library disagree -- regenerate the chain '
              'from this library with '
              'tools/add_pendf_isomeric_branching_to_chain.py.')
+
+    # One informational summary per build for the reactions whose demanded ground
+    # pathway was served by balance. This is NOT a chain<->library disagreement
+    # (the emission is complete: the rows sum to the MF=3 total wherever nothing
+    # was clamped), so it is deliberately separate from the mismatch warning
+    # above; the clamp count exposes source data whose metastable partials
+    # over-sum their total (GENDF's '[clamped N/M pts]' record); the unit is
+    # 'pts' for a pointwise union grid, 'groups' for a grouped library.
+    if balanced:
+        summary = ', '.join(f'{n} {r} [clamped {c}/{t} {u}]'
+                            for n, r, c, t, u in balanced)
+        warn(f'PENDF ground-by-balance: {len(balanced)} reaction(s) demand a '
+             'ground (LFS=0) pathway the library tabulates no MF=10 partial for '
+             f"(the JEFF In113/In115 (n,n') class): {summary}. Their ground rows "
+             'are the clamped remainder max(0, MF=3 total - Sigma(all library '
+             'metastable partials)); the metastable rows are their partials, '
+             'unchanged.')
 
     # One summary warning when a GROUPED library carries an unfilled placeholder
     # ground for qualified reactions (pointwise builds silence-fill in place; a
@@ -2139,7 +2288,11 @@ class MicroXS:
             canonical name and metastable products are qualified, e.g.
             ``(n,gamma)_m1``, so the returned ``reactions`` axis may contain
             product-qualified names. A partial with no matching chain reaction
-            falls back to the MF=3 total (one summary warning). Any negative
+            falls back to the MF=3 total (one summary warning), except when the
+            ground (``LFS=0``) is the only demanded pathway the library lacks:
+            its row is then served by balance as
+            ``max(0, total - Sigma(library metastable partials))`` and reported
+            in a separate informational summary. Any negative
             final one-group value (from noisy or internally inconsistent source
             data) is clamped to zero, with one summary warning naming the
             offenders.

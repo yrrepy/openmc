@@ -12,8 +12,10 @@ import pytest
 import openmc.data
 from openmc.data import Tabulated1D
 from openmc.data.pendf import (PendfLibrary, PendfTapeLibrary,
-                               open_pendf_library, _check_lin_lin,
-                               _discover_pendf_files, _write_mf10_partials,
+                               open_pendf_library, _attr_str, _check_lin_lin,
+                               _dedupe_mf10_partials, _discover_pendf_files,
+                               _iter_mf10_partials, _synthesize_mf10_total,
+                               _write_mf10_partials,
                                _identity_from_evaluation, tape_identity,
                                _TENDL_RE)
 
@@ -1060,3 +1062,250 @@ def test_from_multigroup_flux_rejects_urr_on_tape_adapter(tmp_path):
             nuclides=["Fe56"], reactions=["(n,gamma)"],
             pendf_library=PendfTapeLibrary(src),
             urr_material_dilution={"Fe56": 1.0})
+
+
+# ---------------------------------------------------------------------------
+# MF=10 sections without an MF=3 sibling. Such a reaction is stored with its
+# total SYNTHESIZED from its own MF=10 partials (each event ends in exactly one
+# final state, so their sum is the total), stamped ``total_source='sum-mf10'``
+# and counted in the root ``mf10_only_totals`` attr; MT=5 and MT=18 stay
+# excluded and only warn. The TENDL-2017 fixtures carry exactly one natural
+# instance of the class (W186 MF=10 MT=18, excluded), so the named-MT cases are
+# built by splicing a real tape: dropping an MF=3 section leaves its MF=10
+# sibling parentless, which is the shape found in JEFF-4.0.
+
+
+def _splice_tape(dst, src_path, drop_mf3=(), relabel_mf10=None):
+    """Copy an ENDF-6 tape, dropping MF=3 sections / renumbering MF=10 ones.
+
+    ``drop_mf3`` removes those MF=3 sections outright, so an MF=10 sibling of
+    the same MT becomes an MF=10-without-MF=3 section; ``relabel_mf10`` maps an
+    MF=10 MT onto a different MT number (used to manufacture the excluded MT=5
+    case, which no TENDL-2017 tape carries). Records are identified by the
+    ENDF-6 MF/MT fields (columns 71-72 and 73-75), exactly as
+    :class:`openmc.data.endf.Evaluation` reads them; the section-terminating
+    SEND records (MT=0) are untouched, and the MF=1/451 directory is left as-is
+    (the parser builds its section map from the records themselves).
+    """
+    relabel_mf10 = dict(relabel_mf10 or {})
+    kept = []
+    for line in src_path.read_text().splitlines(keepends=True):
+        try:
+            mf, mt = int(line[70:72]), int(line[72:75])
+        except ValueError:
+            kept.append(line)                      # TPID / malformed: keep
+            continue
+        if mf == 3 and mt in drop_mf3:
+            continue
+        if mf == 10 and mt in relabel_mf10:
+            line = f"{line[:72]}{relabel_mf10[mt]:>3d}{line[75:]}"
+        kept.append(line)
+    dst.write_text("".join(kept))
+    return dst
+
+
+def _spliced_tape_dir(tmp_path, name, dirname="spliced", **splice):
+    """Directory holding one spliced copy of a fixture tape."""
+    src = tmp_path / dirname
+    src.mkdir()
+    _splice_tape(src / _FIXTURES[name], _PENDF_DIR / _FIXTURES[name], **splice)
+    return src
+
+
+def test_synthesize_mf10_total_union_grid():
+    # The synthesized total is the sum of the partials on the UNION of their
+    # grids, each partial zero-filled outside its own range, with Q values taken
+    # from the section (QM shared; QI from the LFS=0 partial) -- never fabricated.
+    subs = [
+        (7.0, 7.0, 49116, 0, [(1.0, 2.0), (3.0, 4.0)]),          # ground
+        (7.0, 5.0, 49116, 1, [(2.0, 1.0), (4.0, 1.0)]),          # starts later
+    ]
+    ev = _fake_mf10_evaluation(102, subs)
+    unique = _dedupe_mf10_partials(list(_iter_mf10_partials(ev, 102, "Xx100")),
+                                   "n-Xx100.pendf", "Xx100", 102)
+    energy, xs, qm, qi = _synthesize_mf10_total(unique)
+    np.testing.assert_array_equal(energy, [1.0, 2.0, 3.0, 4.0])
+    # ground 2,3,4,0 (zero past its last point) + metastable 0,1,1,1
+    np.testing.assert_array_equal(xs, [2.0, 4.0, 5.0, 1.0])
+    assert (qm, qi) == (7.0, 7.0)
+
+    # Metastable-only section: QI falls back to the section QM, not to 0.0.
+    ev_m = _fake_mf10_evaluation(102, subs[1:])
+    unique_m = _dedupe_mf10_partials(
+        list(_iter_mf10_partials(ev_m, 102, "Xx100")), "n-Xx100.pendf",
+        "Xx100", 102)
+    _e, _xs, qm_m, qi_m = _synthesize_mf10_total(unique_m)
+    assert (qm_m, qi_m) == (7.0, 7.0)
+
+
+def test_mf10_only_total_stored(tmp_path, evaluations):
+    # A named MT whose MF=3 section is absent is stored as a complete reaction
+    # group: energy/xs (the union-grid partial sum), section-sourced QM/QI, its
+    # partials, and the ``total_source`` stamp; the root census counts it.
+    src = _spliced_tape_dir(tmp_path, "In115", drop_mf3=(102,))
+    out = tmp_path / "spliced.h5"
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        lib = PendfLibrary.from_endf_directory(
+            src, out, library="TENDL-2017", temperature=293.16)
+    # Stored, not dropped: the old warning must not fire for this reaction.
+    assert not [w for w in records
+                if "isomeric partials dropped" in str(w.message)]
+    try:
+        assert 102 in lib.reactions("In115")
+        assert lib.mf10_only_totals == 1
+        assert lib.pathways("In115", 102) == [(0, 49116), (1, 49116), (4, 49116)]
+        energy, xs = lib.xs("In115", 102)
+        expected = np.zeros_like(energy)
+        for lfs, izap in lib.pathways("In115", 102):
+            pe, pxs = lib.pathway_xs("In115", 102, lfs, izap)
+            expected = expected + np.interp(energy, pe, pxs, left=0.0, right=0.0)
+        np.testing.assert_array_equal(xs, expected)
+    finally:
+        lib.close()
+
+    with h5py.File(out, "r") as f:
+        grp = f["In115"]["MT102"]
+        assert _attr_str(grp.attrs, "total_source") == "sum-mf10"
+        # Q values come from the MF=10 section: QM is the shared section QM and
+        # QI the LFS=0 partial's QI (ELFS = 0 there, so the two agree). Nothing
+        # is fabricated -- there is no MF=3 HEAD to read them from.
+        _ns, subs = _mf10(evaluations["In115"], 102)
+        assert grp.attrs["QM"] == pytest.approx(subs[0][0])
+        assert grp.attrs["QI"] == pytest.approx(subs[0][1])
+        assert {"energy", "xs", "LFS0", "LFS1", "LFS4"} == set(grp.keys())
+        assert int(f.attrs["mf10_only_totals"]) == 1
+
+
+def test_mf10_only_totals_counted_on_clean_library(tmp_path):
+    # The census attr is written even when nothing needed it, so its PRESENCE
+    # marks a library that can serve the class at all.
+    src = _tape_dir(tmp_path, ("Fe56",))
+    out = tmp_path / "clean.h5"
+    lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+    try:
+        assert lib.mf10_only_totals == 0
+    finally:
+        lib.close()
+    with h5py.File(out, "r") as f:
+        assert int(f.attrs["mf10_only_totals"]) == 0
+
+
+def test_mf10_only_mt5_and_mt18_excluded(tmp_path):
+    # MT=5 (lumped channel, never consumed downstream) and MT=18 (sub-actinide
+    # fission placeholders the grouped binner's whitelist would propagate) are
+    # NOT stored: they keep the warn-and-drop behavior. W186 carries a real
+    # MF=10 MT=18 without MF=3; the MT=5 case is spliced (MF=10 MT=102 -> MT=5
+    # with MF=3 MT=5 removed), no TENDL-2017 tape having one naturally.
+    src = tmp_path / "excluded"
+    src.mkdir()
+    _splice_tape(src / _FIXTURES["W186"], _PENDF_DIR / _FIXTURES["W186"])
+    _splice_tape(src / _FIXTURES["In115"], _PENDF_DIR / _FIXTURES["In115"],
+                 drop_mf3=(5,), relabel_mf10={102: 5})
+
+    out = tmp_path / "excluded.h5"
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        lib = PendfLibrary.from_endf_directory(
+            src, out, library="TENDL-2017", temperature=293.16)
+    dropped = {str(w.message) for w in records
+               if "isomeric partials dropped" in str(w.message)}
+    assert any("W186 MF=10 MT=18" in m for m in dropped)
+    assert any("In115 MF=10 MT=5" in m for m in dropped)
+    try:
+        assert 18 not in lib.reactions("W186")
+        assert 5 not in lib.reactions("In115")
+        assert lib.mf10_only_totals == 0
+    finally:
+        lib.close()
+
+
+def test_mf10_only_totals_disabled_restores_previous_build(tmp_path):
+    # The --no-mf10-only-totals escape: the MF=3-less MT warns and is dropped,
+    # no census attr is written (so the file reads back as unable to serve the
+    # class), and the rest of the library is identical to the default build --
+    # the feature is purely additive.
+    src = _spliced_tape_dir(tmp_path, "In115", drop_mf3=(102,))
+    on = tmp_path / "on.h5"
+    off = tmp_path / "off.h5"
+    PendfLibrary.from_endf_directory(
+        src, on, library="TENDL-2017", temperature=293.16).close()
+    with pytest.warns(UserWarning, match=r"In115 MF=10 MT=102 has no MF=3"):
+        lib = PendfLibrary.from_endf_directory(
+            src, off, library="TENDL-2017", temperature=293.16,
+            mf10_only_totals=False)
+    try:
+        assert lib.mf10_only_totals is None
+        assert 102 not in lib.reactions("In115")
+    finally:
+        lib.close()
+
+    def compare(a, b, path=""):
+        assert set(a.attrs) == set(b.attrs), path
+        for k in a.attrs:
+            np.testing.assert_array_equal(a.attrs[k], b.attrs[k], err_msg=path)
+        assert set(a.keys()) == set(b.keys()), path
+        for k in a:
+            if isinstance(a[k], h5py.Group):
+                compare(a[k], b[k], f"{path}/{k}")
+            else:
+                np.testing.assert_array_equal(a[k][()], b[k][()],
+                                              err_msg=f"{path}/{k}")
+
+    with h5py.File(on, "r") as fon, h5py.File(off, "r") as foff:
+        assert "mf10_only_totals" in fon.attrs
+        assert "mf10_only_totals" not in foff.attrs
+        assert "MT102" not in foff["In115"]
+        # Everything the escape does keep is bit-for-bit the default build's.
+        for nuc in foff:
+            assert set(fon[nuc].attrs) == set(foff[nuc].attrs)
+            for mt_name in foff[nuc]:
+                compare(fon[nuc][mt_name], foff[nuc][mt_name],
+                        f"/{nuc}/{mt_name}")
+
+
+def test_tape_vs_h5_synthesized_total_bit_identical(tmp_path):
+    # The tape adapter synthesizes the same total as the h5 build, so a collapse
+    # from the tape directory stays bit-identical to one from an h5 built from
+    # it with an MF=3-less reaction in play (In115(n,gamma), whose MF=3 section
+    # is spliced out, expands into ground + m1/m2 off the synthesized total).
+    from openmc.deplete.microxs import _build_xs_table_pendf
+
+    src = _spliced_tape_dir(tmp_path, "In115", drop_mf3=(102,))
+    out = tmp_path / "spliced.h5"
+    h5lib = PendfLibrary.from_endf_directory(
+        src, out, library="TENDL-2017", temperature=293.16)
+    tapelib = PendfTapeLibrary(src)
+    try:
+        assert tapelib.mf10_only_totals is True
+        assert tapelib.reactions("In115") == h5lib.reactions("In115")
+        assert tapelib._load("In115")[102]["total_source"] == "sum-mf10"
+        he, hx = h5lib.xs("In115", 102)
+        te, tx = tapelib.xs("In115", 102)
+        np.testing.assert_array_equal(he, te)
+        np.testing.assert_array_equal(hx, tx)
+
+        base_names = {102: "(n,gamma)", 16: "(n,2n)", 17: "(n,3n)"}
+        chain = _chain_from_library_pathways(tapelib, base_names)
+        edges = np.array([1e-5, 1e-3, 1e-1, 1e1, 1e3, 1e5, 1e6, 5e6, 1e7,
+                          1.5e7, 2e7])
+        nuclides = sorted(tapelib.nuclides)
+        reactions = list(dict.fromkeys(base_names.values()))
+        t_h5 = _build_xs_table_pendf(nuclides, reactions, edges, h5lib, chain)
+        t_tp = _build_xs_table_pendf(nuclides, reactions, edges, tapelib, chain)
+        assert t_h5.reactions == t_tp.reactions
+        assert np.abs(t_h5.xs_matrix - t_tp.xs_matrix).max() == 0.0
+        # The synthesized-total reaction really is in the table.
+        assert "(n,gamma)_m1" in t_tp.reactions
+        assert t_tp.xs_matrix.max() > 0.0
+    finally:
+        h5lib.close()
+        tapelib.close()
+
+
+def test_tape_mf10_only_totals_disabled(tmp_path):
+    # The adapter's escape mirrors the build's: the MF=3-less reaction vanishes.
+    src = _spliced_tape_dir(tmp_path, "In115", drop_mf3=(102,))
+    with PendfTapeLibrary(src, mf10_only_totals=False) as lib:
+        assert 102 not in lib.reactions("In115")

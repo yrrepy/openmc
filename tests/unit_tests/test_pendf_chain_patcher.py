@@ -250,7 +250,7 @@ def test_main_stamps_chain_provenance(tmp_path, monkeypatch):
         102: dict(qm=6784720.0, qi=6784720.0,
                   partials=_in115_ng_metastables())}})
     monkeypatch.setattr(patcher, "open_pendf_source",
-                        lambda path, library=None: fake_source)
+                        lambda path, library=None, **kwargs: fake_source)
     monkeypatch.setattr(patcher, "parse_decay_isomeric_levels",
                         lambda decay_file: _decay_lookup())
 
@@ -1114,3 +1114,453 @@ def test_asc_mf10_without_mf3_not_decorable(tmp_path, monkeypatch):
     assert "MF=10 without MF=3 (not decorable):     1" in text
     section = text.split("MF=10 WITHOUT MF=3 (NOT DECORABLE)", 1)[1]
     assert "In115" in section and "(n,np)" in section and "In114" in section
+
+
+# ---------------------------------------------------------------------------
+# --emit-mf10-only-reactions: symmetric visibility + the three emission shapes
+# ---------------------------------------------------------------------------
+
+# In115 as seen by all three source forms: a normal MT=102 (MF=3 + MF=10) plus
+# an MF=10-only MT=17 (n,3n) -> In113, the ground-only "Cr (n,3n)" class.
+_MF10_ONLY_MT = 17
+_MF10_ONLY_Q = -1.2e7
+# Q values are chosen to round-trip EXACTLY through the 11-character ENDF-6
+# field of the synthetic tape (5 significant digits), so the tape-sourced and
+# h5-sourced chains can be compared byte for byte.
+_NG_PARTIALS = [(6784700.0, 6784700.0, 49116, 0),
+                (6784700.0, 6657400.0, 49116, 1),
+                (6784700.0, 6495100.0, 49116, 4)]
+_N3N_PARTIALS = [(_MF10_ONLY_Q, _MF10_ONLY_Q, 49113, 0)]
+# MF=10-only (n,2n) -> In114 (LFS 0) + In114_m1 (LFS 1, ELFS 190 keV).
+_N2N_PARTIALS = [(-9.0e6, -9.0e6, 49114, 0), (-9.0e6, -9.19e6, 49114, 1)]
+
+
+def _emit_tape_source(tmp_path, monkeypatch, emit=False, with_metastable=False):
+    """`_AscSource` over a synthetic In115 tape carrying the MF=10-only MT.
+
+    ``with_metastable`` adds a second MF=10-only MT -- (n,2n) with a ground AND
+    a metastable partial -- for the ground+metastable shape.
+    """
+    import types
+
+    import add_pendf_isomeric_branching_to_chain as patcher
+    import openmc.data.endf as endf_mod
+    import openmc.data.pendf as pendf_mod
+
+    sections = {
+        (3, 102): _mf3_text(49115, 6784700.0, 6784700.0),
+        (10, 102): _mf10_text(49115, _NG_PARTIALS),
+        (10, _MF10_ONLY_MT): _mf10_text(49115, _N3N_PARTIALS),
+    }
+    if with_metastable:
+        sections[(10, 16)] = _mf10_text(49115, _N2N_PARTIALS)
+    ev = types.SimpleNamespace(
+        target=dict(atomic_number=49, mass_number=115, isomeric_state=0,
+                    excitation_energy=0.0),
+        section=sections)
+    tape = tmp_path / "n-In115.pendf"
+    tape.write_text("")
+    monkeypatch.setattr(pendf_mod, "_discover_pendf_files",
+                        lambda d: [(tape, None)])
+    monkeypatch.setattr(endf_mod, "Evaluation", lambda f: ev)
+    monkeypatch.setattr(patcher, "tape_identity", lambda p: "synthetic-tape")
+    return patcher._AscSource(tmp_path, emit_mf10_only_reactions=emit)
+
+
+def _write_emit_h5(path, *, stamped, root_attr):
+    """Minimal PendfLibrary-openable h5 with In115 MT=102 (+ optional MT=17).
+
+    ``stamped`` adds the MF=10-only MT=17 group with the builder's
+    ``total_source='sum-mf10'`` stamp; ``root_attr`` writes the root
+    ``mf10_only_totals`` census (its ABSENCE is what marks a pre-feature file).
+    """
+    import h5py
+
+    grid = np.array([1.0e-5, 1.0e6])
+
+    def _write(group, qm, qi, subs, total_source=None):
+        group.attrs["QM"] = qm
+        group.attrs["QI"] = qi
+        if total_source is not None:
+            group.attrs["total_source"] = np.bytes_(total_source)
+        group.create_dataset("energy", data=grid)
+        group.create_dataset("xs", data=np.full(2, 4.0))
+        for pqm, pqi, izap, lfs in subs:
+            sub = group.create_group(f"LFS{lfs}")
+            sub.attrs["LFS"] = lfs
+            sub.attrs["IZAP"] = izap
+            sub.attrs["QM"] = pqm
+            sub.attrs["QI"] = pqi
+            sub.attrs["ELFS"] = pqm - pqi
+            sub.create_dataset("energy", data=grid)
+            sub.create_dataset("xs", data=np.full(2, 1.0))
+
+    with h5py.File(path, "w") as f:
+        f.attrs["format_version"] = 2
+        f.attrs["library"] = np.bytes_("synthetic")
+        f.attrs["temperature"] = 293.16
+        if root_attr is not None:
+            f.attrs["mf10_only_totals"] = int(root_attr)
+        nuc = f.create_group("In115")
+        nuc.attrs["ELIS"] = 0.0
+        _write(nuc.create_group("MT102"), 6784700.0, 6784700.0, _NG_PARTIALS)
+        if stamped:
+            _write(nuc.create_group(f"MT{_MF10_ONLY_MT}"), _MF10_ONLY_Q,
+                   _MF10_ONLY_Q, _N3N_PARTIALS, total_source="sum-mf10")
+    return path
+
+
+def _emit_chain():
+    """Chain carrying In115 (n,gamma) plus every product these tests need."""
+    return _chain_with(["In115", "In113", "In114", "In114_m1", "In116",
+                        "In116_m1", "In116_m2"],
+                       reactions={"In115": [("(n,gamma)", "In116", 6784700.0)]})
+
+
+def _emit_run(source, tmp_path, name, decay=None):
+    """map_library + decorate_chain + export; returns (xml bytes, stats)."""
+    chain = _emit_chain()
+    branching, stats = map_library(source, chain, decay or _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+    out = tmp_path / f"{name}.xml"
+    chain.export_to_xml(out)
+    return out.read_bytes(), stats, chain
+
+
+def test_emit_flag_off_identical_on_three_source_forms(tmp_path, monkeypatch):
+    # Symmetric visibility contract: with --emit-mf10-only-reactions OFF the
+    # MF=10-without-MF=3 class is invisible in EVERY source form, so an old h5
+    # (no such group), a NEW h5 (stamped group filtered out and recorded) and an
+    # ASC tape (section excluded and recorded) all yield the SAME chain, byte for
+    # byte. Rebuilding an h5 with the feature therefore cannot silently change a
+    # flag-off chain.
+    import add_pendf_isomeric_branching_to_chain as patcher
+
+    old_h5 = _write_emit_h5(tmp_path / "old.h5", stamped=False, root_attr=None)
+    new_h5 = _write_emit_h5(tmp_path / "new.h5", stamped=True, root_attr=1)
+
+    old_src = patcher._H5Source(old_h5)
+    xml_old, stats_old, _ = _emit_run(old_src, tmp_path, "old")
+    new_src = patcher._H5Source(new_h5)
+    xml_new, stats_new, chain_new = _emit_run(new_src, tmp_path, "new")
+    tape_src = _emit_tape_source(tmp_path, monkeypatch)
+    xml_tape, stats_tape, _ = _emit_run(tape_src, tmp_path, "tape")
+
+    assert xml_new == xml_old
+    assert xml_tape == xml_old
+    assert b"(n,3n)" not in xml_old                  # the class never decorates
+    assert not any(rx.type.startswith("(n,3n)")
+                   for rx in chain_new["In115"].reactions)
+
+    # The new h5 filters the stamped group and RECORDS it, exactly as the tape
+    # adapter records the excluded section; the old h5 carries none.
+    assert new_src.serve_mf10_only is False
+    assert sorted(new_src.reactions("In115")) == [102]
+    assert stats_old["mf10_without_mf3"] == 0
+    assert stats_new["mf10_without_mf3"] == 1
+    assert stats_tape["mf10_without_mf3"] == 1
+    rec_new = stats_new["mf10_without_mf3_list"][0]
+    rec_tape = stats_tape["mf10_without_mf3_list"][0]
+    for rec in (rec_new, rec_tape):
+        assert (rec["parent"], rec["mt"], rec["reaction"]) == \
+            ("In115", _MF10_ONLY_MT, "(n,3n)")
+        assert rec["lfs"] == [0] and rec["products"] == ["In113"]
+        assert rec["metastable"] is False
+
+    # Nothing was examined for emission in any form, and no counter block or
+    # emission section reaches the log.
+    for stats in (stats_old, stats_new, stats_tape):
+        assert stats["mf10_only_enabled"] is False
+        assert stats["mf10_only"]["examined"] == 0
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=7)
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats_new, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "MF=10-ONLY EMISSION (--emit-mf10-only-reactions)" not in text
+    assert "MF=10-only emitted" not in text
+
+
+def _emit_decay_lookup():
+    """`_decay_lookup_with_in114` plus Ag111 (ground + m1 at 60 keV)."""
+    d = _decay_lookup_with_in114()
+    d[(47, 111)] = [
+        DecayState(47, 111, 0.0, 0, half_life=None),
+        DecayState(47, 111, 60000.0, 1, half_life=64.8),
+    ]
+    return d
+
+
+def _emit_shapes_source():
+    """Synthetic source serving the three MF=10-only shapes on In115.
+
+    MT=17 (n,3n) is ground-only (In113), MT=16 (n,2n) is ground+metastable
+    (In114 / In114_m1) and MT=22 (n,na) is metastable-only (Ag111_m1, whose
+    ground Ag111 IS in the chain -- proving the metastable-only fold is a
+    deliberate choice, not a failed target lookup).
+    """
+    data = {"In115": {
+        17: dict(qm=_MF10_ONLY_Q, qi=_MF10_ONLY_Q, mf3_less=True, partials=[
+            dict(lfs=0, izap=49113, qi=_MF10_ONLY_Q, qm=_MF10_ONLY_Q,
+                 elfs=0.0)]),
+        16: dict(qm=-9.0e6, qi=-9.0e6, mf3_less=True, partials=[
+            dict(lfs=0, izap=49114, qi=-9.0e6, qm=-9.0e6, elfs=0.0),
+            dict(lfs=1, izap=49114, qi=-9.19e6, qm=-9.0e6, elfs=190000.0)]),
+        22: dict(qm=-5.0e6, qi=-5.0e6, mf3_less=True, partials=[
+            dict(lfs=1, izap=47111, qi=-5.06e6, qm=-5.0e6, elfs=60000.0)]),
+    }}
+    source = _FakeSource(data, elis={"In115": 0.0})
+    source.emit_mf10_only = True                     # the flag, source side
+    return source
+
+
+def test_emit_flag_on_three_shapes(tmp_path):
+    # Flag ON: the ground-only MT becomes a PLAIN reaction (no branching child,
+    # Q = the LFS=0 partial's QI), the ground+metastable MT decorates normally
+    # with real section-sourced Q values, and the metastable-only MT folds with
+    # metastable members only. Counters reconcile.
+    chain = _chain_with(["In115", "In113", "In114", "In114_m1", "Ag111",
+                         "Ag111_m1"])
+    source = _emit_shapes_source()
+    branching, stats = map_library(source, chain, _emit_decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+
+    # Shape 2 -- ground-only: plain reaction, no pendf_lfs (never folded).
+    n3n = rxns["(n,3n)"]
+    assert (n3n.target, n3n.Q, n3n.pendf_lfs) == ("In113", _MF10_ONLY_Q, None)
+
+    # Shape 1 -- ground + metastable: branched, both Q values MF=10-sourced.
+    assert (rxns["(n,2n)"].target, rxns["(n,2n)"].Q,
+            rxns["(n,2n)"].pendf_lfs) == ("In114", -9.0e6, 0)
+    assert (rxns["(n,2n)_m1"].target, rxns["(n,2n)_m1"].Q,
+            rxns["(n,2n)_m1"].pendf_lfs) == ("In114_m1", -9.19e6, 1)
+
+    # Shape 3 -- metastable-only: no ground member although Ag111 is in chain.
+    assert "(n,na)" not in rxns
+    assert (rxns["(n,na)_m1"].target, rxns["(n,na)_m1"].pendf_lfs) == \
+        ("Ag111_m1", 1)
+
+    # Serialization: the ground-only MT is stock, the others fold.
+    out = tmp_path / "chain.xml"
+    chain.export_to_xml(out)
+    text = out.read_text()
+    assert '<reaction type="(n,3n)" Q="-12000000.0" target="In113"/>' in text
+    assert 'targets="In114 In114_m1"' in text
+    assert 'targets="Ag111_m1"' in text
+
+    book = stats["mf10_only"]
+    assert stats["mf10_only_enabled"] is True
+    assert (book["examined"], book["emitted_ground_only"],
+            book["emitted_branched"]) == (3, 1, 2)
+    from add_pendf_isomeric_branching_to_chain import (
+        _mf10_only_reconciliation)
+    examined, emitted, skipped = _mf10_only_reconciliation(book)
+    assert examined == emitted + skipped == 3 and skipped == 0
+
+    # The log gains the greppable emission section with one row per MT, and the
+    # summary block gains the counters.
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "MF=10-only emitted (ground-only):     1" in text
+    assert "MF=10-only examined (= emitted+skips):     3   [3 + 0]" in text
+    section = text.split("MF=10-ONLY EMISSION", 1)[1]
+    assert "EMITTED plain (ground-only)" in section
+    assert "EMITTED branched" in section
+    assert "ground-only" in section and "g+m" in section and "m-only" in section
+    assert "VACUOUS" in section                      # audit-vacuity statement
+
+
+def test_emit_flag_on_target_not_in_chain_skipped(tmp_path):
+    # A ground-only MF=10-only MT whose (dA, dZ) daughter is absent from the
+    # chain emits nothing, is counted as a skip, and still reconciles.
+    chain = _chain_with(["In115", "In114", "In114_m1", "Ag111", "Ag111_m1"])
+    source = _emit_shapes_source()                   # In113 NOT in this chain
+    branching, stats = map_library(source, chain, _emit_decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+
+    assert not any(rx.type.startswith("(n,3n)")
+                   for rx in chain["In115"].reactions)
+    book = stats["mf10_only"]
+    assert book["skipped_no_target"] == 1
+    assert (book["emitted_ground_only"], book["emitted_branched"]) == (0, 2)
+    from add_pendf_isomeric_branching_to_chain import (
+        _mf10_only_reconciliation)
+    examined, emitted, skipped = _mf10_only_reconciliation(book)
+    assert examined == emitted + skipped == 3
+
+
+def test_emit_flag_on_pre_upgrade_h5_warns_and_emits_nothing(tmp_path, capsys):
+    # Flag ON against an h5 that predates MF=10-only totals (no root attr): warn
+    # once and behave exactly as flag-off for the class -- even a stamped group
+    # (hand-made here) stays filtered, since the missing root attr is the signal
+    # that the file cannot serve the class.
+    import add_pendf_isomeric_branching_to_chain as patcher
+
+    path = _write_emit_h5(tmp_path / "pre.h5", stamped=True, root_attr=None)
+    source = patcher._H5Source(path, emit_mf10_only_reactions=True)
+    err = capsys.readouterr().err
+    assert "h5 predates MF=10-only totals" in err
+    assert "tools/pendf_to_hdf5.py" in err
+    assert source.mf10_only_totals is None
+    assert source.serve_mf10_only is False
+    assert sorted(source.reactions("In115")) == [102]
+
+    xml, stats, chain = _emit_run(source, tmp_path, "pre")
+    assert b"(n,3n)" not in xml
+    assert stats["mf10_only"]["examined"] == 0       # nothing even examined
+    assert stats["mf10_without_mf3"] == 1            # recorded, like flag-off
+
+
+def test_emit_flag_on_tape_source_serves_and_audits_vacuously(tmp_path,
+                                                              monkeypatch):
+    # Flag ON against an ASC tape: an MF=10-only MT is served with Q values from
+    # the MF=10 section itself (no MF=3 HEAD exists) and a total synthesized as
+    # the union-grid sum of its partials -- exactly what the h5 builder stores.
+    # The audit is therefore VACUOUS by construction: the summed partials ARE
+    # the total, so every band ratio is 1.0 and worst_dev is 0, and the reaction
+    # can never be an offender or be band-rejected.
+    source = _emit_tape_source(tmp_path, monkeypatch, emit=True,
+                               with_metastable=True)
+    rxns = source.reactions("In115")
+    assert sorted(rxns) == [16, 17, 102]             # both MF=10-only MTs served
+    assert rxns[16]["mf3_less"] is True and rxns[102]["mf3_less"] is False
+    # QM = section QM, QI = the LFS=0 partial's QI; never fabricated.
+    assert (rxns[16]["qm"], rxns[16]["qi"]) == (-9.0e6, -9.0e6)
+
+    energy, xs = source.total_xs("In115", 16)
+    part = sum(source.pathway_xs("In115", 16, lfs, 49114)[1]
+               for lfs in (0, 1))
+    assert np.allclose(xs, part) and xs.size == energy.size
+
+    chain = _emit_chain()
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0, reject_band_ratio=0.3)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+
+    audit = _audit_reaction(source, "In115", 16, rxns[16]["partials"])
+    assert audit["worst_dev"] == pytest.approx(0.0, abs=1e-12)
+    assert audit["integral_ratio"] == pytest.approx(1.0)
+    assert all(audit[k] is None or audit[k] == pytest.approx(1.0)
+               for k in ("ratio_thermal", "ratio_epithermal",
+                         "ratio_intermediate", "ratio_fast"))
+    assert stats["rejected_count"] == 0               # never rejectable
+
+    types_ = {rx.type: rx for rx in chain["In115"].reactions}
+    assert (types_["(n,2n)"].target, types_["(n,2n)"].pendf_lfs) == ("In114", 0)
+    assert types_["(n,2n)_m1"].target == "In114_m1"
+    assert (types_["(n,3n)"].target, types_["(n,3n)"].pendf_lfs) == \
+        ("In113", None)                               # plain, ground-only
+    book = stats["mf10_only"]
+    assert (book["examined"], book["emitted_ground_only"],
+            book["emitted_branched"]) == (2, 1, 1)
+    assert stats["mf10_without_mf3"] == 0             # nothing left undecorable
+
+
+def test_emit_flag_on_h5_source_serves_and_matches_tape(tmp_path, monkeypatch):
+    # The h5 SERVE path (flag ON against a stamped, current-format library): the
+    # MF=10-only MT is enumerated alongside the ordinary one, carries its
+    # section-sourced Q values, and emits the same plain reaction the tape
+    # adapter emits -- the two source forms produce byte-identical chains.
+    import add_pendf_isomeric_branching_to_chain as patcher
+
+    h5 = _write_emit_h5(tmp_path / "serve.h5", stamped=True, root_attr=1)
+    source = patcher._H5Source(h5, emit_mf10_only_reactions=True)
+    assert source.serve_mf10_only is True
+    assert source.mf10_only_totals == 1
+
+    rxns = source.reactions("In115")
+    assert sorted(rxns) == [_MF10_ONLY_MT, 102]      # served, not filtered
+    assert rxns[_MF10_ONLY_MT]["mf3_less"] is True
+    assert rxns[102]["mf3_less"] is False            # the ordinary MT is normal
+    # Q values come from the MF=10 section itself (there is no MF=3 HEAD).
+    assert (rxns[_MF10_ONLY_MT]["qm"],
+            rxns[_MF10_ONLY_MT]["qi"]) == (_MF10_ONLY_Q, _MF10_ONLY_Q)
+    ground = rxns[_MF10_ONLY_MT]["partials"][0]
+    assert (ground["lfs"], ground["izap"], ground["qi"]) == \
+        (0, 49113, _MF10_ONLY_Q)
+    # The stored (builder-synthesized) total is served like any other total.
+    energy, xs = source.total_xs("In115", _MF10_ONLY_MT)
+    assert xs.size == energy.size == 2
+    assert source.pathway_xs("In115", _MF10_ONLY_MT, 0, 49113)[1].size == 2
+
+    xml_h5, stats, chain = _emit_run(source, tmp_path, "serve")
+    types_ = {rx.type: rx for rx in chain["In115"].reactions}
+    assert (types_["(n,3n)"].target, types_["(n,3n)"].Q,
+            types_["(n,3n)"].pendf_lfs) == ("In113", _MF10_ONLY_Q, None)
+    book = stats["mf10_only"]
+    assert (book["examined"], book["emitted_ground_only"],
+            book["emitted_branched"]) == (1, 1, 0)
+    assert stats["mf10_without_mf3"] == 0            # nothing left undecorable
+
+    # Parity claim: same content through the ASC-tape adapter -> same chain.
+    tape_src = _emit_tape_source(tmp_path, monkeypatch, emit=True)
+    xml_tape, stats_tape, _ = _emit_run(tape_src, tmp_path, "serve_tape")
+    assert xml_h5 == xml_tape
+    assert stats_tape["mf10_only"]["emitted_ground_only"] == 1
+
+
+def test_emit_name_colliding_mts_reconcile(tmp_path):
+    # Two MF=10-only MTs of one parent share a chain reaction name (MT=16 and
+    # MT=875 are both '(n,2n)'). Last MT wins the branching entry -- unchanged,
+    # pre-existing behavior -- and the DISPLACED entry is terminated in the
+    # 'superseded' bucket so the reconciliation identity still holds and no row
+    # is left '(pending)'.
+    chain = _chain_with(["In115", "In114", "In114_m1"])
+
+    def _n2n(gq):
+        """Ground + m1 partials (In114 / In114_m1) with ground Q ``gq``."""
+        return [dict(lfs=0, izap=49114, qi=gq, qm=gq, elfs=0.0),
+                dict(lfs=1, izap=49114, qi=gq - 1.9e5, qm=gq, elfs=190000.0)]
+
+    source = _FakeSource({"In115": {
+        16: dict(qm=-9.0e6, qi=-9.0e6, mf3_less=True, partials=_n2n(-9.0e6)),
+        875: dict(qm=-9.1e6, qi=-9.1e6, mf3_less=True, partials=_n2n(-9.1e6)),
+    }}, elis={"In115": 0.0})
+    source.emit_mf10_only = True
+
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+
+    # Data behavior: exactly one '(n,2n)' fold, taken from the LAST MT (875).
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    assert sorted(rxns) == ["(n,2n)", "(n,2n)_m1"]
+    assert (rxns["(n,2n)"].target, rxns["(n,2n)"].Q,
+            rxns["(n,2n)"].pendf_lfs) == ("In114", -9.1e6, 0)
+    assert (rxns["(n,2n)_m1"].target, rxns["(n,2n)_m1"].Q,
+            rxns["(n,2n)_m1"].pendf_lfs) == ("In114_m1", -9.29e6, 1)
+
+    # Bookkeeping: 2 examined = 1 emitted + 1 skip (the displaced MT=16).
+    book = stats["mf10_only"]
+    from add_pendf_isomeric_branching_to_chain import (
+        _mf10_only_reconciliation)
+    examined, emitted, skipped = _mf10_only_reconciliation(book)
+    assert (examined, emitted, skipped) == (2, 1, 1)
+    assert examined == emitted + skipped
+    assert book["emitted_branched"] == 1
+    assert book["skipped_superseded"] == 1
+    outcomes = {r["mt"]: r["outcome"] for r in book["rows"]}
+    assert "(pending)" not in outcomes.values()
+    assert "superseded" in outcomes[16] and "MT=875" in outcomes[16]
+    assert outcomes[875].startswith("EMITTED branched")
+
+    # ... and the log reconciles, with no MISMATCH marker anywhere.
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+    assert "MISMATCH" not in text
+    assert "= 2 = 1 + 1" in text
+    assert "superseded by another MT (MT=875)" in text

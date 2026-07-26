@@ -5,10 +5,11 @@ Covers the ORIGEN-style "Option A" per-product rows built by
 metastable products get an ``_m{n}`` suffix), the **chain-sourced** row naming
 (each MF=10 ``LFS`` partial is bound to the depletion-chain reaction carrying
 that ``pendf_lfs``), the demand-side chain semantics (extra library LFS ignored,
-demanded-missing LFS falling back to the MF=3 total, the self-loop ground waiver),
-the deplete-time chain<->MicroXS pathway-mismatch hard error, the chain provenance
-stamp, the in-domain silence-fill of a placeholder ground, and the always-on
-expansion through :meth:`MicroXS.from_multigroup_flux`. Pathway rows come
+demanded-missing LFS falling back to the MF=3 total, the ground-by-balance serve
+when the ground is the ONLY missing demanded LFS), the deplete-time
+chain<->MicroXS pathway-mismatch hard error, the chain provenance stamp, the
+in-domain silence-fill of a placeholder ground, and the always-on expansion
+through :meth:`MicroXS.from_multigroup_flux`. Pathway rows come
 exclusively from MF=10 partial cross sections -- never from static branching
 ratios; the product *names* come from the chain, never from the library.
 """
@@ -365,10 +366,12 @@ def test_stock_chain_emits_mf3_total_silently(recwarn):
 def test_demanded_lfs_missing_falls_back_and_warns():
     """A demanded LFS missing from the library falls back to the MF=3 total and is
     collected into one summary warning naming BOTH LFS sets -- for a missing
-    metastable (chain {0,1} vs library {0}), a total absence of MF=10 (library {}),
-    and a non-self-loop ground missing (library {1}; the self-loop waiver does NOT
-    apply because the ground target != parent). The value is always the MF=3 total,
-    identical to the old silent fallback; only the warning is new."""
+    metastable (chain {0,1} vs library {0}), a total absence of MF=10 (library {},
+    so ``missing`` is the strict superset {0,1}), and a missing ground PLUS a
+    missing metastable (library {2}). Only the EXACT ``missing == {0}`` shape is
+    ground-by-balance; a ``missing`` superset of {0} stays on this warn+fallback
+    path. The value is always the MF=3 total, identical to the old silent
+    fallback; only the warning is new."""
     edges = np.array([0.0, 2.0e7])
 
     # (a) Chain demands {0, 1}; the library has only the ground LFS 0.
@@ -404,10 +407,12 @@ def test_demanded_lfs_missing_falls_back_and_warns():
     assert table.rxn_indices.tolist() == [0]
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
 
-    # (c) Demanded ground missing whose target != parent (NOT a self-loop) -> warns.
+    # (c) BOTH the ground and a metastable missing (library {2}): ``missing`` is
+    # {0, 1}, a strict superset of {0}, so ground-by-balance does NOT apply and the
+    # reaction stays on the warn + full-MF=3-total path.
     fake = _FakePendf(
         mf3={"In115": {102: _const(5.0)}},
-        mf10={"In115": {102: {1: ("In116_m1", _const(1.0))}}})   # ground missing
+        mf10={"In115": {102: {2: ("In116_m2", _const(1.0))}}})   # neither 0 nor 1
     chain = Chain()
     nuc = Nuclide("In115")
     nuc.add_reaction("(n,gamma)", "In116", 0.0, 1.0, pendf_lfs=0)
@@ -417,34 +422,10 @@ def test_demanded_lfs_missing_falls_back_and_warns():
         table = _build_xs_table_pendf(["In115"], ["(n,gamma)"], edges, fake, chain)
     msg = str(record[0].message)
     assert "chain LFS {0, 1}" in msg
-    assert "library LFS {1}" in msg
+    assert "library LFS {2}" in msg
+    assert "ground-by-balance" not in msg
     assert table.reactions == ["(n,gamma)"]
     np.testing.assert_allclose(table.xs_matrix[0], [5.0])
-
-
-def test_self_loop_ground_waiver_stages_base_from_total(recwarn):
-    """Self-loop ground waiver: In115 (n,n') chain demands {0, 1} with the ground a
-    self-loop (target == parent) but the tape carries only the metastable LFS 1
-    (JEFF In113/In115 behavior). The base row is staged from the MF=3 total and the
-    m1 row from its partial -- no fallback, no warning (restores In115m (n,n')
-    production)."""
-    fake = _FakePendf(
-        mf3={"In115": {4: _const(2.0)}},
-        mf10={"In115": {4: {1: ("In115_m1", _const(0.8))}}})   # only the metastable
-    edges = np.array([0.0, 2.0e7])
-    chain = Chain()
-    nuc = Nuclide("In115")
-    nuc.add_reaction("(n,n')", "In115", 0.0, 1.0, pendf_lfs=0)         # self-loop
-    nuc.add_reaction("(n,n')_m1", "In115_m1", 0.0, 1.0, pendf_lfs=1)
-    chain.add_nuclide(nuc)
-
-    table = _build_xs_table_pendf(["In115"], ["(n,n')"], edges, fake, chain)
-
-    assert table.reactions == ["(n,n')", "(n,n')_m1"]
-    rows = {r: table.xs_matrix[i] for i, r in enumerate(table.rxn_indices)}
-    np.testing.assert_allclose(rows[0], [2.0])   # base row == MF=3 total
-    np.testing.assert_allclose(rows[1], [0.8])   # m1 row == LFS 1 partial
-    assert len(recwarn) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1061,214 @@ def test_silence_fill_real_endfb81_ir192_noop():
         pe0, px0 = lib.pathway_xs("Ir192", 102, 0, None)
         np.testing.assert_array_equal(_row(table, "(n,gamma)"),
                                       _group_average(pe0, px0, edges))
+    finally:
+        lib.close()
+
+
+# ---------------------------------------------------------------------------
+# Ground-by-balance: a demanded LFS=0 the library tabulates no partial for
+# ---------------------------------------------------------------------------
+#
+# When the ONLY demanded LFS missing from the library is the ground, the ground
+# row is served implicitly as ``max(0, MF=3 total - Sigma(ALL library metastable
+# partials))`` -- ALL, not just the demanded ones, so yield to an untracked level
+# is never reattributed to ground. This replaces BOTH the old self-loop waiver
+# (which staged the FULL MF=3 total as the base row) and, for a non-self-loop
+# ground, the mismatch fallback (which dropped the metastable rows entirely).
+# The mismatch warning no longer fires for this shape; one informational summary
+# with the clamp count does.
+
+def _balance_summary(record):
+    """The single ground-by-balance summary message captured in ``record``."""
+    msgs = [str(w.message) for w in record
+            if "ground-by-balance" in str(w.message)]
+    assert len(msgs) == 1
+    return msgs[0]
+
+
+def _ground_plus_meta_chain(parent, base, ground_target, metas):
+    """Chain demanding LFS=0 (``ground_target``) plus each ``(lfs, product)``."""
+    chain = Chain()
+    nuclide = Nuclide(parent)
+    nuclide.add_reaction(base, ground_target, 0.0, 1.0, pendf_lfs=0)
+    for lfs, product in metas:
+        nuclide.add_reaction(f"{base}_m{_liso_from_gnds(product)}", product,
+                             0.0, 1.0, pendf_lfs=lfs)
+    chain.add_nuclide(nuclide)
+    return chain
+
+
+def test_balance_ground_self_loop_in115_style():
+    """Self-loop ground (In115 (n,n'), target == parent): the tape carries only the
+    metastable LFS 1, so the base row is the BALANCE remainder total - sigma_m1 --
+    the true ground-production cross section -- not the full MF=3 total the retired
+    waiver staged. The m1 row and its branching ratio are untouched, the rows sum
+    to the total exactly, and the only warning is the informational balance summary
+    (never the chain<->library mismatch)."""
+    fake = _FakePendf(
+        mf3={"In115": {4: _const(2.0)}},
+        mf10={"In115": {4: {1: ("In115_m1", _const(0.8))}}})   # only the metastable
+    edges = np.array([0.0, 2.0e7])
+    chain = _ground_plus_meta_chain("In115", "(n,n')", "In115",   # self-loop ground
+                                    [(1, "In115_m1")])
+
+    with pytest.warns(UserWarning, match="ground-by-balance") as record:
+        table = _build_xs_table_pendf(["In115"], ["(n,n')"], edges, fake, chain)
+
+    assert table.reactions == ["(n,n')", "(n,n')_m1"]
+    base, meta = _row(table, "(n,n')"), _row(table, "(n,n')_m1")
+    np.testing.assert_allclose(base, [1.2])      # 2.0 - 0.8, NOT the 2.0 total
+    np.testing.assert_allclose(meta, [0.8])      # m1 row == LFS 1 partial
+    np.testing.assert_allclose(base + meta, [2.0])            # exact conservation
+    assert meta[0] / 2.0 == pytest.approx(0.4)                # BR preserved
+    assert len(record) == 1                                   # no other warning
+    msg = _balance_summary(record)
+    assert "In115 (n,n') [clamped 0/2 pts]" in msg
+    assert "chain and library disagree" not in msg
+
+    # The balance ground is NOT silence-filled: with a placeholder metastable the
+    # branching reads "silent", but there is no LFS=0 partial to supply the fill's
+    # domain and the remainder already subtracts the metastables, so the ground is
+    # exactly total - sigma_m1 everywhere (filling would double-apply it).
+    grid = np.array([1e-5, 1.0, 1e3, 2e7])
+    total = np.array([100.0, 1.0, 4.0, 1.0])
+    meta_xs = np.array([_PH, _PH, 2.0, 0.4])       # placeholder at thermal
+    fake = _FakePendf(
+        mf3={"In113": {4: (grid, total)}},
+        mf10={"In113": {4: {1: ("In113_m1", (grid, meta_xs))}}})
+    chain = _ground_plus_meta_chain("In113", "(n,n')", "In113",
+                                    [(1, "In113_m1")])
+    edges = np.array([1e-5, 0.625, 2e7])
+    with pytest.warns(UserWarning, match="ground-by-balance"):
+        table = _build_xs_table_pendf(["In113"], ["(n,n')"], edges, fake, chain)
+    np.testing.assert_allclose(
+        _row(table, "(n,n')"), _group_average(grid, total - meta_xs, edges))
+
+
+def test_balance_ground_non_self_loop_keeps_metastables():
+    """Non-self-loop ground (target != parent): the metastable rows are KEPT --
+    before, a missing demanded ground dropped them and staged the bare MF=3 total --
+    and the ground row is the CLAMPED remainder. The summary names the reaction with
+    its clamp count (the metastable over-sums the total at one grid point)."""
+    grid = np.array([1e-5, 1.0, 1e3, 2e7])
+    total = np.array([10.0, 8.0, 4.0, 1.0])
+    meta = np.array([2.0, 9.0, 1.0, 0.2])          # over-sums the total at 1.0 eV
+    fake = _FakePendf(
+        mf3={"Xx100": {102: (grid, total)}},
+        mf10={"Xx100": {102: {1: ("Yy101_m1", (grid, meta))}}})
+    chain = _ground_plus_meta_chain("Xx100", "(n,gamma)", "Yy101",
+                                    [(1, "Yy101_m1")])
+    edges = np.array([1e-5, 0.625, 2e7])
+
+    with pytest.warns(UserWarning, match="ground-by-balance") as record:
+        table = _build_xs_table_pendf(["Xx100"], ["(n,gamma)"], edges, fake, chain)
+
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]   # metastable KEPT
+    np.testing.assert_allclose(
+        _row(table, "(n,gamma)"),
+        _group_average(grid, np.maximum(total - meta, 0.0), edges))
+    np.testing.assert_allclose(_row(table, "(n,gamma)_m1"),
+                               _group_average(grid, meta, edges))
+    msg = _balance_summary(record)
+    assert "Xx100 (n,gamma) [clamped 1/4 pts]" in msg          # one negative point
+    assert "chain and library disagree" not in msg
+
+    # ALL library metastable partials are subtracted, not just the demanded ones:
+    # an UNDEMANDED level's yield must not be reattributed to the ground channel.
+    # Its row is still dropped (the chain is the demand side).
+    grid = np.array([1e-5, 1.0, 2e7])
+    total = np.array([10.0, 8.0, 1.0])
+    m1 = np.array([2.0, 1.6, 0.2])
+    m2 = np.array([3.0, 2.4, 0.3])                 # in the library, not demanded
+    fake = _FakePendf(
+        mf3={"Xx200": {102: (grid, total)}},
+        mf10={"Xx200": {102: {1: ("Yy201_m1", (grid, m1)),
+                              2: ("Yy201_m2", (grid, m2))}}})
+    chain = _ground_plus_meta_chain("Xx200", "(n,gamma)", "Yy201",
+                                    [(1, "Yy201_m1")])
+    with pytest.warns(UserWarning, match="ground-by-balance"):
+        table = _build_xs_table_pendf(["Xx200"], ["(n,gamma)"], edges, fake, chain)
+    assert table.reactions == ["(n,gamma)", "(n,gamma)_m1"]    # m2 not emitted
+    np.testing.assert_allclose(_row(table, "(n,gamma)"),
+                               _group_average(grid, total - m1 - m2, edges))
+
+
+def test_balance_ground_grouped_group_wise_remainder():
+    """Grouped library: the remainder is taken GROUP-wise (a grouped file carries no
+    pointwise data to rebin) and clamped per group; the clamp count is in groups."""
+    edges = np.array([1e-5, 0.625, 2e7])
+    fake = _FakeGroupedPendf(
+        edges,
+        mf3_g={"Gb": {102: [10.0, 1.0]}},
+        mf10_g={"Gb": {102: {1: ("Hb101_m1", [4.0, 1.5])}}})   # over-sums group 1
+    chain = _ground_plus_meta_chain("Gb", "(n,gamma)", "Hb101",
+                                    [(1, "Hb101_m1")])
+
+    with pytest.warns(UserWarning, match="ground-by-balance") as record:
+        table = _build_xs_table_pendf(["Gb"], ["(n,gamma)"], edges, fake, chain)
+
+    np.testing.assert_allclose(_row(table, "(n,gamma)"), [6.0, 0.0])   # 1-1.5 -> 0
+    np.testing.assert_allclose(_row(table, "(n,gamma)_m1"), [4.0, 1.5])
+    # The count is in GROUPS here, and the message says so (a pointwise build
+    # reports 'pts' -- the union-grid points it actually clamped).
+    assert "Gb (n,gamma) [clamped 1/2 groups]" in _balance_summary(record)
+
+
+def test_metastable_only_fold_leaves_zero_base_row(recwarn):
+    """Pin (design section 3.4): a chain fold with NO ground member (metastable-only,
+    the MF=10-only Ta181 (n,2na) shape) does NOT trigger balance -- there is no
+    ground tuple to serve. The always-emitted unsuffixed base COLUMN reads 0.0
+    silently while the metastable row is its partial. Any future change to this
+    contract must be deliberate."""
+    fake = _FakePendf(
+        mf3={"Ta181": {24: _const(3.0)}},
+        mf10={"Ta181": {24: {1: ("Lu176_m1", _const(3.0))}}})
+    chain = Chain()
+    nuc = Nuclide("Ta181")
+    nuc.add_reaction("(n,2na)_m1", "Lu176_m1", 0.0, 1.0, pendf_lfs=1)   # no ground
+    chain.add_nuclide(nuc)
+    edges = np.array([0.0, 2.0e7])
+
+    table = _build_xs_table_pendf(["Ta181"], ["(n,2na)"], edges, fake, chain)
+    assert table.reactions == ["(n,2na)", "(n,2na)_m1"]   # base column always there
+    assert _row(table, "(n,2na)") is None                 # never staged
+    np.testing.assert_allclose(_row(table, "(n,2na)_m1"), [3.0])
+
+    micro = MicroXS.from_multigroup_flux(
+        energies=[0.0, 2.0e7], multigroup_flux=[1.0], chain_file=chain,
+        nuclides=["Ta181"], reactions=["(n,2na)"], pendf_library=fake)
+    assert micro["Ta181", "(n,2na)"] == pytest.approx([0.0])   # zero, silently
+    assert micro["Ta181", "(n,2na)_m1"] == pytest.approx([3.0])
+    assert len(recwarn) == 0
+
+
+@pytest.mark.skipif(not _JEFF_V1.exists(),
+                    reason="JEFF-4.0 v1 pointwise PENDF h5 not available")
+def test_balance_ground_real_jeff_in115():
+    """Real data, the live class: JEFF-4.0 In115 (n,n') carries MF=10 LFS 1 only.
+    The base row becomes total - sigma_m1 (was the full MF=3 total), the m1 row and
+    its 0.1565 branching ratio at 14.1 MeV are unchanged, and base + m1 reproduces
+    the MF=3 total exactly in a group with no clamping."""
+    import openmc.data as od
+    lib = od.PendfLibrary(_JEFF_V1)
+    try:
+        assert lib.pathways("In115", 4) == [(1, 49115)]   # metastable only
+        chain = _ground_plus_meta_chain("In115", "(n,n')", "In115",
+                                        [(1, "In115_m1")])
+        # A narrow group bracketing 14.1 MeV, well away from the 20 MeV grid
+        # discontinuity (a duplicated tape energy the union grid collapses).
+        edges = np.array([1e-5, 1.40e7, 1.42e7, 2.0e7])
+        with pytest.warns(UserWarning, match="ground-by-balance") as record:
+            table = _build_xs_table_pendf(["In115"], ["(n,n')"], edges, lib, chain)
+        base, meta = _row(table, "(n,n')"), _row(table, "(n,n')_m1")
+        total_g = _group_average(*lib.xs("In115", 4), edges)
+
+        g = 1                                     # the 14.0-14.2 MeV group
+        assert base[g] + meta[g] == pytest.approx(total_g[g], rel=1e-9)
+        assert base[g] == pytest.approx(total_g[g] - meta[g], rel=1e-9)
+        assert base[g] < total_g[g]               # the decision-1 value change
+        assert meta[g] / total_g[g] == pytest.approx(0.1565, abs=5e-4)  # BR intact
+        assert "In115 (n,n') [clamped 0/" in _balance_summary(record)
     finally:
         lib.close()
 

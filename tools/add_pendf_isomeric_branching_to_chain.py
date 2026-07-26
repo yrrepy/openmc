@@ -137,6 +137,7 @@ def build_parser():
     parser.add_argument('--audit-emax',             type=float,                                   default=2.0e7,  help='Cap the MF=10-vs-MF=3 audit at E <= this many eV (default: 2.0e7 = application group cap; MF=10 partials legitimately stop near 30 MeV while MF=3 runs to 200 MeV)')
     parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help="Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (self-loop-ground reactions are EXEMPT -- a metastable-only (n,n') has dev pinned at 1.0) (default: None = audit only, reject nothing)")
     parser.add_argument('--mf10-reject-band-ratio', type=float,                                   default=None,   help='Leave a reaction stock when any DEFINED lethargy-weighted band ratio has ratio-1 > X (over-summing ONLY; under-summing never rejects -- the collapse silence-fill and Class-4 policy own it) (self-loop-ground reactions are EXEMPT -- their ground route is a depletion-matrix no-op) (default: None = off; None-ratio bands never trigger)')
+    parser.add_argument('--emit-mf10-only-reactions', action='store_true',                        default=False,  help='Emit chain reactions for MTs the library carries as MF=10 partials with NO MF=3 total (their total is the partial sum). Needs an h5 built with MF=10-only totals (tools/pendf_to_hdf5.py, on by default) or an ASC tape source; MT=5/MT=18 are never emitted. Default: off -- the class stays invisible in BOTH source forms.')
     parser.add_argument('-v', '--verbose',          action='store_true',                          default=True,   help='Enable verbose output (default: True)')
     parser.add_argument('-q', '--quiet',            action='store_true',                          default=False,  help='Disable verbose output')
     parser.add_argument('--prune-nn-prime-self-loops', action='store_true',                       default=False,  help="Remove (n,n') reactions with no isomeric branching whose target is EXACTLY the parent -- ground-parent self-loops that are an exact no-op in the depletion matrix. A metastable parent's (n,n') to ground is real isomer burnup and is KEPT. Default: keep all (n,n') reactions.")
@@ -234,6 +235,28 @@ def _self_loop_ground(parent, r_name, partials, chain):
 # PENDF source adapters (h5 and ASC), one interface
 # =============================================================================
 
+def _h5_attr_text(attrs, key):
+    """Return HDF5 string attribute ``key`` as ``str``, or ``None`` if absent."""
+    if key not in attrs:
+        return None
+    value = attrs[key]
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _mf10_only_qm_qi(partials):
+    """``(QM, QI)`` of a reaction whose Q values must come from MF=10 itself.
+
+    An MF=10 section with no MF=3 sibling has no HEAD record to read Q values
+    from, so they are taken from the partials, matching what the HDF5 builder
+    stores (``openmc.data.pendf._synthesize_mf10_total``): QM is the partials'
+    shared section QM and QI is the LFS=0 partial's QI when the section has one
+    (ELFS = 0 there, so QI == QM), else QM. No Q value is ever fabricated.
+    """
+    qm = float(partials[0]['qm'])
+    qi = next((float(p['qi']) for p in partials if p['lfs'] == 0), qm)
+    return qm, qi
+
+
 class _H5Source:
     """PENDF HDF5 library backend built on :class:`openmc.data.PendfLibrary`.
 
@@ -241,11 +264,19 @@ class _H5Source:
     reader; per-partial ``QI``/``QM``/``ELFS`` attributes are read directly off
     the HDF5 groups (they have no public accessor -- documented in
     ``openmc/data/pendf.py``).
+
+    A reaction the builder stored with a total SYNTHESIZED from its MF=10
+    partials (group attr ``total_source='sum-mf10'`` -- an MT with no MF=3
+    section) is served only when ``emit_mf10_only_reactions`` is set. With the
+    flag off it is filtered out and booked in ``mf10_without_mf3``, exactly as
+    the ASC adapter excludes the same tape sections, so rebuilding an h5 with
+    the feature on cannot silently change a flag-off chain and the two source
+    forms keep enumerating identical reactions.
     """
 
     kind = 'h5'
 
-    def __init__(self, path):
+    def __init__(self, path, emit_mf10_only_reactions=False):
         self._lib = openmc.data.PendfLibrary(path)
         self.nuclides = list(self._lib.nuclides)
         # For provenance stamping prefer the h5's tape-derived source_identity
@@ -254,6 +285,21 @@ class _H5Source:
         self.library = (self._lib.source_identity or self._lib.library
                         or 'unknown')
         self.mapping = self._lib.mapping
+        self.emit_mf10_only = bool(emit_mf10_only_reactions)
+        # ``None`` (no root attr on some file) means the library predates the
+        # feature and cannot serve the class at all -- distinct from a count of
+        # 0 (feature on, nothing in the tapes needed it).
+        self.mf10_only_totals = self._lib.mf10_only_totals
+        self.serve_mf10_only = (self.emit_mf10_only
+                                and self.mf10_only_totals is not None)
+        self.mf10_without_mf3 = []       # excluded, undecorable MT groups
+        self._recorded = set()           # (nuclide, mt) already booked
+        if self.emit_mf10_only and self.mf10_only_totals is None:
+            # Warned once, at open time: nothing in this file is stamped, so the
+            # class is served exactly as if the flag were off.
+            print("  WARNING: --emit-mf10-only-reactions: h5 predates MF=10-only "
+                  "totals; rebuild with tools/pendf_to_hdf5.py to serve this "
+                  "class. Nothing will be emitted for it.", file=sys.stderr)
 
     def reactions(self, nuclide):
         grp = self._lib._groups[nuclide]
@@ -263,6 +309,14 @@ class _H5Source:
                 continue
             mt = int(mtk[2:])
             mtg = grp[mtk]
+            # MF=10-only reactions (no MF=3 sibling, total = Sum(MF=10)) are
+            # served only under the flag; MT=5 (lumped channel) and MT=18
+            # (fission placeholders) never are -- the builder stores neither,
+            # the guard is defensive.
+            mf3_less = _h5_attr_text(mtg.attrs, 'total_source') == 'sum-mf10'
+            if mf3_less and (not self.serve_mf10_only or mt in (5, 18)):
+                self._record_mf10_without_mf3(nuclide, mt, mtg)
+                continue
             partials = []
             for sk in mtg:
                 if not sk.startswith('LFS'):
@@ -273,11 +327,45 @@ class _H5Source:
                     qi=float(attrs['QI']), qm=float(attrs['QM']),
                     elfs=float(attrs['ELFS'])))
             out[mt] = dict(qm=float(mtg.attrs['QM']), qi=float(mtg.attrs['QI']),
-                           partials=partials)
+                           partials=partials, mf3_less=mf3_less)
         return out
 
+    def _record_mf10_without_mf3(self, nuclide, mt, mtg):
+        """Book one excluded MF=10-without-MF=3 reaction for the mapping log.
+
+        The h5 twin of :meth:`_AscSource._record_mf10_without_mf3`, producing
+        the same record shape from the stored group attrs so an h5-sourced run
+        and a tape-sourced run report the same class. Only NAMED transmutation
+        MTs are recorded (MT=5/MT=18 have no chain reaction name and were never
+        candidates), and each (nuclide, MT) is booked once however often
+        :meth:`reactions` is called.
+        """
+        r_name = _MT_TO_NAME.get(mt)
+        if r_name is None or (nuclide, mt) in self._recorded:
+            return
+        self._recorded.add((nuclide, mt))
+        lfs, products = [], []
+        for sk in sorted(mtg, key=lambda k: int(mtg[k].attrs['LFS'])
+                         if k.startswith('LFS') else -1):
+            if not sk.startswith('LFS'):
+                continue
+            attrs = mtg[sk].attrs
+            lfs.append(int(attrs['LFS']))
+            izap = int(attrs['IZAP'])
+            product = _safe_gnds_name(izap // 1000, izap % 1000)
+            if product not in products:
+                products.append(product)
+        self.mf10_without_mf3.append(dict(
+            parent=nuclide, mt=mt, reaction=r_name, lfs=lfs, products=products,
+            metastable=any(v != 0 for v in lfs)))
+
     def total_xs(self, nuclide, mt):
-        """(energy, xs) of the MF=3 total cross section (barn vs eV)."""
+        """(energy, xs) of the reaction's stored total (barn vs eV).
+
+        The MF=3 cross section, or -- for an MF=10-only MT served under
+        ``--emit-mf10-only-reactions`` -- the total the builder synthesized as
+        the sum of that reaction's MF=10 partials.
+        """
         return self._lib.xs(nuclide, mt)
 
     def pathway_xs(self, nuclide, mt, lfs, izap=None):
@@ -308,12 +396,16 @@ class _AscSource:
     An MF=10 section with no MF=3 sibling is EXCLUDED from :meth:`reactions`
     (see :meth:`_record_mf10_without_mf3`) and booked in ``mf10_without_mf3``
     for the log, so a tape-sourced run enumerates exactly the reactions an
-    h5-sourced run does.
+    h5-sourced run does. With ``emit_mf10_only_reactions`` set, a NAMED MT of
+    that class is served instead -- Q values from the MF=10 section itself and
+    the total synthesized as the union-grid sum of the partials, exactly what an
+    h5 built with MF=10-only totals stores -- while MT=5 and MT=18 stay
+    excluded either way.
     """
 
     kind = 'asc'
 
-    def __init__(self, path, library=None):
+    def __init__(self, path, library=None, emit_mf10_only_reactions=False):
         from openmc.data.pendf import _discover_pendf_files, _iter_mf10_partials
         from openmc.data.endf import (Evaluation, get_head_record,
                                        get_tab1_record)
@@ -324,6 +416,7 @@ class _AscSource:
         # no tape identity can be read.
         self.library = tape_identity(Path(path)) or 'unknown'
         self.mapping = None
+        self.emit_mf10_only = bool(emit_mf10_only_reactions)
         self._data = {}
         self._tapes = {}                 # GNDS name -> tape path
         self._elis = {}                  # GNDS name -> MF=1/451 ELIS [eV]
@@ -343,29 +436,40 @@ class _AscSource:
             reactions = {}
             mf10_mts = {mt for (mf, mt) in ev.section if mf == 10}
             for mt in sorted(mf10_mts):
-                # A chain may only carry reactions the library SOURCE FORMS can
-                # serve: an MF=10 section with no MF=3 sibling is dropped by all
-                # of them (the h5 build warns and stores nothing;
-                # PendfTapeLibrary mirrors it), so decorating one would put a
-                # chain row that collapses to a silent zero. Excluded here --
-                # before any candidate enumeration or stats counting -- so a
-                # tape-built chain is identical to an h5-built one. Serving
-                # these instead would mean synthesizing the total from
-                # Sum(MF=10) at BUILD time: deferred, not done here.
-                if (3, mt) not in ev.section:
+                # An MF=10 section with no MF=3 sibling carries no total of its
+                # own. Unless --emit-mf10-only-reactions is set it is EXCLUDED
+                # here -- before any candidate enumeration or stats counting --
+                # because with the flag off no source form serves it (a new h5
+                # filters its stamped groups the same way), so decorating one
+                # would put a chain row that collapses to a silent zero. Under
+                # the flag a NAMED MT is served with the union-grid partial sum
+                # as its total, matching the h5 build; MT=5 (lumped channel) and
+                # MT=18 (fission placeholders) stay excluded either way.
+                mf3_less = (3, mt) not in ev.section
+                if mf3_less and (not self.emit_mf10_only or mt in (5, 18)):
                     self._record_mf10_without_mf3(ev, name, mt)
                     continue
-                fo = io.StringIO(ev.section[3, mt])
-                get_head_record(fo)
-                (qm, qi, _l1, _lr), _tab = get_tab1_record(fo)
+                qm = qi = None
+                if not mf3_less:
+                    fo = io.StringIO(ev.section[3, mt])
+                    get_head_record(fo)
+                    (qm, qi, _l1, _lr), _tab = get_tab1_record(fo)
                 partials = []
                 for pqm, pqi, izap, lfs, _ptab in _iter_mf10_partials(
                         ev, mt, name):
                     partials.append(dict(
                         lfs=int(lfs), izap=int(izap), qi=float(pqi),
                         qm=float(pqm), elfs=float(pqm - pqi)))
+                if mf3_less:
+                    if not partials:
+                        # Nothing to synthesize a total from: undecorable after
+                        # all, booked like a flag-off exclusion.
+                        self._record_mf10_without_mf3(ev, name, mt)
+                        continue
+                    # No MF=3 HEAD to read Q from: MF=10 sources them.
+                    qm, qi = _mf10_only_qm_qi(partials)
                 reactions[mt] = dict(qm=float(qm), qi=float(qi),
-                                     partials=partials)
+                                     partials=partials, mf3_less=mf3_less)
             self._data[name] = reactions
             self._tapes[name] = tape
             # The target's own MF=1/451 excitation energy (ELIS, eV); ``None``
@@ -433,6 +537,20 @@ class _AscSource:
                 partials[(int(lfs), int(izap))] = (
                     np.asarray(ptab.x, dtype=float),
                     np.asarray(ptab.y, dtype=float))
+            if (total is None and self.emit_mf10_only and mt not in (5, 18)
+                    and partials):
+                # Served MF=10-only reaction: its total is the union-grid sum of
+                # its own partials, the same arithmetic the h5 build stores
+                # (``openmc.data.pendf._synthesize_mf10_total``), so the audit
+                # sees identical numbers from either source form. The sum equals
+                # the partials by construction, which is why such a reaction can
+                # never be an audit offender or be band-rejected.
+                grids = [pe for pe, _pxs in partials.values()]
+                e = np.unique(np.concatenate(grids))
+                xs = np.zeros_like(e)
+                for pe, pxs in partials.values():
+                    xs = xs + np.interp(e, pe, pxs, left=0.0, right=0.0)
+                total = (e, xs)
             cache[mt] = dict(total=total, partials=partials)
         self._xs_cache_name = nuclide
         self._xs_cache = cache
@@ -474,17 +592,24 @@ class _AscSource:
         pass
 
 
-def open_pendf_source(path, library=None):
-    """Return the PENDF source adapter for ``path`` (h5 file or ASC directory)."""
+def open_pendf_source(path, library=None, emit_mf10_only_reactions=False):
+    """Return the PENDF source adapter for ``path`` (h5 file or ASC directory).
+
+    ``emit_mf10_only_reactions`` is handed to whichever adapter is built, so the
+    MF=10-without-MF=3 class is visible -- or invisible -- in BOTH source forms
+    under one switch.
+    """
     path = Path(path)
+    emit = emit_mf10_only_reactions
     if path.is_file() and path.suffix == '.h5':
-        return _H5Source(path)
+        return _H5Source(path, emit_mf10_only_reactions=emit)
     if path.is_dir() and any(path.glob('*.h5')):
-        return _H5Source(path)
+        return _H5Source(path, emit_mf10_only_reactions=emit)
     if path.is_dir():
-        return _AscSource(path, library=library)
+        return _AscSource(path, library=library,
+                          emit_mf10_only_reactions=emit)
     if path.is_file():
-        return _H5Source(path)
+        return _H5Source(path, emit_mf10_only_reactions=emit)
     raise FileNotFoundError(str(path))
 
 
@@ -685,6 +810,91 @@ def _append_note(row, marker):
 
 
 # =============================================================================
+# MF=10-only emission bookkeeping (--emit-mf10-only-reactions)
+# =============================================================================
+
+# Terminal buckets of one examined MF=10-only MT. Every examined reaction lands
+# in exactly one of these or in an ``emitted_*`` counter, which is what makes
+# the reconciliation identity (examined = emitted + Sum(skips)) a real check.
+_MF10_ONLY_SKIPS = (
+    ('skipped_no_name',              'MT maps to no chain reaction'),
+    ('skipped_parent_not_in_chain',  'parent not in chain'),
+    ('skipped_no_target',            'ground target not in chain'),
+    ('skipped_already_present',      'reaction type already in chain'),
+    ('skipped_superseded',           'superseded by another MT'),
+    ('skipped_no_mapped_metastable', 'no metastable mapped into the chain'),
+    ('skipped_rejected',             'audit-rejected (left stock)'),
+    ('skipped_no_ground_partial',    'no usable LFS=0 partial'),
+)
+
+_MF10_ONLY_OUTCOMES = dict(
+    [('emitted_ground_only', 'EMITTED plain (ground-only)'),
+     ('emitted_branched', 'EMITTED branched (isomeric_branching)')]
+    + [(key, f'skipped: {label}') for key, label in _MF10_ONLY_SKIPS])
+
+
+def _new_mf10_only_book():
+    """Fresh counter/record book for the MF=10-only emission pass."""
+    book = dict(examined=0, emitted_ground_only=0, emitted_branched=0, rows=[])
+    for key, _label in _MF10_ONLY_SKIPS:
+        book[key] = 0
+    return book
+
+
+def _mf10_only_open_row(book, parent, mt, r_name, partials):
+    """Open (and count) one examined MF=10-only reaction's log row."""
+    lfs = sorted(int(p['lfs']) for p in partials)
+    products = []
+    for p in partials:
+        izap = int(p['izap'])
+        product = _safe_gnds_name(izap // 1000, izap % 1000)
+        if product not in products:
+            products.append(product)
+    shape = ('ground-only' if all(v == 0 for v in lfs)
+             else ('g+m' if 0 in lfs else 'm-only'))
+    row = dict(parent=parent, mt=mt, reaction=r_name, lfs=lfs,
+               products=products, shape=shape, target='-', q=None,
+               outcome='(pending)')
+    book['examined'] += 1
+    book['rows'].append(row)
+    return row
+
+
+def _mf10_only_note(book, row, key, target=None, q=None, note=None):
+    """Terminate one examined MF=10-only reaction in bucket ``key``.
+
+    ``note`` is a short parenthetical appended to the row's outcome text (e.g.
+    the MT that superseded this one); it never changes the bucket counted.
+    """
+    if book is None:
+        return
+    book[key] = book.get(key, 0) + 1
+    if row is not None:
+        row['outcome'] = _MF10_ONLY_OUTCOMES.get(key, key)
+        if note:
+            row['outcome'] = f"{row['outcome']} ({note})"
+        if target is not None:
+            row['target'] = target
+        if q is not None:
+            row['q'] = q
+
+
+def _mf10_only_row_for(book, parent, mt):
+    """The open row of ``(parent, mt)``, or ``None``."""
+    for row in book['rows']:
+        if row['parent'] == parent and row['mt'] == mt:
+            return row
+    return None
+
+
+def _mf10_only_reconciliation(book):
+    """``(examined, emitted, skipped)`` of the MF=10-only emission pass."""
+    emitted = book['emitted_ground_only'] + book['emitted_branched']
+    skipped = sum(book[key] for key, _label in _MF10_ONLY_SKIPS)
+    return book['examined'], emitted, skipped
+
+
+# =============================================================================
 # Mapping core -- classify each MF=10 metastable partial of a reaction
 # =============================================================================
 
@@ -819,18 +1029,24 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     ``metastable-only MF=10 (no LFS=0)`` in its audit row's ``notes``. Purely a
     report: no rejection or decoration decision depends on it.
 
-    Sections the SOURCE excluded as undecorable -- an MF=10 with no MF=3 sibling,
-    visible only to the ASC-tape adapter -- are carried through to
+    Sections the SOURCE excluded as undecorable -- an MF=10 with no MF=3 sibling
+    that the source is not serving -- are carried through to
     ``stats['mf10_without_mf3']`` / ``['mf10_without_mf3_list']`` for the console
     and log so the class stays greppable; they never reach the counters above.
+
+    When the source serves that class (``--emit-mf10-only-reactions``; both
+    adapters expose it as ``source.emit_mf10_only``), its reactions arrive marked
+    ``mf3_less`` and are decorated like any other -- a ground-only one is queued
+    with an empty metastable set so :func:`decorate_chain` emits a plain
+    reaction. Every examined MF=10-only MT is booked in ``stats['mf10_only']``,
+    which reconciles as ``examined = emitted + Sum(skips)``.
     """
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
 
-    # Tape sections the source excluded as undecorable (MF=10 with no MF=3).
-    # Only an ASC-tape source can see this class -- an h5 library cannot carry
-    # it -- so an h5 run legitimately reports zero.
-    mf10_without_mf3 = list(getattr(source, 'mf10_without_mf3', []))
+    # MF=10-only emission book (empty and unreported unless the flag is on).
+    mf10_only_enabled = bool(getattr(source, 'emit_mf10_only', False))
+    mf10_only = _new_mf10_only_book()
 
     isomer_mappings = []          # matched-in-chain rows (per-parent tables)
     elis_errors = []              # rtol_exceeded / no_dk / zero_elis
@@ -870,14 +1086,49 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
 
         for mt, rxinfo in sorted(reactions.items()):
             r_name = _MT_TO_NAME.get(mt)
-            if r_name is None:
-                continue  # MT not a depletion reaction (e.g. MT=5 lumped)
             partials = rxinfo['partials']
             if not partials:
                 continue
+            # An MF=10-only reaction (no MF=3 sibling, total = Sum(MF=10)) is
+            # visible only under --emit-mf10-only-reactions; when it is, every
+            # such MT is booked so the emission pass reconciles.
+            mf3_less = bool(rxinfo.get('mf3_less'))
+            if r_name is None:
+                # MT not a depletion reaction (e.g. MT=5 lumped): invisible to
+                # the chain, but still booked when it reached us as MF=10-only.
+                if mf3_less:
+                    _mf10_only_note(
+                        mf10_only,
+                        _mf10_only_open_row(mf10_only, parent, mt, f'MT{mt}',
+                                            partials),
+                        'skipped_no_name')
+                continue
+            mf10_row = (_mf10_only_open_row(mf10_only, parent, mt, r_name,
+                                            partials) if mf3_less else None)
             metastables = [p for p in partials if p['lfs'] != 0]
             if not metastables:
                 ground_only += 1
+                if mf3_less:
+                    # Ground-only MF=10-only MT (the Cr (n,3n) class): queued
+                    # with an empty metastable set, which decorate_chain emits
+                    # as a PLAIN <reaction type Q target> -- no branching child.
+                    ground = next((p for p in partials if p['lfs'] == 0), None)
+                    if ground is None:
+                        _mf10_only_note(mf10_only, mf10_row,
+                                        'skipped_no_ground_partial')
+                    elif not parent_in_chain:
+                        _mf10_only_note(mf10_only, mf10_row,
+                                        'skipped_parent_not_in_chain')
+                    elif r_name in branching[parent]:
+                        # Another MT of this parent already claimed the reaction
+                        # name (e.g. MT=103 and MT=600 are both '(n,p)').
+                        _mf10_only_note(mf10_only, mf10_row,
+                                        'skipped_already_present')
+                    else:
+                        branching[parent][r_name] = dict(
+                            mt=mt, ground=ground, qm=rxinfo['qm'],
+                            qi=rxinfo['qi'], metastables=[],
+                            parent_elis=parent_elis, mf3_less=True)
                 continue
 
             total_lfs += len(metastables)
@@ -1088,13 +1339,44 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
             # the collapse's MF=3 fallback routes the total to the ground target.
             if mapped and parent_in_chain and not reject_this:
                 ground = next((p for p in partials if p['lfs'] == 0), None)
+                prev = branching[parent].get(r_name)
+                if prev is not None and prev.get('mf3_less'):
+                    # This reaction name was already queued by ANOTHER MF=10-only
+                    # MT of the same parent (several MTs share one chain reaction
+                    # name -- MT=16 and MT=875..891 are all '(n,2n)'). The
+                    # newcomer overwrites it below (last wins, the pre-existing
+                    # idiom for name-colliding MTs); terminate the DISPLACED
+                    # entry's row here -- whatever its shape -- so the emission
+                    # reconciliation identity stays exact instead of leaving a
+                    # '(pending)' row behind.
+                    _mf10_only_note(
+                        mf10_only,
+                        _mf10_only_row_for(mf10_only, parent, prev['mt']),
+                        'skipped_superseded', note=f'MT={mt}')
                 branching[parent][r_name] = dict(
                     mt=mt, ground=ground, qm=rxinfo['qm'], qi=rxinfo['qi'],
-                    metastables=mapped, parent_elis=parent_elis)
+                    metastables=mapped, parent_elis=parent_elis,
+                    mf3_less=mf3_less)
             elif not mapped:
                 # MF=10 metastables present but none mapped into the chain:
                 # the base reaction is left stock.
                 ground_only += 1
+                if mf3_less:
+                    _mf10_only_note(mf10_only, mf10_row,
+                                    'skipped_no_mapped_metastable')
+            elif mf3_less and not parent_in_chain:
+                _mf10_only_note(mf10_only, mf10_row,
+                                'skipped_parent_not_in_chain')
+            elif mf3_less:
+                # Mapped and in chain, so the audit gate is what stopped it.
+                _mf10_only_note(mf10_only, mf10_row, 'skipped_rejected')
+
+    # Sections the source excluded as undecorable (MF=10 with no MF=3). Both
+    # adapters report the class: the tape adapter fills its list eagerly while
+    # parsing the tapes, the h5 adapter lazily as ``reactions()`` walks each
+    # nuclide's stamped ``total_source='sum-mf10'`` groups -- so the snapshot is
+    # taken AFTER the loop above, never before it.
+    mf10_without_mf3 = list(getattr(source, 'mf10_without_mf3', []))
 
     # Unique base names absent from the decay library, grouped by lookup_liso
     # status (no_decay_data / no_metastables / no_match).
@@ -1121,6 +1403,17 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         metastable_only=metastable_only,
         mf10_without_mf3=len(mf10_without_mf3),
         mf10_without_mf3_list=mf10_without_mf3,
+        # True only for an h5 built WITH MF=10-only totals (root attr present):
+        # such a library can carry the class, which the log section says. An
+        # older h5 -- like a tape run -- keeps the original wording.
+        mf10_without_mf3_from_h5=(
+            getattr(source, 'kind', None) == 'h5'
+            and getattr(source, 'mf10_only_totals', None) is not None),
+        # MF=10-only emission (--emit-mf10-only-reactions); the counters and the
+        # log section are reported ONLY when the flag is on, so a flag-off run's
+        # console and log stay byte-identical to a run without the feature.
+        mf10_only_enabled=mf10_only_enabled,
+        mf10_only=mf10_only,
         isomer_mappings=isomer_mappings,
         elis_errors=elis_errors,
         products_not_in_chain_errors=products_not_in_chain,
@@ -1174,6 +1467,37 @@ def _note_mg_ground(stats, parent, r_name, marker, skipped=False):
             _append_note(row, marker)
 
 
+def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row):
+    """Append the PLAIN ground reaction of a ground-only MF=10-only MT.
+
+    The Cr ``(n,3n)`` class: an MT the library serves with a total synthesized
+    from MF=10 partials, whose only partial is LFS=0. It carries no isomeric
+    branching, so it is appended as a stock ``<reaction type Q target>`` --
+    ``pendf_lfs`` left ``None`` so the writer never folds it into an
+    ``<isomeric_branching>`` element.
+
+    Target resolution follows the existing synthesized-ground path (the
+    reaction's ``(dA, dZ)`` shift, :func:`_ground_product`) and Q is the LFS=0
+    partial's QI -- section-sourced, never fabricated. Returns 1 when a reaction
+    was appended, else 0 (an already-present reaction type or an unresolvable /
+    off-chain target is skipped and counted).
+    """
+    if any(rx.type == r_name for rx in nuc.reactions):
+        # Idempotency: re-running the patcher on an already-patched chain, or a
+        # base chain that harvested this MT from another source.
+        _mf10_only_note(book, row, 'skipped_already_present')
+        return 0
+    daughter = _ground_product(z, a, r_name)
+    if daughter is None or daughter not in chain.nuclide_dict:
+        _mf10_only_note(book, row, 'skipped_no_target',
+                        target=(daughter or '-'))
+        return 0
+    q = float(info['ground']['qi'])
+    nuc.add_reaction(r_name, daughter, q, 1.0)
+    _mf10_only_note(book, row, 'emitted_ground_only', target=daughter, q=q)
+    return 1
+
+
 def decorate_chain(chain, branching, stats=None):
     """Add ground + qualified metastable ReactionTuples to the chain in place.
 
@@ -1184,11 +1508,36 @@ def decorate_chain(chain, branching, stats=None):
 
     ``stats`` (the :func:`map_library` dict) is an optional sink for the
     metastable-parent ``(n,n')`` ground bookkeeping -- see
-    :func:`_note_mg_ground`.
+    :func:`_note_mg_ground` -- and for the MF=10-only emission counters
+    (``stats['mf10_only']``). The decoration itself never depends on it.
+
+    A reaction marked ``mf3_less`` (served only under
+    ``--emit-mf10-only-reactions``) takes one of three shapes:
+
+    * **ground-only** -- no metastable pathway at all: a PLAIN
+      ``<reaction type Q target>`` is appended (``pendf_lfs`` unset, so the
+      writer never folds it), with the target from the reaction's ``(dA, dZ)``
+      shift and Q from the LFS=0 partial's QI.
+    * **ground + metastable(s)** -- the ordinary added-reaction path, unchanged;
+      its Q values are now MF=10-section-sourced rather than MF=3-sourced.
+    * **metastable-only** -- folded with ``ground = None`` (a branched element
+      whose members are all metastable): there is neither an LFS=0 partial nor
+      an MF=3 total to serve a ground row from, and the metastable partials
+      already sum to the reaction's synthesized total. One exception, by
+      precedence: the two ``(n,n')`` branches below are taken first, so an
+      MF=10-only ``(n,n')`` (MT=4 or a level MT) still receives a synthesized
+      ground member -- the m->g transition for a metastable parent, the
+      ``target == parent`` self-loop otherwise. Harmless in both cases: a
+      self-loop is a depletion-matrix no-op, and the collapse serves that
+      ground row by balance as identically zero (the metastable partials
+      already sum to the synthesized total).
     """
     if stats is not None:
         stats.setdefault('mg_ground_synthesized', 0)
         stats.setdefault('mg_ground_skipped', 0)
+    book = stats.get('mf10_only') if stats is not None else None
+    rows = ({(r['parent'], r['mt']): r for r in book['rows']}
+            if book is not None else {})
     reactions_added = 0
     for parent, reactions in branching.items():
         nuc = chain[parent]
@@ -1196,7 +1545,13 @@ def decorate_chain(chain, branching, stats=None):
         folded_members = {}
         for r_name, info in reactions.items():
             metastables = info['metastables']
+            mf3_less = bool(info.get('mf3_less'))
+            row = rows.get((parent, info.get('mt')))
             if not metastables:
+                # Ground-only MF=10-only MT: a plain reaction, no branching.
+                if mf3_less:
+                    reactions_added += _emit_mf10_only_ground(
+                        nuc, chain, z, a, r_name, info, book, row)
                 continue
             existing = next((rx for rx in nuc.reactions if rx.type == r_name),
                             None)
@@ -1232,6 +1587,8 @@ def decorate_chain(chain, branching, stats=None):
                         _note_mg_ground(
                             stats, parent, r_name,
                             f"m->g (n,n') left stock: {reason}", skipped=True)
+                        if mf3_less:
+                            _mf10_only_note(book, row, 'skipped_no_target')
                         continue
                     ground = ReactionTuple(r_name, target, float(elis), 1.0, 0)
                     _note_mg_ground(
@@ -1240,6 +1597,13 @@ def decorate_chain(chain, branching, stats=None):
                         f"Q=+{float(elis):.1f} eV")
                 elif r_name == "(n,n')":
                     ground = ReactionTuple(r_name, parent, 0.0, 1.0, 0)
+                elif mf3_less and info['ground'] is None:
+                    # METASTABLE-ONLY MF=10-only MT (no LFS=0 partial, and no
+                    # MF=3 total either): nothing can serve a ground row, and
+                    # the metastable partials already sum to the reaction's
+                    # synthesized total. Fold metastable-only rather than
+                    # inventing a ground pathway the library cannot serve.
+                    ground = None
                 else:
                     daughter = _ground_product(z, a, r_name)
                     if daughter is None or daughter not in chain.nuclide_dict:
@@ -1259,6 +1623,12 @@ def decorate_chain(chain, branching, stats=None):
                     f"{r_name}_m{m['liso']}", m['product'], float(m['qi']),
                     1.0, m['lfs']))
             folded_members[r_name] = members
+            if mf3_less:
+                _mf10_only_note(
+                    book, row, 'emitted_branched',
+                    target=(ground.target if ground is not None
+                            else members[0].target),
+                    q=(ground.Q if ground is not None else members[0].Q))
 
         # Rebuild the reaction list: replace each decorated base (and any of its
         # pre-existing _m qualifiers) in place; append newly-added MTs at end.
@@ -1372,6 +1742,17 @@ def print_stats(stats, mode):
     print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
     print(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}")
     print(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}")
+    if stats.get('mf10_only_enabled'):
+        # Only with --emit-mf10-only-reactions, so a flag-off run's console and
+        # log blocks stay byte-identical to a run without the feature.
+        book = stats['mf10_only']
+        examined, emitted, skipped = _mf10_only_reconciliation(book)
+        print(f"               MF=10-only emitted (ground-only): {book['emitted_ground_only']:5d}")
+        print(f"                  MF=10-only emitted (branched): {book['emitted_branched']:5d}")
+        print(f"                MF=10-only skipped (left stock): {skipped:5d}")
+        print(f"          MF=10-only examined (= emitted+skips): {examined:5d}"
+              f"   [{emitted} + {skipped}"
+              f"{'' if examined == emitted + skipped else ' -- MISMATCH'}]")
     print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
     print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
@@ -1799,32 +2180,65 @@ def _write_lfs_sentinel_section(f, sentinels):
                 f"{s.get('method', ''):<10}  {s.get('outcome', ''):<44}\n")
 
 
-def _write_mf10_without_mf3_section(f, records):
-    """MF=10 WITHOUT MF=3 section: tape sections excluded as not decorable.
+def _write_mf10_without_mf3_section(f, records, emit_enabled=False,
+                                    from_h5=False):
+    """MF=10 WITHOUT MF=3 section: sections excluded as not decorable.
 
-    Only the ASC-tape source can observe this class (an h5 library stores no
-    such MT at all), so an h5-sourced run always reports none -- that asymmetry
-    is the point of the remedy, not a gap. Listed unconditionally, like the
-    other audit sections, so the exclusion is greppable rather than silent.
+    With ``--emit-mf10-only-reactions`` off (``emit_enabled=False``) and nothing
+    recorded from an HDF5 source (``from_h5=False``) the wording is the original
+    one, so such a run's log is byte-identical to a run without the feature. The
+    two flags select the wording that is true of the run actually made: an h5
+    built with MF=10-only totals DOES carry the class (its stamped groups are
+    filtered out and recorded here), and with the flag on the class is served
+    and reported in the MF=10-ONLY EMISSION section instead.
+
+    Listed unconditionally, like the other audit sections, so the exclusion is
+    greppable rather than silent.
     """
     f.write("\n\n" + "=" * 220 + "\n")
     f.write("MF=10 WITHOUT MF=3 (NOT DECORABLE)\n")
     f.write("=" * 220 + "\n\n")
-    f.write("Tape sections carrying MF=10 isomeric production for an MT with "
-            "NO MF=3 total. Every PENDF library source form the collapse can "
-            "read -- pointwise HDF5,\n")
-    f.write("grouped HDF5, and the ASC-tape adapter -- drops such an MT (a "
-            "total is never synthesized from the partials), so a chain "
-            "reaction decorated from one would\n")
-    f.write("collapse to a silent zero row. They are therefore excluded from "
-            "the decoration candidates BEFORE any counting above, making a "
-            "tape-sourced run identical to an\n")
-    f.write("h5-sourced one. Only NAMED transmutation MTs are listed: MT=5 "
-            "(lumped residual) and MT=18 (fission) map to no chain reaction "
-            "and were never candidates.\n\n")
+    if emit_enabled or from_h5:
+        f.write("Library sections carrying MF=10 isomeric production for an MT "
+                "with NO MF=3 total. Such an MT has no total of its own unless "
+                "one is synthesized from\n")
+        f.write("its partials, which the HDF5 builder does (stamping the "
+                "reaction group 'total_source=sum-mf10') and which the chain "
+                "patcher consumes only under\n")
+        f.write("--emit-mf10-only-reactions. The sections listed here are the "
+                "ones this run did NOT decorate: with the flag off that is the "
+                "whole class, in either source\n")
+        f.write("form (an h5's stamped groups are filtered out exactly as the "
+                "tape adapter excludes the same sections, so the two stay "
+                "identical); with the flag on only MT=5\n")
+        f.write("and MT=18 remain excluded, and the served ones are reported "
+                "in the MF=10-ONLY EMISSION section. Only NAMED transmutation "
+                "MTs are listed: MT=5 (lumped\n")
+        f.write("residual) and MT=18 (fission) map to no chain reaction and "
+                "were never candidates.\n\n")
+    else:
+        f.write("Tape sections carrying MF=10 isomeric production for an MT "
+                "with NO MF=3 total. Every PENDF library source form the "
+                "collapse can read -- pointwise HDF5,\n")
+        f.write("grouped HDF5, and the ASC-tape adapter -- drops such an MT (a "
+                "total is never synthesized from the partials), so a chain "
+                "reaction decorated from one would\n")
+        f.write("collapse to a silent zero row. They are therefore excluded "
+                "from the decoration candidates BEFORE any counting above, "
+                "making a tape-sourced run identical to an\n")
+        f.write("h5-sourced one. Only NAMED transmutation MTs are listed: MT=5 "
+                "(lumped residual) and MT=18 (fission) map to no chain reaction "
+                "and were never candidates.\n\n")
     if not records:
-        f.write("No MF=10 sections without an MF=3 total "
-                "(an HDF5 source can never carry any).\n")
+        if emit_enabled:
+            f.write("No MF=10 sections without an MF=3 total were left "
+                    "undecorated (--emit-mf10-only-reactions is ON).\n")
+        elif from_h5:
+            f.write("No MF=10 sections without an MF=3 total "
+                    "(this HDF5 library carries none).\n")
+        else:
+            f.write("No MF=10 sections without an MF=3 total "
+                    "(an HDF5 source can never carry any).\n")
         return
     meta = sum(1 for r in records if r.get('metastable'))
     f.write(f"Total sections excluded: {len(records)}  "
@@ -1839,6 +2253,73 @@ def _write_mf10_without_mf3_section(f, records):
         f.write(f"{r['parent']:<12}  {r['mt']:>5}  {r['reaction']:<12}  "
                 f"{lfs:<16}  {products:<28}  "
                 f"{'yes' if r.get('metastable') else 'no':<10}\n")
+
+
+def _write_mf10_only_section(f, book):
+    """MF=10-ONLY EMISSION section: every MT served without an MF=3 total.
+
+    Written only when ``--emit-mf10-only-reactions`` is on, so a flag-off log is
+    byte-identical to one from a build without the feature. Carries the counter
+    block, the reconciliation identity, and one row per examined MT (emitted or
+    skipped, with the reason).
+    """
+    examined, emitted, skipped = _mf10_only_reconciliation(book)
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("MF=10-ONLY EMISSION (--emit-mf10-only-reactions)\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("MTs whose library data is MF=10 isomeric production with NO MF=3 "
+            "total. Their total is the union-grid SUM of their own partials "
+            "(each event ends in exactly\n")
+    f.write("one final state, so the sum IS the total) -- synthesized by the "
+            "HDF5 builder and stamped 'total_source=sum-mf10', and reproduced "
+            "identically by the ASC-tape\n")
+    f.write("adapter. Q values come from the MF=10 section itself (QM = "
+            "section QM; ground Q = the LFS=0 partial's QI), never fabricated. "
+            "MT=5 (lumped residual) and MT=18\n")
+    f.write("(fission placeholders) are never emitted; they stay in the MF=10 "
+            "WITHOUT MF=3 section.\n\n")
+    f.write("Emission shapes: a ground-only MT becomes a PLAIN reaction (no "
+            "isomeric_branching child); a ground+metastable MT decorates "
+            "normally; a metastable-only MT\n")
+    f.write("folds with metastable members only (no ground row exists to "
+            "serve). Products are always ELIS-mapped -- an MF=10 LFS is a level "
+            "index, never an isomer ordinal.\n\n")
+    f.write("Audit note: these MTs are VACUOUS to the MF=10-vs-MF=3 audit BY "
+            "CONSTRUCTION -- their total is the partial sum, so every band "
+            "ratio is 1.0 and the worst\n")
+    f.write("deviation is 0 (up to float round-off). They can never be audit "
+            "offenders and can never be band-rejected; that silence is "
+            "expected, not a gap.\n\n")
+    counters = [('Emitted plain (ground-only)', book['emitted_ground_only']),
+                ('Emitted branched (g+m / m-only)', book['emitted_branched'])]
+    counters += [(f'Skipped: {label}', book[key])
+                 for key, label in _MF10_ONLY_SKIPS]
+    width = max(len(label) for label, _n in counters)
+    for label, n in counters:
+        f.write(f"  {label:<{width}}  {n:6d}\n")
+    f.write("-" * (width + 10) + "\n")
+    f.write(f"  Reconciliation: examined MF=10-only MTs = emitted + skips = "
+            f"{examined} = {emitted} + {skipped}"
+            f"{'' if examined == emitted + skipped else '   *** MISMATCH ***'}"
+            "\n\n")
+    if not book['rows']:
+        f.write("No MF=10-only MTs were examined (the library carries none, or "
+                "it predates MF=10-only totals).\n")
+        return
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'Shape':<12}  "
+              f"{'LFS':<16}  {'Product(s)':<28}  {'Target':<12}  "
+              f"{'Q[eV]':>16}  {'Outcome':<44}")
+    sep = "-" * len(header)
+    f.write(header + "\n" + sep + "\n")
+    for r in sorted(book['rows'], key=lambda x: (x['parent'], x['mt'])):
+        lfs = ", ".join(str(v) for v in r.get('lfs', []))
+        products = ", ".join(r.get('products', []))
+        q = r.get('q')
+        q_str = f"{q:.4e}" if q is not None else "-"
+        f.write(f"{r['parent']:<12}  {r['mt']:>5}  {r['reaction']:<12}  "
+                f"{r['shape']:<12}  {lfs:<16}  {products:<28}  "
+                f"{r.get('target', '-'):<12}  {q_str:>16}  "
+                f"{r.get('outcome', ''):<44}\n")
 
 
 def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
@@ -1921,6 +2402,15 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
         f.write(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}\n")
         f.write(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}\n")
+        if stats.get('mf10_only_enabled'):
+            book = stats['mf10_only']
+            examined, emitted, skipped = _mf10_only_reconciliation(book)
+            f.write(f"               MF=10-only emitted (ground-only): {book['emitted_ground_only']:5d}\n")
+            f.write(f"                  MF=10-only emitted (branched): {book['emitted_branched']:5d}\n")
+            f.write(f"                MF=10-only skipped (left stock): {skipped:5d}\n")
+            f.write(f"          MF=10-only examined (= emitted+skips): {examined:5d}"
+                    f"   [{emitted} + {skipped}"
+                    f"{'' if examined == emitted + skipped else ' -- MISMATCH'}]\n")
         f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
@@ -2014,7 +2504,11 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         _write_absent_decay_section(f, stats.get('absent_by_status', {}))
         _write_lfs_sentinel_section(f, stats.get('lfs_sentinels', []))
         _write_mf10_without_mf3_section(
-            f, stats.get('mf10_without_mf3_list', []))
+            f, stats.get('mf10_without_mf3_list', []),
+            emit_enabled=bool(stats.get('mf10_only_enabled')),
+            from_h5=bool(stats.get('mf10_without_mf3_from_h5')))
+        if stats.get('mf10_only_enabled'):
+            _write_mf10_only_section(f, stats['mf10_only'])
 
     print(f"Isomer mapping log written to: {log_file}")
 
@@ -2027,7 +2521,7 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
          log_file=None, mapping_mode='elis', elis_rtol=ELIS_RTOL,
          elis_atol=ELIS_ATOL, verbose=True, library=None, reject_rtol=None,
          audit_emax=2.0e7, reject_band_ratio=None,
-         prune_nn_prime_self_loops=False):
+         prune_nn_prime_self_loops=False, emit_mf10_only_reactions=False):
     """Patch a chain with PENDF MF=10 isomeric branching. Returns the Chain."""
     if decay_file is None:
         raise ValueError("decay_file is required for isomeric branching.")
@@ -2048,9 +2542,16 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     print(f"  Loaded {len(chain.nuclides)} nuclides")
 
     print("\nStep 2: Opening PENDF source...")
-    source = open_pendf_source(pendf_path, library=library)
+    source = open_pendf_source(
+        pendf_path, library=library,
+        emit_mf10_only_reactions=emit_mf10_only_reactions)
     print(f"  Backend: {source.kind}; nuclides: {len(source.nuclides)}; "
           f"library: {source.library}")
+    if emit_mf10_only_reactions:
+        # Printed only under the flag, so a flag-off console log is unchanged.
+        print("  MF=10-only emission: ON (MTs with MF=10 partials but no MF=3 "
+              "total are served with their partial sum as the total; "
+              "MT=5/MT=18 excluded)")
     if source.kind == 'h5' and source.mapping not in (None, 'elis', 'lfs_order'):
         print(f"  NOTE: PENDF library mapping attr = {source.mapping!r}")
 
@@ -2191,6 +2692,8 @@ if __name__ == '__main__':
     print(f"Tolerances:   rtol={args.rtol}, atol={args.atol}")
     if args.prune_nn_prime_self_loops:
         print("Prune (n,n') self-loops: ENABLED")
+    if args.emit_mf10_only_reactions:
+        print("Emit MF=10-only reactions: ENABLED")
     print(f"Audit emax:   {args.audit_emax:.3e} eV")
     if args.mf10_reject_rtol is None and args.mf10_reject_band_ratio is None:
         print("MF=10 reject: off (audit only)")
@@ -2215,7 +2718,8 @@ if __name__ == '__main__':
          verbose=verbose, library=args.library,
          reject_rtol=args.mf10_reject_rtol, audit_emax=args.audit_emax,
          reject_band_ratio=args.mf10_reject_band_ratio,
-         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops)
+         prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
+         emit_mf10_only_reactions=args.emit_mf10_only_reactions)
 
     print("\n" + "=" * 70)
     print("Done. Chain saved to:", output_chain)
