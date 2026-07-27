@@ -1901,7 +1901,7 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'single_target_suppressed', 'repaired_dropped_no_metastable',
         'pathway_q_corrections', 'pathway_q_qm_disagreements',
         'pathway_q_rejected', 'q_from_mf10', 'q_from_elis', 'q_replicated',
-        'q_chain_anchored'
+        'q_chain_anchored', 'q_zero_anchor'
     """
     tree = ET.parse(original_xml_file)
     root = tree.getroot()
@@ -1920,6 +1920,7 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'q_from_elis': 0,   # ... from the legacy gq - ELIS (no QM/QI pair)
         'q_replicated': 0,  # pathway Q slots replicated (no QM/QI, no ELIS)
         'q_chain_anchored': 0,  # ... kept legacy because the gate refused
+        'q_zero_anchor': 0,  # reactions whose gate was skipped (chain Q = 0)
         'pathway_q_corrections': [],  # slots that differ from the legacy fold
         'pathway_q_qm_disagreements': [],  # non-uniform QM within one section
         'pathway_q_rejected': [],  # reactions whose file QM failed the gate
@@ -2161,11 +2162,19 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 # (0.0 for every ground-parent MT=4 section, 424/424), so
                 # "disagreement" is the very defect being fixed. A reaction with
                 # no scalar Q has nothing to check against and keeps the file.
+                # An explicit Q="0.0" is the evaluators' missing-Q placeholder,
+                # never a physical transmutation Q: it anchors nothing, so the
+                # gate is skipped (file values kept) and the reaction counted.
                 file_ground_qm = ground_qm if ground_qm is not None else section_qm
+                q_zero_anchor = (
+                    branching.mt != 4 and scalar_q is not None
+                    and gq == 0.0 and file_ground_qm is not None)
                 q_chain_reject = (
                     branching.mt != 4 and scalar_q is not None
-                    and file_ground_qm is not None
+                    and gq != 0.0 and file_ground_qm is not None
                     and abs(file_ground_qm - gq) > PATHWAY_Q_CHAIN_TOL)
+                if q_zero_anchor:
+                    summary['q_zero_anchor'] += 1
 
                 q_values, q_legacy, q_sources = [], [], []
                 q_refused = []  # file values the gate threw away (ledger only)
@@ -2648,20 +2657,22 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                        if stats else [])
         q_rejected = stats.get('pathway_q_rejected', []) if stats else []
         if pathway_q:
-            f.write(f"                      Pathway-Q QM/QI-corrected: {len(pathway_q):5d}\n")
+            f.write(f"                          Pathway-Q QM/QI-corrected: {len(pathway_q):5d}\n")
         if q_rejected:
-            f.write(f"         Pathway-Q file QM rejected (reactions): {len(q_rejected):5d}\n")
+            f.write(f"             Pathway-Q file QM rejected (reactions): {len(q_rejected):5d}\n")
         if stats is not None:
             # Both counters always: a fallback-heavy run must be visible here,
             # not only by its absence from the corrections list.
-            f.write(f"               Pathway-Q slots from MF=10 QM/QI: {stats.get('q_from_mf10', 0):5d}\n")
+            f.write(f"                   Pathway-Q slots from MF=10 QM/QI: {stats.get('q_from_mf10', 0):5d}\n")
             if stats.get('q_from_elis'):
-                f.write(f"           Pathway-Q slots from ELIS arithmetic: {stats['q_from_elis']:5d}\n")
+                f.write(f"               Pathway-Q slots from ELIS arithmetic: {stats['q_from_elis']:5d}\n")
             if stats.get('q_chain_anchored'):
-                f.write(f"          Pathway-Q slots chain-anchored (gate): {stats['q_chain_anchored']:5d}\n")
-            f.write(f"          Pathway-Q slots replicated (scalar Q): {stats.get('q_replicated', 0):5d}\n")
+                f.write(f"Pathway-Q slots chain-anchored (gate, incl. ground): {stats['q_chain_anchored']:5d}\n")
+            # Unconditional: a skipped gate is a silent non-event otherwise.
+            f.write(f"       Pathway-Q gate skipped (zero-Q chain anchor): {stats.get('q_zero_anchor', 0):5d}\n")
+            f.write(f"              Pathway-Q slots replicated (scalar Q): {stats.get('q_replicated', 0):5d}\n")
         if qm_disagree:
-            f.write(f"             Pathway-Q QM disagreement sections: {len(qm_disagree):5d}\n")
+            f.write(f"                 Pathway-Q QM disagreement sections: {len(qm_disagree):5d}\n")
         f.write("\n")
 
         # Policy 3(a): metastable-only MF=10 (stable ground omitted by the
@@ -3702,8 +3713,13 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
               f"file ground QM more than {_q_str(PATHWAY_Q_CHAIN_TOL)} eV from "
               "the chain's scalar Q; their file values were REFUSED and the "
               "chain-anchored legacy values kept "
-              f"({summary['q_chain_anchored']} slot(s)); see PATHWAY-Q FILE-QM "
-              "REJECTED in the mapping log")
+              f"({summary['q_chain_anchored']} slot(s) incl. ground); see "
+              "PATHWAY-Q FILE-QM REJECTED in the mapping log")
+
+    if summary['q_zero_anchor']:
+        print(f"Pathway-Q gate skipped: {summary['q_zero_anchor']} reaction(s) "
+              "carry a chain Q of exactly 0 (missing-Q placeholder, not an "
+              "anchor); their file QM/QI values were kept")
 
     if summary['q_replicated']:
         print(f"WARNING: {summary['q_replicated']} pathway-Q slot(s) had no "
@@ -3765,6 +3781,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             'q_from_elis': summary['q_from_elis'],
             'q_replicated': summary['q_replicated'],
             'q_chain_anchored': summary['q_chain_anchored'],
+            'q_zero_anchor': summary['q_zero_anchor'],
         }
         write_isomer_mapping_log(summary['elis_mappings'], isomer_mapping_log_file,
                                 stats=stats, elis_errors=elis_errors,

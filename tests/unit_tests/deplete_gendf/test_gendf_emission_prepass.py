@@ -663,3 +663,48 @@ def test_pathway_q_file_qm_gated_against_chain_scalar(tmp_path, qm_offset,
         [rec] = summary["pathway_q_corrections"]
         assert rec["source"] == ["QM", "QI"] and rec["q_legacy"] == legacy
         assert summary["q_from_mf10"] == 2 and summary["q_chain_anchored"] == 0
+
+
+def test_pathway_q_zero_chain_anchor_exempts_the_gate(tmp_path):
+    """A chain Q of exactly 0 is a missing-Q placeholder, not an anchor.
+
+    Same shape as the refusing parametrisation above (non-MT=4, file ground QM
+    megaelectronvolts away from the chain scalar), except the scalar is the
+    explicit ``Q="0.0"`` some evaluators write when they have no value. Firing
+    the gate there would revert correct file QM/QI to a bogus zero, so the gate
+    is skipped, the file values are kept, and the skip is counted per reaction.
+    """
+    file_qm = _AM241_CHAIN_Q                      # 5.54 MeV from the chain's 0
+    qi_meta = file_qm - _AM242M_ELIS_J40
+
+    chain = openmc.deplete.Chain()
+    am = openmc.deplete.Nuclide("Am241")
+    am.add_reaction("(n,gamma)", "Am242", Q=0.0, branching_ratio=1.0)
+    chain.add_nuclide(am)
+    for name in ("Am242", "Am242_m1"):
+        chain.add_nuclide(openmc.deplete.Nuclide(name))
+    base = tmp_path / "am_zeroq_chain.xml"
+    chain.export_to_xml(str(base))
+
+    sections = {"Am241": {
+        (3, 102): {"sigma": None},
+        (10, 102): {"levels": [
+            dict(_level(0, 95242, file_qm, file_qm), sigma=_Sigma([0.9, 0.6])),
+            dict(_level(2, 95242, file_qm, qi_meta),
+                 sigma=_Sigma([0.1, 0.4]))]}}}
+    decay = {(95, 242): [DecayState(z=95, a=242, elis=0.0, liso=0),
+                         DecayState(z=95, a=242, elis=_AM242M_ELIS_J40, liso=1,
+                                    half_life=4907.0)]}
+    lib = _ToyLib(sections, decay)
+
+    data = lib.process_library_for_branching(mt_list=[102], chain=chain)
+    patched = tmp_path / "am_zeroq_patched.xml"
+    summary = tool.add_branching_to_xml(str(base), data, str(patched), chain,
+                                        verbose=False)
+
+    written = _reaction_elem(patched, "Am241",
+                             "(n,gamma)").find("isomeric_branching").get("Q")
+    assert written.split() == ["5537650.0", "5489587.0"]     # file, unreverted
+    assert summary["pathway_q_rejected"] == []
+    assert summary["q_zero_anchor"] == 1                     # once per reaction
+    assert summary["q_from_mf10"] == 2 and summary["q_chain_anchored"] == 0
