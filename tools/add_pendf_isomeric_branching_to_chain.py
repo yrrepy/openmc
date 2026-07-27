@@ -1464,22 +1464,26 @@ def _half_life(chain, name):
 # Chain decoration -- work at the Chain-object level (never raw XML)
 # =============================================================================
 
-def _note_mg_ground(stats, parent, r_name, marker, skipped=False):
+def _note_mg_ground(stats, parent, r_name, mt, marker, skipped=False):
     """Count + log one metastable-parent ``(n,n')`` ground synthesis or skip.
 
     The counters (``mg_ground_synthesized`` / ``mg_ground_skipped``) print
     unconditionally in the console and log summary blocks; the marker is
     appended to every mapping-log row of ``parent``'s reaction ``r_name``, so a
     synthesized -- or refused -- m->g ground is visible in the Notes column next
-    to the pathways it belongs to, not only in the summary. No-op when
-    :func:`decorate_chain` is called without a ``stats`` sink.
+    to the pathways it belongs to, not only in the summary. The row match is
+    MT-scoped: a name-colliding MT family ((n,p) = MT 103/600-649, (n,2n) = MT
+    16/875-891) shares one reaction name, so parent+name alone would mark rows
+    of an MT this decision never touched. No-op when :func:`decorate_chain` is
+    called without a ``stats`` sink.
     """
     if stats is None:
         return
     key = 'mg_ground_skipped' if skipped else 'mg_ground_synthesized'
     stats[key] = stats.get(key, 0) + 1
     for row in stats.get('isomer_mappings', []):
-        if row.get('parent') == parent and row.get('reaction') == r_name:
+        if (row.get('parent') == parent and row.get('reaction') == r_name
+                and row.get('mt') == mt):
             _append_note(row, marker)
 
 
@@ -1516,8 +1520,11 @@ def _note_pathway_q_reject(stats, parent, r_name, record):
     ``record['q_kept']`` holds one entry per member, so the slot counter credits
     the METASTABLE slots only -- the ground slot is chain-anchored by
     construction and does not move. The reaction count is ``len`` of the record
-    list, which is the number the GENDF patcher reports for the same gate. No-op
-    when :func:`decorate_chain` is called without a ``stats`` sink.
+    list, which is the number the GENDF patcher reports for the same gate. The
+    row match is MT-scoped for the same reason as :func:`_note_mg_ground`: the
+    name-colliding MT families would otherwise take the marker on rows of an MT
+    the gate never judged. No-op when :func:`decorate_chain` is called without a
+    ``stats`` sink.
     """
     if stats is None:
         return
@@ -1525,7 +1532,8 @@ def _note_pathway_q_reject(stats, parent, r_name, record):
     stats['q_chain_anchored'] = (stats.get('q_chain_anchored', 0)
                                  + record['reverted_slots'])
     for row in stats.get('isomer_mappings', []):
-        if row.get('parent') == parent and row.get('reaction') == r_name:
+        if (row.get('parent') == parent and row.get('reaction') == r_name
+                and row.get('mt') == record['mt']):
             _append_note(row, _PATHWAY_Q_REJECT_MARKER)
 
 
@@ -1602,6 +1610,7 @@ def decorate_chain(chain, branching, stats=None):
         stats.setdefault('mg_ground_skipped', 0)
         stats.setdefault('pathway_q_rejected', [])
         stats.setdefault('q_chain_anchored', 0)
+        stats.setdefault('pathway_q_zero_anchor', 0)
     book = stats.get('mf10_only') if stats is not None else None
     rows = ({(r['parent'], r['mt']): r for r in book['rows']}
             if book is not None else {})
@@ -1638,12 +1647,21 @@ def decorate_chain(chain, branching, stats=None):
             # QI(MF=3) = -E(level), a different quantity than QM, so
             # "disagreement" is expected rather than evidence against the file.
             # A reaction absent from the chain has no anchor to check against.
+            # Neither is a chain Q of exactly 0.0: that is the chain reader's
+            # missing-Q default and a systematic evaluation placeholder, never a
+            # physical transmutation Q, so firing on it would rewrite sound file
+            # values to a bogus zero. The skip is counted, not silent.
             chain_q = existing.Q if existing is not None else None
             file_ground_qm = _pathway_q_file_ground_qm(info)
+            q_zero_anchor = (info.get('mt') != 4 and chain_q == 0.0
+                             and file_ground_qm is not None)
             q_chain_reject = (
                 info.get('mt') != 4 and chain_q is not None
-                and file_ground_qm is not None
+                and chain_q != 0.0 and file_ground_qm is not None
                 and abs(file_ground_qm - chain_q) > PATHWAY_Q_CHAIN_TOL)
+            if q_zero_anchor and stats is not None:
+                stats['pathway_q_zero_anchor'] = (
+                    stats.get('pathway_q_zero_anchor', 0) + 1)
 
             if existing is not None:
                 ground = ReactionTuple(r_name, existing.target, existing.Q,
@@ -1675,14 +1693,14 @@ def decorate_chain(chain, branching, stats=None):
                         reason = ('parent MF=1/451 ELIS absent or 0' if not elis
                                   else f'ground {target} not in chain')
                         _note_mg_ground(
-                            stats, parent, r_name,
+                            stats, parent, r_name, info.get('mt'),
                             f"m->g (n,n') left stock: {reason}", skipped=True)
                         if mf3_less:
                             _mf10_only_note(book, row, 'skipped_no_target')
                         continue
                     ground = ReactionTuple(r_name, target, float(elis), 1.0, 0)
                     _note_mg_ground(
-                        stats, parent, r_name,
+                        stats, parent, r_name, info.get('mt'),
                         f"synthesized m->g (n,n') ground: -> {target}, "
                         f"Q=+{float(elis):.1f} eV")
                 elif r_name == "(n,n')":
@@ -1867,8 +1885,9 @@ def print_stats(stats, mode):
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
     print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
     print(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}")
-    print(f"        Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}")
-    print(f"         Pathway-Q slots chain-anchored (gate): {stats.get('q_chain_anchored', 0):5d}")
+    print(f"         Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}")
+    print(f"      Pathway-Q metastable slots chain-anchored: {stats.get('q_chain_anchored', 0):5d}")
+    print(f"   Pathway-Q gate skipped (zero-Q chain anchor): {stats.get('pathway_q_zero_anchor', 0):5d}")
     print(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}")
     print(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}")
 
@@ -2592,8 +2611,9 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
         f.write(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}\n")
-        f.write(f"        Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}\n")
-        f.write(f"         Pathway-Q slots chain-anchored (gate): {stats.get('q_chain_anchored', 0):5d}\n")
+        f.write(f"         Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}\n")
+        f.write(f"      Pathway-Q metastable slots chain-anchored: {stats.get('q_chain_anchored', 0):5d}\n")
+        f.write(f"   Pathway-Q gate skipped (zero-Q chain anchor): {stats.get('pathway_q_zero_anchor', 0):5d}\n")
         if stats.get('nn_prime_prune_enabled'):
             f.write(f"                       Pruned (n,n') self-loops: {stats.get('nn_prime_pruned_count', 0):5d}\n")
         f.write(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}\n")

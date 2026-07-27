@@ -1727,7 +1727,7 @@ def test_pathway_q_reject_logged_and_noted(tmp_path):
     before, section = text.split(title, 1)
     # Summary counters.
     assert "Pathway-Q file QM rejected (reactions):     1" in text
-    assert "Pathway-Q slots chain-anchored (gate):     1" in text
+    assert "Pathway-Q metastable slots chain-anchored:     1" in text
     # Section row: parent, the trigger QM, the anchor, the signed delta.
     assert "Total rejected: 1 reaction(s), 1 metastable slot(s)" in section
     assert "Am241" in section and "5541000.0000" in section
