@@ -1564,3 +1564,273 @@ def test_emit_name_colliding_mts_reconcile(tmp_path):
     assert "MISMATCH" not in text
     assert "= 2 = 1 + 1" in text
     assert "superseded by another MT (MT=875)" in text
+
+
+# ---------------------------------------------------------------------------
+# Pathway-Q chain-consistency gate (GENDF parity)
+# ---------------------------------------------------------------------------
+
+# JEFF-4.0 Am241(n,gamma), the reference case: the file's ground QM sits 3350 eV
+# above the chain's scalar Q, and the chain is the accurate one (9.8 eV from AME
+# Sn(Am242) = 5537640.17, vs the file's 3359.8 -- 344x closer).
+_AM241_CHAIN_Q = 5537650.0
+_AM242M_ELFS = 48063.0          # QM - QI of the mapped LFS=2 level
+
+
+def _am241_decay():
+    return {(95, 242): [
+        DecayState(95, 242, 0.0, 0, half_life=None),
+        DecayState(95, 242, _AM242M_ELFS, 1, half_life=4907.0),
+    ]}
+
+
+def _am241_scene(file_qm):
+    """Chain + source for Am241 (n,gamma) with a chosen file ground QM."""
+    chain = _chain_with(
+        ["Am241", "Am242", "Am242_m1"],
+        reactions={"Am241": [("(n,gamma)", "Am242", _AM241_CHAIN_Q)]})
+    source = _FakeSource({"Am241": {
+        102: dict(qm=file_qm, qi=file_qm, partials=[
+            dict(lfs=0, izap=95242, qi=file_qm, qm=file_qm, elfs=0.0),
+            dict(lfs=2, izap=95242, qi=file_qm - _AM242M_ELFS, qm=file_qm,
+                 elfs=_AM242M_ELFS)]),
+    }})
+    return chain, source
+
+
+@pytest.mark.parametrize("qm_offset, rejected", [(3350.0, True), (0.3, False)])
+def test_pathway_q_file_qm_gated_against_chain_scalar(qm_offset, rejected):
+    # Outside MT=4 a file QM is adopted only if it corroborates the chain Q.
+    # Both offsets are measured magnitudes: 3350 eV is Am241 (n,gamma)'s real
+    # divergence (refused), 0.3 eV the benign post-rounding jitter (adopted).
+    file_qm = _AM241_CHAIN_Q + qm_offset
+    chain, source = _am241_scene(file_qm)
+    branching, stats = map_library(source, chain, _am241_decay(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    rxns = {rx.type: rx for rx in chain["Am241"].reactions}
+
+    # The ground slot is the chain scalar either way -- it never moves.
+    assert rxns["(n,gamma)"].Q == _AM241_CHAIN_Q
+    assert rxns["(n,gamma)"].pendf_lfs == 0
+
+    if rejected:
+        # Metastable reverts to the chain-anchored difference, so both slots
+        # share ONE energy zero.
+        assert rxns["(n,gamma)_m1"].Q == _AM241_CHAIN_Q - _AM242M_ELFS
+        [rec] = stats["pathway_q_rejected"]
+        assert (rec["parent"], rec["reaction"], rec["mt"]) == (
+            "Am241", "(n,gamma)", 102)
+        assert rec["targets"] == ["Am242", "Am242_m1"]
+        assert rec["lfs"] == [0, 2]
+        assert rec["file_ground_qm"] == file_qm
+        assert rec["chain_q"] == _AM241_CHAIN_Q
+        assert rec["delta"] == pytest.approx(3350.0)
+        # Ledgered, written nowhere.
+        assert rec["q_file"] == ["n/a (ground already chain-anchored)",
+                                 file_qm - _AM242M_ELFS]
+        assert rec["q_kept"] == [_AM241_CHAIN_Q,
+                                 _AM241_CHAIN_Q - _AM242M_ELFS]
+        # Only the metastable slot moved.
+        assert rec["reverted_slots"] == 1
+        assert stats["q_chain_anchored"] == 1
+    else:
+        assert rxns["(n,gamma)_m1"].Q == file_qm - _AM242M_ELFS
+        assert stats["pathway_q_rejected"] == []
+        assert stats["q_chain_anchored"] == 0
+
+
+def test_pathway_q_mt4_exempt():
+    # MT=4 is exempt, load-bearingly: the chain scalar is QI(MF=3) = -E(level 1)
+    # while QM is 0.0, a 336 keV gap that at any other MT would refuse the file.
+    # That gap is the quantity mismatch, not evidence against the file.
+    chain = _chain_with(["In115", "In115_m1"],
+                        reactions={"In115": [("(n,n')", "In115", -336240.0)]})
+    source = _FakeSource({"In115": {
+        4: dict(qm=0.0, qi=-336240.0, partials=[
+            dict(lfs=0, izap=49115, qi=0.0, qm=0.0, elfs=0.0),
+            dict(lfs=1, izap=49115, qi=-336244.0, qm=0.0, elfs=336244.0)]),
+    }})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    assert rxns["(n,n')_m1"].Q == -336244.0          # file QI kept
+    assert stats["pathway_q_rejected"] == []
+    assert stats["q_chain_anchored"] == 0
+
+
+def test_pathway_q_no_chain_reaction_exempt():
+    # A reaction absent from the base chain has no anchor to check against: its
+    # ground Q is the LFS=0 partial's QI and the metastables keep their file QI,
+    # however far the file sits from anything.
+    chain = _chain_with(["In115", "In116", "In116_m1"])
+    source = _FakeSource({"In115": {
+        102: dict(qm=1.0e7, qi=1.0e7, partials=[
+            dict(lfs=0, izap=49116, qi=1.0e7, qm=1.0e7, elfs=0.0),
+            dict(lfs=1, izap=49116, qi=1.0e7 - 127270.0, qm=1.0e7,
+                 elfs=127270.0)]),
+    }})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    assert rxns["(n,gamma)"].Q == 1.0e7               # synthesized from LFS=0
+    assert rxns["(n,gamma)_m1"].Q == 1.0e7 - 127270.0
+    assert stats["pathway_q_rejected"] == []
+    assert stats["q_chain_anchored"] == 0
+
+
+@pytest.mark.parametrize("qm_shift, rejected", [(0.0, False), (5000.0, True)])
+def test_pathway_q_metastable_only_uses_sibling_qm(qm_shift, rejected):
+    # No LFS=0 partial: the probe is a mapped metastable's own QM, reconstructed
+    # as QI + ELFS (the classified records carry no 'qm' key).
+    chain_q = 6784720.0
+    elfs = 127270.0
+    qi = chain_q + qm_shift - elfs
+    chain = _chain_with(["In115", "In116", "In116_m1"],
+                        reactions={"In115": [("(n,gamma)", "In116", chain_q)]})
+    source = _FakeSource({"In115": {
+        102: dict(qm=chain_q + qm_shift, qi=chain_q, partials=[
+            dict(lfs=1, izap=49116, qi=qi, qm=chain_q + qm_shift, elfs=elfs)]),
+    }})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    if rejected:
+        [rec] = stats["pathway_q_rejected"]
+        assert rec["file_ground_qm"] == pytest.approx(chain_q + qm_shift)
+        assert rec["delta"] == pytest.approx(5000.0)
+        assert rxns["(n,gamma)_m1"].Q == chain_q - elfs
+    else:
+        assert stats["pathway_q_rejected"] == []
+        assert rxns["(n,gamma)_m1"].Q == qi
+
+
+def test_pathway_q_reject_logged_and_noted(tmp_path):
+    # The refusal is invisible in the written Q values, so the log carries the
+    # only trace: a dedicated section plus a per-row note on the mapping table.
+    chain, source = _am241_scene(_AM241_CHAIN_Q + 3350.0)
+    branching, stats = map_library(source, chain, _am241_decay(),
+                                   "elis", 0.50, 0.0)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+
+    log = tmp_path / "log.txt"
+    source_stats = dict(base_chain="c", pendf="p", decay_file="d",
+                        output_chain="o", chain_nuclides=len(chain.nuclides))
+    from add_pendf_isomeric_branching_to_chain import write_isomer_mapping_log
+    write_isomer_mapping_log(log, stats, source_stats, "elis", 0.50, 0.0)
+    text = log.read_text()
+
+    title = "PATHWAY-Q FILE-QM REJECTED (CHAIN-ANCHORED VALUES RETAINED)"
+    before, section = text.split(title, 1)
+    # Summary counters.
+    assert "Pathway-Q file QM rejected (reactions):     1" in text
+    assert "Pathway-Q slots chain-anchored (gate):     1" in text
+    # Section row: parent, the trigger QM, the anchor, the signed delta.
+    assert "Total rejected: 1 reaction(s), 1 metastable slot(s)" in section
+    assert "Am241" in section and "5541000.0000" in section
+    assert "5537650.0000" in section and "+3350.0000" in section
+    assert "n/a (ground already chain-anchored)" in section
+    # Per-row marker on the mapping table, BEFORE the section.
+    assert "PATHWAY-Q FILE-QM REJECTED" in before
+
+
+def _n2n_emit_source(file_qm):
+    """MF=10-only MT=875 ('(n,2n)') on In115, with a chosen section QM."""
+    elfs = 190000.0
+    data = {"In115": {
+        875: dict(qm=file_qm, qi=file_qm, mf3_less=True, partials=[
+            dict(lfs=0, izap=49114, qi=file_qm, qm=file_qm, elfs=0.0),
+            dict(lfs=1, izap=49114, qi=file_qm - elfs, qm=file_qm,
+                 elfs=elfs)]),
+    }}
+    source = _FakeSource(data, elis={"In115": 0.0})
+    source.emit_mf10_only = True                     # the flag, source side
+    return source
+
+
+def test_pathway_q_emit_lane_bypassed_without_chain_anchor():
+    # An MF=10-only MT has no MF=3 total, so a base chain built from MF=3 cannot
+    # carry it: nothing anchors the gate and the file Q values stand.
+    chain = _chain_with(["In115", "In114", "In114_m1"])
+    source = _n2n_emit_source(-9.0e6)
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    assert rxns["(n,2n)_m1"].Q == -9.19e6
+    assert stats["pathway_q_rejected"] == []
+
+
+def test_pathway_q_emit_lane_gated_on_name_collision():
+    # ... unless a name-colliding MT of the family (MT=16 here) already put the
+    # reaction on the chain: that scalar Q IS an anchor, and the gate applies.
+    chain_q = -9.0e6
+    chain = _chain_with(["In115", "In114", "In114_m1"],
+                        reactions={"In115": [("(n,2n)", "In114", chain_q)]})
+    source = _n2n_emit_source(chain_q + 7.9e6)
+    branching, stats = map_library(source, chain, _decay_lookup_with_in114(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    [rec] = stats["pathway_q_rejected"]
+    assert rec["mt"] == 875                          # the surviving level MT
+    assert rec["delta"] == pytest.approx(7.9e6)
+    assert rxns["(n,2n)"].Q == chain_q
+    assert rxns["(n,2n)_m1"].Q == chain_q - 190000.0
+
+
+def test_pathway_q_clean_section_serializes_unchanged(tmp_path):
+    # A corroborated section is untouched: the exported Q list is the file's own
+    # values verbatim, with no rounding applied anywhere on the normal path.
+    chain = _chain_with(["In115", "In116", "In116_m1", "In116_m2"],
+                        reactions={"In115": [("(n,gamma)", "In116",
+                                              6784720.0)]})
+    source = _FakeSource({"In115": {
+        102: dict(qm=6784720.0, qi=6784720.0, partials=(
+            [dict(lfs=0, izap=49116, qi=6784720.0, qm=6784720.0, elfs=0.0)]
+            + _in115_ng_metastables())),
+    }})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+    assert stats["pathway_q_rejected"] == []
+
+    out = tmp_path / "chain.xml"
+    chain.export_to_xml(out)
+    assert 'Q="6784720.0 6657450.0 6495060.0"' in out.read_text()
+
+
+def test_pathway_q_revert_value_rounded(tmp_path):
+    # ENDF/B-8.1 (n,alpha) shape: the file QM is 7.9 MeV out, so the revert is a
+    # float subtraction that leaves dust (-1758720.2999999998). Reverted values
+    # are rounded to 4 dp -- ample for eV-scale level energies -- so no artefact
+    # reaches the chain XML.
+    chain_q = -1702000.0
+    file_qm = 6198000.0                              # wrong by +7.9 MeV
+    elfs = file_qm - 6141279.7                       # 56720.299999999814
+    chain = _chain_with(["Ir191", "Re188", "Re188_m1"],
+                        reactions={"Ir191": [("(n,a)", "Re188", chain_q)]})
+    source = _FakeSource({"Ir191": {
+        107: dict(qm=file_qm, qi=file_qm, partials=[
+            dict(lfs=0, izap=75188, qi=file_qm, qm=file_qm, elfs=0.0),
+            dict(lfs=1, izap=75188, qi=6141279.7, qm=file_qm, elfs=elfs)]),
+    }})
+    decay = {(75, 188): [
+        DecayState(75, 188, 0.0, 0, half_life=None),
+        DecayState(75, 188, elfs, 1, half_life=1140.0),
+    ]}
+    branching, stats = map_library(source, chain, decay, "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+
+    assert len(stats["pathway_q_rejected"]) == 1
+    q = {rx.type: rx.Q for rx in chain["Ir191"].reactions}["(n,a)_m1"]
+    assert q == pytest.approx(chain_q - elfs)
+    assert q == round(q, 4) == -1758720.3            # dust removed
+
+    out = tmp_path / "chain.xml"
+    chain.export_to_xml(out)
+    assert "-1758720.3" in out.read_text()
+    assert "-1758720.2999999998" not in out.read_text()

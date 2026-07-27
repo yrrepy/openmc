@@ -658,6 +658,22 @@ _BAND_THERMAL_HI = 0.625
 _BAND_EPITHERMAL_HI = 1.0e5
 _BAND_INTERMEDIATE_HI = 1.0e6
 
+# Pathway-Q sanity gate (eV, absolute): how far a non-MT=4 reaction's own MF=10
+# ground QM may sit from the base chain's scalar Q before the file's absolute Q
+# scale is refused and the metastable pathways keep chain-anchored values. 1 eV
+# separates the populations cleanly: benign file jitter on agreeing sections is
+# <= 0.31 eV, the smallest genuine divergence is Am241 (n,gamma) at 3350 eV
+# (where the chain scalar is 344x closer to AME than the file), and the corrupt
+# ENDF/B-8.1 (n,alpha) sections are 7.9-12.0 MeV out, sign included. Sub-eV
+# agreement is not luck: both numbers descend from the same mass evaluation.
+PATHWAY_Q_CHAIN_TOL = 1.0
+
+# Reverted pathway Q values are rounded to this many decimals: ``Q - ELFS`` is a
+# float subtraction that leaves artefacts (-13286354.999999998) the file-sourced
+# path never produces. Applied to REVERTED values only, so a run in which the
+# gate never fires serializes byte-identically to one without it.
+_PATHWAY_Q_REVERT_DECIMALS = 4
+
 
 def _lethargy_integral(e, xs):
     """Trapezoidal integral of the lethargy-weighted cross section (int sigma/E dE).
@@ -1467,6 +1483,52 @@ def _note_mg_ground(stats, parent, r_name, marker, skipped=False):
             _append_note(row, marker)
 
 
+# Per-row marker for a gate-refused reaction. The core string matches the
+# mapping-log section title (and the GENDF patcher's) so one grep finds both.
+_PATHWAY_Q_REJECT_MARKER = 'PATHWAY-Q FILE-QM REJECTED'
+
+
+def _pathway_q_file_ground_qm(info):
+    """The file's own ground QM for the pathway-Q gate, or ``None``.
+
+    The probe is the LFS=0 partial's OWN QM -- the same subsection whose QI the
+    metastable partials are offset from. A reaction with no LFS=0 partial (the
+    metastable-only class) has no such value, so a mapped metastable's QM stands
+    in, reconstructed as ``QI + ELFS``: the classified records carry no ``qm``
+    key, and ELFS is defined as ``QM - QI``, so the sum is exact.
+
+    The MF=3 head QM (``info['qm']``) is NEVER the probe: it is a different
+    quantity, and comparing the file against its own MF=3 head would validate
+    nothing about the MF=10 absolute scale the gate exists to check.
+    """
+    ground = info.get('ground')
+    if ground is not None and ground.get('qm') is not None:
+        return float(ground['qm'])
+    for m in info.get('metastables') or []:
+        if m.get('qi') is not None and m.get('elfs') is not None:
+            return float(m['qi']) + float(m['elfs'])
+    return None
+
+
+def _note_pathway_q_reject(stats, parent, r_name, record):
+    """Count + log one pathway-Q gate refusal.
+
+    ``record['q_kept']`` holds one entry per member, so the slot counter credits
+    the METASTABLE slots only -- the ground slot is chain-anchored by
+    construction and does not move. The reaction count is ``len`` of the record
+    list, which is the number the GENDF patcher reports for the same gate. No-op
+    when :func:`decorate_chain` is called without a ``stats`` sink.
+    """
+    if stats is None:
+        return
+    stats.setdefault('pathway_q_rejected', []).append(record)
+    stats['q_chain_anchored'] = (stats.get('q_chain_anchored', 0)
+                                 + record['reverted_slots'])
+    for row in stats.get('isomer_mappings', []):
+        if row.get('parent') == parent and row.get('reaction') == r_name:
+            _append_note(row, _PATHWAY_Q_REJECT_MARKER)
+
+
 def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row):
     """Append the PLAIN ground reaction of a ground-only MF=10-only MT.
 
@@ -1508,8 +1570,11 @@ def decorate_chain(chain, branching, stats=None):
 
     ``stats`` (the :func:`map_library` dict) is an optional sink for the
     metastable-parent ``(n,n')`` ground bookkeeping -- see
-    :func:`_note_mg_ground` -- and for the MF=10-only emission counters
-    (``stats['mf10_only']``). The decoration itself never depends on it.
+    :func:`_note_mg_ground` -- for the pathway-Q gate ledger (see
+    :func:`_note_pathway_q_reject`) and for the MF=10-only emission counters
+    (``stats['mf10_only']``). The decoration itself never depends on it: the
+    pathway-Q revert happens with or without a stats sink, only its record does
+    not.
 
     A reaction marked ``mf3_less`` (served only under
     ``--emit-mf10-only-reactions``) takes one of three shapes:
@@ -1535,6 +1600,8 @@ def decorate_chain(chain, branching, stats=None):
     if stats is not None:
         stats.setdefault('mg_ground_synthesized', 0)
         stats.setdefault('mg_ground_skipped', 0)
+        stats.setdefault('pathway_q_rejected', [])
+        stats.setdefault('q_chain_anchored', 0)
     book = stats.get('mf10_only') if stats is not None else None
     rows = ({(r['parent'], r['mt']): r for r in book['rows']}
             if book is not None else {})
@@ -1555,6 +1622,29 @@ def decorate_chain(chain, branching, stats=None):
                 continue
             existing = next((rx for rx in nuc.reactions if rx.type == r_name),
                             None)
+
+            # Pathway-Q sanity gate. The metastable slots below transcribe the
+            # MF=10 subsection's own ABSOLUTE QI, which nothing validates: the
+            # ENDF/B-8.1 (n,alpha) sections are wrong by up to 12 MeV, sign
+            # included. The ground slot of a chain-present reaction is the base
+            # chain's scalar Q -- AME/evaluation-derived -- so a corrupt file
+            # would leave the two halves of one pathway set on DIFFERENT energy
+            # zeros. Where the file's own ground QM fails to corroborate that
+            # scalar, the metastable slots revert to the chain-anchored
+            # ``Q_chain - ELFS``, which consumes only the QM-QI DIFFERENCE and is
+            # immune to an absolute-scale error; the whole set then shares the
+            # chain's zero. The refused file values are ledgered and written
+            # nowhere. MT=4 is exempt by construction: there the chain scalar is
+            # QI(MF=3) = -E(level), a different quantity than QM, so
+            # "disagreement" is expected rather than evidence against the file.
+            # A reaction absent from the chain has no anchor to check against.
+            chain_q = existing.Q if existing is not None else None
+            file_ground_qm = _pathway_q_file_ground_qm(info)
+            q_chain_reject = (
+                info.get('mt') != 4 and chain_q is not None
+                and file_ground_qm is not None
+                and abs(file_ground_qm - chain_q) > PATHWAY_Q_CHAIN_TOL)
+
             if existing is not None:
                 ground = ReactionTuple(r_name, existing.target, existing.Q,
                                        1.0, 0)
@@ -1618,11 +1708,31 @@ def decorate_chain(chain, branching, stats=None):
             members = []
             if ground is not None:
                 members.append(ground)
+            q_refused = ([] if ground is None
+                         else ['n/a (ground already chain-anchored)'])
             for m in metastables:
+                if q_chain_reject:
+                    q = round(chain_q - float(m['elfs']),
+                              _PATHWAY_Q_REVERT_DECIMALS)
+                    q_refused.append(float(m['qi']))
+                else:
+                    q = float(m['qi'])
                 members.append(ReactionTuple(
-                    f"{r_name}_m{m['liso']}", m['product'], float(m['qi']),
-                    1.0, m['lfs']))
+                    f"{r_name}_m{m['liso']}", m['product'], q, 1.0, m['lfs']))
             folded_members[r_name] = members
+
+            if q_chain_reject:
+                # Ledgered here and nowhere else: a refused reaction's written Q
+                # values are indistinguishable from a clean section's, so
+                # without this record a 12 MeV file defect leaves no trace.
+                _note_pathway_q_reject(stats, parent, r_name, dict(
+                    parent=parent, reaction=r_name, mt=info.get('mt'),
+                    targets=[rx.target for rx in members],
+                    lfs=[rx.pendf_lfs for rx in members],
+                    file_ground_qm=file_ground_qm, chain_q=chain_q,
+                    delta=file_ground_qm - chain_q, q_file=q_refused,
+                    q_kept=[rx.Q for rx in members],
+                    reverted_slots=len(metastables)))
             if mf3_less:
                 _mf10_only_note(
                     book, row, 'emitted_branched',
@@ -1757,6 +1867,8 @@ def print_stats(stats, mode):
     print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
     print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
     print(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}")
+    print(f"        Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}")
+    print(f"         Pathway-Q slots chain-anchored (gate): {stats.get('q_chain_anchored', 0):5d}")
     print(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}")
     print(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}")
 
@@ -2094,6 +2206,71 @@ def _write_rejected_section(f, rejected, reject_rtol, reject_band_ratio=None):
                 f"{tot_str:>14}  {crit:<28}  {consequence:<52}\n")
 
 
+def _write_pathway_q_rejected_section(f, records):
+    """PATHWAY-Q FILE-QM REJECTED section: reactions whose file Q scale failed.
+
+    A refused reaction is INVISIBLE everywhere else -- it writes exactly the
+    values an ungated run would have written -- so the refused file values are
+    printed here or not at all.
+    """
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("PATHWAY-Q FILE-QM REJECTED (CHAIN-ANCHORED VALUES RETAINED)\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("Sanity gate: for a non-MT=4 reaction present in the base chain, "
+            "the file's own MF=10 ground QM must agree with the chain's scalar "
+            f"Q to within {PATHWAY_Q_CHAIN_TOL} eV\n")
+    f.write("(PATHWAY_Q_CHAIN_TOL) before ANY of the reaction's per-pathway "
+            "file Q values are adopted. The chain scalar is AME/evaluation-"
+            "derived; an absolute MF=10 QM is\n")
+    f.write("unvalidated and can be badly wrong (ENDF/B-8.1 (n,alpha): 7.9-12.0 "
+            "MeV out, sign included). On failure each metastable pathway keeps "
+            "Q_chain - ELFS, which\n")
+    f.write("consumes only the QM-QI difference and is immune to an absolute-"
+            "scale error; the refused file values are listed here and written "
+            "nowhere.\n\n")
+    f.write("The ground slot is NOT listed as reverted because it is chain-"
+            "anchored by construction: a chain-present reaction's ground "
+            "pathway already carries the base\n")
+    f.write("chain's scalar Q. The refusal therefore restores the property the "
+            "gate exists to protect -- every pathway of one reaction sharing "
+            "ONE energy zero -- while only\n")
+    f.write("the metastable slots move numerically. MT=4 is exempt: there the "
+            "chain scalar is QI(MF=3) = -E(level), a different quantity than "
+            "QM, so the mismatch is\n")
+    f.write("expected rather than evidence against the file. A reaction absent "
+            "from the base chain has no anchor and is exempt too.\n\n")
+    f.write("On name-colliding MT families ((n,p) = MT 103/600-649, (n,2n) = "
+            "MT 16/875-891) the MT below is the surviving level MT while the "
+            "chain anchor may come from\n")
+    f.write("the family total -- benign, because MF=10 QM is the ground-to-"
+            "ground reaction Q and is MT-invariant within a family.\n\n")
+    if not records:
+        f.write("No reaction's file ground QM diverged from the chain's "
+                "scalar Q beyond the tolerance.\n")
+        return
+    slots = sum(r['reverted_slots'] for r in records)
+    f.write(f"Total rejected: {len(records)} reaction(s), {slots} metastable "
+            f"slot(s) chain-anchored\n\n")
+    header = (f"{'Parent':<12}  {'Reaction':<12}  {'MT':>5}  "
+              f"{'File ground QM[eV]':>18}  {'Chain Q[eV]':>16}  "
+              f"{'Delta[eV]':>16}  {'Refused -> kept per pathway':<80}")
+    sep = "-" * len(header)
+    f.write(header + "\n" + sep + "\n")
+    for r in sorted(records, key=lambda x: abs(x['delta']), reverse=True):
+        pathways = "  ".join(
+            f"{t}[LFS={l}]={_fmt_pathway_q(qf)} (kept {_fmt_pathway_q(qk)})"
+            for t, l, qf, qk in zip(r['targets'], r['lfs'], r['q_file'],
+                                    r['q_kept']))
+        f.write(f"{r['parent']:<12}  {r['reaction']:<12}  {r['mt']:>5}  "
+                f"{r['file_ground_qm']:>18.4f}  {r['chain_q']:>16.4f}  "
+                f"{r['delta']:>+16.4f}  {pathways:<80}\n")
+
+
+def _fmt_pathway_q(value):
+    """Format one pathway-Q ledger entry (float, or the ground slot's text)."""
+    return f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+
+
 _ABSENT_STATUS_LABELS = (
     ('no_decay_data', 'ABSENT ENTIRELY (no decay data for this Z,A)'),
     ('no_metastables', 'PRESENT BUT NO METASTABLE DATA (only a ground state)'),
@@ -2415,6 +2592,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
         f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
         f.write(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}\n")
+        f.write(f"        Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}\n")
+        f.write(f"         Pathway-Q slots chain-anchored (gate): {stats.get('q_chain_anchored', 0):5d}\n")
         if stats.get('nn_prime_prune_enabled'):
             f.write(f"                       Pruned (n,n') self-loops: {stats.get('nn_prime_pruned_count', 0):5d}\n")
         f.write(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}\n")
@@ -2501,6 +2680,8 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         _write_rejected_section(
             f, stats.get('rejected', []), stats.get('reject_rtol'),
             stats.get('reject_band_ratio'))
+        _write_pathway_q_rejected_section(
+            f, stats.get('pathway_q_rejected', []))
         _write_absent_decay_section(f, stats.get('absent_by_status', {}))
         _write_lfs_sentinel_section(f, stats.get('lfs_sentinels', []))
         _write_mf10_without_mf3_section(
@@ -2595,6 +2776,14 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
 
     print_stats(stats, mapping_mode)
     _print_lfs_sentinel_warning(stats.get('lfs_sentinels', []), mapping_mode)
+    q_rejected = stats.get('pathway_q_rejected', [])
+    if q_rejected:
+        print(f"\nWARNING: {len(q_rejected)} reaction(s) had a file ground QM "
+              f"more than {PATHWAY_Q_CHAIN_TOL} eV from the chain's scalar Q; "
+              "their file Q values were REFUSED and the chain-anchored values "
+              f"kept ({stats.get('q_chain_anchored', 0)} metastable slot(s)); "
+              "see PATHWAY-Q FILE-QM REJECTED in the mapping log",
+              file=sys.stderr)
     if nn_prime_pruned:
         print(f"\nPruned (n,n') self-loops: {len(nn_prime_pruned)}")
 
