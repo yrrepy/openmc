@@ -568,8 +568,12 @@ class IndependentOperator(OpenMCOperator):
 
             for i_nuc in nuc_index:
                 nuc = self.nuc_ind_map[i_nuc]
+                if nuc not in xs._index_nuc:
+                    continue
                 for i_rx in react_index:
                     rx = self.rx_ind_map[i_rx]
+                    if rx not in xs._index_rx:
+                        continue
 
                     # Get cross section data
                     xs_data = xs[nuc, rx]
@@ -616,7 +620,7 @@ class IndependentOperator(OpenMCOperator):
         # Return number density vector
         return super().initial_condition(self.materials)
 
-    def __call__(self, vec, source_rate):
+    def __call__(self, vec, source_rate) -> OperatorResult:
         """Obtain the reaction rates
 
         Parameters
