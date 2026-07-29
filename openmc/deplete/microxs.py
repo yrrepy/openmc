@@ -7,12 +7,10 @@ IndependentOperator class for depletion.
 from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 from typing import Union, TypeAlias, Self
-import warnings
 
 import h5py
 import pandas as pd
@@ -394,6 +392,7 @@ def get_microxs_and_flux(
 
     # Substitute GENDF MT=4 for the silently-zero CE (n,n') column
     if gendf_mt4_fallback:
+        from .gendf.collapse import _apply_gendf_mt4_fallback
         _apply_gendf_mt4_fallback(micros, fluxes, gendf_library,
                                   nuclides_with_data)
 
@@ -406,232 +405,6 @@ def get_microxs_and_flux(
     return fluxes, micros
 
 
-def get_gendfxs_and_flux(
-    model: openmc.Model,
-    domains: DomainTypes,
-    gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
-    nuclides: Sequence[str] | None = None,
-    reactions: Sequence[str] | None = None,
-    chain_file: PathLike | Chain | None = None,
-    path_statepoint: PathLike | None = None,
-    path_input: PathLike | None = None,
-    run_kwargs=None
-) -> tuple[list[Flux], list[MicroXS]]:
-    """Generate microscopic cross sections and fluxes for multiple domains using GENDF library.
-
-    This function runs a neutron transport solve to obtain the flux in the
-    specified domains and computes collapsed one-group microscopic cross sections
-    from said multi-group flux and a multi-group GENDF cross section library. 
-    It is similar to :func:`get_microxs_and_flux` but uses pre-processed 
-    group-averaged cross-sections instead of calculating them from continuous-energy data.
-
-    .. versionadded:: 0.15.4
-
-    Parameters
-    ----------
-    model : openmc.Model
-        OpenMC model object. Must contain geometry, materials, and settings.
-    domains : list of openmc.Material or openmc.Cell or openmc.Universe, or openmc.MeshBase, or openmc.Filter
-        Domains in which to tally reaction rates, or a spatial tally filter.
-    gendf_library : path-like or GENDFLibrary
-        Path to GENDF library directory or GENDFLibrary instance. If a path is
-        provided, a GENDFLibrary object will be created.
-    nuclides : list of str, optional
-        Nuclides to get cross sections for. If not specified, all burnable
-        nuclides from the depletion chain file that are available in the
-        GENDF library are used.
-    reactions : list of str, optional
-        Reactions to get cross sections for. If not specified, all neutron
-        reactions listed in the depletion chain file are used.
-    chain_file : PathLike or Chain, optional
-        Path to the depletion chain XML file or an instance of
-        openmc.deplete.Chain. Defaults to ``openmc.config['chain_file']``.
-    path_statepoint : path-like, optional
-        Path to write the statepoint file from the neutron transport solve to.
-        By default, the statepoint file is written to a temporary directory and
-        is not kept.
-    path_input : path-like, optional
-        Path to write the model XML file from the neutron transport solve to.
-        By default, the model XML file is written to a temporary directory and
-        not kept.
-    run_kwargs : dict, optional
-        Keyword arguments passed to :meth:`openmc.Model.run`
-
-    Returns
-    -------
-    list of openmc.deplete.Flux
-        Flux in each group in [n-cm/src] for each domain. Each :class:`Flux`
-        is a :class:`numpy.ndarray` subclass that also carries the energy group
-        boundaries in its ``energy_bounds`` attribute.
-    list of MicroXS
-        Cross section data in [b] for each domain, retrieved from GENDF library
-
-    See Also
-    --------
-    get_microxs_and_flux : Similar function using continuous-energy cross-sections
-    openmc.deplete.IndependentOperator
-    openmc.deplete.gendf.GENDFLibrary
-
-    """
-    # Handle GENDF library input
-    if isinstance(gendf_library, (str, Path)):
-        gendf_library = GENDFLibrary(gendf_library)
-    elif not isinstance(gendf_library, _GENDF_TYPES):
-        raise TypeError(
-            f"gendf_library must be a path or GENDFLibrary instance, "
-            f"not {type(gendf_library)}")
-
-    # Use GENDF library's energy structure
-    energies = gendf_library.energy_bounds
-
-    # Save any original tallies on the model
-    original_tallies = list(model.tallies)
-
-    # Determine what reactions and nuclides are available
-    chain = _get_chain(chain_file)
-    if reactions is None:
-        reactions = chain.reactions
-
-    # Get nuclides from chain, filtered to those with GENDF data
-    available_nuclides = gendf_library.available_nuclides_set()
-    if not nuclides:
-        nuclides = [nuc.name for nuc in chain.nuclides
-                    if nuc.name in available_nuclides]
-    else:
-        nuclides = [nuc for nuc in nuclides if nuc in available_nuclides]
-
-    # Set up the flux tallies
-    energy_filter = openmc.EnergyFilter(energies)
-
-    if isinstance(domains, openmc.Filter):
-        domain_filter = domains
-    elif isinstance(domains, openmc.MeshBase):
-        domain_filter = openmc.MeshFilter(domains)
-    elif isinstance(domains[0], openmc.Material):
-        domain_filter = openmc.MaterialFilter(domains)
-    elif isinstance(domains[0], openmc.Cell):
-        domain_filter = openmc.CellFilter(domains)
-    elif isinstance(domains[0], openmc.Universe):
-        domain_filter = openmc.UniverseFilter(domains)
-    else:
-        raise ValueError(f"Unsupported domain type: {type(domains[0])}")
-
-    flux_tally = openmc.Tally(name='GENDF flux')
-    flux_tally.filters = [domain_filter, energy_filter]
-    flux_tally.scores = ['flux']
-    model.tallies = [flux_tally]
-
-    if openmc.lib.is_initialized:
-        openmc.lib.finalize()
-
-        if comm.rank == 0:
-            model.export_to_model_xml()
-        comm.barrier()
-        # Reinitialize with tallies
-        openmc.lib.init(intracomm=comm)
-
-    with TemporaryDirectory() as temp_dir:
-        # Indicate to run in temporary directory unless being executed through
-        # openmc.lib, in which case we don't need to specify the cwd
-        run_kwargs = dict(run_kwargs) if run_kwargs else {}
-        if not openmc.lib.is_initialized:
-            run_kwargs.setdefault('cwd', temp_dir)
-
-        # Run transport simulation and synchronize
-        statepoint_path = model.run(**run_kwargs)
-        comm.barrier()
-
-        if comm.rank == 0:
-            # Move the statepoint file if it is being saved to a specific path
-            if path_statepoint is not None:
-                shutil.move(statepoint_path, path_statepoint)
-                statepoint_path = path_statepoint
-
-            # Export the model to path_input if provided
-            if path_input is not None:
-                model.export_to_model_xml(path_input)
-
-        # Broadcast updated statepoint path to all ranks
-        statepoint_path = comm.bcast(statepoint_path)
-
-        # Read in tally results (on all ranks)
-        with StatePoint(statepoint_path) as sp:
-            flux_tally = sp.tallies[flux_tally.id]
-            flux_tally._read_results()
-
-    # Get flux values and make energy groups last dimension
-    flux = flux_tally.get_reshaped_data()  # (domains, groups, 1, 1)
-    flux = np.moveaxis(flux, 1, -1)  # (domains, 1, 1, groups)
-
-    # Create list where each item corresponds to one domain
-    fluxes = list(flux.squeeze((1, 2)))
-
-    # Build sparse XS table once (GENDF XS are domain-independent)
-    mts = [REACTION_MT[name] for name in reactions]
-    table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
-
-    # Collapse per domain
-    micros = []
-    for flux_i in fluxes:
-        flux_arr = np.asarray(flux_i, dtype=float)
-        flux_sum = flux_arr.sum()
-        if flux_sum == 0.0:
-            micros.append(MicroXS(
-                np.zeros((len(nuclides), len(reactions), 1)),
-                nuclides, reactions))
-            continue
-        collapsed = table.collapse(flux_arr / flux_sum)
-        micros.append(MicroXS(collapsed[:, :, np.newaxis],
-                               nuclides, reactions))
-
-    # Reset tallies
-    model.tallies = original_tallies
-
-    # Return Flux arrays carrying the energy grid for isomeric branching
-    fluxes = [Flux(f, energy_bounds=energy_filter.values) for f in fluxes]
-    return fluxes, micros
-
-
-def _apply_gendf_mt4_fallback(micros, fluxes, gendf_library,
-                              nuclides_with_data):
-    """Substitute GENDF MT=4 data into the (n,n') column of each MicroXS.
-
-    CE HDF5 libraries typically lack the lumped MT=4 reaction, so the (n,n')
-    column is silently zero. Modifies micros in place, restricted to nuclides
-    present in BOTH the CE library (nuclides_with_data) and the GENDF library
-    so a GENDF-only nuclide is never activated through (n,n') alone.
-    """
-    if "(n,n')" not in micros[0].reactions:
-        return
-
-    available = gendf_library.available_nuclides_set()
-    sigma4 = {}
-    for nuc in micros[0].nuclides:
-        if nuc in available and nuc in nuclides_with_data:
-            xs = gendf_library.get_all_xs(nuc, mts=[4])
-            if 4 in xs:
-                sigma4[nuc] = xs[4]
-
-    if comm.rank == 0:
-        print(f" (n,n') cross sections computed from GENDF MT=4 "
-              f"(not CE data) for {len(sigma4)} nuclides")
-
-    n_groups = gendf_library.n_groups
-    for micro, flux_i in zip(micros, fluxes):
-        i_nn = micro.reactions.index("(n,n')")
-        for nuc, sigma4_g in sigma4.items():
-            i_nuc = micro._index_nuc.get(nuc)
-            if i_nuc is None:
-                continue
-            if micro.data.shape[2] == n_groups:
-                # direct mode: groups are GENDF-aligned (validated upstream)
-                micro.data[i_nuc, i_nn, :] = sigma4_g
-            elif micro.data.shape[2] == 1:
-                flux_sum = flux_i.sum()
-                if flux_sum > 0.0:
-                    micro.data[i_nuc, i_nn, 0] = sigma4_g @ flux_i / flux_sum
-
-
 @dataclass
 class _SparseXSTable:
     """Sparse storage of GENDF cross-sections for vectorized flux collapse.
@@ -642,7 +415,6 @@ class _SparseXSTable:
     """
     nuclides: list[str]
     reactions: list[str]
-    n_groups: int
     xs_matrix: np.ndarray
     nuc_indices: np.ndarray
     rxn_indices: np.ndarray
@@ -702,7 +474,6 @@ def _build_sparse_xs_table(
             "Duplicate reaction MT numbers requested for the GENDF sparse "
             "table; each MT maps to a single column: " + "; ".join(dups))
 
-    n_groups = gendf_library.n_groups
     rows = []
     nuc_idx_list = []
     rxn_idx_list = []
@@ -721,12 +492,11 @@ def _build_sparse_xs_table(
     if rows:
         xs_matrix = np.vstack(rows)
     else:
-        xs_matrix = np.empty((0, n_groups))
+        xs_matrix = np.empty((0, gendf_library.n_groups))
 
     return _SparseXSTable(
         nuclides=nuclides,
         reactions=reactions,
-        n_groups=n_groups,
         xs_matrix=xs_matrix,
         nuc_indices=np.array(nuc_idx_list, dtype=np.int32),
         rxn_indices=np.array(rxn_idx_list, dtype=np.int32),
@@ -930,52 +700,11 @@ class MicroXS:
         multigroup flux.
 
         """
-        # Handle GENDF library input
-        if isinstance(gendf_library, (str, Path)):
-            gendf_library = GENDFLibrary(gendf_library)
-        elif not isinstance(gendf_library, _GENDF_TYPES):
-            raise TypeError(
-                f"gendf_library must be a path or GENDFLibrary instance, "
-                f"not {type(gendf_library)}")
+        from .gendf.collapse import _from_multigroup_flux_with_gendf
 
-        # Use GENDF library's energy structure
-        energies = gendf_library.energy_bounds
-
-        # Check dimension consistency
-        if len(multigroup_flux) != len(energies) - 1:
-            raise ValueError('Length of flux array should be len(energies)-1')
-
-
-        chain = _get_chain(chain_file)
-        # get available GENDF nuclides
-        available_nuclides = gendf_library.available_nuclides_set()
-
-        # If no nuclides were specified, default to all nuclides from the chain
-        # regardless, filter to those with GENDF data
-        if not nuclides:
-            nuclides = [nuc.name for nuc in chain.nuclides
-                        if nuc.name in available_nuclides]
-        else:
-            # Filter user-provided nuclides to those with GENDF data
-            nuclides = [nuc for nuc in nuclides if nuc in available_nuclides]
-
-
-        # Get reaction MT values
-        if reactions is None:
-            reactions = chain.reactions
-        mts = [REACTION_MT[name] for name in reactions]
-
-        # If flux is zero, safely return zero cross sections
-        multigroup_flux = np.asarray(multigroup_flux, dtype=float)
-        if (flux_sum := multigroup_flux.sum()) == 0.0:
-            return cls(np.zeros((len(nuclides), len(mts), 1)),
-                       nuclides, reactions)
-
-        # Build sparse table and collapse with normalized flux
-        table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
-        collapsed = table.collapse(multigroup_flux / flux_sum)
-
-        return cls(collapsed[:, :, np.newaxis], nuclides, reactions)
+        return _from_multigroup_flux_with_gendf(
+            cls, multigroup_flux, gendf_library, chain_file, nuclides,
+            reactions)
 
     @classmethod
     def from_csv(cls, csv_file, **kwargs):
@@ -1197,338 +926,25 @@ def read_microxs_hdf5(filename: PathLike) -> dict[str, MicroXS]:
         return {name: MicroXS.from_hdf5(group) for name, group in f.items()}
 
 
-def _write_flux_data(f, fluxes, dtype='float64', compression=None,
-                     compression_opts=None):
-    """Write flux arrays and optional energy bounds to an open HDF5 file."""
-    energy_bounds = None
-    flux_arrays = []
-    for item in fluxes:
-        if isinstance(item, tuple) and len(item) == 2:
-            flux_arrays.append(np.asarray(item[0], dtype=dtype))
-            if energy_bounds is None:
-                energy_bounds = np.asarray(item[1], dtype='float64')
-        elif getattr(item, 'energy_bounds', None) is not None:
-            # Flux ndarray subclass carries its own energy_bounds
-            flux_arrays.append(np.asarray(item, dtype=dtype))
-            if energy_bounds is None:
-                energy_bounds = np.asarray(item.energy_bounds, dtype='float64')
-        else:
-            flux_arrays.append(np.asarray(item, dtype=dtype))
-
-    f.create_dataset('fluxes', data=np.stack(flux_arrays),
-                     compression=compression, compression_opts=compression_opts)
-    if energy_bounds is not None:
-        f.create_dataset('energy_bounds', data=energy_bounds)
+# ---------------------------------------------------------------------------
+# GENDF/MPI split-out modules
+#
+# The HDF5 global-write / local-read implementations live in ``microxs_io``;
+# they are re-exported here so existing importers keep working. The GENDF
+# collapse entry point lives in ``openmc.deplete.gendf.collapse``, which
+# imports from this module, so it is resolved lazily through ``__getattr__``
+# (a module-level import would cycle).
+# ---------------------------------------------------------------------------
+from .microxs_io import (
+    write_global_microxs_hdf5,
+    read_local_microxs_hdf5,
+    _read_global_material_count,
+)
 
 
-def _open_h5_readonly(filename: PathLike) -> h5py.File:
-    """Open an HDF5 file read-only with file locking disabled (NFS-safe).
-
-    Many ranks open the same global file concurrently; default HDF5 locking is
-    fragile on NFS. Retry without the kwarg on older h5py/HDF5 that lacks it.
-    """
-    try:
-        return h5py.File(filename, 'r', locking=False)
-    except (TypeError, ValueError):
-        return h5py.File(filename, 'r')
-
-
-def _read_global_material_count(filename: PathLike) -> int:
-    """Number of materials in a global MicroXS HDF5 file (reads only shape)."""
-    with _open_h5_readonly(filename) as f:
-        return f['material_ids'].shape[0]
-
-
-# Sidecar identity token: a full-content hash at read time would page in the
-# entire memmap and defeat the point of mmap. The threat model is a stale or
-# mismatched sidecar (regeneration/reordering), not bit rot, so a small sample
-# of rows is enough to catch it while touching only a handful of pages.
-def _sidecar_sample_indices(n_rows: int, cap: int = 64) -> list[int]:
-    """Deterministic sorted, deduplicated row-index sample for the sidecar hash."""
-    if n_rows <= 0:
-        return []
-    if n_rows <= cap:
-        return list(range(n_rows))
-    idx = {0, n_rows // 2, n_rows - 1}
-    stride = n_rows / (cap - len(idx))
-    idx.update(int(i * stride) for i in range(cap - len(idx)))
-    return sorted(idx)
-
-
-def _sidecar_sample_hash(arr: np.ndarray, indices: Sequence[int]) -> str:
-    """SHA-256 hex over the given rows of ``arr``, concatenated in index order."""
-    h = hashlib.sha256()
-    for i in indices:
-        h.update(np.ascontiguousarray(arr[i]).tobytes())
-    return h.hexdigest()
-
-
-def _validate_sidecar(f: h5py.File, h5_path: PathLike, sidecar_path: Path,
-                      memmap: np.ndarray) -> None:
-    """Verify a memmapped sidecar against the identity token in HDF5 file ``f``."""
-    if 'sidecar_format' not in f.attrs:
-        warnings.warn(
-            f"sidecar unverified: {h5_path} carries no identity token "
-            f"(written by older OpenMC), so {sidecar_path} cannot be checked "
-            f"for staleness; proceeding.")
-        return
-
-    exp_shape = tuple(int(x) for x in f.attrs['sidecar_shape'])
-    exp_dtype = f.attrs['sidecar_dtype']
-    if isinstance(exp_dtype, bytes):
-        exp_dtype = exp_dtype.decode()
-    exp_hash = f.attrs['sidecar_sha256']
-    if isinstance(exp_hash, bytes):
-        exp_hash = exp_hash.decode()
-
-    remedy = ("Regenerate the sidecar, or rewrite with "
-              "write_global_microxs_hdf5(..., write_sidecar=True).")
-    # Header check reads only the .npy header, not the array data.
-    if memmap.shape != exp_shape or str(memmap.dtype) != exp_dtype:
-        raise ValueError(
-            f"Sidecar {sidecar_path} does not match {h5_path}: shape/dtype "
-            f"{memmap.shape}/{memmap.dtype} != expected {exp_shape}/{exp_dtype}. "
-            f"{remedy}")
-    # Sampled-row hash touches only the sampled pages of the memmap.
-    sample = _sidecar_sample_indices(memmap.shape[0])
-    if _sidecar_sample_hash(memmap, sample) != exp_hash:
-        raise ValueError(
-            f"Sidecar {sidecar_path} is stale relative to {h5_path} "
-            f"(row-sample hash mismatch). {remedy}")
-
-
-def write_global_microxs_hdf5(
-    micros: Sequence[MicroXS],
-    filename: PathLike,
-    material_ids: Sequence[str],
-    fluxes: Sequence | None = None,
-    dtype: str = 'float64',
-    compression: bool | tuple = True,
-    write_sidecar: bool = False,
-) -> None:
-    """Write all MicroXS to a single rank-independent HDF5 file.
-
-    Stores cross section data for every burnable material in a stacked 4D
-    dataset that can be efficiently subset-read by individual MPI ranks
-    using :func:`read_local_microxs_hdf5`.
-    This is meant to reduce RAM usage by each individual rank and enable greater MPI scaling.
-    
-    .. versionadded:: 0.15.4
-
-    Parameters
-    ----------
-    micros : list of MicroXS
-        MicroXS objects, one per burnable material, ordered by
-        ``sorted(material_ids, key=int)``.
-    filename : path-like
-        Output HDF5 file path.
-    material_ids : list of str
-        Material ID strings in the same order as ``micros``. Must be sorted
-        by ``int()`` value.
-    fluxes : list, optional
-        Flux data for each material. Each element is either a 1D numpy
-        array or a ``(flux_array, energy_bounds)`` tuple. MG-flux is needed for isomeric branching
-    dtype : str, optional
-        NumPy dtype for cross section and flux data. Default ``'float64'``.
-        Use ``'float32'`` to halve file size and per-rank RAM.
-    compression : bool or tuple, optional
-        HDF5 compression. Default ``True`` uses lzf. ``False`` disables
-        compression. A tuple ``('gzip', level)`` uses gzip.
-    write_sidecar : bool, optional
-        Write a ``.microxs.npy`` sidecar file for memory-mapped reading.
-        Default ``False``. The sidecar enables ``mmap=True`` in
-        :func:`read_local_microxs_hdf5` for zero-copy XS access.
-
-    See Also
-    --------
-    read_local_microxs_hdf5 : Read local material slices from this file.
-
-    """
-    if len(micros) == 0:
-        raise ValueError("No MicroXS objects to write.")
-    if len(micros) != len(material_ids):
-        raise ValueError(
-            f"Length of micros ({len(micros)}) != length of "
-            f"material_ids ({len(material_ids)})")
-    if fluxes is not None and len(fluxes) != len(micros):
-        raise ValueError(
-            f"Length of fluxes ({len(fluxes)}) != length of "
-            f"micros ({len(micros)})")
-
-    int_ids = [int(mid) for mid in material_ids]
-    if int_ids != sorted(int_ids):
-        raise ValueError("material_ids must be sorted by int() value")
-
-    ref_shape = micros[0].data.shape
-    for i, m in enumerate(micros):
-        if m.data.shape != ref_shape:
-            raise ValueError(
-                f"MicroXS[{i}] shape {m.data.shape} != "
-                f"MicroXS[0] shape {ref_shape}")
-
-    # Resolve compression settings
-    if compression is False:
-        comp, comp_opts = None, None
-    elif compression is True:
-        comp, comp_opts = 'lzf', None
-    elif isinstance(compression, tuple):
-        comp, comp_opts = compression
-    else:
-        raise ValueError(
-            f"compression must be True, False, or a tuple like "
-            f"('gzip', 4), got {compression!r}")
-
-    n_mats = len(micros)
-    n_nuc, n_rxn, n_grp = ref_shape
-    bytes_per_elem = np.dtype(dtype).itemsize
-    target_chunk_bytes = 32 * 1024 * 1024
-    row_bytes = n_nuc * n_rxn * n_grp * bytes_per_elem
-    chunk_mats = max(1, min(n_mats, 256, target_chunk_bytes // row_bytes))
-
-    with h5py.File(filename, 'w') as f:
-        f.attrs['version'] = 1
-        f.attrs['n_materials'] = n_mats
-        f.attrs['n_nuclides'] = n_nuc
-        f.attrs['n_reactions'] = n_rxn
-        f.attrs['n_groups'] = n_grp
-
-        stacked = np.stack([m.data for m in micros]).astype(dtype)
-        f.create_dataset(
-            'xs_data',
-            data=stacked,
-            chunks=(chunk_mats, n_nuc, n_rxn, n_grp),
-            compression=comp,
-            compression_opts=comp_opts,
-        )
-
-        f.create_dataset(
-            'nuclides', data=np.array(micros[0].nuclides, dtype='S'))
-        f.create_dataset(
-            'reactions', data=np.array(micros[0].reactions, dtype='S'))
-        f.create_dataset(
-            'material_ids', data=np.array(material_ids, dtype='S'))
-
-        if fluxes is not None:
-            _write_flux_data(f, fluxes, dtype=dtype,
-                             compression=comp, compression_opts=comp_opts)
-
-        # Stamp an identity token so a mmap read can detect a stale sidecar
-        # (see _sidecar_sample_indices for the sampling rationale).
-        if write_sidecar:
-            sample = _sidecar_sample_indices(stacked.shape[0])
-            f.attrs['sidecar_format'] = 1
-            f.attrs['sidecar_shape'] = np.asarray(stacked.shape, dtype='int64')
-            f.attrs['sidecar_dtype'] = str(stacked.dtype)
-            f.attrs['sidecar_sha256'] = _sidecar_sample_hash(stacked, sample)
-
-    if write_sidecar:
-        sidecar_path = Path(filename).with_suffix('.microxs.npy')
-        np.save(sidecar_path, stacked)
-
-
-def read_local_microxs_hdf5(
-    filename: PathLike,
-    local_mat_ids: Sequence[str],
-    mmap: bool = False,
-) -> tuple[list[MicroXS], list[tuple] | None, np.ndarray | None]:
-    """Read local material slices from a global MicroXS HDF5 file.
-
-    Reads only the rows corresponding to ``local_mat_ids`` from the stacked
-    dataset, using h5py fancy indexing for efficient I/O.
-    This is meant to reduce RAM usage by each individual rank and enable greater MPI scaling.
-
-    .. versionadded:: 0.15.4
-
-    Parameters
-    ----------
-    filename : path-like
-        Path to HDF5 file written by :func:`write_global_microxs_hdf5`.
-    local_mat_ids : list of str
-        Material IDs for this MPI rank.
-    mmap : bool, optional
-        Use memory-mapped sidecar file instead of reading into heap.
-        Requires a ``.microxs.npy`` sidecar written by
-        :func:`write_global_microxs_hdf5` with ``write_sidecar=True``. The
-        sidecar is validated against an identity token in the HDF5 file; a
-        stale or mismatched sidecar raises ``ValueError``. Default ``False``.
-
-    Returns
-    -------
-    micros : list of MicroXS
-        MicroXS objects in the same order as ``local_mat_ids``.
-    flux_with_energy : list of tuple or None
-        If flux data exists in the file, a list of
-        ``(flux_array, energy_bounds)`` tuples. Returns ``None`` if no
-        flux data in file.
-    mmap_ref : numpy.ndarray or None
-        Reference to the memory-mapped array when ``mmap=True``, to
-        prevent garbage collection. ``None`` otherwise.
-
-    See Also
-    --------
-    write_global_microxs_hdf5 : Write the global file.
-
-    """
-    if len(local_mat_ids) == 0:
-        return [], None, None
-
-    with _open_h5_readonly(filename) as f:
-        version = f.attrs.get('version', None)
-        if version != 1:
-            raise ValueError(
-                f"Unsupported MicroXS HDF5 version: {version}. "
-                f"Expected version 1.")
-
-        all_mat_ids = [s.decode() for s in f['material_ids'][:]]
-        nuclides = [s.decode() for s in f['nuclides'][:]]
-        reactions = [s.decode() for s in f['reactions'][:]]
-
-        mat_id_to_row = {mid: i for i, mid in enumerate(all_mat_ids)}
-        local_rows = []
-        for mid in local_mat_ids:
-            if mid not in mat_id_to_row:
-                sample = all_mat_ids[:5]
-                raise ValueError(
-                    f"Material '{mid}' not found in {filename}. "
-                    f"File contains {len(all_mat_ids)} materials: "
-                    f"{sample}{'...' if len(all_mat_ids) > 5 else ''}")
-            local_rows.append(mat_id_to_row[mid])
-
-        # h5py requires fancy indices to be strictly sorted ascending
-        sorted_rows = sorted(local_rows)
-        sort_map = {row: pos for pos, row in enumerate(sorted_rows)}
-        reorder = [sort_map[r] for r in local_rows]
-
-        # Build MicroXS from mmap sidecar or HDF5 data
-        mmap_ref = None
-        if mmap:
-            sidecar_path = Path(filename).with_suffix('.microxs.npy')
-            if not sidecar_path.exists():
-                raise FileNotFoundError(
-                    f"Sidecar file {sidecar_path} not found. Re-run "
-                    f"write_global_microxs_hdf5 with write_sidecar=True.")
-            global_xs = np.load(str(sidecar_path), mmap_mode='r')
-            _validate_sidecar(f, filename, sidecar_path, global_xs)
-            micros = [MicroXS(global_xs[row], nuclides, reactions)
-                      for row in local_rows]
-            mmap_ref = global_xs
-        else:
-            xs_block = f['xs_data'][sorted_rows]
-            xs_block = xs_block[reorder]
-            micros = [MicroXS(xs_block[i], nuclides, reactions)
-                      for i in range(len(local_mat_ids))]
-
-        flux_with_energy = None
-        if 'fluxes' in f:
-            energy_bounds = None
-            if 'energy_bounds' in f:
-                energy_bounds = f['energy_bounds'][:]
-
-            flux_block = f['fluxes'][sorted_rows]
-            flux_block = flux_block[reorder]
-            flux_with_energy = [
-                (flux_block[i], energy_bounds)
-                for i in range(len(local_mat_ids))
-            ]
-
-    return micros, flux_with_energy, mmap_ref
+def __getattr__(name):
+    """Resolve the GENDF collapse entry points without importing eagerly."""
+    if name in ('get_gendfxs_and_flux', '_apply_gendf_mt4_fallback'):
+        from .gendf import collapse
+        return getattr(collapse, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

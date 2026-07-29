@@ -23,8 +23,8 @@ import pytest
 from openmc import Material
 from openmc.deplete import Flux, IndependentOperator, MicroXS
 from openmc.deplete.helpers import GENDFFluxCollapseHelper
-from openmc.deplete.microxs import (
-    _build_sparse_xs_table,
+from openmc.deplete.microxs import _build_sparse_xs_table
+from openmc.deplete.microxs_io import (
     write_global_microxs_hdf5,
     read_local_microxs_hdf5,
 )
@@ -294,7 +294,8 @@ def _create_microxs_with_mocks(chain_nuclides, gendf_nuclides, user_nuclides=Non
     flux = np.ones(709)  # CCFE-709
 
     # Patch chain loading and add MockGENDFLibrary to valid GENDF types
-    with patch('openmc.deplete.microxs._get_chain', return_value=mock_chain):
+    with patch('openmc.deplete.gendf.collapse._get_chain',
+               return_value=mock_chain):
         import openmc.deplete.microxs as microxs_mod
         original_types = microxs_mod._GENDF_TYPES
         try:

@@ -23,8 +23,8 @@ import openmc.lib
 import openmc.deplete.microxs as microxs_mod
 from openmc.deplete import CoupledOperator
 from openmc.deplete.helpers import DirectWithFluxHelper, FluxCollapseHelper
-from openmc.deplete.microxs import (
-    MicroXS, _apply_gendf_mt4_fallback, get_microxs_and_flux)
+from openmc.deplete.gendf.collapse import _apply_gendf_mt4_fallback
+from openmc.deplete.microxs import MicroXS, get_microxs_and_flux
 
 from .gendf_testing import MockGENDFLibrary, CCFE709_BOUNDS, CCFE709_NGROUPS
 

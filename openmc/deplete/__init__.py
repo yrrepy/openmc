@@ -22,3 +22,4 @@ from .r2s import *
 from . import abc
 from . import cram
 from . import helpers
+from .gendf.collapse import get_gendfxs_and_flux  # star-import skips module __getattr__, so re-export explicitly
