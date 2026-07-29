@@ -18,10 +18,11 @@ from openmc.mpi import comm
 from .abc import ReactionRateHelper, OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
-from .microxs import MicroXS, read_local_microxs_hdf5, _read_global_material_count
+from .microxs import MicroXS
+from .microxs_io import _load_local_microxs, _read_global_material_count
 from .results import Results
-from .helpers import (ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper,
-                      IsomericBranchingHelper)
+from .helpers import ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper
+from .gendf.operators import _setup_independent_isomeric_branching
 
 
 class IndependentOperator(OpenMCOperator):
@@ -392,29 +393,6 @@ class IndependentOperator(OpenMCOperator):
         read_local_microxs_hdf5 : Low-level reader used internally.
 
         """
-        check_type('materials', materials, Iterable, openmc.Material)
-        materials_obj = openmc.Materials(materials)
-
-        # Pre-compute global metadata before filtering materials
-        all_depletable = sorted(
-            [m for m in materials_obj if m.depletable],
-            key=lambda m: int(m.id))
-        burnable_mats = [str(m.id) for m in all_depletable]
-        if not burnable_mats:
-            raise RuntimeError(
-                "No depletable materials were found in the model.")
-        volume = {}
-        heavy_metal = 0.0
-        for m in all_depletable:
-            if m.volume is None:
-                name_str = f" Name={m.name}" if m.name else ""
-                raise RuntimeError(
-                    f"Volume not specified for depletable material "
-                    f"with ID={m.id}{name_str}.")
-            volume[str(m.id)] = m.volume
-            heavy_metal += m.fissionable_mass
-        name_list = [m.name for m in all_depletable]
-
         # Fail fast on over-decomposition before any per-rank work: more ranks
         # than materials leaves empty-slice ranks that KeyError mid-step and
         # deadlock the rest. All ranks read the same file, so this check is
@@ -426,24 +404,8 @@ class IndependentOperator(OpenMCOperator):
                 f"materials in {microxs_file}. Use at most {n_materials} ranks "
                 f"for this file.")
 
-        local_mats = _distribute(burnable_mats)
-
-        local_micros, local_flux_with_energy, mmap_ref = read_local_microxs_hdf5(
-            microxs_file, local_mats, mmap=mmap)
-
-        # Build fluxes list from HDF5 data or default to unit flux.
-        # Pass full (flux, energy_bounds) tuples so __init__ populates
-        # _flux_with_energy for isomeric branching.
-        if local_flux_with_energy is not None:
-            local_fluxes = list(local_flux_with_energy)
-        else:
-            n_groups = local_micros[0].data.shape[2] if local_micros else 1
-            local_fluxes = [np.ones(n_groups) for _ in local_mats]
-
-        # Filter materials to local-only before passing to __init__
-        local_set = set(local_mats)
-        local_materials = openmc.Materials(
-            [m for m in materials_obj if str(m.id) in local_set])
+        local_materials, local_fluxes, local_micros, metadata, mmap_ref = \
+            _load_local_microxs(materials, microxs_file, mmap=mmap)
 
         op = cls(
             local_materials,
@@ -459,12 +421,7 @@ class IndependentOperator(OpenMCOperator):
             fission_yield_opts=fission_yield_opts,
             gendf_library=gendf_library,
             _prefiltered=True,
-            _precomputed_metadata={
-                'heavy_metal': heavy_metal,
-                'burnable_mats': burnable_mats,
-                'volume': volume,
-                'name_list': name_list,
-            },
+            _precomputed_metadata=metadata,
         )
 
         op._microxs_mmap = mmap_ref  # prevent GC of memory-mapped array
@@ -510,38 +467,8 @@ class IndependentOperator(OpenMCOperator):
                 self.prev_res.append(new_res)
 
     def _setup_isomeric_branching(self):
-        """Set up isomeric branching helper if chain has targets and GENDF library is available."""
-        self._isomeric_branching = None
-
-        if not self.chain.isomeric_branching_targets:
-            return
-
-        if self._gendf_library is None:
-            raise ValueError(
-                "Chain has isomeric branching targets but no GENDF library "
-                "was provided. Pass gendf_library= to the operator, or use a "
-                "chain without isomeric branching data."
-            )
-
-        if not hasattr(self._gendf_library, 'get_branching_ratios'):
-            raise ValueError(
-                "GENDF library backend does not support get_branching_ratios(). "
-                "Re-patch chain with the updated patcher tool to add the "
-                "gendf_lfs attribute, use the Python backend with a decay_file, "
-                "or use a chain without isomeric branching data."
-            )
-
-        helper = IsomericBranchingHelper(
-            self.chain,
-            self._gendf_library,
-        )
-
-        # The group structure is authoritative on the GENDF library; flux-carried
-        # energy bounds are inert metadata here. The helper takes spectra only and
-        # always collapses on the library grid.
-        self._isomeric_branching = helper.compute_for_materials(
-            [flux_spectrum for flux_spectrum, _ in self._flux_with_energy]
-        )
+        """Delegates to :func:`openmc.deplete.gendf.operators._setup_independent_isomeric_branching`."""
+        _setup_independent_isomeric_branching(self)
 
     def _get_burnable_mats(self):
         """Override to use pre-computed metadata when materials are pre-filtered."""
