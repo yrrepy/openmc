@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 from dataclasses import dataclass
+import io
 import itertools
 import warnings
 
@@ -68,12 +69,46 @@ ATOMIC_SYMBOL = {
 }
 
 def _parse_endf_material(filepath):
-    """Parse an ENDF-format file, suppressing benign MF/MT warnings."""
+    """Parse an ENDF-format file, suppressing benign MF/MT warnings.
+
+    WORKAROUND -- MF=40 (covariance) lines are stripped before parsing.
+
+    This is a workaround for a bug in the ``endf`` package: ``parse_mf40``
+    (endf/mf40.py) loops exactly ``NS`` times, where ``NS`` is the subsection
+    count declared in the section HEAD record, with no SEND-record or EOF
+    guard. When a file's HEAD over-declares ``NS``, the parser reads past the
+    end of the section and eventually crashes with
+    ``ValueError: invalid literal for int() with base 10: ''``.
+
+    The EAF-2010 GENDF files trigger this: 97 of 816 files (e.g. Ag105g.asc,
+    Am242mg.asc) have a final MF=40 section whose HEAD over-declares ``NS``.
+    Because ``endf.Material.__init__`` has no per-section error isolation, that
+    single bad section aborts the whole file load -- taking the fully intact
+    MF=1/3/8/10 sections we actually need down with it.
+
+    MF=40 covariance data is never used by this module, so dropping those lines
+    is lossless here (and marginally speeds up parsing). Lines are identified by
+    the ENDF column MF field, ``line[70:72]``. Line 0 (the TPID record) is always
+    kept because ``Material`` unconditionally discards the first line.
+
+    REMOVE THIS WORKAROUND once the ``endf`` package is fixed -- either by
+    bounding the ``parse_mf40`` loop with a SEND/EOF check, or by adding a
+    ``sections=`` MF-filter parameter to ``Material.__init__`` so unwanted
+    sections are never parsed.
+    """
+    with open(filepath, 'r') as fh:
+        lines = fh.readlines()
+
+    filtered = ''.join(
+        line for i, line in enumerate(lines)
+        if i == 0 or line[70:72] != '40'
+    )
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore", message=r"MF=\d+, MT=\d+ ignored", category=UserWarning
         )
-        return endf.Material(str(filepath))
+        return endf.Material(io.StringIO(filtered))
 
 
 def _build_mt_to_reaction():
