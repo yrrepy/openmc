@@ -335,12 +335,12 @@ class SingleTargetReason(Enum):
 LIBRARY_CONFIGS = {
     'jendl50': {
         'description': 'JENDL-5.0 (Native pairing) - UKAEA-1102',
-        'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/jendl5data/gendf-1102/',
-        'decay_file': '/home/perry/NukeData/Activation/DecayData/jendl5dd/',
-        'base_chain': '//home/perry/NukeData/openmc_data/src/openmc_data/depletion/JENDL50/Chain_JENDL50.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JENDL50/',
-        'output_prefix': 'Chain_JENDL50-IsoFlag',
-        'log_prefix': 'JENDL50_isomer_mapping',
+        'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/JENDL5data/jendl5-n/gxs-1102/',
+        'decay_file':   '/home/perry/NukeData/Activation/DecayData/jendl5dd/',
+        'base_chain':   '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JENDL50/Chain_JENDL50.xml',
+        'output_dir':   '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JENDL50/GENDF/',
+        'output_prefix': 'Chain_JENDL50-IsoFlagGENDF',
+        'log_prefix': 'JENDL50.IsoFlagGENDF.isomer_mapping',
     },
     'cendl32': {
         'description': 'CENDL-3.2 + ENDF/B-8.0 decay - UKAEA-1102',
@@ -349,97 +349,97 @@ LIBRARY_CONFIGS = {
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/endf-b8.0/chain_endf_b8.0.xml',
         'output_dir': '/home/perry/NukeData/Activation/OMC/Perry-made/Isomeric-Chains/',
         'output_prefix': 'chain_endfCENDL32_dkENDF80_isoCENDL32gendf.mt4.',
-        'log_prefix': 'CENDL32_isomer_mapping',
+        'log_prefix': 'CENDL32.IsoFlagGENDF.isomer_mapping',
     },
     'endfb71_decay2012': {
         'description': 'ENDF/B-7.1 + decay2012 - CCFE-709',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/ENDFB71data/endfb71-n/gxs-709/',
         'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB71_decay2012/Chain_ENDFB71_decay2012.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB71_decay2012/',
-        'output_prefix': 'Chain_ENDFB71_decay2012-IsoFlag',
-        'log_prefix': 'ENDFB71-dk2012_isomer_mapping',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB71_decay2012/GENDF/',
+        'output_prefix': 'Chain_ENDFB71_decay2012-IsoFlagGENDF',
+        'log_prefix': 'ENDFB71-dk2012.IsoFlagGENDF.isomer_mapping',
     },
     'endfb80': {
         'description': 'ENDF/B-8.0 (Native pairing) - CCFE-709',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/ENDFB80data/endfb80-n/gxs-709/',
         'decay_file': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/endf-b8.0-endf/decay/ENDF-B-VIII.0_decay/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/Chain_ENDFB80.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/',
-        'output_prefix': 'Chain_ENDFB80-IsoFlag',
-        'log_prefix': 'ENDFB80_isomer_mapping',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB80/GENDF/',
+        'output_prefix': 'Chain_ENDFB80-IsoFlagGENDF',
+        'log_prefix': 'ENDFB80.IsoFlagGENDF.isomer_mapping',
     },
     'endfb81': {
         'description': 'ENDF/B-8.1 (Native pairing) - UKAEA-1102',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/ENDFB81data/endfb81-n/gxs-1102/',
         'decay_file': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/decay/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/Chain_ENDFB81.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/',
-        'output_prefix': 'Chain_ENDFB81-IsoFlag',
-        'log_prefix': 'ENDFB81_isomer_mapping',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/ENDFB81/GENDF/',
+        'output_prefix': 'Chain_ENDFB81-IsoFlagGENDF',
+        'log_prefix': 'ENDFB81.IsoFlagGENDF.isomer_mapping',
     },
     'tendl2017': {
         'description': 'TENDL-2017 + decay2012 - CCFE-709',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/TENDL2017data/tal2017-n/gxs-709/',
         'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
-        'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017/Chain_TENDL2017.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017/',
-        'output_prefix': 'Chain_TENDL2017-IsoFlag',
-        'log_prefix': 'TENDL2017_isomer_mapping',
+        'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017b/Chain_TENDL2017.xml',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017b/GENDF/',
+        'output_prefix': 'Chain_TENDL2017b-IsoFlagGENDF',
+        'log_prefix': 'TENDL2017b.IsoFlagGENDF.isomer_mapping',
     },
     'tendl2019': {
         'description': 'TENDL-2019 + decay2020 - UKAEA-1102',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/TENDL2019data/gendf-1102/',
         'decay_file': '/home/perry/NukeData/Activation/DecayData/decay_2020/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2019/Chain_TENDL2019.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2019/',
-        'output_prefix': 'Chain_TENDL2019-IsoFlag',
-        'log_prefix': 'TENDL2019_isomer_mapping',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2019/GENDF/',
+        'output_prefix': 'Chain_TENDL2019-IsoFlagGENDF',
+        'log_prefix': 'TENDL2019.IsoFlagGENDF.isomer_mapping',
     },
     'tendl2021': {
         'description': 'TENDL-2021 + decay2020 - UKAEA-1102',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/TENDL2021data/tal2021-n/gendf-1102/',
         'decay_file': '/home/perry/NukeData/Activation/DecayData/decay_2020/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2021/Chain_TENDL2021.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2021/',
-        'output_prefix': 'Chain_TENDL2021-IsoFlag',
-        'log_prefix': 'TENDL2021_isomer_mapping',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2021/GENDF/',
+        'output_prefix': 'Chain_TENDL2021-IsoFlagGENDF',
+        'log_prefix': 'TENDL2021.IsoFlagGENDF.isomer_mapping',
     },
     'jeff33': {
         'description': 'JEFF-3.3 (Native pairing) - CCFE-709',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/JEFF33data/jeff33-n/gxs-709/',
         'decay_file': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/jeff-3.3-endf/decay/',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/Chain_JEFF33.xml',
-        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/',
-        'output_prefix': 'Chain_JEFF33-IsoFlag',
-        'log_prefix': 'JEFF33_isomer_mapping',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF33/GENDF/',
+        'output_prefix': 'Chain_JEFF33-IsoFlagGENDF',
+        'log_prefix': 'JEFF33.IsoFlagGENDF.isomer_mapping',
     },
     'jeff40': {
         'description':   'JEFF-4.0 (Native pairing) - UKAEA-1102',
         'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/JEFF40data/jeff40-n/gxs-1102/',
         'decay_file':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/jeff-4.0-endf/decay/Radioactive_Decay_Data_JEFF-40.txt',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/Chain_JEFF40.xml',
-        'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/',
-        'output_prefix': 'Chain_JEFF40-IsoFlag',
-        'log_prefix':    'JEFF40_isomer_mapping',
+        'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/GENDF/',
+        'output_prefix': 'Chain_JEFF40-IsoFlagGENDF',
+        'log_prefix':    'JEFF40.IsoFlagGENDF.isomer_mapping',
     },
     'eaf2010': {
         'description':   'EAF-2010 (Native pairing) - CCFE-709',
         'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/EAF2010data/eaf2010-n/gxs-709/',
         'decay_file':    '/home/perry/NukeData/Activation/DecayData/JEFF311RDD_ALL.OUT',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/EAF2010/Chain_EAF2010.xml',
-        'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/EAF2010/',
-        'output_prefix': 'Chain_EAF2010-IsoFlag',
-        'log_prefix':    'EAF2010_isomer_mapping',
+        'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/EAF2010/GENDF/',
+        'output_prefix': 'Chain_EAF2010-IsoFlagGENDF',
+        'log_prefix':    'EAF2010.IsoFlagGENDF.isomer_mapping',
     },
     'scale631': {
         'description':   'SCALE-6.3.1: EAF-2010 (JEFF3.1/A+) + ENDF/B-7.1 - CCFE-709',
         'endf_gxs_dir':  '/home/perry/NukeData/Activation/FISPACT/EAF2010data/eaf2010-n/gxs-709/',
         'decay_file':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/jeff-SCALE-6.1.3-endf/decay/decay/',
         'base_chain':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/Chain_SCALE613.xml',
-        'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/',
-        'output_prefix': 'Chain_SCALE613-IsoFlag',
-        'log_prefix':    'SCALE613_isomer_mapping',
+        'output_dir':    '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/SCALE613/GENDF/',
+        'output_prefix': 'Chain_SCALE613-IsoFlagGENDF',
+        'log_prefix':    'SCALE613.IsoFlagGENDF.isomer_mapping',
     },
 }
 
@@ -509,7 +509,7 @@ def build_parser():
     parser.add_argument(
         '--prune-nn-prime-self-loops',
         action='store_true',
-        default=False,
+        default=True,
         help="Remove (n,n') reactions that are exact self-loops (target == parent "
              "nuclide) with no isomeric branching (Bateman diagonal no-ops with no "
              "effect on depletion results). Metastable-parent de-excitation "
@@ -519,7 +519,7 @@ def build_parser():
     parser.add_argument(
         '--suppress-single-target-yields',
         action='store_true',
-        default=False,
+        default=True,
         help="Suppress redundant single-target isomeric yields where the sole product equals "
              "the original reaction target with all 1.0 branching ratios. These add XML bloat "
              "without physics impact. Single-target cases are ALWAYS logged with reasons "
@@ -537,8 +537,8 @@ def build_parser():
 
     parser.add_argument('--audit-emax',               type=float,          default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
     parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band has ratio-1 > X, over-summing ONLY; under-summing never rejects (it is the radioactive-products-only MF=10 signature: an absent stable ground or anonymous levels missing from the partials). Default: None = audit only, reject nothing. GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
-    parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=False, help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: off; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
-    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=False, help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: off. OFF, or ANY anonymous subsection failing the gate, prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
+    parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=True,  help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: off; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
+    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: off. OFF, or ANY anonymous subsection failing the gate, prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
 
     return parser
 
@@ -3431,6 +3431,14 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         raise ValueError(
             f"Invalid mapping_mode '{mapping_mode}'. Must be 'elis' or 'lfs_order'."
         )
+
+    # Create output directories up front (first-run libraries have no GENDF/ dir)
+    for out_file in (output_chain_file, isomer_mapping_log_file,
+                     renormalization_log_file):
+        if out_file:
+            out_dir = os.path.dirname(out_file)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
     print("GENDF Isomeric Branching Chain Patcher v12")
