@@ -2720,12 +2720,20 @@ class _PythonGENDFLibrary:
         def _record_failure(nuclide_name, exc, **where):
             """Classify a failure, record it, and flag the unexpected ones."""
             error_str = str(exc)
-            # NO_METASTABLE_DECAY_DATA is an expected skip on healthy libraries;
-            # every other exception is a data-integrity failure that must not be
-            # swallowed. Record all of them (typed) so the scan completes, then
-            # raise below on the unexpected ones.
+            # NO_METASTABLE_DECAY_DATA is an expected skip on healthy libraries.
+            # A whole-file load failure (tracked in _material_load_failures) is
+            # a known-unparseable file -- e.g. the 97 EAF-2010 endf-crasher
+            # files -- whose channels are unextractable, not a data defect in
+            # parsed content: skip the nuclide, warn in the summary below.
+            # Every other exception is a data-integrity failure that must not
+            # be swallowed. Record all of them (typed) so the scan completes,
+            # then raise below on the unexpected ones.
             if 'NO_METASTABLE_DECAY_DATA' in error_str:
                 error_type = 'no_metastable_decay_data'
+            elif ('Failed to load GENDF file' in error_str
+                    and any(k[0] == nuclide_name
+                            for k in self._material_load_failures)):
+                error_type = 'material_load_failure'
             else:
                 error_type = 'unexpected_processing_error'
             entry = {
@@ -2815,6 +2823,16 @@ class _PythonGENDFLibrary:
                     print(f"  {nuclide_name}: {e}")
                 _record_failure(nuclide_name, e)
                 continue
+
+        # Known-unparseable files are skipped whole, but never silently.
+        load_failed = sorted({e['nuclide'] for e in self._processing_errors
+                              if e['type'] == 'material_load_failure'})
+        if load_failed:
+            preview = ', '.join(load_failed[:5])
+            warnings.warn(
+                f"{len(load_failed)} nuclide(s) skipped entirely: GENDF file "
+                f"failed to parse (endf-crasher files): {preview}"
+                + (', ...' if len(load_failed) > 5 else ''))
 
         # Fail loud on data-integrity errors; expected skips never trigger this.
         if unexpected_errors:
