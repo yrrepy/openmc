@@ -23,7 +23,7 @@ USE_MULTIPROCESSING = True
 # calculations
 NUM_PROCESSES = None
 
-def _distribute(items: List) -> List:
+def _distribute(items: list) -> list:
     """Distribute items across MPI communicator
 
     Parameters
@@ -68,7 +68,7 @@ def _add_external_source(
     return matrices, n_solve
 
 @lru_cache(maxsize=None)
-def _accepts_isomeric_branching(matrix_func: Callable) -> bool:
+def _accepts_isomeric_branching(matrix_func: callable) -> bool:
     """Cached check for whether matrix_func accepts an isomeric_branching arg."""
     return 'isomeric_branching' in inspect.signature(matrix_func).parameters
 
