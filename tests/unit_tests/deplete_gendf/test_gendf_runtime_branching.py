@@ -1032,13 +1032,14 @@ def test_deplete_operator_is_keyword_only():
     order = [p for p in params if params[p].kind is
              inspect.Parameter.POSITIONAL_OR_KEYWORD]
     assert order == ['func', 'chain', 'n', 'rates', 'dt', 'current_timestep',
-                     'matrix_func', 'transfer_rates', 'external_source_rates']
+                     'matrix_func', 'transfer_rates', 'external_source_rates',
+                     'substeps']
 
 
 def test_deplete_positional_operator_goes_to_matrix_args():
-    """A 10th positional lands in matrix_args, never in operator (keyword-only)."""
+    """A positional beyond substeps lands in matrix_args, never in operator."""
     sig = inspect.signature(deplete)
-    bound = sig.bind('f', 'c', 'n', 'r', 'dt', 0, None, None, None, 'EXTRA')
+    bound = sig.bind('f', 'c', 'n', 'r', 'dt', 0, None, None, None, 1, 'EXTRA')
     assert bound.arguments['matrix_args'] == ('EXTRA',)
     assert 'operator' not in bound.arguments
 
@@ -1060,7 +1061,7 @@ def test_deplete_operator_keyword_flows_through(monkeypatch):
         _isomeric_branching = [{'A': {'r': {'t': 1.0}}}]
 
     chain = FakeChain()
-    deplete(lambda m, n0, t: n0, chain, [np.array([1.0])], [None], 1.0,
+    deplete(lambda m, n0, t, s: n0, chain, [np.array([1.0])], [None], 1.0,
             operator=FakeOp())
     assert chain.seen_iso == {'A': {'r': {'t': 1.0}}}
 
@@ -1082,8 +1083,8 @@ def test_deplete_positional_operator_disables_branching(monkeypatch):
         _isomeric_branching = [{'A': {'r': {'t': 1.0}}}]
 
     chain = FakeChain()
-    deplete(lambda m, n0, t: n0, chain, [np.array([1.0])], [None], 1.0,
-            0, None, None, None, FakeOp())
+    deplete(lambda m, n0, t, s: n0, chain, [np.array([1.0])], [None], 1.0,
+            0, None, None, None, 1, FakeOp())
     assert chain.seen_iso is None
 
 
