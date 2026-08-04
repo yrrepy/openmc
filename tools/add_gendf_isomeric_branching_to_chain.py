@@ -378,9 +378,18 @@ LIBRARY_CONFIGS = {
         'output_prefix': 'Chain_ENDFB81-IsoFlagGENDF',
         'log_prefix': 'ENDFB81.IsoFlagGENDF.isomer_mapping',
     },
-    'tendl2017': {
+    'tendl2017a': {
         'description': 'TENDL-2017 + decay2012 - CCFE-709',
         'endf_gxs_dir': '/home/perry/NukeData/Activation/FISPACT/TENDL2017data/tal2017-n/gxs-709/',
+        'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
+        'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017a/Chain_TENDL2017.xml',
+        'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017a/GENDF/',
+        'output_prefix': 'Chain_TENDL2017a-IsoFlagGENDF',
+        'log_prefix': 'TENDL2017a.IsoFlagGENDF.isomer_mapping',
+    },
+    'tendl2017b': {
+        'description': 'TENDL-2017 + decay2012 - CCFE-709',
+        'endf_gxs_dir': '/home/perry/NukeData/Activation/PENDF/Pipeline-Produced/tendl2017b/gxs-709/',
         'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017b/Chain_TENDL2017.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017b/GENDF/',
