@@ -187,7 +187,8 @@ def lookup_liso(
     rtol: float = ELIS_RTOL,
     atol: float = ELIS_ATOL,
     skip_zero_elis_metastables: bool = True,
-    return_nearest: bool = True
+    return_nearest: bool = True,
+    warn_ambiguity: bool = True
 ) -> Dict[str, Any]:
     """Find LISO (isomeric state number) for given excitation energy.
 
@@ -219,6 +220,11 @@ def lookup_liso(
         If True (default), always return the nearest match even when tolerance
         is exceeded, with status indicating 'nearest'. If False, return
         status='no_match' without nearest info when outside tolerance.
+    warn_ambiguity : bool, optional
+        If True (default), emit the once-per-(Z, A) ambiguity warning when a
+        second decay level also passes tolerance. The 'ambiguous' verdict in
+        the returned dict is computed regardless of this flag (callers that
+        branch on ambiguity, e.g. hybrid mapping, pass False).
 
     Returns
     -------
@@ -226,7 +232,13 @@ def lookup_liso(
         Dictionary with 'status' key and additional fields depending on status:
 
         - **'matched'**: Match found within tolerance
-          ``{'status': 'matched', 'liso': int, 'dk_elis': float}``
+          ``{'status': 'matched', 'liso': int, 'dk_elis': float,
+          'ambiguous': bool, 'second_liso': int or None,
+          'second_dk_elis': float or None}``. ``ambiguous`` is True when the
+          second-nearest level also passes tolerance (possible m1/m2
+          mis-assignment); ``second_liso``/``second_dk_elis`` describe that
+          second-nearest level (None when the nuclide has a single valid
+          metastable).
 
         - **'nearest'**: Nearest match found, but outside tolerance (return_nearest=True)
           ``{'status': 'nearest', 'liso': int, 'dk_elis': float, 'diff_pct': float}``
@@ -337,12 +349,19 @@ def lookup_liso(
     # Check if within tolerance
     if elis_match(target_elis, dk_elis, rtol, atol):
         # Ambiguity: a second level also passes tolerance -> possible m1/m2
-        # mis-assignment. Warn once per (Z, A).
-        if second_match is not None and \
-                elis_match(target_elis, second_match[1], rtol, atol):
+        # mis-assignment. The verdict is computed unconditionally (hybrid
+        # mapping abstains on it); only the once-per-(Z, A) warning is gated.
+        ambiguous = second_match is not None and \
+            elis_match(target_elis, second_match[1], rtol, atol)
+        if ambiguous and warn_ambiguity:
             _warn_elis_ambiguity(z, a, target_elis, nearest_match,
                                  second_match, rtol)
-        return {'status': 'matched', 'liso': liso, 'dk_elis': dk_elis}
+        return {
+            'status': 'matched', 'liso': liso, 'dk_elis': dk_elis,
+            'ambiguous': ambiguous,
+            'second_liso': second_match[0] if second_match else None,
+            'second_dk_elis': second_match[1] if second_match else None,
+        }
     else:
         # Outside tolerance
         if return_nearest:

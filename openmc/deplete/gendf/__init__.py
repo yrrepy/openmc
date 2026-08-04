@@ -33,6 +33,7 @@ from .library import __all__
 from .library import (
     DecayState,
     MT_TO_REACTION,
+    PLACEHOLDER_LFS_VALUES,
     REACTION_TO_MT,
     _CppGENDFLibrary,
     _PythonGENDFLibrary,

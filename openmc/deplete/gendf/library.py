@@ -54,6 +54,12 @@ GENDF_RTOL_WARN = 1.0e-4
 # Absolute tolerance for energy matching (only used when values are near zero)
 GENDF_ATOL = 0.0
 
+# LFS placeholder values: "isomer of unspecified level" tags -- unidentified
+# excited states (99 = ENDF/JEFF convention, 40 = TENDL convention). NOT level
+# ordinals: never ranked among real levels, never named _m99/_m40. The
+# patcher's PLACEHOLDER_LFS description dict derives its keys from this set.
+PLACEHOLDER_LFS_VALUES = frozenset({99, 40})
+
 # Atomic symbols for nuclide identification
 ATOMIC_SYMBOL = {
     1: 'H', 2: 'He', 3: 'Li', 4: 'Be', 5: 'B', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 10: 'Ne',
@@ -670,6 +676,13 @@ class _PythonGENDFLibrary:
         ELIS=0 for a metastable indicates invalid data in the decay library
         (e.g., 32 such cases in JEFF-4.0 including Np242_m1, Ta178_m1).
         Set to False only for debugging.
+    mapping_mode : {'elis', 'lfs_order', 'elis_lfs_order'}, optional
+        Isomeric state mapping mode. 'elis' (default): excitation-energy
+        matching only, failures dropped and renormalized. 'lfs_order':
+        FISPACT-like positional mapping. 'elis_lfs_order': hybrid -- ELIS
+        matching first (unambiguous matches only), then positional fallback
+        for the unclaimed levels, orphan states minted instead of dropped
+        (the orphan disposition is the patcher's ``--orphan-policy``).
 
     Attributes
     ----------
@@ -736,7 +749,8 @@ class _PythonGENDFLibrary:
         check_type('elis_rtol', elis_rtol, float)
         check_type('elis_atol', elis_atol, float)
         check_type('skip_zero_elis_metastables', skip_zero_elis_metastables, bool)
-        check_value('mapping_mode', mapping_mode, ('elis', 'lfs_order'))
+        check_value('mapping_mode', mapping_mode,
+                    ('elis', 'lfs_order', 'elis_lfs_order'))
 
         self.library_path = Path(library_path)
         if not self.library_path.exists():
@@ -808,8 +822,9 @@ class _PythonGENDFLibrary:
         Returns
         -------
         str
-            Either 'elis' (ELIS-based matching) or 'lfs_order' (FISPACT-like
-            positional mapping)
+            'elis' (ELIS-based matching), 'lfs_order' (FISPACT-like
+            positional mapping), or 'elis_lfs_order' (hybrid: ELIS first,
+            positional fallback, orphan states kept)
         """
         return self._mapping_mode
 
@@ -1588,81 +1603,38 @@ class _PythonGENDFLibrary:
         }
         self._processing_errors.append(error)
 
-    def _map_via_elis(
-        self,
-        all_meta_levels: list,
-        ground_data,
-        nuclide_name: str,
-        reaction_name: str,
-        mt: int,
-        base_nuclide: str
-    ) -> tuple:
-        """Map metastable products using ELIS-based matching against decay library.
+    @staticmethod
+    def _assign_level_ranks(all_meta_levels):
+        """Stamp per-(z, a) 1-based rank over non-placeholder levels (F7).
 
-        Parameters
-        ----------
-        all_meta_levels : list
-            List of metastable level dicts from _categorize_mf10_levels()
-        ground_data : Tabulated1D or _RemainderXS or None
-            Ground state data for context in duplicate detection
-        nuclide_name : str
-            Parent nuclide name
-        reaction_name : str
-            Reaction name (e.g., '(n,gamma)')
-        mt : int
-            ENDF MT number
-        base_nuclide : str
-            Base product nuclide name (e.g., 'Ir192')
-
-        Returns
-        -------
-        tuple
-            (mapped_meta_levels, lfs_mapping)
+        Input is already LFS-sorted by :meth:`_categorize_mf10_levels`, so
+        rank = position in ascending-LFS order among the product's REAL
+        levels. Placeholder-LFS levels (99/40, unidentified excited states)
+        carry rank None: they are not level ordinals and never rank among
+        real levels.
         """
-        mapped_meta_levels = []
-        lfs_mapping = {}
-
-        # ==============================================================
-        # First pass: Calculate ELIS and try lookup for all metastables
-        # ==============================================================
-        elis_results = []  # [(meta_dict, elis, liso_or_none), ...]
-
+        counters = {}
         for meta in all_meta_levels:
-            level = meta['level']
-
-            # Calculate ELIS from this level's own QM/QI TAB1 head
-            qm = level.get('QM')
-            qi = level.get('QI', 0.0)
-
-            if qm is None:
-                elis = None
+            if meta['lfs'] in PLACEHOLDER_LFS_VALUES:
+                meta['rank'] = None
             else:
-                elis = qm - qi
+                key = (meta['z'], meta['a'])
+                counters[key] = counters.get(key, 0) + 1
+                meta['rank'] = counters[key]
 
-            # Try ELIS lookup - returns dict with 'status' key:
-            #   'matched': Match within tolerance
-            #   'nearest': Outside tolerance (with nearest match info)
-            #   'no_decay_data': Nuclide not in decay library
-            #   'no_metastables': Nuclide exists but only ground state
-            #   'zero_elis_only': Metastables exist but all have ELIS=0
-            liso_result = None
-            if elis is not None:
-                liso_result = lookup_liso(
-                    meta['z'], meta['a'], elis, self.decay_lookup,
-                    rtol=self._elis_rtol, atol=self._elis_atol,
-                    skip_zero_elis_metastables=self._skip_zero_elis_metastables,
-                    return_nearest=True  # Always get nearest match info
-                )
+    def _resolve_duplicate_liso(self, elis_results, ground_data,
+                                all_meta_levels, nuclide_name, reaction_name,
+                                mt, base_nuclide, requeue):
+        """Resolve multiple LFS matching the same LISO; keep the closest.
 
-            elis_results.append((meta, elis, liso_result))
-
-        # ==============================================================
-        # Duplicate Mapping Detection: Multiple LFS -> Same LISO
-        # ==============================================================
-        # When multiple GENDF LFS values have ELIS within tolerance of
-        # the same decay library LISO, keep only the closest match.
-
-        liso_to_matches = {}  # {liso: [(idx, meta, elis, liso_result, elis_diff), ...]}
+        ``elis_results`` is a list of ``(meta, elis, liso_result)`` tuples.
+        Losers are discarded (``requeue=False``, elis mode: sibling branching
+        renormalizes) or handed back for the positional fallback pool
+        (``requeue=True``, hybrid mode: E5). Returns
+        ``(surviving_results, loser_results)``; ``loser_results`` is always
+        empty when ``requeue`` is False.
+        """
+        liso_to_matches = {}  # {liso: [(idx, meta, elis, liso_result, diff)]}
         for idx, (meta, elis, liso_result) in enumerate(elis_results):
             if liso_result is not None and liso_result.get('status') == 'matched':
                 liso = liso_result['liso']
@@ -1672,7 +1644,6 @@ class _PythonGENDFLibrary:
                     liso_to_matches[liso] = []
                 liso_to_matches[liso].append((idx, meta, elis, liso_result, elis_diff))
 
-        # Resolve duplicates - keep only closest match
         indices_to_skip = set()
         for liso, matches in liso_to_matches.items():
             if len(matches) > 1:
@@ -1728,30 +1699,109 @@ class _PythonGENDFLibrary:
                     f"LFS={d['lfs']} (ELIS={d['elis']:.0f}eV, diff={d['diff']:.0f}eV)"
                     for d in discarded_list
                 )
+                loser_tail = ("Requeued to positional fallback: " if requeue
+                              else "Discarding: ")
                 warnings.warn(
                     f"DUPLICATE_MAPPING: {nuclide_name}({reaction_name})->{base_nuclide}_m{liso}: "
                     f"Multiple LFS map to same LISO. Keeping LFS={keeper_lfs} "
                     f"(ELIS={keeper_elis:.0f}eV, diff={keeper_diff:.0f}eV). "
-                    f"Discarding: {discarded_str}",
+                    f"{loser_tail}{discarded_str}",
                     UserWarning
                 )
 
                 # Store in processing errors for detailed logging
+                extra = {'requeued': True} if requeue else {}
                 self._record_processing_error(
                     'duplicate_mapping', nuclide_name, reaction_name, mt,
                     liso=liso, base_nuclide=base_nuclide,
                     kept_lfs=keeper_lfs, kept_elis=keeper_elis,
                     kept_diff=keeper_diff, dk_elis=dk_elis,
                     discarded=discarded_list, gendf_all_lfs=gendf_all_lfs,
-                    decay_all_liso=decay_all_liso, target_z=z, target_a=a
+                    decay_all_liso=decay_all_liso, target_z=z, target_a=a,
+                    **extra
                 )
 
-        # Filter out duplicate mappings
-        if indices_to_skip:
-            elis_results = [
-                item for idx, item in enumerate(elis_results)
-                if idx not in indices_to_skip
-            ]
+        surviving = [item for idx, item in enumerate(elis_results)
+                     if idx not in indices_to_skip]
+        losers = []
+        if requeue and indices_to_skip:
+            losers = [elis_results[idx] for idx in sorted(indices_to_skip)]
+        return surviving, losers
+
+    def _map_via_elis(
+        self,
+        all_meta_levels: list,
+        ground_data,
+        nuclide_name: str,
+        reaction_name: str,
+        mt: int,
+        base_nuclide: str
+    ) -> tuple:
+        """Map metastable products using ELIS-based matching against decay library.
+
+        Parameters
+        ----------
+        all_meta_levels : list
+            List of metastable level dicts from _categorize_mf10_levels()
+        ground_data : Tabulated1D or _RemainderXS or None
+            Ground state data for context in duplicate detection
+        nuclide_name : str
+            Parent nuclide name
+        reaction_name : str
+            Reaction name (e.g., '(n,gamma)')
+        mt : int
+            ENDF MT number
+        base_nuclide : str
+            Base product nuclide name (e.g., 'Ir192')
+
+        Returns
+        -------
+        tuple
+            (mapped_meta_levels, lfs_mapping)
+        """
+        mapped_meta_levels = []
+        lfs_mapping = {}
+        self._assign_level_ranks(all_meta_levels)
+
+        # ==============================================================
+        # First pass: Calculate ELIS and try lookup for all metastables
+        # ==============================================================
+        elis_results = []  # [(meta_dict, elis, liso_or_none), ...]
+
+        for meta in all_meta_levels:
+            level = meta['level']
+
+            # Calculate ELIS from this level's own QM/QI TAB1 head
+            qm = level.get('QM')
+            qi = level.get('QI', 0.0)
+
+            if qm is None:
+                elis = None
+            else:
+                elis = qm - qi
+
+            # Try ELIS lookup - returns dict with 'status' key:
+            #   'matched': Match within tolerance
+            #   'nearest': Outside tolerance (with nearest match info)
+            #   'no_decay_data': Nuclide not in decay library
+            #   'no_metastables': Nuclide exists but only ground state
+            #   'zero_elis_only': Metastables exist but all have ELIS=0
+            liso_result = None
+            if elis is not None:
+                liso_result = lookup_liso(
+                    meta['z'], meta['a'], elis, self.decay_lookup,
+                    rtol=self._elis_rtol, atol=self._elis_atol,
+                    skip_zero_elis_metastables=self._skip_zero_elis_metastables,
+                    return_nearest=True  # Always get nearest match info
+                )
+
+            elis_results.append((meta, elis, liso_result))
+
+        # Duplicate resolution (multiple LFS -> same LISO): keep the closest,
+        # discard the rest. Shared helper; hybrid mode requeues losers instead.
+        elis_results, _ = self._resolve_duplicate_liso(
+            elis_results, ground_data, all_meta_levels,
+            nuclide_name, reaction_name, mt, base_nuclide, requeue=False)
 
         # Collect all ELIS-matched LISO values (only 'matched', not 'nearest')
         assigned_lisos = set()
@@ -1775,7 +1825,20 @@ class _PythonGENDFLibrary:
             alternatives = [f"_m{s.liso} (ELIS={s.elis:.0f}eV)" for s in available_metas]
 
             if liso_result is None:
-                # Should not happen with return_nearest=True, but handle defensively
+                # QM absent on the subsection head: ELIS = QM - QI is
+                # incomputable, so the level cannot be energy-matched.
+                warnings.warn(
+                    f"WARNING: ELIS_INCOMPUTABLE: {nuclide_name}({reaction_name})->"
+                    f"{base_nuclide}_m? LFS={lfs}: subsection head has no QM, "
+                    "ELIS = QM - QI is incomputable. Product skipped; "
+                    "branching will be renormalized.",
+                    UserWarning
+                )
+                self._record_processing_error(
+                    'elis_incomputable', nuclide_name, reaction_name, mt,
+                    lfs=lfs, base_nuclide=base_nuclide,
+                    target_z=z, target_a=a, omitted=True
+                )
                 continue
 
             status = liso_result.get('status')
@@ -1784,7 +1847,7 @@ class _PythonGENDFLibrary:
             result = self._handle_elis_status(
                 status, liso_result, nuclide_name, reaction_name, mt,
                 base_nuclide, lfs, sigma, elis, elis_str, z, a,
-                available_metas, alternatives
+                available_metas, alternatives, meta.get('rank')
             )
 
             if result is not None:
@@ -1813,7 +1876,8 @@ class _PythonGENDFLibrary:
         z: int,
         a: int,
         available_metas: list,
-        alternatives: list
+        alternatives: list,
+        position: Optional[int] = None
     ):
         """Handle ELIS lookup status and return mapped level or None.
 
@@ -1831,7 +1895,10 @@ class _PythonGENDFLibrary:
                 'method': 'elis',
                 'elis': elis,       # GENDF-calculated ELIS
                 'dk_elis': dk_elis, # Decay library ELIS
-                'liso': liso
+                'liso': liso,
+                'position': position,  # rank among the product's real levels
+                'target_z': z,
+                'target_a': a
             }
             return (lfs, mapped_name, sigma, elis_info)
 
@@ -2050,6 +2117,8 @@ class _PythonGENDFLibrary:
                 'gendf_meta_count': gendf_meta_count,
                 'elis_ref_status': elis_ref_status,
                 'elis_ref_diff': elis_ref_diff,
+                'target_z': z,
+                'target_a': a,
             }
 
             mapped_meta_levels.append((lfs, mapped_name, sigma, elis_info))
@@ -2068,6 +2137,319 @@ class _PythonGENDFLibrary:
                 )
 
         return (mapped_meta_levels, lfs_mapping)
+
+    def _map_via_elis_lfs_order(
+        self,
+        all_meta_levels: list,
+        ground_data,
+        nuclide_name: str,
+        reaction_name: str,
+        mt: int,
+        base_nuclide: str
+    ) -> tuple:
+        """Hybrid mapping: ELIS first, positional fallback, orphans kept.
+
+        Three phases per (z, a) product group. Phase 1 accepts unique,
+        unambiguous ELIS matches (duplicate losers requeue instead of
+        dropping). Phase 2 pairs the unclaimed real levels, in rank order,
+        with the unclaimed decay metastables in LISO order -- the decay pool
+        is NOT ELIS-filtered, so it equals lfs_order's. Placeholder-LFS
+        levels (99/40) never rank; one with unknown or failed energy binds
+        to the LOWEST unclaimed metastable after Phase 2 (always-bind rule),
+        report-only when none remains. Phase 3 mints a chain name for every
+        leftover real level (method='orphan_added'); the orphan DISPOSITION
+        lives entirely in the patcher's writer (--orphan-policy).
+
+        Returns
+        -------
+        tuple
+            (mapped_meta_levels, lfs_mapping) -- same contract as the other
+            mappers.
+        """
+        mapped_meta_levels = []
+        lfs_mapping = {}
+        self._assign_level_ranks(all_meta_levels)
+        decay_lookup = self.decay_lookup or {}
+
+        # Phase 0: probe table. z/a read per level -- a section may mix
+        # products, and pools/claims/ranks are all per (z, a).
+        probes = []
+        for meta in all_meta_levels:
+            level = meta['level']
+            qm = level.get('QM')
+            qi = level.get('QI', 0.0)
+            elis = (qm - qi) if qm is not None else None
+            placeholder = meta['lfs'] in PLACEHOLDER_LFS_VALUES
+            # Usable = finite and > 0; NaN must never reach lookup_liso.
+            usable = (elis is not None and np.isfinite(elis) and elis > 0)
+            # Blank QI on an excited-target section disguises an absent
+            # energy as ELFS == QM (JEFF-4.0 Hf178_m1): the placeholder's
+            # energy is UNKNOWN, not evidence. An identified level keeps
+            # QI=0 as a real statement (final state = the target's level).
+            energy_unknown = placeholder and (
+                not usable or (qi == 0.0 and qm is not None and qm > 0))
+            liso_result = None
+            if usable and not energy_unknown:
+                liso_result = lookup_liso(
+                    meta['z'], meta['a'], elis, decay_lookup,
+                    rtol=self._elis_rtol, atol=self._elis_atol,
+                    skip_zero_elis_metastables=self._skip_zero_elis_metastables,
+                    return_nearest=True, warn_ambiguity=False)
+            probes.append({
+                'meta': meta, 'qm': qm, 'qi': qi, 'elis': elis,
+                'usable': usable, 'placeholder': placeholder,
+                'energy_unknown': energy_unknown, 'liso_result': liso_result,
+            })
+
+        groups = {}
+        for p in probes:
+            groups.setdefault((p['meta']['z'], p['meta']['a']), []).append(p)
+
+        for (z, a), gprobes in groups.items():
+            base_product = gprobes[0]['meta']['base_product']
+            decay_states = decay_lookup.get((z, a), [])
+            dk_meta_states = sorted(
+                [s for s in decay_states if s.liso > 0], key=lambda s: s.liso)
+            dk_meta_count = len(dk_meta_states)
+            gendf_meta_count = len(gprobes)
+            group_accepted = []
+
+            def _info(p, method, liso, dk_elis, dk_half_life,
+                      fallback_reason=None, **extra):
+                """Uniform hybrid elis_info (claimed set stamped at group end)."""
+                return {
+                    'method': method,
+                    'lfs': p['meta']['lfs'],
+                    'liso': liso,
+                    'position': p['meta']['rank'],
+                    'fallback_reason': fallback_reason,
+                    'elis': p['elis'],
+                    'qm': p['qm'],
+                    'qi': p['qi'],
+                    'gendf_elis': p['elis'],
+                    'dk_elis': dk_elis,
+                    'dk_half_life': dk_half_life,
+                    'dk_meta_count': dk_meta_count,
+                    'gendf_meta_count': gendf_meta_count,
+                    'target_z': z,
+                    'target_a': a,
+                    **extra,
+                }
+
+            # Phase 1: unique ELIS matches; an ambiguous match abstains
+            # (energy-degenerate states, In122) and re-derives positionally.
+            candidates = []
+            pending = []
+            for p in gprobes:
+                r = p['liso_result']
+                if (r is not None and r.get('status') == 'matched'
+                        and not r.get('ambiguous')):
+                    candidates.append((p['meta'], p['elis'], r))
+                else:
+                    pending.append(p)
+            candidates, losers = self._resolve_duplicate_liso(
+                candidates, ground_data, all_meta_levels,
+                nuclide_name, reaction_name, mt, base_nuclide, requeue=True)
+            loser_ids = {id(meta) for meta, _, _ in losers}
+            probe_by_meta = {id(p['meta']): p for p in gprobes}
+            pending.extend(probe_by_meta[i] for i in loser_ids)
+            pending.sort(key=lambda p: p['meta']['lfs'])
+
+            claimed = set()
+            for meta, elis, r in candidates:
+                p = probe_by_meta[id(meta)]
+                liso = r['liso']
+                claimed.add(liso)
+                dk_state = next(
+                    (s for s in dk_meta_states if s.liso == liso), None)
+                info = _info(p, 'elis', liso, r['dk_elis'],
+                             dk_state.half_life if dk_state else None)
+                group_accepted.append(
+                    (meta['lfs'], f"{base_product}_m{liso}", meta['sigma'],
+                     info))
+            phase1_claimed = sorted(claimed)
+
+            def _fallback_reason(p):
+                """Why this level left Phase 1 (F11 label set)."""
+                if id(p['meta']) in loser_ids:
+                    return 'duplicate_loser'
+                if p['qm'] is None:
+                    return 'qm_absent'
+                if not p['usable']:
+                    return 'elfs_unusable'
+                r = p['liso_result']
+                status = r.get('status') if r is not None else None
+                if status == 'matched' and r.get('ambiguous'):
+                    return 'elis_ambiguous'
+                if status == 'nearest':
+                    return 'elis_tol_exceeded'
+                if status == 'zero_elis_only':
+                    return 'dk_elis_zero'
+                return 'no_dk_partner'
+
+            # Routing records for every real level leaving Phase 1: their own
+            # label so the legacy not-mapped sweeps never double-report them.
+            pool = [p for p in pending if not p['placeholder']]
+            for p in pool:
+                r = p['liso_result'] or {}
+                self._record_processing_error(
+                    'hybrid_fallback', nuclide_name, reaction_name, mt,
+                    fallback_reason=_fallback_reason(p),
+                    lfs=p['meta']['lfs'], elis=p['elis'],
+                    position=p['meta']['rank'], base_nuclide=base_product,
+                    nearest_liso=r.get('liso'),
+                    nearest_dk_elis=r.get('dk_elis'),
+                    diff_pct=r.get('diff_pct'),
+                    second_liso=r.get('second_liso'),
+                    second_dk_elis=r.get('second_dk_elis'),
+                    target_z=z, target_a=a,
+                    routed_to_fallback=True, omitted=False)
+
+            # Phase 2: strictly positional, collision-aware (Bi212 shape) --
+            # rank order onto unclaimed LISOs; no energy preference.
+            free_states = [s for s in dk_meta_states if s.liso not in claimed]
+            n_assign = min(len(pool), len(free_states))
+            for p, s in zip(pool[:n_assign], free_states[:n_assign]):
+                meta = p['meta']
+                claimed.add(s.liso)
+                info = _info(p, 'lfs_order_fallback', s.liso, s.elis,
+                             s.half_life, fallback_reason=_fallback_reason(p))
+                group_accepted.append(
+                    (meta['lfs'], f"{base_product}_m{s.liso}", meta['sigma'],
+                     info))
+            leftovers = pool[n_assign:]
+
+            # Placeholders (LFS 99/40): never positional among real levels.
+            # Unknown/failed energy binds to the lowest unclaimed metastable
+            # (always-bind); nothing unclaimed left -> report-only, the share
+            # spreads pro-rata over ground + kept siblings at runtime.
+            for p in sorted((p for p in pending if p['placeholder']),
+                            key=lambda p: p['meta']['lfs']):
+                meta = p['meta']
+                reason = ('energy_unknown' if p['energy_unknown']
+                          else _fallback_reason(p))
+                free = [s for s in dk_meta_states if s.liso not in claimed]
+                if free:
+                    s = free[0]
+                    claimed.add(s.liso)
+                    how = ('sole unclaimed metastable' if len(free) == 1
+                           else f'lowest of {len(free)} unclaimed metastables')
+                    delta = (f"{abs(p['elis'] - s.elis):.0f} eV"
+                             if p['usable'] and s.elis else 'n/a')
+                    warnings.warn(
+                        f"PLACEHOLDER_LFS_BOUND: {nuclide_name}({reaction_name})"
+                        f"->{base_product}_m{s.liso}: placeholder LFS="
+                        f"{meta['lfs']} (unidentified excited state, {reason}) "
+                        f"bound to the {how} (ELIS={s.elis:.0f} eV, "
+                        f"delta-E={delta}).", UserWarning)
+                    self._record_processing_error(
+                        'placeholder_bound', nuclide_name, reaction_name, mt,
+                        lfs=meta['lfs'], liso=s.liso, elis=p['elis'],
+                        dk_elis=s.elis, dk_half_life=s.half_life,
+                        energy_status=reason, n_unclaimed=len(free),
+                        base_nuclide=base_product, target_z=z, target_a=a,
+                        omitted=False)
+                    info = _info(p, 'placeholder_bound', s.liso, s.elis,
+                                 s.half_life, fallback_reason=reason)
+                    group_accepted.append(
+                        (meta['lfs'], f"{base_product}_m{s.liso}",
+                         meta['sigma'], info))
+                else:
+                    warnings.warn(
+                        f"PLACEHOLDER_LFS_UNMAPPED: {nuclide_name}"
+                        f"({reaction_name})->{base_product}: placeholder LFS="
+                        f"{meta['lfs']} (unidentified excited state, {reason}) "
+                        "has no unclaimed metastable left; report-only. Its "
+                        "share spreads pro-rata over ground + kept siblings "
+                        "at runtime.", UserWarning)
+                    self._record_processing_error(
+                        'placeholder_unmapped', nuclide_name, reaction_name,
+                        mt, lfs=meta['lfs'], elis=p['elis'],
+                        energy_status=reason, base_nuclide=base_product,
+                        target_z=z, target_a=a, omitted=True)
+
+            # Phase 3: leftover real levels become orphan states. The mapper
+            # always mints the name and emits the level; keeping, folding or
+            # renormalizing it is the writer's --orphan-policy decision.
+            for k, p in enumerate(leftovers, start=1):
+                meta = p['meta']
+                reason = _fallback_reason(p)
+                name = self._allocate_orphan_state_name(base_product, z, a, k)
+                elis_str = (f"{p['elis']:.0f}" if p['elis'] is not None
+                            else 'N/A')
+                warnings.warn(
+                    f"ORPHAN_STATE_ADDED: {nuclide_name}({reaction_name})->"
+                    f"{name}: LFS={meta['lfs']} (ELFS={elis_str} eV, {reason}) "
+                    "has no decay partner; orphan state minted. Disposition "
+                    "is decided by --orphan-policy in the writer.",
+                    UserWarning)
+                info = _info(p, 'orphan_added', None, None, None,
+                             fallback_reason=reason, orphan_rank=k)
+                group_accepted.append(
+                    (meta['lfs'], name, meta['sigma'], info))
+                if not hasattr(self, '_orphan_levels'):
+                    self._orphan_levels = []
+                self._orphan_levels.append({
+                    'parent': nuclide_name, 'reaction': reaction_name,
+                    'mt': mt, 'name': name, 'base_nuclide': base_product,
+                    'target_z': z, 'target_a': a, 'lfs': meta['lfs'],
+                    'position': meta['rank'], 'orphan_rank': k,
+                    'elis': p['elis'], 'qm': p['qm'], 'qi': p['qi'],
+                    'fallback_reason': reason,
+                })
+
+            # Decay metastables nothing claimed: informational only -- the
+            # nuclide is already in the chain, it simply gains no production
+            # from this reaction.
+            for s in dk_meta_states:
+                if s.liso not in claimed:
+                    self._record_processing_error(
+                        'hybrid_orphan_dk', nuclide_name, reaction_name, mt,
+                        liso=s.liso, dk_elis=s.elis,
+                        dk_half_life=s.half_life,
+                        dk_meta_count=dk_meta_count,
+                        gendf_meta_count=gendf_meta_count,
+                        base_nuclide=base_product, target_z=z, target_a=a)
+
+            for entry in group_accepted:
+                entry[3]['phase1_claimed_lisos'] = phase1_claimed
+                lfs, mapped_name, sigma, elis_info = entry
+                # Placeholder values must never leak into product names.
+                assert not mapped_name.endswith(('_m40', '_m99')), mapped_name
+                mapped_meta_levels.append(entry)
+                lfs_mapping[mapped_name] = lfs
+
+        return (mapped_meta_levels, lfs_mapping)
+
+    def _allocate_orphan_state_name(self, base_nuclide, z, a, orphan_rank):
+        """Mint or reuse the k-th orphan state name for (z, a).
+
+        Smallest ``_m{n}`` free of the decay library's LISO set, the chain's
+        names (``self._reserved_names``), placeholder values, and this scan's
+        earlier allocations. Per-(z, a) registry: the k-th orphan of EVERY
+        parent shares one name, so several parents feeding the same unmatched
+        state produce one chain nuclide.
+        """
+        if not hasattr(self, '_orphan_name_allocations'):
+            self._orphan_name_allocations = {}
+        names = self._orphan_name_allocations.setdefault((z, a), [])
+        if orphan_rank <= len(names):
+            return names[orphan_rank - 1]
+        decay_lisos = {s.liso for s in (self.decay_lookup or {}).get((z, a), [])}
+        reserved = getattr(self, '_reserved_names', set())
+        n = 1
+        while True:
+            candidate = f"{base_nuclide}_m{n}"
+            if (n not in decay_lisos and n not in PLACEHOLDER_LFS_VALUES
+                    and candidate not in reserved and candidate not in names):
+                names.append(candidate)
+                return candidate
+            n += 1
+
+    @property
+    def orphan_levels(self):
+        """Orphan states minted by hybrid mapping (method='orphan_added')."""
+        return list(getattr(self, '_orphan_levels', []))
 
     def _build_branching_result(
         self,
@@ -2655,6 +3037,14 @@ class _PythonGENDFLibrary:
             mapped_meta_levels, lfs_mapping = self._map_via_lfs_order(
                 all_meta_levels, nuclide_name, reaction_name, mt, base_nuclide
             )
+        elif self._mapping_mode == 'elis_lfs_order':
+            mapped_meta_levels, lfs_mapping = self._map_via_elis_lfs_order(
+                all_meta_levels, ground_data,
+                nuclide_name, reaction_name, mt, base_nuclide
+            )
+        else:
+            raise ValueError(
+                f"Unknown mapping_mode '{self._mapping_mode}'")
 
         result = self._build_branching_result(
             ground_data, ground_product, mapped_meta_levels,
@@ -2752,6 +3142,11 @@ class _PythonGENDFLibrary:
         self._processing_errors = []  # Capture ELIS mismatch errors (missing metastable products)
         self._unmatched_mts = []  # Track reaction TYPES not in chain (nuclide/reaction missing)
         self._ground_repaired = []  # Reactions whose ground was synthesized from MF=3
+        self._orphan_levels = []  # Hybrid mode: orphan states minted by Phase 3
+        self._orphan_name_allocations = {}  # Hybrid: per-(z, a) minted names
+        if chain is not None:
+            # Orphan names must never collide with an existing chain nuclide.
+            self._reserved_names = {nuc.name for nuc in chain.nuclides}
         unexpected_errors = []  # Data-integrity failures that must abort the scan
 
         def _record_failure(nuclide_name, exc, **where):
@@ -3062,14 +3457,21 @@ def GENDFLibrary(
     skip_zero_elis_metastables : bool, optional
         If True, skip metastable states with ELIS=0 in decay library (likely
         data errors). Default is True.
-    mapping_mode : {'elis', 'lfs_order'}, optional
+    mapping_mode : {'elis', 'lfs_order', 'elis_lfs_order'}, optional
         Isomeric state mapping mode:
 
         - 'elis' (default): Use excitation energy (ELIS) matching between
-          GENDF MF=10 products and decay library. Most accurate method.
+          GENDF MF=10 products and decay library. Failures are dropped and
+          sibling branching renormalized.
         - 'lfs_order': Use FISPACT-like positional mapping where the 1st
           metastable LFS maps to _m1, 2nd to _m2, etc. Useful for validation
           testing against FISPACT-II.
+        - 'elis_lfs_order': Hybrid. Phase 1 accepts unambiguous ELIS matches;
+          Phase 2 pairs the unclaimed levels with the unclaimed decay
+          metastables positionally; leftover levels become orphan states
+          (method='orphan_added') instead of being dropped. Placeholder-LFS
+          levels (99/40, unidentified excited states) bind to the lowest
+          unclaimed metastable when their energy is unknown or fails.
 
     Returns
     -------
