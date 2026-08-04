@@ -45,6 +45,12 @@ _logger = logging.getLogger(__name__)
 ELIS_RTOL = 0.50   # 50% relative tolerance
 ELIS_ATOL = 0.0    # No absolute tolerance (rtol-only)
 
+# Dedup store for once-per-(Z, A) ELIS ambiguity warnings.
+# Reset at the start of every parse_decay_isomeric_levels() call so each
+# library load gets its warnings again (a long-lived process that loads
+# several libraries is not silenced after the first).
+_WARNED_ELIS_AMBIGUITY: set = set()
+
 
 # ============================================================================
 # Data Classes
@@ -166,6 +172,19 @@ def elis_match(
     return abs(gendf_elis - dk_elis) <= atol + rtol * abs(dk_elis)
 
 
+def _warn_elis_ambiguity(z, a, target_elis, assigned, other, rtol):
+    """Warn once per (Z, A) when two decay levels both match the derived ELIS."""
+    key = (z, a)
+    if key in _WARNED_ELIS_AMBIGUITY:
+        return
+    _WARNED_ELIS_AMBIGUITY.add(key)
+    warnings.warn(
+        f"Ambiguous ELIS match for Z={z} A={a} (MF=10 ELIS={target_elis:.1f} "
+        f"eV): assigned LISO={assigned[0]} (ELIS={assigned[1]:.1f} eV), but "
+        f"LISO={other[0]} (ELIS={other[1]:.1f} eV) also passes rtol={rtol}. "
+        f"Possible m1/m2 mis-assignment.", UserWarning)
+
+
 def lookup_liso(
     z: int,
     a: int,
@@ -174,7 +193,8 @@ def lookup_liso(
     rtol: float = ELIS_RTOL,
     atol: float = ELIS_ATOL,
     skip_zero_elis_metastables: bool = True,
-    return_nearest: bool = True
+    return_nearest: bool = True,
+    warn_ambiguity: bool = True
 ) -> Dict[str, Any]:
     """Find LISO (isomeric state number) for given excitation energy.
 
@@ -206,6 +226,11 @@ def lookup_liso(
         If True (default), always return the nearest match even when tolerance
         is exceeded, with status indicating 'nearest'. If False, return
         status='no_match' without nearest info when outside tolerance.
+    warn_ambiguity : bool, optional
+        If True (default), emit the once-per-(Z, A) ambiguity warning when a
+        second decay level also passes tolerance. The 'ambiguous' verdict in
+        the returned dict is computed regardless of this flag (callers that
+        branch on ambiguity, e.g. hybrid mapping, pass False).
 
     Returns
     -------
@@ -213,7 +238,13 @@ def lookup_liso(
         Dictionary with 'status' key and additional fields depending on status:
 
         - **'matched'**: Match found within tolerance
-          ``{'status': 'matched', 'liso': int, 'dk_elis': float}``
+          ``{'status': 'matched', 'liso': int, 'dk_elis': float,
+          'ambiguous': bool, 'second_liso': int or None,
+          'second_dk_elis': float or None}``. ``ambiguous`` is True when the
+          second-nearest level also passes tolerance (possible m1/m2
+          mis-assignment); ``second_liso``/``second_dk_elis`` describe that
+          second-nearest level (None when the nuclide has a single valid
+          metastable).
 
         - **'nearest'**: Nearest match found, but outside tolerance (return_nearest=True)
           ``{'status': 'nearest', 'liso': int, 'dk_elis': float, 'diff_pct': float}``
@@ -303,21 +334,40 @@ def lookup_liso(
     if not metastables_valid:
         return {'status': 'no_metastables'}
 
-    # Find nearest match by absolute ELIS difference
+    # Find nearest and second-nearest matches by absolute ELIS difference
     nearest_match = None
     nearest_diff = float('inf')
+    second_match = None
+    second_diff = float('inf')
 
     for state in metastables_valid:
         diff = abs(target_elis - state.elis)
         if diff < nearest_diff:
+            second_diff, second_match = nearest_diff, nearest_match
             nearest_diff = diff
             nearest_match = (state.liso, state.elis)
+        elif diff < second_diff:
+            second_diff = diff
+            second_match = (state.liso, state.elis)
 
     liso, dk_elis = nearest_match
 
     # Check if within tolerance
     if elis_match(target_elis, dk_elis, rtol, atol):
-        return {'status': 'matched', 'liso': liso, 'dk_elis': dk_elis}
+        # Ambiguity: a second level also passes tolerance -> possible m1/m2
+        # mis-assignment. The verdict is computed unconditionally (hybrid
+        # mapping abstains on it); only the once-per-(Z, A) warning is gated.
+        ambiguous = second_match is not None and \
+            elis_match(target_elis, second_match[1], rtol, atol)
+        if ambiguous and warn_ambiguity:
+            _warn_elis_ambiguity(z, a, target_elis, nearest_match,
+                                 second_match, rtol)
+        return {
+            'status': 'matched', 'liso': liso, 'dk_elis': dk_elis,
+            'ambiguous': ambiguous,
+            'second_liso': second_match[0] if second_match else None,
+            'second_dk_elis': second_match[1] if second_match else None,
+        }
     else:
         # Outside tolerance
         if return_nearest:
@@ -391,6 +441,10 @@ def parse_decay_isomeric_levels(
     lookup_liso : Find LISO for given excitation energy
     DecayState : Data class for nuclear state information
     """
+    # New library load: re-arm the once-per-(Z, A) ambiguity warnings so a
+    # second load in the same process is not silently deduped against the first.
+    _WARNED_ELIS_AMBIGUITY.clear()
+
     decay_path = Path(decay_path)
 
     if not decay_path.exists():

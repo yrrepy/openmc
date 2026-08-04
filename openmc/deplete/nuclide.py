@@ -103,6 +103,13 @@ def _unfold_isomeric_branching(base_type, iso_elem, elem_Q):
     pathway gets an ``_m<n>`` suffix where ``n`` is the isomer ordinal parsed
     from the *target* name (not the LFS value). See the Phase 1 chain spec.
 
+    A non-zero LFS whose target carries NO ``_m<n>`` suffix is a
+    GROUND-RECIPIENT entry: the patcher's ``--orphan-policy reattribute`` folds
+    an unidentified level's share into the reaction's ground product, which
+    keeps the level's own LFS (and Q) while naming the ground as its target.
+    Such an entry is read back as a second ``base_type`` pathway -- the LFS
+    distinguishes the two, and the collapse sums same-named rows by design.
+
     Parameters
     ----------
     base_type : str
@@ -144,13 +151,13 @@ def _unfold_isomeric_branching(base_type, iso_elem, elem_Q):
         # Ground vs metastable: keyed on LFS when known, else the target suffix.
         ordinal = _isomer_ordinal(target)
         is_ground = (lfs == 0) if lfs is not None else (ordinal == 0)
-        if is_ground:
+        # A ground-named target is a ground pathway whatever its LFS: with
+        # lfs == 0 it is the reaction's own ground row, with lfs != 0 it is a
+        # ground-RECIPIENT fold (see the docstring). Only the target name can
+        # carry an isomer ordinal, so there is nothing else such an entry could
+        # mean and nothing is lost by reading it.
+        if is_ground or ordinal == 0:
             r_type = base_type
-        elif ordinal == 0:
-            raise ValueError(
-                f"isomeric_branching entry with lfs={lfs} for reaction "
-                f"'{base_type}' has target '{target}' without an _m<n> isomer "
-                "suffix")
         else:
             r_type = f"{base_type}_m{ordinal}"
         reactions.append(ReactionTuple(r_type, target, Q, 1.0, lfs))
