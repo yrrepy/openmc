@@ -8,11 +8,15 @@ data carries a metastable final level, a product-qualified pathway
 resulting groups are serialized by the chain's Phase-1 refold writer as the
 canonical type-only ``<reaction><isomeric_branching .../></reaction>`` form.
 
-Two mapping modes are supported:
+Three mapping modes are supported:
 - 'elis' (default): ELIS-based mapping for accurate LFS->LISO conversion,
   matching each partial's excitation energy (ELFS = QM - QI) against the
   decay-library excitation energies (:mod:`openmc.deplete.decay_elis`).
 - 'lfs_order': FISPACT-like positional mapping for validation testing.
+- 'elis_lfs_order': hybrid -- unique, unambiguous ELIS matches are taken first,
+  every level that failed re-derives positionally against the metastables no
+  ELIS match claimed, and whatever is still left over becomes a minted orphan
+  state (see :func:`_classify_elis_lfs_order`).
 
 IMPORTANT: a decay file is REQUIRED for both modes.
 
@@ -34,8 +38,8 @@ import openmc.data
 from openmc.data import gnds_name, zam, ATOMIC_SYMBOL, DADZ
 from openmc.data.pendf import tape_identity
 from openmc.deplete import Chain
-from openmc.deplete.nuclide import ReactionTuple
-from openmc.deplete.chain import REACTIONS
+from openmc.deplete.nuclide import Nuclide, ReactionTuple
+from openmc.deplete.chain import REACTIONS, _invalidate_chain_cache
 from openmc.deplete.decay_elis import (
     parse_decay_isomeric_levels, lookup_liso, ELIS_RTOL, ELIS_ATOL,
 )
@@ -49,23 +53,31 @@ _TRAPEZOID = getattr(np, 'trapezoid', getattr(np, 'trapz', None))
 
 
 # =============================================================================
-# LFS sentinel values ("unspecified isomer" conventions) -- report-only guard
+# LFS placeholder values ("unspecified isomer" conventions) -- report-only guard
 # =============================================================================
 
 # Some evaluations tag a reaction product whose final-state LEVEL could not be
-# resolved with a SENTINEL LFS instead of a true level index. These sentinels
-# are NOT level ordinals and must NEVER be interpreted as isomer ordinals -- a
-# sentinel must never become ``_m99`` / ``_m40``. ELIS mapping is unaffected
-# (it matches the real ELFS excitation energy, QM - QI); only a positional
-# ``lfs_order`` consumer would mis-name them. Detection below is REPORT-ONLY:
-# no mapping decision and no byte of the output chain depends on it.
-SENTINEL_LFS = {
+# resolved with a PLACEHOLDER LFS instead of a true level index: unidentified
+# excited states. Placeholders are NOT level ordinals and must NEVER be
+# interpreted as isomer ordinals -- a placeholder must never become ``_m99`` /
+# ``_m40``. ELIS mapping is unaffected (it matches the real ELFS excitation
+# energy, QM - QI); only a positional ``lfs_order`` consumer would mis-name
+# them. Detection below is REPORT-ONLY: no mapping decision and no byte of the
+# output chain depends on it. The hybrid ``elis_lfs_order`` mode carries its own
+# placeholder binding rule (see :func:`_classify_elis_lfs_order`).
+PLACEHOLDER_LFS_VALUES = frozenset({99, 40})
+
+_PLACEHOLDER_DESCRIPTIONS = {
     99: 'ENDF/JEFF convention: isomer of unspecified level',
     40: 'TENDL convention: isomer of unspecified level',
 }
+# Keys derive from the value set so the two can never drift (GENDF parity: the
+# value set is the library-side constant there, tool-side here).
+PLACEHOLDER_LFS = {v: _PLACEHOLDER_DESCRIPTIONS[v]
+                   for v in sorted(PLACEHOLDER_LFS_VALUES)}
 
-# Human-readable outcome per classification bucket, for the sentinel report.
-_SENTINEL_OUTCOME = {
+# Human-readable outcome per classification bucket, for the placeholder report.
+_PLACEHOLDER_OUTCOME = {
     'matched':              'mapped (in chain)',
     'product_not_in_chain': 'mapped (product NOT in chain)',
     'rtol_exceeded':        'ELIS rtol exceeded (unmapped)',
@@ -73,6 +85,135 @@ _SENTINEL_OUTCOME = {
     'zero_elis':            'DK-Lib ELIS=0 (unmapped)',
     'duplicate':            'duplicate LFS (discarded)',
     'lfs_order_dropped':    'lfs_order dropped (unmapped)',
+    # Hybrid-only terminal buckets (:func:`_classify_elis_lfs_order`).
+    'orphan_added':         'orphan state minted (writer decides disposition)',
+    'placeholder_unmapped': 'placeholder LFS: no metastable left (report-only)',
+    'hybrid_orphan_dk':     'decay metastable claimed by nothing (informational)',
+}
+
+
+# =============================================================================
+# Mapping modes
+# =============================================================================
+
+# 'elis'          -- ELIS (ELFS = QM - QI) matched against the decay library.
+# 'lfs_order'     -- FISPACT-like positional mapping, for validation.
+# 'elis_lfs_order'-- hybrid: unique ELIS matches first, positional fallback for
+#                    everything that failed, minted orphan states for the rest.
+MAPPING_MODES = ('elis', 'lfs_order', 'elis_lfs_order')
+
+# Per-mode ELIS tolerance default, resolved in main() BEFORE classification. The
+# legacy modes keep 0.50 so their runs stay byte-identical; the hybrid tightens
+# to 0.15 because a demoted row re-derives POSITIONALLY there instead of being
+# dropped, so a false ELIS positive costs more than a miss. ``decay_elis.ELIS_RTOL``
+# (0.50) is the shared library constant and is deliberately NOT changed.
+MODE_DEFAULT_RTOL = {'elis': ELIS_RTOL, 'lfs_order': ELIS_RTOL,
+                     'elis_lfs_order': 0.15}
+
+
+# =============================================================================
+# Orphan policy (mode-agnostic writing layer)
+# =============================================================================
+
+# What the WRITER does with a product the chain does not carry -- a level the
+# mapper could not identify (hybrid Phase 3), or an identified metastable whose
+# decay-library name is absent from the chain. Membership is a POLICY decision
+# here, never a mapper verdict: the mapper marks, the writer disposes.
+#
+# 'add-stable'   keep the branch and materialise the product as a bare
+#                ``<nuclide name=... reactions="0"/>`` (no decay data -> the
+#                chain reader treats it as STABLE: a pure sink that conserves
+#                the branch's mass but models none of the state's own activity).
+# 'drop'         the status quo: the pathway is not written and its share
+#                VANISHES from the chain (the parent under-burns and every
+#                daughter under-produces by exactly that share). This is NOT a
+#                renormalization -- PENDF pathways carry cross sections in
+#                barns, not branching ratios, so there is no ratio channel to
+#                redistribute over. Kept as the byte-identical regression mode.
+# 'reattribute'  fold the orphan's CROSS-SECTION COLUMN into the kept isomeric
+#                sibling of the same product at the nearest LOWER rank (ground
+#                when nothing is below it). The written entry repeats the
+#                recipient's name as its target while keeping the orphan's own
+#                LFS and QI, and the collapse SUMS the two same-named rows
+#                (microxs.stage()). Distinct from GENDF's 'renorm'/'reattribute'
+#                pair, which move BRANCHING RATIOS.
+ORPHAN_POLICIES = ('add-stable', 'drop', 'reattribute')
+
+# One-line banner gloss per policy (console only; the log's own sections carry
+# the full wording). 'drop' is never called a renormalization.
+_ORPHAN_POLICY_BANNER = {
+    'add-stable':  'off-chain products are added to the chain as stable pure '
+                   'sinks and their pathways kept',
+    'drop':        'off-chain products are not written -- their cross-section '
+                   'columns vanish (status quo; NOT a renormalization)',
+    'reattribute': "off-chain products' cross-section columns fold into the "
+                   'kept isomer at the nearest lower rank (ground when none)',
+}
+
+# Why a level left Phase 1 of the hybrid mapper (GENDF F11 label set). The
+# legacy classification buckets map onto these 1:1 -- rtol_exceeded ->
+# elis_tol_exceeded, zero_elis -> dk_elis_zero, no_dk -> no_dk_partner,
+# duplicate -> duplicate_loser -- with 'elis_ambiguous' added by the hybrid's
+# abstention rule and 'qm_absent' / 'elfs_unusable' by its Phase-0 probe.
+HYBRID_FALLBACK_REASONS = (
+    'qm_absent', 'elfs_unusable', 'elis_tol_exceeded', 'elis_ambiguous',
+    'dk_elis_zero', 'no_dk_partner', 'duplicate_loser',
+)
+
+# The subset of the above that means "the file's energy could not identify the
+# level", grouped for the counter block's single ``unusable`` memo line. The two
+# left out are process outcomes, not energy verdicts, and get their own memo
+# lines: 'elis_ambiguous' (abstention) and 'duplicate_loser' (requeue).
+HYBRID_UNUSABLE_REASONS = ('qm_absent', 'elfs_unusable', 'dk_elis_zero',
+                           'elis_tol_exceeded', 'no_dk_partner')
+
+# Plain-language reasons for the log (the mapper's own labels are terse).
+HYBRID_REASON_LABELS = {
+    'qm_absent':         'QM absent: ELFS = QM - QI cannot be computed',
+    'elfs_unusable':     'ELFS zero, negative or not a number',
+    'dk_elis_zero':      'every decay state of the product carries ELIS = 0',
+    'elis_tol_exceeded': 'nearest decay state lies outside the tolerance',
+    'no_dk_partner':     'product has no metastable state in the decay library',
+    'elis_ambiguous':    'two decay states within tolerance: abstained',
+    'duplicate_loser':   'a closer level claimed the same decay state',
+    'energy_unknown':    'placeholder LFS: the excitation energy is unknown',
+}
+
+# Method column display strings. The Method field is 12 characters wide, so the
+# mapper's own labels ('lfs_order_fallback', 'placeholder_bound', ...) overflow
+# it; these are the fixed-width equivalents.
+METHOD_DISPLAY = {
+    'elis':                 'ELIS',
+    'lfs_order':            'LFS_ORDER',
+    'lfs_order_fallback':   'LFS-ORD(fb)',
+    'placeholder_bound':    'PLACEHOLDER',
+    'placeholder_unmapped': 'PLACEHOLDER',
+    'orphan_added':         'ORPHAN+',
+    'missing_ground':       'GROUND+',
+    'not-mapped':           'not-mapped',
+}
+
+# The hybrid-only subset. Narrow columns that predate the hybrid (the LFS
+# PLACEHOLDER table's 10-wide Method) shorten only these, so a legacy log keeps
+# its original 'elis' / 'lfs_order' strings byte for byte while the hybrid's
+# 17-character mapper labels stop overflowing.
+_HYBRID_METHOD_DISPLAY = {
+    k: METHOD_DISPLAY[k]
+    for k in ('lfs_order_fallback', 'placeholder_bound',
+              'placeholder_unmapped', 'orphan_added', 'missing_ground')
+}
+
+# Plain-language gloss for a writer disposition (``stats['orphan_dispositions']``
+# entries). Every one of these is a POLICY outcome, never a mapping verdict.
+ORPHAN_DISPOSITION_LABELS = {
+    'added':                'ADDED to the chain as a stable pure sink',
+    'added_shared':         'kept -- shares an orphan nuclide added elsewhere',
+    'ground_added':         'GROUND ADDED to the chain as a stable pure sink',
+    'ground_shared':        'ground kept -- shares a ground added elsewhere',
+    'folded_to_sibling':    'cross-section column FOLDED into a kept isomer',
+    'folded_to_ground':     'cross-section column FOLDED into the ground',
+    'dropped_no_recipient': 'DROPPED: no kept isomer and no usable ground',
+    'dropped_no_product':   'DROPPED: no nameable product (off-table IZAP)',
 }
 
 
@@ -131,8 +272,9 @@ def build_parser():
     parser.add_argument('--decay-file',             type=Path,                                    default=None,   help='ENDF decay library file or directory (overrides preset)')
     parser.add_argument('--output-chain',           type=Path,                                    default=None,   help='Output chain XML (overrides preset-derived name)')
     parser.add_argument('--log-file',               type=Path,                                    default=None,   help='Isomer mapping log file (overrides preset-derived name)')
-    parser.add_argument('-m', '--map',              choices=['elis', 'lfs_order'],                default='elis', help="Mapping mode: 'elis' (production, default) or 'lfs_order' (FISPACT validation)")
-    parser.add_argument('-r', '--rtol',             type=float,                                   default=0.50,   help='Relative tolerance for ELIS matching (default: 0.50 = 50%%)')
+    parser.add_argument('-m', '--map',              choices=list(MAPPING_MODES),                  default='elis_lfs_order', help="Mapping mode. 'elis_lfs_order' (hybrid, DEFAULT): match each MF=10 level to a decay-library state by excitation energy first (UNAMBIGUOUS matches only), pair the levels left over positionally with the decay states left over, and keep any level with no decay partner at all as an ORPHAN state (disposition set by --orphan-policy) instead of discarding it. 'elis': excitation-energy matching only; every level that fails is dropped. 'lfs_order': FISPACT-like positional mapping (1st LFS -> _m1, 2nd -> _m2, ...), for validation runs.")
+    parser.add_argument('--orphan-policy',          choices=list(ORPHAN_POLICIES),                default='add-stable', help="What the writer does with a reaction product the chain does not carry -- a level the mapper could not identify, or an identified metastable the chain never had. 'add-stable' (DEFAULT): keep the pathway and materialise the product as a new chain nuclide with no decay data (a stable pure SINK -- the branch and its mass survive, the state's own activity is not modelled). Its name is the lowest free _mN of that Z/A, allocated against the decay library's LISO indices and the existing chain names -- a placeholder ordinal, NOT a decay-library LISO; several parents feeding the same unidentified state share ONE nuclide. Referenced-but-missing GROUND products are materialised the same way. 'drop': do not write the pathway -- its cross-section column VANISHES, so the parent under-burns and every daughter under-produces by exactly that share (the historical behaviour, kept as the byte-identical regression mode; this is NOT a renormalization -- PENDF pathways carry barns, not ratios, so there is nothing to redistribute over). 'reattribute': fold the orphan's CROSS-SECTION COLUMN into the kept isomer of the same product at the nearest LOWER rank (the reaction's ground when none is below it, and 'drop' for that reaction when there is no recipient at all -- reported loudly). The folded entry repeats the recipient's name as its target while keeping the orphan's own LFS and QI; the collapse sums the two same-named rows. Placeholder LFS levels (unidentified excited states, 99/40) are never orphan-added under any policy. Every disposition is listed in the ORPHAN DISPOSITION and ORPHAN NUCLIDES ADDED sections of the mapping log.")
+    parser.add_argument('-r', '--rtol',             type=float,                                   default=None,   help='Relative tolerance for ELIS matching. Default depends on the mapping mode: 0.15 (15%%) for elis_lfs_order, 0.50 (50%%) for elis and lfs_order. An explicit value always wins, so a tolerance study stays separable from a mode study.')
     parser.add_argument('-a', '--atol',             type=float,                                   default=0.0,    help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
     parser.add_argument('--audit-emax',             type=float,                                   default=2.0e7,  help='Cap the MF=10-vs-MF=3 audit at E <= this many eV (default: 2.0e7 = application group cap; MF=10 partials legitimately stop near 30 MeV while MF=3 runs to 200 MeV)')
     parser.add_argument('--mf10-reject-rtol',       type=float,                                   default=None,   help="Leave a reaction stock (no isomeric branching) when its MF=10-vs-MF=3 audit max rel dev exceeds X (self-loop-ground reactions are EXEMPT -- a metastable-only (n,n') has dev pinned at 1.0) (default: None = audit only, reject nothing)")
@@ -155,6 +297,12 @@ for _name, _info in REACTIONS.items():
         _MT_TO_NAME.setdefault(_mt, _name)
 
 _ISOMER_SUFFIX = re.compile(r'_m\d+$')
+# Same match with the ordinal captured, for the orphan-policy writer (a minted
+# orphan name carries no decay LISO, so its ordinal is read back off the name).
+_ISOMER_ORDINAL = re.compile(r'_m(\d+)$')
+# The off-table placeholder :func:`_safe_gnds_name` emits for a corrupt IZAP.
+# Such a "name" is a log entry, never a nuclide the writer may materialise.
+_OFF_TABLE_NAME = re.compile(r'^Z\d+-A\d+')
 
 
 def _safe_gnds_name(z, a, liso=0):
@@ -814,6 +962,24 @@ def _audit_reaction(source, parent, mt, partials, emax=2.0e7):
         notes=notes)
 
 
+def _partial_peak_xs(source, parent, mt, lfs, izap):
+    """Peak cross section [b] of one MF=10 partial, or ``None``.
+
+    Read straight off the live PENDF source while it is still open (the mapping
+    scan), because the log is written before ``source.close()`` but does not
+    receive the source. It is the size of what an orphan policy is moving: under
+    ``reattribute`` this is the height of the column being folded onto another
+    state's row, under ``drop`` the height of the column that vanishes. Any
+    source-side failure is swallowed -- a missing peak must never abort a run.
+    """
+    try:
+        _e, xs = source.pathway_xs(parent, mt, lfs, izap)
+        arr = np.asarray(xs, dtype=float)
+        return float(np.nanmax(arr)) if arr.size else None
+    except Exception:
+        return None
+
+
 def _append_note(row, marker):
     """Append ``marker`` to a log row's ``notes`` (semicolon-separated).
 
@@ -841,6 +1007,8 @@ _MF10_ONLY_SKIPS = (
     ('skipped_no_mapped_metastable', 'no metastable mapped into the chain'),
     ('skipped_rejected',             'audit-rejected (left stock)'),
     ('skipped_no_ground_partial',    'no usable LFS=0 partial'),
+    ('skipped_orphan_only_target',   'ground target present only via an '
+                                     'orphan addition'),
 )
 
 _MF10_ONLY_OUTCOMES = dict(
@@ -915,7 +1083,7 @@ def _mf10_only_reconciliation(book):
 # =============================================================================
 
 def _classify_metastables(parent, mt, r_name, metastables, decay_lookup,
-                          chain_names, mode, rtol, atol):
+                          chain_names, mode, rtol, atol, orphan_names=None):
     """Classify each metastable (LFS>0) MF=10 partial of one reaction.
 
     Returns a list of records (one per metastable partial) with a ``bucket``
@@ -924,11 +1092,32 @@ def _classify_metastables(parent, mt, r_name, metastables, decay_lookup,
     ``rtol_exceeded``, ``no_dk`` (no product/metastable in decay library),
     ``zero_elis`` (decay metastable carries ELIS=0), ``duplicate`` (a closer
     LFS mapped to the same LISO), and ``lfs_order_dropped`` (lfs_order mode).
+    The hybrid ``elis_lfs_order`` mode adds ``orphan_added``,
+    ``placeholder_unmapped`` and ``hybrid_orphan_dk``.
+
+    Every record carries ``position``: the level's 1-based rank among the
+    product's NON-placeholder levels in ascending-LFS order (``None`` for a
+    placeholder LFS). It is stamped in EVERY mode so a downstream orphan policy
+    that selects by rank behaves identically under all three.
+
+    ``orphan_names`` is the scan-wide orphan-name registry (see
+    :func:`_allocate_orphan_state_name`); only the hybrid mode uses it.
     """
-    records = []
     if mode == 'lfs_order':
         return _classify_lfs_order(parent, mt, r_name, metastables,
                                    decay_lookup, chain_names, rtol, atol)
+    elif mode == 'elis_lfs_order':
+        return _classify_elis_lfs_order(parent, mt, r_name, metastables,
+                                        decay_lookup, chain_names, rtol, atol,
+                                        orphan_names=orphan_names)
+    elif mode != 'elis':
+        # Terminal guard: a mode string registered at one dispatch site and
+        # forgotten at another must fail loudly, not fall through to 'elis'.
+        raise ValueError(f"Unknown mapping mode {mode!r}; expected one of "
+                         f"{MAPPING_MODES}.")
+
+    records = []
+    ranks = _assign_level_ranks(metastables)
 
     # elis mode: first pass -- resolve each metastable's LISO by ELFS
     results = []
@@ -953,7 +1142,8 @@ def _classify_metastables(parent, mt, r_name, metastables, decay_lookup,
 
     for idx, (p, z, a, res) in enumerate(results):
         rec = dict(lfs=p['lfs'], izap=p['izap'], elfs=p['elfs'], qi=p['qi'],
-                   z=z, a=a, parent=parent, mt=mt, reaction=r_name)
+                   z=z, a=a, parent=parent, mt=mt, reaction=r_name,
+                   position=ranks[id(p)])
         status = res['status']
         if idx in discarded:
             rec.update(bucket='duplicate', liso=discarded[idx]['liso'],
@@ -979,17 +1169,26 @@ def _classify_metastables(parent, mt, r_name, metastables, decay_lookup,
 
 def _classify_lfs_order(parent, mt, r_name, metastables, decay_lookup,
                         chain_names, rtol, atol):
-    """Positional (FISPACT-like) mapping of metastable partials."""
+    """Positional (FISPACT-like) mapping of metastable partials.
+
+    The slot index that becomes the LISO counts EVERY metastable partial,
+    placeholder LFS included -- that is what FISPACT parity means and it is not
+    changed here. The record's ``position`` field is the separate
+    placeholder-free rank (:func:`_assign_level_ranks`), stamped in every mode
+    for a downstream rank-based orphan policy.
+    """
     records = []
     ordered = sorted(metastables, key=lambda p: p['lfs'])
     if not ordered:
         return records
+    ranks = _assign_level_ranks(metastables)
     z, a = ordered[0]['izap'] // 1000, ordered[0]['izap'] % 1000
     dk_meta = sum(1 for s in decay_lookup.get((z, a), []) if s.liso > 0)
     for position, p in enumerate(ordered, start=1):
         zp, ap = p['izap'] // 1000, p['izap'] % 1000
         rec = dict(lfs=p['lfs'], izap=p['izap'], elfs=p['elfs'], qi=p['qi'],
-                   z=zp, a=ap, parent=parent, mt=mt, reaction=r_name)
+                   z=zp, a=ap, parent=parent, mt=mt, reaction=r_name,
+                   position=ranks[id(p)])
         res = lookup_liso(zp, ap, p['elfs'], decay_lookup, rtol=rtol, atol=atol)
         rec['dk_elis'] = res.get('dk_elis')
         if position > dk_meta:
@@ -1003,8 +1202,355 @@ def _classify_lfs_order(parent, mt, r_name, metastables, decay_lookup,
     return records
 
 
+def _assign_level_ranks(metastables):
+    """1-based rank per (Z, A) over the NON-placeholder metastable partials.
+
+    Rank is the position in ascending-LFS order among the product's REAL
+    levels. A placeholder LFS (99 / 40 -- an unidentified excited state) is not
+    a level ordinal, never ranks among the real levels, and carries rank
+    ``None``. LFS values themselves are NOT ordinals (a reaction may carry LFS
+    1 and 9 only), which is exactly why the rank is computed rather than read.
+
+    Returned as ``{id(partial): rank}``: the partial dicts come straight from
+    the source adapters (the ASC adapter caches them for the whole run), so
+    they are never mutated here.
+    """
+    ranks = {}
+    counters = {}
+    for p in sorted(metastables, key=lambda q: (q['izap'], q['lfs'])):
+        if p['lfs'] in PLACEHOLDER_LFS_VALUES:
+            ranks[id(p)] = None
+        else:
+            counters[p['izap']] = counters.get(p['izap'], 0) + 1
+            ranks[id(p)] = counters[p['izap']]
+    return ranks
+
+
+def _allocate_orphan_state_name(z, a, orphan_rank, decay_lookup, chain_names,
+                                allocations):
+    """Mint or reuse the ``orphan_rank``-th orphan state name of ``(z, a)``.
+
+    The smallest free ``_m{n}``: free of the decay library's LISO indices for
+    that (Z, A), of the placeholder values (so an orphan can never be named
+    ``_m40`` / ``_m99``), of the chain's existing names, and of this run's
+    earlier allocations.
+
+    ``allocations`` is the scan-wide ``{(z, a): [name, ...]}`` registry, so the
+    k-th orphan state of a product gets ONE name however many parents orphan it
+    -- several parents feeding the same unidentified state produce one chain
+    nuclide, not one per parent.
+    """
+    names = allocations.setdefault((z, a), [])
+    if orphan_rank <= len(names):
+        return names[orphan_rank - 1]
+    decay_lisos = {s.liso for s in decay_lookup.get((z, a), [])}
+    n = 1
+    while True:
+        candidate = _safe_gnds_name(z, a, n)
+        if (n not in decay_lisos and n not in PLACEHOLDER_LFS_VALUES
+                and candidate not in chain_names and candidate not in names):
+            names.append(candidate)
+            return candidate
+        n += 1
+
+
+def _classify_elis_lfs_order(parent, mt, r_name, metastables, decay_lookup,
+                             chain_names, rtol, atol, orphan_names=None):
+    """Hybrid mapping: ELIS first, positional fallback, orphans minted.
+
+    Sibling of :func:`_classify_metastables` (elis) and
+    :func:`_classify_lfs_order`, with the SAME return contract: one record per
+    metastable partial, each carrying a ``bucket``. Ported from the GENDF
+    cousin's ``_PythonGENDFLibrary._map_via_elis_lfs_order`` (library.py,
+    committed 5e1097a13); everything is partitioned per (Z, A) product, since
+    one MF=10 section may carry levels of more than one product and the decay
+    pool, the claim set and the ranks are all per-product.
+
+    Phase 0 -- probe. Each level's ELFS (= QM - QI) is usable only when it is
+    finite and > 0. A placeholder LFS whose section carries a blank QI while
+    QM > 0 (``QI == 0 and QM > 0``, the JEFF-4.0 Hf178_m1 metastable-parent
+    disguise) has ELFS "=" QM, which is an energy-UNKNOWN, not evidence, so it
+    never enters Phase 1.
+
+    Phase 1 -- ELIS. A match is accepted only when it is UNIQUE: an ``ambiguous``
+    verdict (the second-nearest decay level also passes tolerance -- degenerate
+    m1/m2 pairs) ABSTAINS and re-derives positionally. Accepted matches are
+    trusted absolutely, even where they cross the positional order. When several
+    LFS match the same LISO the closest wins and the loser is REQUEUED to
+    Phase 2 (the 'elis' mode discards it instead -- unchanged there).
+
+    Phase 2 -- positional fallback, strictly positional and collision-aware:
+    the unclaimed real levels in RANK order zip onto the unclaimed decay
+    metastables in LISO order, skipping every LISO Phase 1 already claimed. The
+    decay pool is NOT ELIS-filtered, so a zero-ELIS decay state is claimable
+    (the In120n class) and, with no usable energy anywhere, the mode degrades
+    exactly to ``lfs_order``.
+
+    Placeholder ALWAYS-BIND, after Phase 2: a placeholder LFS with a usable,
+    distinct energy may take part in Phase 1 like any level, but one whose
+    energy is unknown or whose Phase-1 attempt failed binds to the LOWEST
+    unclaimed metastable LISO. With no unclaimed metastable left it is
+    report-only (``bucket='placeholder_unmapped'``): its share then follows the
+    stock/balance path at collapse instead of an explicit pathway. A placeholder
+    is never orphan-added and never becomes ``_m99`` / ``_m40``.
+
+    Phase 3 -- leftovers. Every real level still unpaired gets a minted orphan
+    name (``method='orphan_added'``, see :func:`_allocate_orphan_state_name`).
+    This classifier only MARKS and MINTS; what happens to an orphan's share --
+    add the nuclide, drop it, or fold it into a kept sibling -- belongs to the
+    writing layer's orphan policy.
+
+    Record fields beyond the shared contract
+    ----------------------------------------
+    ``method``              'elis' | 'lfs_order_fallback' | 'placeholder_bound'
+                            | 'orphan_added' | 'placeholder_unmapped'
+    ``position``            placeholder-free rank (``None`` for a placeholder)
+    ``fallback_reason``     one of :data:`HYBRID_FALLBACK_REASONS`, or
+                            ``'energy_unknown'`` for a blank-QI placeholder
+    ``routed_to_fallback``  True on every real level that left Phase 1 -- such a
+                            level is ALREADY accounted for by its terminal
+                            bucket and must be excluded from any not-mapped or
+                            skipped sweep, or it double-reports
+    ``in_chain``            is the mapped product a name the chain already has
+    ``needs_chain_entry``   True when the share survives only if the writer
+                            materialises the product (product-not-in-chain and
+                            orphan records) -- membership is a POLICY decision
+                            here, so nothing is discarded for it
+    ``orphan`` / ``orphan_rank``   Phase-3 marks
+    ``placeholder_lfs``     the level's LFS is 99 / 40
+    ``large_delta_e``       a Phase-2 pair whose |ELFS - decay ELIS| is outside
+                            the tolerance band: positional by decision, flagged
+                            for audit
+    ``duplicate_requeued`` / ``duplicate_liso`` / ``kept_lfs``  requeued loser
+    ``phase1_claimed_lisos``  the LISOs Phase 1 took, for Phase-2 context
+    """
+    records = []
+    if not metastables:
+        return records
+    if orphan_names is None:
+        orphan_names = {}
+    ranks = _assign_level_ranks(metastables)
+
+    # ---- Phase 0: probe every level exactly once -----------------------
+    probes = []
+    for p in metastables:
+        z, a = p['izap'] // 1000, p['izap'] % 1000
+        qm = p.get('qm')
+        qi = p.get('qi', 0.0) or 0.0
+        elfs = p.get('elfs')
+        if elfs is None and qm is not None:
+            elfs = qm - qi
+        placeholder = p['lfs'] in PLACEHOLDER_LFS_VALUES
+        # Usable = finite and > 0; a NaN must never reach lookup_liso.
+        usable = elfs is not None and np.isfinite(elfs) and elfs > 0
+        # Blank QI on an excited-target section disguises an ABSENT energy as
+        # ELFS == QM. For a placeholder that is an energy-UNKNOWN; an identified
+        # level keeps QI=0 as a real statement (final state = target's level).
+        energy_unknown = placeholder and (
+            not usable or (qi == 0.0 and qm is not None and qm > 0))
+        res = None
+        if usable and not energy_unknown:
+            res = lookup_liso(z, a, elfs, decay_lookup, rtol=rtol, atol=atol,
+                              return_nearest=True, warn_ambiguity=False)
+        probes.append(dict(p=p, z=z, a=a, qm=qm, qi=qi, elfs=elfs,
+                           usable=usable, placeholder=placeholder,
+                           energy_unknown=energy_unknown, res=res,
+                           rank=ranks[id(p)]))
+
+    groups = defaultdict(list)
+    for pr in probes:
+        groups[(pr['z'], pr['a'])].append(pr)
+
+    for (z, a), gprobes in groups.items():
+        dk_meta_states = sorted(
+            (s for s in decay_lookup.get((z, a), []) if s.liso > 0),
+            key=lambda s: s.liso)
+        dk_meta_count = len(dk_meta_states)
+        pendf_meta_count = len(gprobes)
+        group_records = []
+
+        def _diag(pr):
+            """Whatever the Phase-0 probe learned, for the log."""
+            res = pr['res'] or {}
+            return dict(nearest_liso=res.get('liso'),
+                        nearest_dk_elis=res.get('dk_elis'),
+                        diff_pct=res.get('diff_pct'),
+                        ambiguous=bool(res.get('ambiguous')),
+                        second_liso=res.get('second_liso'),
+                        second_dk_elis=res.get('second_dk_elis'))
+
+        def _rec(pr, method, bucket, liso=None, product=None, dk_elis=None,
+                 dk_half_life=None, fallback_reason=None, **extra):
+            """Uniform hybrid record (claimed set stamped at group end)."""
+            p = pr['p']
+            rec = dict(
+                lfs=p['lfs'], izap=p['izap'], elfs=pr['elfs'], qi=pr['qi'],
+                qm=pr['qm'], z=z, a=a, target_z=z, target_a=a,
+                parent=parent, mt=mt, reaction=r_name,
+                bucket=bucket, method=method, position=pr['rank'],
+                liso=liso, product=product, dk_elis=dk_elis,
+                dk_half_life=dk_half_life, fallback_reason=fallback_reason,
+                dk_meta_count=dk_meta_count,
+                pendf_meta_count=pendf_meta_count,
+                placeholder_lfs=pr['placeholder'],
+                in_chain=product is not None and product in chain_names,
+                needs_chain_entry=False,
+                **_diag(pr))
+            rec.update(extra)
+            return rec
+
+        def _bucket_for(product):
+            """Membership is a filter, never a verdict -- the writer decides."""
+            return 'matched' if product in chain_names else 'product_not_in_chain'
+
+        # ---- Phase 1: unique, unambiguous ELIS matches ------------------
+        candidates, pending = [], []
+        for pr in gprobes:
+            res = pr['res']
+            if (res is not None and res.get('status') == 'matched'
+                    and not res.get('ambiguous')):
+                candidates.append(pr)
+            else:
+                pending.append(pr)
+
+        # Several LFS onto one LISO: closest wins, the loser is REQUEUED.
+        by_liso = defaultdict(list)
+        for pr in candidates:
+            by_liso[pr['res']['liso']].append(
+                (abs(pr['elfs'] - pr['res']['dk_elis']), pr))
+        losers = {}
+        for liso, matches in by_liso.items():
+            if len(matches) > 1:
+                matches.sort(key=lambda m: m[0])
+                keeper = matches[0][1]
+                for _diff, pr in matches[1:]:
+                    losers[id(pr)] = dict(duplicate_requeued=True,
+                                          duplicate_liso=liso,
+                                          kept_lfs=keeper['p']['lfs'])
+        if losers:
+            candidates = [pr for pr in candidates if id(pr) not in losers]
+            pending.extend(pr for pr in gprobes if id(pr) in losers)
+        pending.sort(key=lambda pr: pr['p']['lfs'])
+
+        claimed = set()
+        for pr in sorted(candidates, key=lambda q: q['p']['lfs']):
+            res = pr['res']
+            liso = res['liso']
+            claimed.add(liso)
+            state = next((s for s in dk_meta_states if s.liso == liso), None)
+            product = _safe_gnds_name(z, a, liso)
+            group_records.append(_rec(
+                pr, 'elis', _bucket_for(product), liso=liso, product=product,
+                dk_elis=res['dk_elis'],
+                dk_half_life=state.half_life if state is not None else None,
+                needs_chain_entry=product not in chain_names))
+        phase1_claimed = sorted(claimed)
+
+        def _fallback_reason(pr):
+            """Why this level left Phase 1 (the F11 label set)."""
+            if id(pr) in losers:
+                return 'duplicate_loser'
+            if pr['qm'] is None:
+                return 'qm_absent'
+            if not pr['usable']:
+                return 'elfs_unusable'
+            res = pr['res']
+            status = res.get('status') if res is not None else None
+            if status == 'matched' and res.get('ambiguous'):
+                return 'elis_ambiguous'
+            if status == 'nearest':
+                return 'elis_tol_exceeded'
+            if status == 'zero_elis_only':
+                return 'dk_elis_zero'
+            return 'no_dk_partner'
+
+        # ---- Phase 2: strictly positional, collision-aware --------------
+        pool = [pr for pr in pending if not pr['placeholder']]
+        free_states = [s for s in dk_meta_states if s.liso not in claimed]
+        n_assign = min(len(pool), len(free_states))
+        for pr, s in zip(pool[:n_assign], free_states[:n_assign]):
+            claimed.add(s.liso)
+            product = _safe_gnds_name(z, a, s.liso)
+            # Pairing is positional by decision; a wide energy gap is an audit
+            # flag on the pair, never a veto (the energy already failed once).
+            large_delta_e = bool(
+                pr['usable'] and s.elis
+                and abs(pr['elfs'] - s.elis) > atol + rtol * abs(s.elis))
+            group_records.append(_rec(
+                pr, 'lfs_order_fallback', _bucket_for(product), liso=s.liso,
+                product=product, dk_elis=s.elis, dk_half_life=s.half_life,
+                fallback_reason=_fallback_reason(pr), routed_to_fallback=True,
+                large_delta_e=large_delta_e,
+                needs_chain_entry=product not in chain_names,
+                **losers.get(id(pr), {})))
+        leftovers = pool[n_assign:]
+
+        # ---- Placeholder ALWAYS-BIND (never positional among real levels)
+        for pr in sorted((q for q in pending if q['placeholder']),
+                         key=lambda q: q['p']['lfs']):
+            reason = ('energy_unknown' if pr['energy_unknown']
+                      else _fallback_reason(pr))
+            free = [s for s in dk_meta_states if s.liso not in claimed]
+            if free:
+                s = free[0]
+                claimed.add(s.liso)
+                product = _safe_gnds_name(z, a, s.liso)
+                group_records.append(_rec(
+                    pr, 'placeholder_bound', _bucket_for(product), liso=s.liso,
+                    product=product, dk_elis=s.elis, dk_half_life=s.half_life,
+                    fallback_reason=reason, routed_to_fallback=True,
+                    n_unclaimed=len(free),
+                    needs_chain_entry=product not in chain_names,
+                    **losers.get(id(pr), {})))
+            else:
+                # Report-only: no explicit pathway is created, so the share
+                # follows the reaction's stock / balance path at collapse.
+                group_records.append(_rec(
+                    pr, 'placeholder_unmapped', 'placeholder_unmapped',
+                    fallback_reason=reason, routed_to_fallback=True,
+                    report_only=True, **losers.get(id(pr), {})))
+
+        # ---- Phase 3: leftover real levels become orphan states ---------
+        for k, pr in enumerate(leftovers, start=1):
+            name = _allocate_orphan_state_name(z, a, k, decay_lookup,
+                                               chain_names, orphan_names)
+            group_records.append(_rec(
+                pr, 'orphan_added', 'orphan_added', product=name,
+                fallback_reason=_fallback_reason(pr), routed_to_fallback=True,
+                orphan=True, orphan_rank=k, needs_chain_entry=True,
+                **losers.get(id(pr), {})))
+
+        # Decay metastables nothing claimed: informational only -- the nuclide
+        # is already in the chain, it simply gains no production from this
+        # reaction. Carries lfs=None so the level sweeps skip it.
+        for s in dk_meta_states:
+            if s.liso not in claimed:
+                group_records.append(dict(
+                    lfs=None, izap=z * 1000 + a, elfs=None, qi=None, qm=None,
+                    z=z, a=a, target_z=z, target_a=a, parent=parent, mt=mt,
+                    reaction=r_name, bucket='hybrid_orphan_dk',
+                    method='hybrid_orphan_dk', position=None, liso=s.liso,
+                    product=_safe_gnds_name(z, a, s.liso), dk_elis=s.elis,
+                    dk_half_life=s.half_life, fallback_reason=None,
+                    dk_meta_count=dk_meta_count,
+                    pendf_meta_count=pendf_meta_count, placeholder_lfs=False,
+                    in_chain=_safe_gnds_name(z, a, s.liso) in chain_names,
+                    needs_chain_entry=False, informational=True))
+
+        for rec in group_records:
+            rec['phase1_claimed_lisos'] = phase1_claimed
+            # A placeholder value must never leak into a product name.
+            product = rec.get('product')
+            assert product is None or not product.endswith(('_m40', '_m99')), \
+                product
+            records.append(rec)
+
+    return records
+
+
 def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
-                reject_rtol=None, audit_emax=2.0e7, reject_band_ratio=None):
+                reject_rtol=None, audit_emax=2.0e7, reject_band_ratio=None,
+                orphan_policy='drop'):
     """Map every PENDF nuclide's MF=10 metastable partials against the chain.
 
     Returns ``(branching, stats)`` where ``branching`` is
@@ -1045,6 +1591,17 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     ``metastable-only MF=10 (no LFS=0)`` in its audit row's ``notes``. Purely a
     report: no rejection or decoration decision depends on it.
 
+    ``orphan_policy`` decides whether an OFF-CHAIN product reaches the writer.
+    Under ``drop`` (the status quo, and the byte-identical regression mode) it
+    does not: chain membership filters here exactly as it always has. Under
+    ``add-stable`` / ``reattribute`` the records marked ``needs_chain_entry`` by
+    the classifier are carried on the reaction's ``orphans`` list for
+    :func:`_apply_orphan_policy` to dispose of, and a reaction whose EVERY
+    metastable is off-chain is queued rather than skipped -- otherwise the
+    policy could never rescue it. ``metastables`` still holds the in-chain
+    pathways only, so nothing that reads it (the pathway-Q probe above all)
+    changes shape with the policy.
+
     Sections the SOURCE excluded as undecorable -- an MF=10 with no MF=3 sibling
     that the source is not serving -- are carried through to
     ``stats['mf10_without_mf3']`` / ``['mf10_without_mf3_list']`` for the console
@@ -1057,8 +1614,13 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     reaction. Every examined MF=10-only MT is booked in ``stats['mf10_only']``,
     which reconciles as ``examined = emitted + Sum(skips)``.
     """
+    if orphan_policy not in ORPHAN_POLICIES:
+        raise ValueError(f"Invalid orphan_policy {orphan_policy!r}; expected "
+                         f"one of {ORPHAN_POLICIES}.")
     chain_names = set(chain.nuclide_dict)
     branching = defaultdict(dict)
+    # Off-chain products reach the writer only when a policy can act on them.
+    carry_orphans = orphan_policy != 'drop'
 
     # MF=10-only emission book (empty and unreported unless the flag is on).
     mf10_only_enabled = bool(getattr(source, 'emit_mf10_only', False))
@@ -1069,8 +1631,12 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     products_not_in_chain = []    # matched but target absent from chain
     duplicate_errors = []         # kept-closest, others discarded
     lfs_order_dropped = []
-    lfs_sentinels = []            # report-only: classified partials whose LFS
-                                  # is a library "unspecified level" sentinel
+    lfs_placeholders = []         # report-only: classified partials whose LFS
+                                  # is a library "unspecified level" placeholder
+    orphan_levels_list = []       # hybrid Phase-3 minted levels (every policy)
+    hybrid_records = []           # every hybrid classifier record, for the
+                                  # HYBRID MAPPING section and the counter
+                                  # census (empty in the legacy modes)
 
     audit_offenders = []          # reactions with worst_dev > CONSISTENCY_RTOL
     audit_clean = 0               # auditable reactions within CONSISTENCY_RTOL
@@ -1078,6 +1644,12 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
     band_reject_exempt = 0        # self-loop-ground reactions spared band reject
     rtol_reject_exempt = 0        # self-loop-ground reactions spared rtol reject
     absent_status = {}            # base GNDS name -> lookup_liso status (no_dk)
+
+    # Orphan-state name registry for the hybrid mode, shared across the whole
+    # scan: {(z, a): [name, ...]} in mint order, so the k-th orphan state of a
+    # product gets ONE chain name however many parents feed it. Untouched by
+    # the legacy modes (they mint nothing).
+    orphan_names = {}
 
     nuclides_with_branching = set()
     total_lfs = 0
@@ -1236,33 +1808,47 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
 
             records = _classify_metastables(
                 parent, mt, r_name, metastables, decay_lookup,
-                chain_names, mode, rtol, atol)
+                chain_names, mode, rtol, atol, orphan_names=orphan_names)
 
-            # Report-only LFS sentinel scan: flag any classified partial whose
-            # LFS is a library "unspecified level" sentinel (99 / 40). This
-            # runs regardless of the mapping outcome or the rejection gates and
-            # never alters a decision -- it only records the occurrence so a
-            # sentinel LFS is never silently consumed as an isomer ordinal.
+            if mode == 'elis_lfs_order':
+                # The phase detail lives only on these records; the per-parent
+                # tables keep the legacy row shape, so the HYBRID MAPPING
+                # section and the terminal-class census read the records
+                # themselves. `rejected` marks a reaction the audit gates left
+                # stock: its levels were still classified, but nothing of it
+                # was written.
+                for rec in records:
+                    rec['rejected'] = reject_this
+                hybrid_records.extend(records)
+
+            # Report-only LFS placeholder scan: flag any classified partial
+            # whose LFS is a library "unspecified level" placeholder (99 / 40).
+            # This runs regardless of the mapping outcome or the rejection gates
+            # and never alters a decision -- it only records the occurrence so a
+            # placeholder LFS is never silently consumed as an isomer ordinal.
             for rec in records:
-                if rec['lfs'] not in SENTINEL_LFS:
+                if rec['lfs'] not in PLACEHOLDER_LFS:
                     continue
                 zr, ar = rec['z'], rec['a']
                 base = (gnds_name(zr, ar, 0) if zr in ATOMIC_SYMBOL
                         else f"Z{zr}-A{ar}")
-                outcome = _SENTINEL_OUTCOME.get(rec['bucket'], rec['bucket'])
+                outcome = _PLACEHOLDER_OUTCOME.get(rec['bucket'], rec['bucket'])
                 prod = rec.get('product')
                 if prod and rec['bucket'] in ('matched', 'product_not_in_chain'):
                     outcome = f"{outcome} -> {prod}"
-                lfs_sentinels.append(dict(
+                lfs_placeholders.append(dict(
                     parent=parent, mt=mt, reaction=r_name, lfs=rec['lfs'],
-                    description=SENTINEL_LFS[rec['lfs']],
-                    convention=SENTINEL_LFS[rec['lfs']].split(':')[0],
+                    description=PLACEHOLDER_LFS[rec['lfs']],
+                    convention=PLACEHOLDER_LFS[rec['lfs']].split(':')[0],
                     target_z=zr, target_a=ar, base_nuclide=base,
                     elfs=rec['elfs'], bucket=rec['bucket'], product=prod,
-                    method=('lfs_order' if mode == 'lfs_order' else 'elis'),
+                    method=rec.get(
+                        'method',
+                        'lfs_order' if mode == 'lfs_order' else 'elis'),
                     outcome=outcome))
 
             mapped = []           # matched + in chain
+            orphans = []          # off-chain products the writer may materialise
             dup_by_liso = defaultdict(list)
             for rec in records:
                 bucket = rec['bucket']
@@ -1274,8 +1860,14 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                                 product=rec['product'], lfs=rec['lfs'],
                                 liso=rec['liso'], elis=rec['elfs'],
                                 dk_elis=rec['dk_elis'],
-                                method=('lfs_order' if mode == 'lfs_order'
-                                        else 'elis'),
+                                # The hybrid stamps its own per-level method
+                                # ('elis' / 'lfs_order_fallback' /
+                                # 'placeholder_bound'); the legacy modes carry
+                                # none, so the mode name stands in.
+                                method=rec.get(
+                                    'method',
+                                    'lfs_order' if mode == 'lfs_order'
+                                    else 'elis'),
                                 half_life=hl if hl is not None else 'stable',
                                 target_z=rec['z'], target_a=rec['a'])
                     # A matched pathway on an audit-rejected reaction is left
@@ -1293,13 +1885,35 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                     mapped.append(rec)
                 elif bucket == 'product_not_in_chain':
                     nuclides_with_branching.add(parent)
+                    # Under a rescuing policy the record is NOT a skip: the
+                    # writer materialises or folds it, and the ORPHAN
+                    # DISPOSITION section says which. Marked here so the
+                    # not-mapped tables do not report it a second time as a
+                    # loss (the classifier's membership filter is advisory
+                    # under every policy but 'drop').
+                    rescued = carry_orphans and not reject_this
+                    rec['peak_xs'] = _partial_peak_xs(
+                        source, parent, mt, rec['lfs'], rec.get('izap'))
+                    # The legacy classifiers stamp no per-level method, so the
+                    # mode name stands in -- the same substitution the mapped
+                    # rows make, so an orphan's provenance is never blank in
+                    # the ORPHAN NUCLIDES ADDED roll call.
+                    rec.setdefault(
+                        'method',
+                        'lfs_order' if mode == 'lfs_order' else 'elis')
+                    if rescued:
+                        orphans.append(rec)
                     products_not_in_chain.append(dict(
                         type='no_metastable_decay_data', parent=parent, mt=mt,
                         reaction=r_name, lfs=rec['lfs'], elis=rec['elfs'],
                         base_nuclide=_safe_gnds_name(rec['z'], rec['a']),
                         target_z=rec['z'], target_a=rec['a'],
                         product=rec['product'], liso=rec.get('liso'),
-                        note='Product not in chain'))
+                        position=rec.get('position'),
+                        peak_xs=rec.get('peak_xs'), rescued=rescued,
+                        note=('Product not in chain -- kept, see ORPHAN '
+                              'DISPOSITION' if rescued
+                              else 'Product not in chain')))
                 elif bucket == 'rtol_exceeded':
                     nuclides_with_branching.add(parent)
                     elis_errors.append(dict(
@@ -1337,6 +1951,30 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                         parent=parent, mt=mt, reaction=r_name, lfs=rec['lfs'],
                         would_be_liso=rec['liso'], gendf_elis=rec['elfs'],
                         dk_meta_count=None))
+                elif bucket == 'orphan_added':
+                    # Hybrid Phase 3: a real level with no decay partner at all.
+                    # Minted here, disposed of by the writer's orphan policy --
+                    # the level is listed either way so the class stays visible
+                    # even under 'drop'.
+                    nuclides_with_branching.add(parent)
+                    # Peak sigma of the column at stake, read while the source
+                    # is open: it sizes what the policy is about to move (fold)
+                    # or lose (drop). Computed for every policy so a 'drop' run
+                    # reports the height of what vanished.
+                    rec['peak_xs'] = _partial_peak_xs(
+                        source, parent, mt, rec['lfs'], rec.get('izap'))
+                    if carry_orphans and not reject_this:
+                        orphans.append(rec)
+                    orphan_levels_list.append(dict(
+                        parent=parent, mt=mt, reaction=r_name, lfs=rec['lfs'],
+                        position=rec.get('position'), elis=rec['elfs'],
+                        orphan_rank=rec.get('orphan_rank'),
+                        fallback_reason=rec.get('fallback_reason'),
+                        base_nuclide=_safe_gnds_name(rec['z'], rec['a']),
+                        target_z=rec['z'], target_a=rec['a'],
+                        product=rec.get('product'),
+                        peak_xs=rec.get('peak_xs'),
+                        rejected=reject_this))
 
             for liso, dups in dup_by_liso.items():
                 base_nuc = _safe_gnds_name(dups[0]['z'], dups[0]['a'])
@@ -1353,7 +1991,7 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
             # A reaction the audit rejected (reject_this) is skipped here: no
             # <isomeric_branching> is created, the base reaction stays stock, and
             # the collapse's MF=3 fallback routes the total to the ground target.
-            if mapped and parent_in_chain and not reject_this:
+            if (mapped or orphans) and parent_in_chain and not reject_this:
                 ground = next((p for p in partials if p['lfs'] == 0), None)
                 prev = branching[parent].get(r_name)
                 if prev is not None and prev.get('mf3_less'):
@@ -1371,8 +2009,8 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
                         'skipped_superseded', note=f'MT={mt}')
                 branching[parent][r_name] = dict(
                     mt=mt, ground=ground, qm=rxinfo['qm'], qi=rxinfo['qi'],
-                    metastables=mapped, parent_elis=parent_elis,
-                    mf3_less=mf3_less)
+                    metastables=mapped, orphans=orphans,
+                    parent_elis=parent_elis, mf3_less=mf3_less)
             elif not mapped:
                 # MF=10 metastables present but none mapped into the chain:
                 # the base reaction is left stock.
@@ -1446,8 +2084,28 @@ def map_library(source, chain, decay_lookup, mode, rtol, atol, verbose=True,
         rejected=rejected,
         band_reject_exempt=band_reject_exempt,
         rtol_reject_exempt=rtol_reject_exempt,
-        lfs_sentinels=lfs_sentinels,
-        lfs_sentinel_count=len(lfs_sentinels),
+        lfs_placeholders=lfs_placeholders,
+        lfs_placeholder_count=len(lfs_placeholders),
+        # Hybrid (elis_lfs_order) terminal buckets -- all zero in the legacy
+        # modes, which emit none of them.
+        orphan_levels=counts['orphan_added'],
+        orphan_levels_list=orphan_levels_list,
+        hybrid_records=hybrid_records,
+        placeholder_unmapped=counts['placeholder_unmapped'],
+        unclaimed_dk_metastables=counts['hybrid_orphan_dk'],
+        orphan_names=orphan_names,
+        # Orphan policy (writing layer). The counters below are filled by
+        # decorate_chain -- seeded here so every consumer sees the same keys
+        # under every policy, including 'drop', where they all stay zero.
+        orphan_policy=orphan_policy,
+        orphan_dispositions=[],
+        orphan_nuclides_added={},
+        orphan_products_kept=0,
+        orphan_grounds_added=0,
+        orphan_folds_sibling=0,
+        orphan_folds_ground=0,
+        orphan_folds_stranded=0,
+        orphan_dropped=0,
         absent_by_status=absent_by_status,
         absent_unique_count=len(absent_status),
     )
@@ -1537,7 +2195,8 @@ def _note_pathway_q_reject(stats, parent, r_name, record):
             _append_note(row, _PATHWAY_Q_REJECT_MARKER)
 
 
-def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row):
+def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row,
+                           orphan_names=None):
     """Append the PLAIN ground reaction of a ground-only MF=10-only MT.
 
     The Cr ``(n,3n)`` class: an MT the library serves with a total synthesized
@@ -1551,6 +2210,13 @@ def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row):
     partial's QI -- section-sourced, never fabricated. Returns 1 when a reaction
     was appended, else 0 (an already-present reaction type or an unresolvable /
     off-chain target is skipped and counted).
+
+    ``orphan_names`` is the ``--orphan-policy add-stable`` roll call. A target
+    present ONLY because the policy materialised it for some OTHER reaction is
+    SKIPPED and logged (GENDF F9 mirror): this emission path is opt-in
+    (``--emit-mf10-only-reactions``) and its target is derived, not mapped, so
+    it must not be the thing that decides an add-stable nuclide now carries
+    production. The nuclide keeps whatever pathway justified adding it.
     """
     if any(rx.type == r_name for rx in nuc.reactions):
         # Idempotency: re-running the patcher on an already-patched chain, or a
@@ -1562,13 +2228,244 @@ def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row):
         _mf10_only_note(book, row, 'skipped_no_target',
                         target=(daughter or '-'))
         return 0
+    if orphan_names and daughter in orphan_names:
+        _mf10_only_note(book, row, 'skipped_orphan_only_target',
+                        target=daughter)
+        return 0
     q = float(info['ground']['qi'])
     nuc.add_reaction(r_name, daughter, q, 1.0)
     _mf10_only_note(book, row, 'emitted_ground_only', target=daughter, q=q)
     return 1
 
 
-def decorate_chain(chain, branching, stats=None):
+# =============================================================================
+# Orphan policy -- the writing layer's disposition of off-chain products
+# =============================================================================
+
+def _member_ordinal(rec):
+    """The ``_m<n>`` ordinal a decorated member's reaction type must carry.
+
+    The decay library's LISO when the mapper resolved one; otherwise the ordinal
+    of the MINTED orphan name (a hybrid Phase-3 record carries a product name
+    but no LISO, because no decay state backs it). Zero means the member is a
+    ground pathway and its type stays the bare reaction name.
+    """
+    liso = rec.get('liso')
+    if liso is not None:
+        return int(liso)
+    return _isomer_ordinal_of(rec.get('product'))
+
+
+def _add_stable_nuclide(chain, name, stats, source):
+    """Materialise an off-chain product as a stable nuclide, in place.
+
+    ``<nuclide name="X_m3" reactions="0"/>`` carries no decay data, so the chain
+    reader treats it as STABLE: the pathway is kept and its mass conserved, but
+    the state's own activity is not modelled. Idempotent BY NAME -- several
+    parents feeding the same unidentified state share one nuclide and each
+    records its own source row -- and the new name is registered in
+    ``chain.nuclide_dict`` immediately, so every later reaction of this run (and
+    every other parent) sees it.
+
+    The nuclide is inserted after the LAST sibling of the same base nuclide so
+    the family stays grouped in the exported XML; :meth:`Chain.add_nuclide`
+    appends, so the index map is rebuilt here rather than reusing it.
+
+    Returns True when this call created the element, False when it already
+    existed (an earlier parent, or the base chain itself).
+    """
+    if stats is not None:
+        stats.setdefault('orphan_nuclides_added', {}).setdefault(
+            name, []).append(source)
+    if name in chain.nuclide_dict:
+        return False
+
+    base = name.split('_')[0]
+    insert_at = len(chain.nuclides)
+    for i, nuc in enumerate(chain.nuclides):
+        if nuc.name.split('_')[0] == base:
+            insert_at = i + 1
+    chain.nuclides.insert(insert_at, Nuclide(name))
+    chain.nuclide_dict = {nuc.name: i for i, nuc in enumerate(chain.nuclides)}
+    _invalidate_chain_cache(chain)
+    return True
+
+
+def _reattribution_recipient(orphan, kept, ground):
+    """Pick the kept pathway an orphan's cross-section column folds DOWN into.
+
+    The recipient is the kept isomeric sibling of the SAME product ``(Z, A)`` at
+    the nearest LOWER rank, and the reaction's ground pathway when nothing is
+    below it. RANK -- not energy -- decides: a level only reaches this point
+    because its excitation energy failed to identify it, so that energy is
+    exactly the datum not to trust again (and it is identically zero across
+    whole evaluations). A level high in the band cascades DOWN into the isomer
+    below it, never up. The energy gap is still computed, for the audit only.
+
+    ``kept`` is the reaction's MAPPED metastable record list and ``ground`` its
+    ground :class:`ReactionTuple` (or None). The ground qualifies only when its
+    target is the orphan's own base nuclide: a synthesized self-loop or an
+    m->g ``(n,n')`` ground names a DIFFERENT nuclide, and folding a share onto
+    that would move production to the wrong species rather than the wrong state.
+
+    Returns ``(recipient, siblings)``. ``recipient`` is None when the reaction
+    has no kept pathway of that product at all -- the caller then behaves as
+    ``drop`` for this orphan and says so. ``siblings`` lists every kept isomer
+    of the product with its rank and energies, logged so a large-energy fold
+    stays visible.
+    """
+    base = _safe_gnds_name(orphan['z'], orphan['a'])
+    orphan_rank = orphan.get('position')
+
+    siblings = []
+    for rec in kept:
+        if _safe_gnds_name(rec['z'], rec['a']) != base:
+            continue
+        if rec['lfs'] in PLACEHOLDER_LFS_VALUES:
+            continue          # unidentified state: never a rank, never a target
+        siblings.append(dict(product=rec['product'], position=rec.get('position'),
+                             lfs=rec['lfs'], elfs=rec.get('elfs'),
+                             dk_elis=rec.get('dk_elis')))
+
+    below = [s for s in siblings
+             if s['position'] is not None and orphan_rank is not None
+             and s['position'] < orphan_rank]
+    if below:
+        recipient = max(below, key=lambda s: s['position'])
+        return dict(recipient, is_ground=False), siblings
+    if ground is not None and ground.target == base:
+        return dict(product=base, position=0, lfs=0, elfs=None, dk_elis=None,
+                    is_ground=True), siblings
+    return None, siblings
+
+
+def _apply_orphan_policy(chain, parent, r_name, info, ground, orphan_policy,
+                         stats):
+    """Dispose of one reaction's off-chain products; return extra members.
+
+    Mode-agnostic: the mapper marked these records (``needs_chain_entry``) in
+    whichever mapping mode ran, and the policy decides here. ``drop`` never
+    reaches this function -- the mapper carries no orphan records under it, so
+    the status quo is reproduced by construction rather than re-implemented.
+
+    Under ``add-stable`` each orphan product is materialised (idempotent) and
+    then decorated exactly like a mapped metastable. Under ``reattribute`` the
+    column folds into :func:`_reattribution_recipient`'s pick: the written entry
+    repeats the RECIPIENT's name as its target while keeping the ORPHAN's own
+    LFS and QI, which is what makes it a distinct row the collapse then sums
+    onto the recipient's. An orphan with no recipient is dropped for that
+    reaction and recorded with ``disposition='dropped_no_recipient'``.
+    """
+    extra = []
+    for rec in info.get('orphans') or ():
+        product = rec.get('product')
+        entry = dict(parent=parent, reaction=r_name, mt=info.get('mt'),
+                     lfs=rec.get('lfs'), position=rec.get('position'),
+                     elfs=rec.get('elfs'), qi=rec.get('qi'),
+                     method=rec.get('method'), bucket=rec.get('bucket'),
+                     fallback_reason=rec.get('fallback_reason'),
+                     orphan=product, target_z=rec.get('z'),
+                     target_a=rec.get('a'), policy=orphan_policy,
+                     recipient=None, recipient_position=None,
+                     rank_distance=None, delta_elfs=None, siblings=[],
+                     peak_xs=rec.get('peak_xs'),
+                     created=False, disposition=None)
+        if product is None or _OFF_TABLE_NAME.match(product):
+            # No name, or the off-table ``Z<z>-A<a>`` placeholder a corrupt IZAP
+            # produces: never materialised, never folded -- it is a report, not
+            # a nuclide (see :func:`_safe_gnds_name`).
+            entry['disposition'] = 'dropped_no_product'
+            _note_orphan(stats, entry, 'orphan_dropped')
+            continue
+
+        if orphan_policy == 'add-stable':
+            entry['created'] = _add_stable_nuclide(
+                chain, product, stats,
+                dict(parent=parent, reaction=r_name, mt=info.get('mt'),
+                     lfs=rec.get('lfs'), elfs=rec.get('elfs'),
+                     position=rec.get('position'), method=rec.get('method'),
+                     bucket=rec.get('bucket')))
+            entry['disposition'] = ('added' if entry['created']
+                                    else 'added_shared')
+            extra.append((rec, product, _member_ordinal(rec)))
+            _note_orphan(stats, entry, 'orphan_products_kept')
+            continue
+
+        # reattribute
+        recipient, siblings = _reattribution_recipient(
+            rec, info['metastables'], ground)
+        entry['siblings'] = siblings
+        if recipient is None:
+            entry['disposition'] = 'dropped_no_recipient'
+            _note_orphan(stats, entry, 'orphan_folds_stranded')
+            continue
+        o_rank, r_rank = rec.get('position'), recipient['position']
+        o_elfs, r_elfs = rec.get('elfs'), recipient['elfs']
+        entry.update(
+            recipient=recipient['product'], recipient_position=r_rank,
+            rank_distance=(o_rank - r_rank if None not in (o_rank, r_rank)
+                           else None),
+            delta_elfs=(o_elfs - r_elfs if None not in (o_elfs, r_elfs)
+                        else None),
+            disposition=('folded_to_ground' if recipient['is_ground']
+                         else 'folded_to_sibling'))
+        # The member is named for the RECIPIENT (its target and its _m<n>
+        # ordinal) but carries the ORPHAN's LFS and Q: that is the duplicate
+        # target the collapse sums, and the LFS is what keeps the two rows
+        # distinct in the chain XML.
+        ordinal = (0 if recipient['is_ground']
+                   else _isomer_ordinal_of(recipient['product']))
+        extra.append((rec, recipient['product'], ordinal))
+        _note_orphan(stats, entry,
+                     'orphan_folds_ground' if recipient['is_ground']
+                     else 'orphan_folds_sibling')
+    return extra
+
+
+def _isomer_ordinal_of(name):
+    """The ``_m<n>`` ordinal of a nuclide name, 0 when it has none."""
+    match = _ISOMER_ORDINAL.search(name or '')
+    return int(match.group(1)) if match else 0
+
+
+def _add_stable_missing_ground(chain, name, stats, parent, r_name, info):
+    """Materialise a referenced-but-missing GROUND product (add-stable only).
+
+    The ground analogue of an orphan metastable: the reaction's LFS=0 route
+    names a nuclide the chain does not carry, so today the ground row is dropped
+    (or, for a metastable parent's m->g ``(n,n')``, the WHOLE reaction is left
+    stock and its metastable pathways go with it). Under ``add-stable`` the same
+    disposition applies as to any other off-chain product -- keep the pathway,
+    add a stable pure sink -- and it is logged in the same roll call, tagged
+    ``missing_ground`` so it is never confused with a MINTED orphan ordinal
+    (a ground name is exact; a ``_mN`` orphan name is a placeholder).
+    """
+    created = _add_stable_nuclide(
+        chain, name, stats,
+        dict(parent=parent, reaction=r_name, mt=info.get('mt'), lfs=0,
+             elfs=None, position=0, method='missing_ground',
+             bucket='missing_ground'))
+    _note_orphan(stats, dict(
+        parent=parent, reaction=r_name, mt=info.get('mt'), lfs=0, position=0,
+        elfs=None, qi=None, method='missing_ground', bucket='missing_ground',
+        fallback_reason=None, orphan=name, target_z=None, target_a=None,
+        policy='add-stable', recipient=None, recipient_position=None,
+        rank_distance=None, delta_elfs=None, siblings=[], peak_xs=None,
+        created=created,
+        disposition='ground_added' if created else 'ground_shared'),
+        'orphan_grounds_added')
+    return created
+
+
+def _note_orphan(stats, entry, counter):
+    """Record one orphan disposition + bump its counter. No-op without stats."""
+    if stats is None:
+        return
+    stats.setdefault('orphan_dispositions', []).append(entry)
+    stats[counter] = stats.get(counter, 0) + 1
+
+
+def decorate_chain(chain, branching, stats=None, orphan_policy='drop'):
     """Add ground + qualified metastable ReactionTuples to the chain in place.
 
     Every tuple carries a ``pendf_lfs`` (ground = 0, metastable = tape LFS) so
@@ -1604,13 +2501,32 @@ def decorate_chain(chain, branching, stats=None):
       self-loop is a depletion-matrix no-op, and the collapse serves that
       ground row by balance as identically zero (the metastable partials
       already sum to the synthesized total).
+
+    ``orphan_policy`` (see :data:`ORPHAN_POLICIES`) disposes of the reaction's
+    off-chain products, which :func:`map_library` carried here on the
+    ``orphans`` list -- empty under ``drop``, so that policy is the untouched
+    status quo. Under ``add-stable`` a referenced-but-missing GROUND product is
+    materialised too: it is the same class of gap as a missing metastable, and
+    without it the reaction either loses its ground row (an off-chain DADZ
+    target) or is left stock entirely (a metastable parent's m->g ``(n,n')``
+    whose true ground the chain never carried).
     """
+    if orphan_policy not in ORPHAN_POLICIES:
+        raise ValueError(f"Invalid orphan_policy {orphan_policy!r}; expected "
+                         f"one of {ORPHAN_POLICIES}.")
     if stats is not None:
         stats.setdefault('mg_ground_synthesized', 0)
         stats.setdefault('mg_ground_skipped', 0)
         stats.setdefault('pathway_q_rejected', [])
         stats.setdefault('q_chain_anchored', 0)
         stats.setdefault('pathway_q_zero_anchor', 0)
+        stats.setdefault('orphan_dispositions', [])
+        stats.setdefault('orphan_nuclides_added', {})
+        for key in ('orphan_products_kept', 'orphan_grounds_added',
+                    'orphan_folds_sibling', 'orphan_folds_ground',
+                    'orphan_folds_stranded', 'orphan_dropped'):
+            stats.setdefault(key, 0)
+        stats['orphan_policy'] = orphan_policy
     book = stats.get('mf10_only') if stats is not None else None
     rows = ({(r['parent'], r['mt']): r for r in book['rows']}
             if book is not None else {})
@@ -1623,11 +2539,12 @@ def decorate_chain(chain, branching, stats=None):
             metastables = info['metastables']
             mf3_less = bool(info.get('mf3_less'))
             row = rows.get((parent, info.get('mt')))
-            if not metastables:
+            if not metastables and not info.get('orphans'):
                 # Ground-only MF=10-only MT: a plain reaction, no branching.
                 if mf3_less:
                     reactions_added += _emit_mf10_only_ground(
-                        nuc, chain, z, a, r_name, info, book, row)
+                        nuc, chain, z, a, r_name, info, book, row,
+                        orphan_names=(stats or {}).get('orphan_nuclides_added'))
                 continue
             existing = next((rx for rx in nuc.reactions if rx.type == r_name),
                             None)
@@ -1689,6 +2606,14 @@ def decorate_chain(chain, branching, stats=None):
                     # no-op this branch exists to remove.
                     target = _ISOMER_SUFFIX.sub('', parent)
                     elis = info.get('parent_elis')
+                    if (elis and orphan_policy == 'add-stable'
+                            and target not in chain.nuclide_dict):
+                        # Referenced-but-missing GROUND (E3 parity): the isomer's
+                        # own ground state, absent from the chain. Materialising
+                        # it rescues the whole reaction -- without it the m->g
+                        # route AND every metastable pathway are left stock.
+                        _add_stable_missing_ground(chain, target, stats, parent,
+                                                   r_name, info)
                     if not elis or target not in chain.nuclide_dict:
                         reason = ('parent MF=1/451 ELIS absent or 0' if not elis
                                   else f'ground {target} not in chain')
@@ -1714,6 +2639,15 @@ def decorate_chain(chain, branching, stats=None):
                     ground = None
                 else:
                     daughter = _ground_product(z, a, r_name)
+                    if (daughter is not None and orphan_policy == 'add-stable'
+                            and daughter not in chain.nuclide_dict):
+                        # Referenced-but-missing GROUND (E3 parity): the DADZ
+                        # ground product of a reaction the chain does not carry.
+                        # Same gap class as a missing metastable, so the same
+                        # policy applies -- materialise it and write the ground
+                        # row instead of degrading to a metastable-only group.
+                        _add_stable_missing_ground(chain, daughter, stats,
+                                                   parent, r_name, info)
                     if daughter is None or daughter not in chain.nuclide_dict:
                         # No usable ground target: emit a metastable-only group
                         # (still folds -- Phase 1 tolerates no LFS 0 entry).
@@ -1723,20 +2657,52 @@ def decorate_chain(chain, branching, stats=None):
                         ground = ReactionTuple(r_name, daughter, float(gq),
                                                1.0, 0)
                 reactions_added += 1
+
+            # Orphan policy (mode-agnostic): materialise, fold, or drop the
+            # products the chain does not carry. Runs after the ground pathway
+            # is known -- a fold-to-ground needs it -- and before the members
+            # are built, so a reaction whose every pathway is stranded can be
+            # left stock rather than written with a lone ground row.
+            extra = _apply_orphan_policy(chain, parent, r_name, info, ground,
+                                         orphan_policy, stats)
+            if not metastables and not extra:
+                # Nothing survived the policy: leave the reaction stock, exactly
+                # as the mapper's own membership filter would have.
+                if existing is None:
+                    reactions_added -= 1
+                if mf3_less:
+                    _mf10_only_note(book, row, 'skipped_no_mapped_metastable')
+                continue
+
             members = []
             if ground is not None:
                 members.append(ground)
             q_refused = ([] if ground is None
                          else ['n/a (ground already chain-anchored)'])
-            for m in metastables:
+
+            def _member(product, ordinal, lfs, qi, elfs):
+                """One decorated pathway, with the pathway-Q gate applied."""
                 if q_chain_reject:
-                    q = round(chain_q - float(m['elfs']),
-                              _PATHWAY_Q_REVERT_DECIMALS)
-                    q_refused.append(float(m['qi']))
+                    q = round(chain_q - float(elfs), _PATHWAY_Q_REVERT_DECIMALS)
+                    q_refused.append(float(qi))
                 else:
-                    q = float(m['qi'])
-                members.append(ReactionTuple(
-                    f"{r_name}_m{m['liso']}", m['product'], q, 1.0, m['lfs']))
+                    q = float(qi)
+                r_type = r_name if ordinal == 0 else f"{r_name}_m{ordinal}"
+                return ReactionTuple(r_type, product, q, 1.0, lfs)
+
+            for m in metastables:
+                members.append(_member(m['product'], m['liso'], m['lfs'],
+                                       m['qi'], m['elfs']))
+            # Orphan members last: an add-stable pathway names its own minted
+            # product, a reattributed one repeats the RECIPIENT's name while
+            # keeping the orphan's own LFS and QI -- the duplicate target the
+            # collapse sums (microxs.stage()). The pathway-Q gate treats them
+            # exactly like any other metastable slot: a reaction whose file Q
+            # values were refused must not leave one pathway on the file's
+            # energy zero and the rest on the chain's.
+            for rec, product, ordinal in extra:
+                members.append(_member(product, ordinal, rec['lfs'],
+                                       rec['qi'], rec['elfs']))
             folded_members[r_name] = members
 
             if q_chain_reject:
@@ -1750,7 +2716,7 @@ def decorate_chain(chain, branching, stats=None):
                     file_ground_qm=file_ground_qm, chain_q=chain_q,
                     delta=file_ground_qm - chain_q, q_file=q_refused,
                     q_kept=[rx.Q for rx in members],
-                    reverted_slots=len(metastables)))
+                    reverted_slots=len(metastables) + len(extra)))
             if mf3_less:
                 _mf10_only_note(
                     book, row, 'emitted_branched',
@@ -1838,93 +2804,222 @@ def _prune_nn_prime_self_loops(chain):
 # Console statistics block
 # =============================================================================
 
-def print_stats(stats, mode):
-    total_lfs = (stats['matched'] + stats['matched_rejected']
-                 + stats['products_not_in_chain']
-                 + stats['rtol_exceeded'] + stats['no_dk'] + stats['zero_elis']
-                 + stats['duplicate_discarded'] + stats['lfs_order_dropped'])
-    print(f"\n                      nuclides in PENDF library: {stats['pendf_nuclides_total']:5d}")
-    print(f"               nuclides in PENDF with branching: {stats['nuclides_with_branching']:5d}")
-    print("-" * 52)
-    print(f"                          Total PENDF-LFS found: {total_lfs:5d}")
+def _hybrid_census(stats):
+    """Terminal-class census of the hybrid mapper, plus its memo counters.
+
+    EVERY classified level lands in exactly ONE terminal class -- Phase-1 ELIS,
+    Phase-2 positional, placeholder-bound, placeholder-unmapped, or Phase-3
+    orphan -- because each carries exactly one ``method``. The abstention,
+    unusable and requeue counters are MEMO lines describing how a level reached
+    its class, so they overlap the classes and are never added to the total.
+
+    ``terminal`` is the identity anchor: it must equal ``stats['total_lfs']``,
+    the raw count of metastable MF=10 partials the scan saw.
+    """
+    recs = stats.get('hybrid_records') or []
+
+    def by_method(name):
+        return sum(1 for r in recs if r.get('method') == name)
+
+    def by_reason(reason):
+        return sum(1 for r in recs if r.get('fallback_reason') == reason)
+
+    census = dict(
+        phase1=by_method('elis'),
+        phase2=by_method('lfs_order_fallback'),
+        placeholder_bound=by_method('placeholder_bound'),
+        placeholder_unmapped=by_method('placeholder_unmapped'),
+        orphan_levels=by_method('orphan_added'),
+        unclaimed_dk=by_method('hybrid_orphan_dk'),
+        abstained=by_reason('elis_ambiguous'),
+        requeued=sum(1 for r in recs if r.get('duplicate_requeued')),
+        unusable=sum(by_reason(r) for r in HYBRID_UNUSABLE_REASONS),
+        large_delta_e=sum(1 for r in recs if r.get('large_delta_e')),
+    )
+    census['terminal'] = (census['phase1'] + census['phase2']
+                          + census['placeholder_bound']
+                          + census['placeholder_unmapped']
+                          + census['orphan_levels'])
+    return census
+
+
+def _total_lfs_found(stats, mode):
+    """'Total PENDF-LFS found': the sum of the mode's TERMINAL classes.
+
+    The legacy modes partition by classification bucket; the hybrid partitions
+    by mapper method (:func:`_hybrid_census`), whose buckets the legacy sum does
+    not name at all -- summing the legacy way there would silently omit the
+    placeholder-unmapped and Phase-3 orphan levels.
+    """
+    if mode == 'elis_lfs_order':
+        return _hybrid_census(stats)['terminal']
+    return (stats['matched'] + stats['matched_rejected']
+            + stats['products_not_in_chain']
+            + stats['rtol_exceeded'] + stats['no_dk'] + stats['zero_elis']
+            + stats['duplicate_discarded'] + stats['lfs_order_dropped'])
+
+
+def _counter_lines(stats, mode):
+    """The MATCHING SETTINGS counter block, as a list of lines.
+
+    ONE definition, consumed by both the console summary and the mapping log,
+    so a counter can never be present in one and missing from the other.
+    """
+    lines = []
+
+    def add(label, value, suffix='', width=47):
+        lines.append(f"{label:>{width}}: {value:5d}{suffix}")
+
+    add('nuclides in PENDF library', stats['pendf_nuclides_total'])
+    add('nuclides in PENDF with branching', stats['nuclides_with_branching'])
+    lines.append("-" * 52)
+    add('Total PENDF-LFS found', _total_lfs_found(stats, mode))
     if mode == 'elis':
-        print(f"                                   ELIS matched: {stats['matched']:5d}")
+        add('ELIS matched', stats['matched'])
+    elif mode == 'elis_lfs_order':
+        census = _hybrid_census(stats)
+        add('Phase-1 ELIS matched (unique)', census['phase1'])
+        add('Phase-2 positional fallback', census['phase2'])
+        add('Placeholder LFS bound', census['placeholder_bound'])
+        add('Placeholder LFS unmapped (report-only)',
+            census['placeholder_unmapped'])
+        add('Phase-3 orphan levels minted', census['orphan_levels'])
+        raw = stats.get('total_lfs')
+        ok = 'ok' if raw is None or census['terminal'] == raw else 'MISMATCH'
+        add('-- terminal classes, one per level (sum)', census['terminal'],
+            f"   [{ok}]")
+        add('of the above, mapped into the chain', stats['matched'])
+        add('memo: Phase-1 abstained (ambiguous)', census['abstained'])
+        add('memo: Phase-1 unusable (QM/ELFS/rtol)', census['unusable'])
+        add('memo: duplicate LFS requeued to Phase 2', census['requeued'])
+        add('memo: Phase-2 pairs flagged large-Delta-E',
+            census['large_delta_e'])
+        add('memo: decay metastables nothing claimed',
+            census['unclaimed_dk'])
     else:
-        print(f"                               LFS-order mapped: {stats['matched']:5d}")
+        add('LFS-order mapped', stats['matched'])
     if stats['matched_rejected']:
-        print(f"         matched but band-rejected (left stock): {stats['matched_rejected']:5d}")
+        add('matched but band-rejected (left stock)',
+            stats['matched_rejected'])
     if stats['rtol_exceeded']:
-        print(f"                             ELIS rtol exceeded: {stats['rtol_exceeded']:5d}")
+        add('ELIS rtol exceeded', stats['rtol_exceeded'])
     if stats['no_dk']:
-        print(f"                           No product in DK-Lib: {stats['no_dk']:5d}")
+        add('No product in DK-Lib', stats['no_dk'])
     if stats['zero_elis']:
-        print(f"                       Zero-ELIS in DK-Lib (QA): {stats['zero_elis']:5d}")
+        add('Zero-ELIS in DK-Lib (QA)', stats['zero_elis'])
     if stats['duplicate_resolved']:
-        print(f"                    Duplicate mappings resolved: {stats['duplicate_resolved']:5d} ({stats['duplicate_discarded']} LFS discarded)")
+        add('Duplicate mappings resolved', stats['duplicate_resolved'],
+            f" ({stats['duplicate_discarded']} LFS discarded)")
     if stats['lfs_order_dropped']:
-        print(f"                 LFS dropped (exceeds DK count): {stats['lfs_order_dropped']:5d}")
-    print(f"                          Products not in chain: {stats['products_not_in_chain']:5d}")
-    print(f"                       Reactions added to chain: {stats['reactions_added']:5d}")
-    print(f"                Synthesized m->g (n,n') grounds: {stats.get('mg_ground_synthesized', 0):5d}")
-    print(f"           Skipped m->g (n,n') (no ELIS/ground): {stats.get('mg_ground_skipped', 0):5d}")
-    print(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}")
-    print(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}")
-    print(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}")
+        add('LFS dropped (exceeds DK count)', stats['lfs_order_dropped'])
+    add('Products not in chain', stats['products_not_in_chain'])
+    # Orphan-policy dispositions: a SECOND partition, over the orphan subset
+    # only, never part of the total above. Suppressed under 'drop', where every
+    # one of them is zero by construction and the block must stay byte-identical
+    # to the pre-triad log.
+    if stats.get('orphan_policy', 'drop') != 'drop':
+        add('Orphan nuclides ADDED to chain',
+            len(stats.get('orphan_nuclides_added') or {}))
+        add('Orphan pathways kept (add-stable)',
+            stats.get('orphan_products_kept', 0))
+        add('Referenced grounds ADDED to chain',
+            stats.get('orphan_grounds_added', 0))
+        add('Orphan columns folded to a sibling',
+            stats.get('orphan_folds_sibling', 0))
+        add('Orphan columns folded to the ground',
+            stats.get('orphan_folds_ground', 0))
+        add('Orphan columns dropped (no recipient)',
+            stats.get('orphan_folds_stranded', 0))
+        add('Orphan columns dropped (no product)',
+            stats.get('orphan_dropped', 0))
+    add('Reactions added to chain', stats['reactions_added'])
+    add("Synthesized m->g (n,n') grounds",
+        stats.get('mg_ground_synthesized', 0))
+    add("Skipped m->g (n,n') (no ELIS/ground)",
+        stats.get('mg_ground_skipped', 0))
+    add('Ground-only MF=10 reactions', stats['ground_only'])
+    add('Metastable-only MF=10 reactions', stats['metastable_only'])
+    add('MF=10 without MF=3 (not decorable)',
+        stats.get('mf10_without_mf3', 0))
     if stats.get('mf10_only_enabled'):
         # Only with --emit-mf10-only-reactions, so a flag-off run's console and
         # log blocks stay byte-identical to a run without the feature.
         book = stats['mf10_only']
         examined, emitted, skipped = _mf10_only_reconciliation(book)
-        print(f"               MF=10-only emitted (ground-only): {book['emitted_ground_only']:5d}")
-        print(f"                  MF=10-only emitted (branched): {book['emitted_branched']:5d}")
-        print(f"                MF=10-only skipped (left stock): {skipped:5d}")
-        print(f"          MF=10-only examined (= emitted+skips): {examined:5d}"
-              f"   [{emitted} + {skipped}"
-              f"{'' if examined == emitted + skipped else ' -- MISMATCH'}]")
-    print(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}")
-    print(f"                                 MF=10 rejected: {stats['rejected_count']:5d}")
-    print(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}")
-    print(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}")
-    print(f"         Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}")
-    print(f"      Pathway-Q metastable slots chain-anchored: {stats.get('q_chain_anchored', 0):5d}")
-    print(f"   Pathway-Q gate skipped (zero-Q chain anchor): {stats.get('pathway_q_zero_anchor', 0):5d}")
-    print(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}")
-    print(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}")
+        add('MF=10-only emitted (ground-only)', book['emitted_ground_only'])
+        add('MF=10-only emitted (branched)', book['emitted_branched'])
+        add('MF=10-only skipped (left stock)', skipped)
+        add('MF=10-only examined (= emitted+skips)', examined,
+            f"   [{emitted} + {skipped}"
+            f"{'' if examined == emitted + skipped else ' -- MISMATCH'}]")
+    add('MF=10 audit offenders', stats['audit_offenders'])
+    add('MF=10 rejected', stats['rejected_count'])
+    add('Band-reject exempt (self-loop)', stats['band_reject_exempt'])
+    add('Rtol-reject exempt (self-loop)', stats['rtol_reject_exempt'])
+    add('Pathway-Q file QM rejected (reactions)',
+        len(stats.get('pathway_q_rejected', [])))
+    add('Pathway-Q metastable slots chain-anchored',
+        stats.get('q_chain_anchored', 0))
+    add('Pathway-Q gate skipped (zero-Q chain anchor)',
+        stats.get('pathway_q_zero_anchor', 0))
+    if stats.get('nn_prime_prune_enabled'):
+        add("Pruned (n,n') self-loops",
+            stats.get('nn_prime_pruned_count', 0))
+    # Historical column width for this one label (46, not 47): kept so a legacy
+    # log stays byte-identical.
+    add('LFS placeholder occurrences', stats['lfs_placeholder_count'], width=46)
+    add('Unique nuclides absent from DK-Lib', stats['absent_unique_count'])
+    return lines
 
 
-def _print_lfs_sentinel_warning(sentinels, mode):
-    """Loud console warning + per-value breakdown when LFS sentinels were seen.
+def print_stats(stats, mode):
+    """Console echo of the mapping log's counter block (identical content)."""
+    print()
+    for line in _counter_lines(stats, mode):
+        print(line)
+
+
+def _print_lfs_placeholder_warning(placeholders, mode):
+    """Loud console warning + per-value breakdown when LFS placeholders appeared.
 
     Report-only: no mapping decision or chain output depends on this. Under
-    'elis' mapping the sentinel rows are matched on their real ELFS excitation
-    energy and are SAFE; the risk is only a downstream POSITIONAL consumer
-    (FISPACT-parity lfs_order tooling) that would mis-name them ``_m99`` /
-    ``_m40``. Under 'lfs_order' the tool IS doing positional naming, so the
-    warning is emphatic.
+    'elis' mapping the placeholder rows are matched on their real ELFS
+    excitation energy and are SAFE; the risk is only a downstream POSITIONAL
+    consumer (FISPACT-parity lfs_order tooling) that would mis-name them
+    ``_m99`` / ``_m40``. Under 'lfs_order' the tool IS doing positional naming,
+    so the warning is emphatic. The hybrid ``elis_lfs_order`` mode binds a
+    placeholder LFS explicitly (never positionally among the real levels), so
+    its rows are safe by construction.
     """
-    if not sentinels:
+    if not placeholders:
         return
-    by_val = Counter(s['lfs'] for s in sentinels)
+    by_val = Counter(s['lfs'] for s in placeholders)
     bar = "!" * 70
     print("\n" + bar)
-    print(f"WARNING: {len(sentinels)} LFS SENTINEL occurrence(s) detected "
+    print(f"WARNING: {len(placeholders)} LFS PLACEHOLDER occurrence(s) detected "
           "(unspecified-level isomer tags)")
     print(bar)
     for val in sorted(by_val):
-        print(f"  LFS={val:<3d} x{by_val[val]:<4d} {SENTINEL_LFS[val]}")
-    print("  Sentinel LFS values are NOT level ordinals; they must never be")
+        print(f"  LFS={val:<3d} x{by_val[val]:<4d} {PLACEHOLDER_LFS[val]}")
+    print("  Placeholder LFS values are NOT level ordinals; they must never be")
     print("  interpreted as isomer ordinals (e.g. _m99 / _m40).")
     if mode == 'lfs_order':
         print("  MODE=lfs_order is ACTIVE: positional product naming is "
               "UNRELIABLE for these")
         print("  rows -- use ELIS mapping for production calculations.")
+    elif mode == 'elis_lfs_order':
+        print("  MODE=elis_lfs_order is ACTIVE: a placeholder LFS never ranks "
+              "among the real")
+        print("  levels; one whose energy is unknown or unmatched binds to the "
+              "lowest unclaimed")
+        print("  metastable, or is left report-only when none remains.")
     else:
         print("  ELIS mapping is active, so these rows are matched on real "
               "excitation energy")
         print("  and are SAFE here; the risk is only if the chain is later "
               "consumed ORDINALLY")
         print("  (e.g. FISPACT-parity lfs_order tooling).")
-    print("  See the 'LFS SENTINEL VALUES' section of the mapping log for "
+    print("  See the 'LFS PLACEHOLDER VALUES' section of the mapping log for "
           "every occurrence.")
     print(bar)
 
@@ -1957,7 +3052,11 @@ def _write_mapping_row(f, m):
         if product == '?':
             product = m.get('base_nuclide', '?')
     elif err_type == 'no_metastable_decay_data':
-        method = 'not-mapped'
+        # A product the chain lacks is a SKIP only under --orphan-policy drop.
+        # Rescued by any other policy, it is written and its fate is in the
+        # ORPHAN DISPOSITION section -- calling it not-mapped here would report
+        # the same level a second time as a loss.
+        method = 'orphan_added' if m.get('rescued') else 'not-mapped'
         notes = m.get('note', 'Product not in DK-Lib')
         if product == '?':
             product = m.get('base_nuclide', '?')
@@ -2013,12 +3112,7 @@ def _write_mapping_row(f, m):
         else:
             disc_str = "N/A"
 
-    if method == 'elis':
-        method_display = 'ELIS'
-    elif method == 'lfs_order':
-        method_display = 'LFS_ORDER'
-    else:
-        method_display = method
+    method_display = METHOD_DISPLAY.get(method, method)
 
     f.write(f"{mt_str:>5}  {reaction:<12}  {lfs_str:>9}  {pendf_product:<15}  "
             f"{liso_str:>7}  {chain_product:<15}  {half_life_str:>12}  "
@@ -2297,8 +3391,16 @@ _ABSENT_STATUS_LABELS = (
 )
 
 
-def _write_absent_decay_section(f, absent_by_status):
-    """NUCLIDES ABSENT FROM DECAY LIBRARY section: unique base names by status."""
+def _write_absent_decay_section(f, absent_by_status, mode=None):
+    """NUCLIDES ABSENT FROM DECAY LIBRARY section: unique base names by status.
+
+    Fed by the ``no_dk`` classification bucket, which only the legacy modes
+    emit: the hybrid never leaves a level unmapped for want of a decay partner
+    (it mints an orphan state instead), so this list is empty there and the
+    equivalent decay-library gap list lives in ORPHAN DISPOSITION / ORPHAN
+    NUCLIDES ADDED. Said in the section rather than left to be inferred from an
+    empty table.
+    """
     f.write("\n\n" + "=" * 220 + "\n")
     f.write("NUCLIDES ABSENT FROM DECAY LIBRARY\n")
     f.write("=" * 220 + "\n\n")
@@ -2307,6 +3409,13 @@ def _write_absent_decay_section(f, absent_by_status):
             "carries no usable metastable data,\n")
     f.write("grouped by the reason lookup_liso returned. Each name is listed "
             "once regardless of how many reactions produced it.\n\n")
+    if mode == 'elis_lfs_order':
+        f.write("MODE elis_lfs_order: this list is EMPTY BY CONSTRUCTION. The "
+                "hybrid mapper never abandons a level for want of a decay "
+                "partner -- it mints an orphan\n")
+        f.write("state and hands it to --orphan-policy -- so the "
+                "decay-library gap for this run is the ORPHAN DISPOSITION and "
+                "ORPHAN NUCLIDES ADDED sections, not this one.\n\n")
     total = sum(len(absent_by_status.get(s, [])) for s, _ in _ABSENT_STATUS_LABELS)
     # Include any status not in the fixed label set (defensive).
     other = {s: n for s, n in absent_by_status.items()
@@ -2333,47 +3442,66 @@ def _write_absent_decay_section(f, absent_by_status):
             f.write("  " + "  ".join(f"{n:<12}" for n in names[i:i + 8]) + "\n")
 
 
-def _write_lfs_sentinel_section(f, sentinels):
-    """LFS SENTINEL VALUES section: every classified partial with a sentinel LFS.
+def _write_lfs_placeholder_section(f, placeholders, mode=None):
+    """LFS PLACEHOLDER VALUES section: every partial carrying a placeholder LFS.
 
-    Report-only. Lists all occurrences (all nuclides/targets) so a sentinel LFS
-    is never silently consumed as an isomer ordinal. Printed unconditionally
+    Report-only. Lists all occurrences (all nuclides/targets) so a placeholder
+    LFS is never silently consumed as an isomer ordinal. Printed unconditionally
     (mirrors the other audit sections), with a 'none found' line when empty.
+    Under ``elis_lfs_order`` the placeholder rows are the subject of an explicit
+    binding rule rather than a passing energy match, so the explanation follows
+    the mode that actually ran.
     """
     f.write("\n\n" + "=" * 220 + "\n")
-    f.write('LFS SENTINEL VALUES ("unspecified isomer" conventions)\n')
+    f.write('LFS PLACEHOLDER VALUES (unidentified excited states)\n')
     f.write("=" * 220 + "\n\n")
     f.write("Some evaluations tag a product whose final-state LEVEL could not "
-            "be resolved with a SENTINEL LFS instead of a true level index:\n")
-    for val, desc in sorted(SENTINEL_LFS.items()):
+            "be resolved with a PLACEHOLDER LFS instead of a true level index:\n")
+    for val, desc in sorted(PLACEHOLDER_LFS.items()):
         f.write(f"    LFS={val:<3d} = {desc}\n")
-    f.write("These sentinels are NOT level ordinals. ELIS mapping (this tool's "
-            "default) is unaffected -- it matches the real ELFS excitation "
-            "energy, so the CHAIN-Product\n")
-    f.write("column carries the correct _m<liso> even though the raw "
-            "PENDF-Product column shows the misleading _m<sentinel>. A "
-            "positional/lfs_order consumer, however, would mis-name\n")
-    f.write("these rows _m99 / _m40. They are reported here so such misuse is "
-            "caught; mapping decisions and the output chain are UNCHANGED.\n\n")
-    if not sentinels:
-        f.write("No LFS sentinel values found.\n")
+    if mode == 'elis_lfs_order':
+        f.write("These placeholders are NOT level ordinals, and the hybrid "
+                "mode never treats them as such: a placeholder takes no rank "
+                "among the real levels and\n")
+        f.write("never displaces one. With a usable, distinct energy it "
+                "competes in Phase 1 like any level; otherwise it binds, after "
+                "Phase 2, to the lowest decay state\n")
+        f.write("still unclaimed, or is left report-only when none remains "
+                "(then no explicit pathway is written and its share follows "
+                "the reaction's stock / balance route).\n")
+        f.write("A placeholder is never orphan-added and never becomes _m99 / "
+                "_m40. See HYBRID MAPPING for the per-row binding detail.\n\n")
+    else:
+        f.write("These placeholders are NOT level ordinals. ELIS mapping is "
+                "unaffected -- it matches the real ELFS excitation energy, so "
+                "the CHAIN-Product\n")
+        f.write("column carries the correct _m<liso> even though the raw "
+                "PENDF-Product column shows the misleading _m<placeholder>. A "
+                "positional/lfs_order consumer, however, would mis-name\n")
+        f.write("these rows _m99 / _m40. They are reported here so such misuse "
+                "is caught; mapping decisions and the output chain are "
+                "UNCHANGED.\n\n")
+    if not placeholders:
+        f.write("No LFS placeholder values found.\n")
         return
-    by_val = Counter(s['lfs'] for s in sentinels)
+    by_val = Counter(s['lfs'] for s in placeholders)
     breakdown = ", ".join(f"LFS={v}: {by_val[v]}" for v in sorted(by_val))
-    f.write(f"Total sentinel occurrences: {len(sentinels)}  ({breakdown})\n\n")
+    f.write(f"Total placeholder occurrences: {len(placeholders)}  "
+            f"({breakdown})\n\n")
     header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
               f"{'Convention':<22}  {'Target':<12}  {'PENDF-ELFS[eV]':>14}  "
               f"{'Method':<10}  {'Outcome':<44}")
     sep = "-" * len(header)
     f.write(header + "\n" + sep + "\n")
-    for s in sorted(sentinels, key=lambda x: (x['parent'], x.get('mt') or 0,
-                                              x['lfs'])):
+    for s in sorted(placeholders, key=lambda x: (x['parent'],
+                                                 x.get('mt') or 0, x['lfs'])):
         elfs = s.get('elfs')
         elfs_str = f"{elfs:.1f}" if elfs is not None else "N/A"
         f.write(f"{s['parent']:<12}  {s['mt']:>5}  {s['reaction']:<12}  "
                 f"{s['lfs']:>4}  {s.get('convention', ''):<22}  "
                 f"{s.get('base_nuclide', '?'):<12}  {elfs_str:>14}  "
-                f"{s.get('method', ''):<10}  {s.get('outcome', ''):<44}\n")
+                f"{_HYBRID_METHOD_DISPLAY.get(s.get('method'), s.get('method', '')):<10}"
+                f"  {s.get('outcome', ''):<44}\n")
 
 
 def _write_mf10_without_mf3_section(f, records, emit_enabled=False,
@@ -2518,12 +3646,469 @@ def _write_mf10_only_section(f, book):
                 f"{r.get('outcome', ''):<44}\n")
 
 
+def _elfs_str(value, width=14):
+    """Right-aligned energy in eV, 'N/A' when the file gave none."""
+    return (f"{value:>{width}.1f}" if isinstance(value, (int, float))
+            else f"{'N/A':>{width}}")
+
+
+def _xs_str(value, width=10):
+    """Right-aligned peak cross section in barn, 'n/a' when unavailable."""
+    return (f"{value:>{width}.4g}" if isinstance(value, (int, float))
+            else f"{'n/a':>{width}}")
+
+
+def _hybrid_crossings(records):
+    """The Phase-2 records whose level order is inverted against a sibling.
+
+    A crossing is not an error. A Phase-1 energy match is trusted absolutely, so
+    the level below it can legitimately end up in a HIGHER decay state than a
+    level above it. Detected by comparing rank against LISO across every level
+    of one product of one reaction, and flagged only so an audit can look.
+    """
+    by_product = defaultdict(list)
+    for r in records:
+        if r.get('liso') is None or r.get('position') is None:
+            continue
+        by_product[(r.get('parent'), r.get('mt'), r.get('z'),
+                    r.get('a'))].append(r)
+
+    crossed = set()
+    for rows in by_product.values():
+        for r in rows:
+            for s in rows:
+                if s is r:
+                    continue
+                if ((s['position'] < r['position'] and s['liso'] > r['liso'])
+                        or (s['position'] > r['position']
+                            and s['liso'] < r['liso'])):
+                    crossed.add(id(r))
+                    break
+    return crossed
+
+
+def _write_hybrid_section(f, hybrid_records):
+    """HYBRID MAPPING: how each level reached its state, phase by phase.
+
+    Written only under ``-m elis_lfs_order``. Nothing on this page is a loss:
+    every row is either mapped by position or reported as a placeholder that
+    could not be placed.
+    """
+    recs = hybrid_records or []
+    abstained = [r for r in recs
+                 if r.get('fallback_reason') == 'elis_ambiguous']
+    requeued = [r for r in recs if r.get('duplicate_requeued')]
+    unusable = [r for r in recs
+                if r.get('fallback_reason') in HYBRID_UNUSABLE_REASONS
+                and not r.get('duplicate_requeued')]
+    phase2 = [r for r in recs if r.get('method') == 'lfs_order_fallback']
+    bound = [r for r in recs if r.get('method') == 'placeholder_bound']
+    unmapped = [r for r in recs if r.get('method') == 'placeholder_unmapped']
+
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("HYBRID MAPPING (elis_lfs_order) -- PHASE DETAIL\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("Phase 1 binds a level to the decay state whose excitation energy "
+            "matches its PENDF-ELFS (QM - QI), and only when that state is the "
+            "single candidate within\n")
+    f.write("tolerance. Phase 2 takes the levels left over, in rank order, and "
+            "pairs them with the decay metastables left over, in LISO order -- "
+            "energies play no part\n")
+    f.write("there. Phase 3 mints an orphan state for whatever is still "
+            "unpaired (its fate is in ORPHAN DISPOSITION). Every level below "
+            "was mapped or reported; none\n")
+    f.write("was discarded.\n\n")
+
+    f.write("PHASE-1 ABSTENTIONS (two decay states within tolerance)\n")
+    f.write("-" * 150 + "\n")
+    if not abstained:
+        f.write("None.\n")
+    else:
+        f.write("The level's energy fits two states, so binding either one "
+                "would be a coin toss; the level is re-derived by position "
+                "instead.\n")
+        f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+                f"{'PENDF-ELFS[eV]':>14}  {'Nearest':<10}  "
+                f"{'DK-ELIS[eV]':>14}  {'Second':<10}  {'DK-ELIS[eV]':>14}\n")
+        f.write("-" * 150 + "\n")
+        for r in sorted(abstained, key=_hybrid_sort_key):
+            f.write(f"{str(r.get('parent')):<12}  {str(r.get('mt')):>5}  "
+                    f"{str(r.get('reaction')):<12}  {str(r.get('lfs')):>4}  "
+                    f"{_elfs_str(r.get('elfs'))}  "
+                    f"{'_m' + str(r.get('nearest_liso')):<10}  "
+                    f"{_elfs_str(r.get('nearest_dk_elis'))}  "
+                    f"{'_m' + str(r.get('second_liso')):<10}  "
+                    f"{_elfs_str(r.get('second_dk_elis'))}\n")
+    f.write("\n")
+
+    f.write("PHASE-1 LEVELS ROUTED ONWARD (energy unusable, unmatched, or a "
+            "duplicate loser)\n")
+    f.write("-" * 150 + "\n")
+    if not (unusable or requeued):
+        f.write("None.\n")
+    else:
+        f.write("None of these is a loss: each level is handed to the "
+                "positional phase, which is what the lfs_order mode would have "
+                "done with it from the start.\n")
+        f.write("A level with no decay state left after Phase 2 becomes a "
+                "Phase-3 orphan -- still written, still listed (ORPHAN "
+                "DISPOSITION), never silently dropped.\n")
+        f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+                f"{'Rank':>4}  {'PENDF-ELFS[eV]':>14}  {'Landed in':<22}  "
+                f"{'Reason':<60}\n")
+        f.write("-" * 150 + "\n")
+        for r in sorted(unusable + requeued, key=_hybrid_sort_key):
+            reason = HYBRID_REASON_LABELS.get(r.get('fallback_reason'),
+                                              str(r.get('fallback_reason')))
+            if r.get('duplicate_requeued'):
+                reason = (f"{HYBRID_REASON_LABELS['duplicate_loser']} "
+                          f"(_m{r.get('duplicate_liso')} to LFS="
+                          f"{r.get('kept_lfs')})")
+            rank = r.get('position')
+            f.write(f"{str(r.get('parent')):<12}  {str(r.get('mt')):>5}  "
+                    f"{str(r.get('reaction')):<12}  {str(r.get('lfs')):>4}  "
+                    f"{('-' if rank is None else str(rank)):>4}  "
+                    f"{_elfs_str(r.get('elfs'))}  "
+                    f"{METHOD_DISPLAY.get(r.get('method'), str(r.get('method'))):<22}  "
+                    f"{reason:<60}\n")
+    f.write("\n")
+
+    f.write("PHASE-2 POSITIONAL ASSIGNMENTS\n")
+    f.write("-" * 205 + "\n")
+    if not phase2:
+        f.write("None.\n")
+    else:
+        f.write("Rank = the level's place among the product's real levels "
+                "(a placeholder LFS never takes a rank). 'Phase-1 held' lists "
+                "the decay states already claimed\n")
+        f.write("by an energy match when this pairing was made -- those are "
+                "skipped, which is what keeps a fallback off a state that is "
+                "already spoken for. 'Crossing?'\n")
+        f.write("flags a pairing whose level order is inverted against an "
+                "energy-matched sibling: allowed by design (an energy match is "
+                "trusted absolutely), shown for\n")
+        f.write("audit only. A large Delta(ELFS-ELIS) is likewise an audit "
+                "flag on the pair, never a veto -- the energy already failed "
+                "once, which is why the level is here.\n")
+        f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+                f"{'Rank':>4}  {'CHAIN-Product':<15}  {'PENDF-ELFS[eV]':>14}  "
+                f"{'DK-ELIS[eV]':>14}  {'D(ELFS-ELIS)':>22}  "
+                f"{'Phase-1 held':<16}  {'Crossing?':<9}  {'Large-dE?':<9}  "
+                f"{'Routed by':<50}\n")
+        f.write("-" * 205 + "\n")
+        crossed = _hybrid_crossings(recs)
+        for r in sorted(phase2, key=_hybrid_sort_key):
+            elfs, dk_elis = r.get('elfs'), r.get('dk_elis')
+            if isinstance(elfs, (int, float)) and dk_elis:
+                delta = (f"{abs(elfs - dk_elis):.0f}eV "
+                         f"({abs(elfs - dk_elis) / abs(dk_elis) * 100:.2f}%)")
+            else:
+                delta = "N/A"
+            claimed = r.get('phase1_claimed_lisos') or []
+            claimed_str = ", ".join(f"_m{i}" for i in claimed) or 'none'
+            rank = r.get('position')
+            reason = HYBRID_REASON_LABELS.get(r.get('fallback_reason'),
+                                              str(r.get('fallback_reason')))
+            f.write(f"{str(r.get('parent')):<12}  {str(r.get('mt')):>5}  "
+                    f"{str(r.get('reaction')):<12}  {str(r.get('lfs')):>4}  "
+                    f"{('-' if rank is None else str(rank)):>4}  "
+                    f"{str(r.get('product')):<15}  {_elfs_str(elfs)}  "
+                    f"{_elfs_str(dk_elis)}  {delta:>22}  {claimed_str:<16}  "
+                    f"{('YES' if id(r) in crossed else 'no'):<9}  "
+                    f"{('YES' if r.get('large_delta_e') else 'no'):<9}  "
+                    f"{reason:<50}\n")
+    f.write("\n")
+
+    f.write("PLACEHOLDER LFS BINDING (unidentified excited states)\n")
+    f.write("-" * 150 + "\n")
+    f.write("A placeholder LFS says 'an isomer, level unidentified'. It never "
+            "takes a rank among the real levels and never displaces one. With "
+            "its energy unknown or\n")
+    f.write("unmatched it binds, after Phase 2, to the lowest decay state "
+            "still unclaimed; with no state left it is reported only -- no "
+            "explicit pathway is written and\n")
+    f.write("that share follows the reaction's stock / balance route at "
+            "collapse. A placeholder is never orphan-added and never named "
+            "_m99 / _m40.\n")
+    if not (bound or unmapped):
+        f.write("None found.\n")
+    else:
+        for r in sorted(bound, key=_hybrid_sort_key):
+            n_free = r.get('n_unclaimed')
+            which = ('sole' if n_free == 1 else f'lowest of {n_free}')
+            f.write(f"  BOUND      {str(r.get('parent')):<10} "
+                    f"{str(r.get('reaction')):<12} MT={str(r.get('mt')):<4} "
+                    f"LFS={r.get('lfs')} -> {r.get('product')} "
+                    f"({which} unclaimed state, "
+                    f"DK-ELIS={_elfs_str(r.get('dk_elis'), 1).strip()} eV, "
+                    f"{HYBRID_REASON_LABELS.get(r.get('fallback_reason'), r.get('fallback_reason'))})\n")
+        for r in sorted(unmapped, key=_hybrid_sort_key):
+            f.write(f"  UNMAPPED   {str(r.get('parent')):<10} "
+                    f"{str(r.get('reaction')):<12} MT={str(r.get('mt')):<4} "
+                    f"LFS={r.get('lfs')} -> no decay state left to bind "
+                    f"({HYBRID_REASON_LABELS.get(r.get('fallback_reason'), r.get('fallback_reason'))}); "
+                    "report-only -- its share follows the reaction's stock / "
+                    "balance route\n")
+    f.write("\n")
+
+
+def _hybrid_sort_key(r):
+    return (str(r.get('parent')), r.get('mt') or 0, r.get('lfs') or 0)
+
+
+# Per-policy note for a Phase-3 orphan row in the per-parent mapping tables.
+_ORPHAN_ROW_NOTE = {
+    'add-stable':  'orphan state added to chain',
+    'drop':        'orphan: column dropped',
+    'reattribute': 'orphan: column folded',
+}
+
+
+def _hybrid_table_rows(hybrid_records, orphan_policy):
+    """Per-parent table rows for the Phase-3 orphan levels.
+
+    A minted orphan is a terminal class with no home in ``isomer_mappings``
+    (mapped rows), ``elis_errors`` or ``products_not_in_chain``, so without this
+    shape it would be counted in the block above and then appear in no table at
+    all. It is not reported as a failure: the row carries the minted name and
+    points at ORPHAN DISPOSITION, which holds the actual outcome. The other
+    hybrid-only class, a report-only placeholder, has no chain product to name
+    and keeps its own always-written LFS PLACEHOLDER VALUES section instead.
+    """
+    rows = []
+    for r in hybrid_records or []:
+        if r.get('method') != 'orphan_added':
+            continue
+        note = (
+            'orphan: reaction left stock' if r.get('rejected')
+            else _ORPHAN_ROW_NOTE.get(orphan_policy, 'orphan'))
+        rows.append(dict(
+            parent=r.get('parent'), reaction=r.get('reaction'), mt=r.get('mt'),
+            lfs=r.get('lfs'), product=r.get('product') or '-',
+            liso=None, half_life='-', elis=r.get('elfs'),
+            dk_elis=None, method='orphan_added',
+            notes=f"{note}; see ORPHAN DISPOSITION"))
+    return rows
+
+
+def _write_orphan_disposition_section(f, stats, orphan_policy):
+    """ORPHAN DISPOSITION: every product the chain could not account for.
+
+    Written in EVERY mapping mode and under EVERY policy -- with a 'none' line
+    when there is nothing to report -- so the class is never invisible. Rows
+    come from the writer's ``orphan_dispositions`` ledger; under ``drop`` the
+    writer sees no orphans at all, so the mapper's own ``orphan_levels_list``
+    supplies the rows and each one is reported as a vanished column.
+    """
+    dispositions = stats.get('orphan_dispositions') or []
+    minted = stats.get('orphan_levels_list') or []
+    off_chain = stats.get('products_not_in_chain_errors') or []
+    ledgered = {(d.get('parent'), d.get('mt'), d.get('lfs'))
+                for d in dispositions}
+
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("ORPHAN DISPOSITION\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("An ORPHAN is a reaction product the chain cannot account for: an "
+            "excited state whose identity did not resolve against the decay "
+            "library, or a whole product\n")
+    f.write("nuclide that library never carried. The reaction rate into it is "
+            "real either way, so what happens to its CROSS-SECTION COLUMN is "
+            "chosen at patch time with\n")
+    f.write(f"--orphan-policy (this run: {orphan_policy}):\n\n")
+    f.write("  add-stable   the product is added to the output chain with no "
+            "decay data and the pathway is kept. Mass is conserved and the "
+            "column stays visible; the\n")
+    f.write("               state's own activity is not modelled (see ORPHAN "
+            "NUCLIDES ADDED TO CHAIN).\n")
+    f.write("  drop         the pathway is not written and its column VANISHES "
+            "-- the parent under-burns and every daughter under-produces by "
+            "exactly that share.\n")
+    f.write("               This is NOT a renormalization: PENDF pathways "
+            "carry cross sections in barns, not branching ratios, so there is "
+            "no ratio channel to\n")
+    f.write("               redistribute over and nothing takes up the slack.\n")
+    f.write("  reattribute  the column is FOLDED into the kept isomer of the "
+            "same product at the nearest LOWER rank (the reaction's ground "
+            "when nothing sits below it).\n")
+    f.write("               Rank, not energy, decides: an orphan is here "
+            "precisely because its energy failed to identify it, and a "
+            "high-lying state cascades down,\n")
+    f.write("               never up. The written entry repeats the "
+            "recipient's name while keeping the orphan's own LFS and QI; the "
+            "collapse SUMS the two same-named\n")
+    f.write("               rows, so the reaction total is preserved.\n\n")
+    f.write("Consequence of a fold, stated plainly: the reaction rate survives "
+            "but is attributed to the WRONG STATE. A fold into the ground of a "
+            "reaction whose every\n")
+    f.write("metastable is orphaned reproduces the stock MF=3 total exactly -- "
+            "there the gain is disclosure, not numbers. A fold into a kept "
+            "sibling moves real isomer\n")
+    f.write("production onto a neighbouring state and WILL change the "
+            "inventory.\n\n")
+
+    rows = []
+    for d in dispositions:
+        rows.append(d)
+    for e in off_chain:
+        # An identified metastable whose decay-library name the chain never
+        # carried. Rescued ones are already in the writer's ledger above; the
+        # rest lost their column and belong here, in EVERY mode -- this is the
+        # whole of the class under 'drop', where no orphan reaches the writer.
+        key = (e.get('parent'), e.get('mt'), e.get('lfs'))
+        if e.get('rescued') or key in ledgered:
+            continue
+        rows.append(dict(
+            parent=e.get('parent'), reaction=e.get('reaction'),
+            mt=e.get('mt'), lfs=e.get('lfs'), position=e.get('position'),
+            elfs=e.get('elis'), method='not-mapped', fallback_reason=None,
+            orphan=e.get('product'), peak_xs=e.get('peak_xs'),
+            policy=orphan_policy, recipient=None, siblings=[],
+            disposition=('dropped_policy' if orphan_policy == 'drop'
+                         else 'dropped_band_rejected')))
+    for lvl in minted:
+        key = (lvl.get('parent'), lvl.get('mt'), lvl.get('lfs'))
+        if key in ledgered:
+            continue
+        # Minted by the mapper but never seen by the writer: either 'drop' (no
+        # orphan reaches the policy at all) or a reaction the audit gates left
+        # stock. Both end the same way -- the column is not written.
+        rows.append(dict(
+            parent=lvl.get('parent'), reaction=lvl.get('reaction'),
+            mt=lvl.get('mt'), lfs=lvl.get('lfs'),
+            position=lvl.get('position'), elfs=lvl.get('elis'),
+            method='orphan_added', fallback_reason=lvl.get('fallback_reason'),
+            orphan=lvl.get('product'), peak_xs=lvl.get('peak_xs'),
+            policy=orphan_policy, recipient=None, siblings=[],
+            disposition=('dropped_band_rejected' if lvl.get('rejected')
+                         else 'dropped_policy')))
+
+    if not rows:
+        f.write("None: every reaction product had a partner in the chain.\n")
+        return
+
+    f.write(f"Total orphan pathways: {len(rows)}\n\n")
+    f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+            f"{'Rank':>4}  {'PENDF-ELFS[eV]':>14}  {'Peak sigma[b]':>13}  "
+            f"{'Orphan product':<15}  {'Why orphaned':<52}  "
+            f"{'Disposition -> chain product'}\n")
+    f.write("-" * 220 + "\n")
+    for row in sorted(rows, key=lambda r: (str(r.get('parent')),
+                                           r.get('mt') or 0,
+                                           r.get('lfs') or 0)):
+        reason = HYBRID_REASON_LABELS.get(
+            row.get('fallback_reason'),
+            row.get('fallback_reason') or 'product not in the chain')
+        rank = row.get('position')
+        disposition = _orphan_disposition_text(row)
+        f.write(f"{str(row.get('parent')):<12}  {str(row.get('mt')):>5}  "
+                f"{str(row.get('reaction')):<12}  "
+                f"{('-' if row.get('lfs') is None else str(row['lfs'])):>4}  "
+                f"{('-' if rank is None else str(rank)):>4}  "
+                f"{_elfs_str(row.get('elfs'))}  {_xs_str(row.get('peak_xs'), 13)}"
+                f"  {str(row.get('orphan')):<15}  {reason:<52}  "
+                f"{disposition}\n")
+        for s in row.get('siblings') or []:
+            f.write(f"{'':<12}  {'':>5}  {'':<12}  -> kept isomer "
+                    f"{str(s.get('product')):<12} rank="
+                    f"{'-' if s.get('position') is None else s['position']} "
+                    f"LFS={s.get('lfs')} "
+                    f"PENDF-ELFS={_elfs_str(s.get('elfs'), 1).strip()} eV "
+                    f"DK-ELIS={_elfs_str(s.get('dk_elis'), 1).strip()} eV\n")
+    f.write("\n")
+
+
+def _orphan_disposition_text(row):
+    """One-line plain-language fate of a single orphan pathway."""
+    disposition = row.get('disposition')
+    if disposition == 'dropped_policy':
+        return ("NOT WRITTEN -- column vanishes (--orphan-policy drop); the "
+                "parent under-burns by that share")
+    if disposition == 'dropped_band_rejected':
+        return ("NOT WRITTEN -- the reaction was left stock by the MF=10 "
+                "rejection gate")
+    label = ORPHAN_DISPOSITION_LABELS.get(disposition, str(disposition))
+    if disposition in ('added', 'added_shared', 'ground_added',
+                       'ground_shared'):
+        return f"{label} -> {row.get('orphan')}"
+    if disposition in ('folded_to_sibling', 'folded_to_ground'):
+        dist = row.get('rank_distance')
+        delta = row.get('delta_elfs')
+        return (f"{label} -> {row.get('recipient')} (rank distance "
+                f"{'?' if dist is None else dist}, D-ELFS "
+                f"{'n/a' if delta is None else f'{delta:.0f} eV'})")
+    return label
+
+
+def _write_orphan_nuclides_section(f, orphan_nuclides_added):
+    """ORPHAN NUCLIDES ADDED TO CHAIN (--orphan-policy add-stable)."""
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("ORPHAN NUCLIDES ADDED TO CHAIN (--orphan-policy add-stable)\n")
+    f.write("=" * 220 + "\n\n")
+    if not orphan_nuclides_added:
+        f.write("No nuclides were added to the chain.\n")
+        return
+
+    f.write("Each nuclide below was written into the output chain as "
+            "<nuclide name=\"...\" reactions=\"0\"/> -- no decay data, so the "
+            "chain reads it as STABLE.\n")
+    f.write("What that buys and what it costs, plainly:\n")
+    f.write("  KEPT      the reaction pathway into the state survives with its "
+            "own cross-section column; nothing vanishes and the parent's "
+            "burn-up stays whole.\n")
+    f.write("  SINK      the state never decays in the calculation. If the "
+            "real state is short-lived, its daughters are never produced and "
+            "its decay radiation is\n")
+    f.write("            missing from the results -- the inventory holds "
+            "material at a level that should have moved on.\n")
+    f.write("  NAME      the _mN suffix is a free ordinal for that Z/A, "
+            "allocated against the decay-library LISO indices and the existing "
+            "chain names. It is NOT a\n")
+    f.write("            decay-library isomeric state number and must not be "
+            "read as one.\n")
+    f.write("  SHARED    several parents feeding the same unidentified state "
+            "share one nuclide. A wide spread of PENDF-ELFS among those "
+            "parents means they do not\n")
+    f.write("            agree on which state it is; a narrow spread means "
+            "they do, and only the decay library is missing it.\n")
+    f.write("  GROUND+   a row tagged 'missing_ground' is a referenced-but-"
+            "absent GROUND product, not a minted ordinal: that name is exact, "
+            "the chain simply lacked it.\n\n")
+    f.write("This list doubles as the DECAY-LIBRARY GAP LIST: closing it "
+            "upstream, one state at a time, is what removes the need for these "
+            "additions.\n\n")
+
+    f.write(f"Nuclides added: {len(orphan_nuclides_added)}\n\n")
+    for name in sorted(orphan_nuclides_added):
+        sources = orphan_nuclides_added[name]
+        energies = [s['elfs'] for s in sources
+                    if isinstance(s.get('elfs'), (int, float))]
+        if len(energies) > 1:
+            spread = (f"PENDF-ELFS {min(energies):.1f} .. {max(energies):.1f} "
+                      f"eV (spread {max(energies) - min(energies):.1f} eV)")
+        elif energies:
+            spread = f"PENDF-ELFS {energies[0]:.1f} eV"
+        else:
+            spread = "no PENDF-ELFS on file"
+        f.write(f"  {name:<14} from {len(sources)} pathway(s); {spread}\n")
+        for s in sorted(sources, key=lambda x: (str(x['parent']),
+                                                x.get('mt') or 0)):
+            f.write(f"      {str(s['parent']):<10} {str(s['reaction']):<12} "
+                    f"MT={str(s['mt']):<4} LFS="
+                    f"{'-' if s.get('lfs') is None else s['lfs']:<4} "
+                    f"ELFS={_elfs_str(s.get('elfs'), 1).strip():<12} "
+                    f"mapper={s.get('method') or '-'}\n")
+    f.write("\n")
+
+
 def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
     """Write the comprehensive PENDF isomer mapping log."""
     isomer_mappings = stats['isomer_mappings']
     elis_errors = list(stats['elis_errors'])
     products_not_in_chain = stats['products_not_in_chain_errors']
     duplicate_errors = stats['duplicate_errors']
+    hybrid_records = stats.get('hybrid_records') or []
+    orphan_policy = stats.get('orphan_policy', 'drop')
 
     with open(log_file, 'w') as f:
         f.write("=" * 220 + "\n")
@@ -2538,10 +4123,76 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             f.write("  WARNING: May produce incorrect results for nuclides where\n")
             f.write("           LFS order does not match LISO order (e.g., Ag116).\n")
             f.write("           Use 'elis' mode for production calculations.\n")
+        elif mode == 'elis_lfs_order':
+            f.write("MODE: ELIS_LFS_ORDER (excitation energy first, then position)\n\n")
+            f.write("  Phase 1 -- energy. A level binds to the decay state whose\n")
+            f.write("    excitation energy matches its PENDF-ELFS (QM - QI) within the\n")
+            f.write("    tolerance below, and ONLY when that state is the single\n")
+            f.write("    candidate within it. The level ABSTAINS and waits for Phase 2\n")
+            f.write("    when two decay states both fit (energy-degenerate isomers), when\n")
+            f.write("    the file gives no usable ELFS (no QM, zero or negative energy),\n")
+            f.write("    when every decay state of the product carries ELIS = 0, when the\n")
+            f.write("    nearest state lies outside tolerance, or when a closer level\n")
+            f.write("    claimed the same state (the loser is REQUEUED, never dropped).\n")
+            f.write("  Phase 2 -- position. The levels left over, in rank order, pair\n")
+            f.write("    with the decay metastables left over, in LISO order. States\n")
+            f.write("    already claimed in Phase 1 are skipped, so no pairing collides.\n")
+            f.write("    Energies play no part here; a large gap is flagged for audit,\n")
+            f.write("    not acted on. The decay pool is not ELIS-filtered, so a\n")
+            f.write("    zero-ELIS decay state is still claimable.\n")
+            f.write("  Crossings are permitted. A Phase-1 energy match is trusted\n")
+            f.write("    absolutely, so a Phase-2 pairing may end up order-inverted\n")
+            f.write("    against it (level 5 to _m2 while level 10 takes _m1). The\n")
+            f.write("    PHASE-2 table marks those rows.\n")
+            f.write("  Placeholder LFS values (99 ENDF/JEFF, 40 TENDL) mean 'an isomer,\n")
+            f.write("    level unidentified'. They never take a rank among real levels\n")
+            f.write("    and never displace one. With a usable, distinct energy a\n")
+            f.write("    placeholder competes in Phase 1 like any level; otherwise it\n")
+            f.write("    ALWAYS BINDS, after Phase 2, to the lowest decay state still\n")
+            f.write("    unclaimed, and is report-only when none is left. A placeholder\n")
+            f.write("    is never orphan-added and never named _m99 / _m40.\n")
+            f.write("  Phase 3 -- orphans. A level with no decay state left is minted as\n")
+            f.write("    an orphan state; --orphan-policy decides its fate (see the\n")
+            f.write("    ORPHAN DISPOSITION section).\n")
         else:
             f.write("MODE: ELIS (decay library excitation energy matching)\n\n")
             f.write("  Maps PENDF MF=10 products to OpenMC _m{n} naming based on\n")
             f.write("  excitation energy (ELFS = QM - QI) matching with decay library.\n")
+        f.write("\n")
+        f.write(f"ORPHAN POLICY: {orphan_policy}\n")
+        f.write(f"  ({_ORPHAN_POLICY_BANNER[orphan_policy]})\n")
+        f.write("\n")
+
+        # The consequence of an unmapped metastable partial, in every mode and
+        # under every policy. The chain is the DEMAND side of the PENDF
+        # collapse, so an undemanded partial is not an error anywhere -- it is
+        # simply never collapsed.
+        f.write("WHAT AN UNMAPPED METASTABLE PARTIAL COSTS\n")
+        f.write("-" * 70 + "\n")
+        f.write("  The depletion chain is the DEMAND side of the PENDF collapse: a\n")
+        f.write("  pathway the chain does not ask for is silently ignored, with no\n")
+        f.write("  warning at collapse time and no trace in the results. So a metastable\n")
+        f.write("  partial that never reaches the chain does not merely lose its own\n")
+        f.write("  isomer -- the PARENT UNDER-BURNS by exactly that share and EVERY\n")
+        f.write("  DAUGHTER UNDER-PRODUCES by the same fraction. Nothing renormalizes it\n")
+        f.write("  away: PENDF pathways carry cross sections in barns, not branching\n")
+        f.write("  ratios, so there is no ratio channel for the missing share to be\n")
+        f.write("  redistributed over. It is gone.\n")
+        f.write("\n")
+
+        f.write("DOCUMENTED LIMITATION -- WHAT THIS TOOL CAN AND CANNOT KNOW\n")
+        f.write("-" * 70 + "\n")
+        f.write("  The DECAY LIBRARY is the sole authority on state identity here. The\n")
+        f.write("  chain FILTERS names; it never testifies to identity -- a state absent\n")
+        f.write("  from the chain may be absent from the decay library, or present under\n")
+        f.write("  a different index, and the chain cannot tell the two apart.\n")
+        f.write("  Orphan handling therefore errs in BOTH directions: a genuine isomer\n")
+        f.write("  whose identity was lost is modelled as STABLE (its real decay, its\n")
+        f.write("  daughters and its radiation all missing), while a prompt, sub-second\n")
+        f.write("  level can be held up as if it were a long-lived species (mass parked\n")
+        f.write("  where it should have flowed on inside the first time step).\n")
+        f.write("  The remedy is a decay library that carries the state, not a better\n")
+        f.write("  guess here. The ORPHAN NUCLIDES ADDED list is that gap list.\n")
         f.write("\n\n")
 
         f.write("SOURCE FILES\n")
@@ -2559,65 +4210,30 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write("\n\nMATCHING SETTINGS\n")
         f.write("-" * 70 + "\n")
         f.write(f"Mapping mode:    {mode}\n")
+        f.write(f"Orphan policy:   {orphan_policy}\n")
         f.write(f"ELIS tolerance:  rtol={rtol} ({rtol*100:.0f}%), atol={atol} eV\n")
+        if mode == 'elis_lfs_order':
+            f.write("Default tolerance in this mode is 0.15: a Phase-1 match is trusted\n")
+            f.write("absolutely, so a level that misses it is re-derived by position rather\n")
+            f.write("than lost, which makes a false positive cost more than a miss.\n")
+        elif mode != 'elis':
+            f.write("In LFS-order mode: tolerance used for ELIS reference warnings only.\n")
+        # What happens to a product the mapper could not place is a POLICY
+        # statement, not a mode statement -- so this line follows the policy.
         if mode == 'elis':
             f.write("Products beyond tolerance or not in decay library are skipped.\n")
+        if orphan_policy == 'drop':
             f.write("Products mapped to nuclides absent from the chain are skipped and logged.\n\n")
+        elif orphan_policy == 'add-stable':
+            f.write("Products mapped to nuclides absent from the chain are ADDED to the chain\n")
+            f.write("as stable pure sinks and their pathways kept (see ORPHAN DISPOSITION).\n\n")
         else:
-            f.write("In LFS-order mode: tolerance used for ELIS reference warnings only.\n\n")
+            f.write("Products mapped to nuclides absent from the chain have their cross-section\n")
+            f.write("columns FOLDED into the kept isomer at the nearest lower rank, or into the\n")
+            f.write("ground (see ORPHAN DISPOSITION).\n\n")
 
-        total_lfs = (stats['matched'] + stats['matched_rejected']
-                     + stats['products_not_in_chain']
-                     + stats['rtol_exceeded'] + stats['no_dk']
-                     + stats['zero_elis'] + stats['duplicate_discarded']
-                     + stats['lfs_order_dropped'])
-        f.write(f"                      nuclides in PENDF library: {stats['pendf_nuclides_total']:5d}\n")
-        f.write(f"               nuclides in PENDF with branching: {stats['nuclides_with_branching']:5d}\n")
-        f.write("-" * 52 + "\n")
-        f.write(f"                          Total PENDF-LFS found: {total_lfs:5d}\n")
-        if mode == 'elis':
-            f.write(f"                                   ELIS matched: {stats['matched']:5d}\n")
-        else:
-            f.write(f"                               LFS-order mapped: {stats['matched']:5d}\n")
-        if stats['matched_rejected']:
-            f.write(f"         matched but band-rejected (left stock): {stats['matched_rejected']:5d}\n")
-        if stats['rtol_exceeded']:
-            f.write(f"                             ELIS rtol exceeded: {stats['rtol_exceeded']:5d}\n")
-        if stats['no_dk']:
-            f.write(f"                           No product in DK-Lib: {stats['no_dk']:5d}\n")
-        if stats['zero_elis']:
-            f.write(f"                       Zero-ELIS in DK-Lib (QA): {stats['zero_elis']:5d}\n")
-        if stats['duplicate_resolved']:
-            f.write(f"                    Duplicate mappings resolved: {stats['duplicate_resolved']:5d} ({stats['duplicate_discarded']} LFS discarded)\n")
-        if stats['lfs_order_dropped']:
-            f.write(f"                 LFS dropped (exceeds DK count): {stats['lfs_order_dropped']:5d}\n")
-        f.write(f"                          Products not in chain: {stats['products_not_in_chain']:5d}\n")
-        f.write(f"                       Reactions added to chain: {stats['reactions_added']:5d}\n")
-        f.write(f"                Synthesized m->g (n,n') grounds: {stats.get('mg_ground_synthesized', 0):5d}\n")
-        f.write(f"           Skipped m->g (n,n') (no ELIS/ground): {stats.get('mg_ground_skipped', 0):5d}\n")
-        f.write(f"                    Ground-only MF=10 reactions: {stats['ground_only']:5d}\n")
-        f.write(f"                Metastable-only MF=10 reactions: {stats['metastable_only']:5d}\n")
-        f.write(f"             MF=10 without MF=3 (not decorable): {stats.get('mf10_without_mf3', 0):5d}\n")
-        if stats.get('mf10_only_enabled'):
-            book = stats['mf10_only']
-            examined, emitted, skipped = _mf10_only_reconciliation(book)
-            f.write(f"               MF=10-only emitted (ground-only): {book['emitted_ground_only']:5d}\n")
-            f.write(f"                  MF=10-only emitted (branched): {book['emitted_branched']:5d}\n")
-            f.write(f"                MF=10-only skipped (left stock): {skipped:5d}\n")
-            f.write(f"          MF=10-only examined (= emitted+skips): {examined:5d}"
-                    f"   [{emitted} + {skipped}"
-                    f"{'' if examined == emitted + skipped else ' -- MISMATCH'}]\n")
-        f.write(f"                          MF=10 audit offenders: {stats['audit_offenders']:5d}\n")
-        f.write(f"                                 MF=10 rejected: {stats['rejected_count']:5d}\n")
-        f.write(f"                 Band-reject exempt (self-loop): {stats['band_reject_exempt']:5d}\n")
-        f.write(f"                 Rtol-reject exempt (self-loop): {stats['rtol_reject_exempt']:5d}\n")
-        f.write(f"         Pathway-Q file QM rejected (reactions): {len(stats.get('pathway_q_rejected', [])):5d}\n")
-        f.write(f"      Pathway-Q metastable slots chain-anchored: {stats.get('q_chain_anchored', 0):5d}\n")
-        f.write(f"   Pathway-Q gate skipped (zero-Q chain anchor): {stats.get('pathway_q_zero_anchor', 0):5d}\n")
-        if stats.get('nn_prime_prune_enabled'):
-            f.write(f"                       Pruned (n,n') self-loops: {stats.get('nn_prime_pruned_count', 0):5d}\n")
-        f.write(f"                       LFS sentinel occurrences: {stats['lfs_sentinel_count']:5d}\n")
-        f.write(f"             Unique nuclides absent from DK-Lib: {stats['absent_unique_count']:5d}\n")
+        for line in _counter_lines(stats, mode):
+            f.write(line + "\n")
         f.write("\n")
 
         # Column definitions
@@ -2639,8 +4255,28 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
         f.write("                  Excitation energy of the target nucleus relative to 0.0 for the ground state.\n\n")
         f.write("D(ELFS-ELIS)    = Discrepancy between PENDF-ELFS and DK-ELIS.\n")
         f.write("                  Shows absolute difference [eV] and relative difference [%].\n\n")
-        f.write("Method          = 'ELIS' (matched via excitation energy), 'not-mapped' (failed to match)\n\n")
-        f.write("Notes           = Additional information (skip reason / renormalization).\n\n")
+        f.write("Method          = How the level reached its chain product:\n")
+        f.write("                    'ELIS'        matched via excitation energy (Phase 1 in the hybrid mode)\n")
+        f.write("                    'LFS_ORDER'   positional mapping (lfs_order mode)\n")
+        f.write("                    'LFS-ORD(fb)' hybrid Phase-2 positional fallback -- the energy match failed\n")
+        f.write("                                  or abstained, and the level was re-derived by rank\n")
+        f.write("                    'PLACEHOLDER' a placeholder LFS (99 / 40, level unidentified) bound to the\n")
+        f.write("                                  lowest unclaimed decay state, or reported when none was left\n")
+        f.write("                    'ORPHAN+'     no decay state left at all: the level is an ORPHAN and its\n")
+        f.write("                                  fate is set by --orphan-policy (see ORPHAN DISPOSITION)\n")
+        f.write("                    'GROUND+'     a referenced-but-missing GROUND product materialised by\n")
+        f.write("                                  --orphan-policy add-stable (an exact name, not an ordinal)\n")
+        f.write("                    'not-mapped'  failed to match and not rescued: the pathway is not written\n\n")
+        f.write("Rank (position) = The level's 1-based place among the product's NON-placeholder levels in\n")
+        f.write("                  ascending-LFS order. LFS values are NOT ordinals (a reaction may carry LFS 1\n")
+        f.write("                  and 9 only), so the rank is computed, not read. A placeholder LFS never takes\n")
+        f.write("                  a rank. Used by the hybrid's Phase 2 and by 'reattribute' recipient selection;\n")
+        f.write("                  stamped on every record in EVERY mode so those behave identically.\n")
+        f.write("                  Shown in the HYBRID MAPPING and ORPHAN DISPOSITION sections.\n\n")
+        f.write("Peak sigma[b]   = Largest tabulated value of the MF=10 partial's own cross section, in barn.\n")
+        f.write("                  The size of the column an orphan policy is about to move (reattribute) or\n")
+        f.write("                  lose (drop). 'n/a' when the source could not serve the partial.\n\n")
+        f.write("Notes           = Additional information (skip reason / orphan disposition).\n\n")
         f.write("Further info:\n")
         f.write("  | LIS/LFS | Level number          | All excited states (short-lived + long-lived) |\n")
         f.write("  | LISO    | Isomeric state number | Only Isomeric (metastable/long-lived) states  |\n\n")
@@ -2654,6 +4290,11 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             by_parent[e.get('parent', '?')].append(e)
         for e in products_not_in_chain:
             by_parent[e.get('parent', '?')].append(e)
+        # The hybrid terminal class that reaches none of the three lists above:
+        # a Phase-3 orphan level is neither a mapped row nor an error, so
+        # without this it would appear nowhere in the per-parent tables at all.
+        for r in _hybrid_table_rows(hybrid_records, orphan_policy):
+            by_parent[r['parent']].append(r)
 
         header = (f"{'MT':>5}  {'Reaction':<12}  {'PENDF-LFS':>9}  {'PENDF-Product':<15}  "
                   f"{'DK-LISO':>7}  {'CHAIN-Product':<15}  {'CHAIN-t1/2[s]':>12}  "
@@ -2680,7 +4321,12 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             high.append({**e, 'rel_diff': e.get('diff_percent', float('inf')),
                          'method': 'not-mapped'})
         for e in products_not_in_chain:
-            high.append({**e, 'rel_diff': float('inf'), 'method': 'not-mapped'})
+            # A product an orphan policy rescued is NOT a failed mapping: it is
+            # written, and the ORPHAN DISPOSITION section holds its fate.
+            # Labelling it 'not-mapped' here would double-report it as a loss.
+            high.append({**e, 'rel_diff': float('inf'),
+                         'method': ('orphan_added' if e.get('rescued')
+                                    else 'not-mapped')})
         high.sort(key=lambda x: x.get('rel_diff', 0), reverse=True)
         if not high:
             f.write("No entries with >50% discrepancy or failed mappings.\n")
@@ -2694,6 +4340,14 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
 
         _write_proximity_check(f, isomer_mappings, rtol)
         _write_duplicate_section(f, duplicate_errors)
+        if mode == 'elis_lfs_order':
+            _write_hybrid_section(f, hybrid_records)
+        # ALWAYS written, in every mode and under every policy: the class must
+        # never be invisible, so an empty run says so in as many words.
+        _write_orphan_disposition_section(f, stats, orphan_policy)
+        if orphan_policy == 'add-stable':
+            _write_orphan_nuclides_section(
+                f, stats.get('orphan_nuclides_added') or {})
         _write_consistency_audit_section(
             f, stats.get('audit_offenders_list', []),
             stats.get('audit_clean', 0), stats.get('audit_emax', 2.0e7))
@@ -2702,8 +4356,10 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
             stats.get('reject_band_ratio'))
         _write_pathway_q_rejected_section(
             f, stats.get('pathway_q_rejected', []))
-        _write_absent_decay_section(f, stats.get('absent_by_status', {}))
-        _write_lfs_sentinel_section(f, stats.get('lfs_sentinels', []))
+        _write_absent_decay_section(f, stats.get('absent_by_status', {}),
+                                    mode=mode)
+        _write_lfs_placeholder_section(f, stats.get('lfs_placeholders', []),
+                                       mode=mode)
         _write_mf10_without_mf3_section(
             f, stats.get('mf10_without_mf3_list', []),
             emit_enabled=bool(stats.get('mf10_only_enabled')),
@@ -2719,15 +4375,27 @@ def write_isomer_mapping_log(log_file, stats, source_stats, mode, rtol, atol):
 # =============================================================================
 
 def main(base_chain_file, pendf_path, decay_file, output_chain_file,
-         log_file=None, mapping_mode='elis', elis_rtol=ELIS_RTOL,
+         log_file=None, mapping_mode='elis', elis_rtol=None,
          elis_atol=ELIS_ATOL, verbose=True, library=None, reject_rtol=None,
          audit_emax=2.0e7, reject_band_ratio=None,
-         prune_nn_prime_self_loops=False, emit_mf10_only_reactions=False):
-    """Patch a chain with PENDF MF=10 isomeric branching. Returns the Chain."""
+         prune_nn_prime_self_loops=False, emit_mf10_only_reactions=False,
+         orphan_policy='add-stable'):
+    """Patch a chain with PENDF MF=10 isomeric branching. Returns the Chain.
+
+    ``elis_rtol=None`` resolves per mode from :data:`MODE_DEFAULT_RTOL` BEFORE
+    any classification runs; an explicit value always wins.
+    """
     if decay_file is None:
         raise ValueError("decay_file is required for isomeric branching.")
-    if mapping_mode not in ('elis', 'lfs_order'):
-        raise ValueError(f"Invalid mapping_mode {mapping_mode!r}.")
+    if mapping_mode not in MAPPING_MODES:
+        raise ValueError(f"Invalid mapping_mode {mapping_mode!r}; expected one "
+                         f"of {MAPPING_MODES}.")
+    if orphan_policy not in ORPHAN_POLICIES:
+        raise ValueError(f"Invalid orphan_policy {orphan_policy!r}; expected "
+                         f"one of {ORPHAN_POLICIES}.")
+    rtol_default = elis_rtol is None
+    if rtol_default:
+        elis_rtol = MODE_DEFAULT_RTOL[mapping_mode]
 
     print("=" * 60)
     print("PENDF Isomeric Branching Chain Patcher v1")
@@ -2735,8 +4403,15 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     print(f"\nMAPPING MODE: {mapping_mode.upper()}")
     if mapping_mode == 'lfs_order':
         print("  (FISPACT-like positional mapping for validation)")
+    elif mapping_mode == 'elis_lfs_order':
+        print("  (hybrid: unique ELIS matches, then positional fallback, then "
+              "minted orphan states)")
     else:
         print("  (ELIS-based matching - production recommended)")
+    print(f"ORPHAN POLICY: {orphan_policy}")
+    print(f"  ({_ORPHAN_POLICY_BANNER[orphan_policy]})")
+    print(f"ELIS RTOL: {elis_rtol} "
+          f"({'mode default' if rtol_default else 'explicit -r'})")
 
     print("\nStep 1: Loading base chain...")
     chain = Chain.from_xml(base_chain_file)
@@ -2753,7 +4428,7 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
         print("  MF=10-only emission: ON (MTs with MF=10 partials but no MF=3 "
               "total are served with their partial sum as the total; "
               "MT=5/MT=18 excluded)")
-    if source.kind == 'h5' and source.mapping not in (None, 'elis', 'lfs_order'):
+    if source.kind == 'h5' and source.mapping not in (None,) + MAPPING_MODES:
         print(f"  NOTE: PENDF library mapping attr = {source.mapping!r}")
 
     print("\nStep 3: Loading decay library...")
@@ -2776,11 +4451,18 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     branching, stats = map_library(
         source, chain, decay_lookup, mapping_mode, elis_rtol, elis_atol,
         verbose=verbose, reject_rtol=reject_rtol, audit_emax=audit_emax,
-        reject_band_ratio=reject_band_ratio)
+        reject_band_ratio=reject_band_ratio, orphan_policy=orphan_policy)
 
     print("\nStep 5: Decorating chain...")
-    reactions_added = decorate_chain(chain, branching, stats)
+    print(f"  Orphan policy: {orphan_policy}")
+    n_chain_before = len(chain.nuclides)
+    reactions_added = decorate_chain(chain, branching, stats,
+                                     orphan_policy=orphan_policy)
     stats['reactions_added'] = reactions_added
+    stats['orphan_nuclides_added_count'] = len(chain.nuclides) - n_chain_before
+    if stats['orphan_nuclides_added_count']:
+        print(f"  Nuclides added to chain (add-stable): "
+              f"{stats['orphan_nuclides_added_count']}")
 
     # Optionally prune stock (n,n') ground self-loops (target == parent). Runs
     # AFTER decoration -- branched (n,n') groups already carry their pendf_lfs=0
@@ -2795,7 +4477,8 @@ def main(base_chain_file, pendf_path, decay_file, output_chain_file,
     stats['nn_prime_pruned_count'] = len(nn_prime_pruned)
 
     print_stats(stats, mapping_mode)
-    _print_lfs_sentinel_warning(stats.get('lfs_sentinels', []), mapping_mode)
+    _print_lfs_placeholder_warning(stats.get('lfs_placeholders', []),
+                                   mapping_mode)
     q_rejected = stats.get('pathway_q_rejected', [])
     if q_rejected:
         print(f"\nWARNING: {len(q_rejected)} reaction(s) had a file ground QM "
@@ -2856,7 +4539,11 @@ def _resolve_paths(args):
     pendf = args.pendf or config.get('pendf')
     decay_file = args.decay_file or config.get('decay_file')
 
-    suffix = '.elis_mapped' if args.map == 'elis' else '.lfs_order_mapped'
+    # One suffix per mapping mode; the two legacy names are unchanged so a
+    # legacy run's output/log paths stay exactly what earlier runs produced.
+    suffix = {'elis':           '.elis_mapped',
+              'lfs_order':      '.lfs_order_mapped',
+              'elis_lfs_order': '.elis_lfs_order_mapped'}[args.map]
     if args.output_chain is not None:
         output_chain = args.output_chain
     elif config:
@@ -2898,7 +4585,13 @@ if __name__ == '__main__':
         print(f"\nLibrary:      {args.library} - "
               f"{LIBRARY_CONFIGS[args.library]['description']}")
     print(f"Mapping mode: {args.map}")
-    print(f"Tolerances:   rtol={args.rtol}, atol={args.atol}")
+    print(f"Orphan policy: {args.orphan_policy} - "
+          f"{_ORPHAN_POLICY_BANNER[args.orphan_policy]}")
+    resolved_rtol = (MODE_DEFAULT_RTOL[args.map] if args.rtol is None
+                     else args.rtol)
+    print(f"Tolerances:   rtol={resolved_rtol}"
+          f"{'' if args.rtol is not None else ' (mode default)'}, "
+          f"atol={args.atol}")
     if args.prune_nn_prime_self_loops:
         print("Prune (n,n') self-loops: ENABLED")
     if args.emit_mf10_only_reactions:
@@ -2928,7 +4621,8 @@ if __name__ == '__main__':
          reject_rtol=args.mf10_reject_rtol, audit_emax=args.audit_emax,
          reject_band_ratio=args.mf10_reject_band_ratio,
          prune_nn_prime_self_loops=args.prune_nn_prime_self_loops,
-         emit_mf10_only_reactions=args.emit_mf10_only_reactions)
+         emit_mf10_only_reactions=args.emit_mf10_only_reactions,
+         orphan_policy=args.orphan_policy)
 
     print("\n" + "=" * 70)
     print("Done. Chain saved to:", output_chain)
