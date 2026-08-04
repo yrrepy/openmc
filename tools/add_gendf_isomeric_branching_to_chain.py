@@ -2,11 +2,18 @@
 GENDF Isomeric Branching Chain Patcher (v12)
 
 Adds energy-dependent isomeric branching from GENDF MF=10 data to OpenMC chains.
-Supports two mapping modes:
-- 'elis' (default): ELIS-based mapping for accurate LFS→LISO conversion
+Three mapping modes:
+- 'elis_lfs_order' (default): hybrid - ELIS energy matching first, positional
+  fallback for the levels left over, orphan states kept instead of dropped
+- 'elis': ELIS-based mapping only; unmatched levels are dropped and the sibling
+  branching renormalized
 - 'lfs_order': FISPACT-like positional mapping for validation testing
 
-IMPORTANT: decay_file is REQUIRED for both modes (for count validation and logging).
+A product with no partner in the chain (an unidentified excited state, or a
+whole nuclide the decay library never carried) is handled by --orphan-policy
+{add-stable, renorm, reattribute}, orthogonal to the mapping mode.
+
+IMPORTANT: decay_file is REQUIRED for every mode (for count validation and logging).
 
 IMPORTANT: the input base_chain MUST be an UNPATCHED chain. A rerun's output
 chain and mapping log are unsupported: the first pass consumes the scalar Q
@@ -18,6 +25,12 @@ only slots that fell back to the scalar Q would zero. Always start from a clean,
 unpatched chain.
 
 v12 Changes:
+- 'elis_lfs_order' hybrid mapping mode, now the default; -r/--rtol defaults per
+  mode (0.15 hybrid, 0.50 legacy)
+- --orphan-policy {add-stable, renorm, reattribute} with add-stable the default:
+  a product missing from the chain is added as a stable nuclide and its branch
+  kept, instead of being dropped and renormalized away
+- --output-dir / --log-dir keep verification runs out of the production outputs
 - --reattribute-mf10-noIZAP recovers MF=10 subsections written with IZAP=0
   (evidence gate C1-C4); OFF or a gate failure prunes the reaction's ENTIRE
   isomeric decoration, all-or-nothing
@@ -48,27 +61,93 @@ import numpy as np
 import openmc.data
 from openmc.deplete import Chain
 from openmc.deplete.chain import REACTIONS
+from openmc.deplete.nuclide import Nuclide
 from openmc.deplete.decay_elis import lookup_liso
 from openmc.deplete.gendf import (
-    GENDFLibrary, REACTION_TO_MT, MT_TO_REACTION, get_product_name
+    GENDFLibrary, REACTION_TO_MT, MT_TO_REACTION, PLACEHOLDER_LFS_VALUES,
+    get_product_name
 )
 
 
 # =============================================================================
-# LFS sentinel values ("unspecified isomer" conventions) -- report-only guard
+# LFS placeholder values ("unspecified isomer" conventions) -- report-only guard
 # =============================================================================
 
 # Some evaluations tag a reaction product whose final-state LEVEL could not be
-# resolved with a SENTINEL LFS instead of a true level index. These sentinels
-# are NOT level ordinals and must NEVER be interpreted as isomer ordinals -- a
-# sentinel must never become ``_m99`` / ``_m40``. ELIS mapping is unaffected
-# (it matches the real GENDF-ELFS excitation energy, QM - QI); only a
-# positional ``lfs_order`` consumer would mis-name them. Detection below is
-# REPORT-ONLY: no mapping decision and no byte of the output chain depends on it.
-SENTINEL_LFS = {
+# resolved with a PLACEHOLDER LFS instead of a true level index: unidentified
+# excited states. Placeholders are NOT level ordinals and must NEVER be
+# interpreted as isomer ordinals -- a placeholder must never become ``_m99`` /
+# ``_m40``. ELIS mapping is unaffected (it matches the real GENDF-ELFS
+# excitation energy, QM - QI); only a positional ``lfs_order`` consumer would
+# mis-name them. Detection below is REPORT-ONLY: no mapping decision and no
+# byte of the output chain depends on it. The hybrid ``elis_lfs_order`` mode
+# carries its own placeholder binding rule, implemented library-side.
+_PLACEHOLDER_DESCRIPTIONS = {
     99: 'ENDF/JEFF convention: isomer of unspecified level',
     40: 'TENDL convention: isomer of unspecified level',
 }
+# Keys derive from the library-side value set so the two can never drift.
+PLACEHOLDER_LFS = {v: _PLACEHOLDER_DESCRIPTIONS[v]
+                   for v in sorted(PLACEHOLDER_LFS_VALUES)}
+
+
+# =============================================================================
+# Mapping modes, orphan dispositions and their tolerance defaults
+# =============================================================================
+
+MAPPING_MODES = ('elis', 'lfs_order', 'elis_lfs_order')
+
+# What happens to a reaction product with no partner in the chain (an orphan):
+# a state the mapper could not identify, or a whole product nuclide the decay
+# library never carried. All three are selectable at patch time and all three
+# are reported in the ORPHAN DISPOSITION section of the mapping log.
+ORPHAN_POLICIES = ('add-stable', 'renorm', 'reattribute')
+
+# Mode-dependent -r/--rtol default (an explicit -r always wins). The hybrid
+# trusts a Phase-1 ELIS accept absolutely -- it may cross the positional order
+# -- so a wrong match costs far more there than a demotion to the positional
+# fallback, and 0.15 sits in the empty valley of the accepted-difference
+# distribution while still accepting the tightest genuine sibling pair on file
+# (Lu166 m1/m2, 34.4 / 42.9 keV). The legacy modes keep 0.50, which reproduces
+# every earlier production run byte for byte.
+DEFAULT_ELIS_RTOL = {'elis': 0.50, 'lfs_order': 0.50, 'elis_lfs_order': 0.15}
+
+# Hybrid bookkeeping records (lib.processing_errors types). None of these is a
+# drop: they describe HOW a level was mapped, so they never feed the not-mapped
+# tables. 'elis_incomputable' is the exception -- an elis-mode omission.
+HYBRID_ERROR_TYPES = ('hybrid_fallback', 'placeholder_bound',
+                      'placeholder_unmapped', 'hybrid_orphan_dk')
+
+# Why a level left Phase 1, grouped for the counter block.
+HYBRID_UNUSABLE_REASONS = ('qm_absent', 'elfs_unusable', 'dk_elis_zero',
+                           'elis_tol_exceeded', 'no_dk_partner')
+
+# Plain-language reasons for the log (the mapper's own labels are terse).
+HYBRID_REASON_LABELS = {
+    'qm_absent':         'QM absent: ELFS = QM - QI cannot be computed',
+    'elfs_unusable':     'ELFS zero, negative or not a number',
+    'dk_elis_zero':      'every decay state of the product carries ELIS = 0',
+    'elis_tol_exceeded': 'nearest decay state lies outside the tolerance',
+    'no_dk_partner':     'product has no metastable state in the decay library',
+    'elis_ambiguous':    'two decay states within tolerance: abstained',
+    'duplicate_loser':   'a closer level claimed the same decay state',
+    'energy_unknown':    'placeholder LFS: the excitation energy is unknown',
+}
+
+# EAF-2010 (n,n') channels stored as TWO metastable levels with no ground
+# subsection: emitting one static target would hand it the whole rate, and
+# there is no MF=3 total to synthesize the ground from, so the channel is not
+# emitted at all. Listed in the log as a standing exclusion class; the fix
+# (ground-less two-isomer split emission) belongs to the full patcher run.
+EAF_DUAL_METASTABLE_NN = (
+    'Nb90', 'Sb124', 'Sb126', 'Eu152', 'Tb154', 'Lu177', 'Hf177', 'Hf178',
+    'Hf179', 'Ir191', 'Ir194', 'Au194', 'Au196', 'Pb203',
+)
+
+
+def resolve_elis_rtol(mapping_mode, rtol=None):
+    """Apply the mode-dependent -r/--rtol default (explicit value wins)."""
+    return DEFAULT_ELIS_RTOL[mapping_mode] if rtol is None else rtol
 
 
 # =============================================================================
@@ -105,7 +184,7 @@ REATTRIB_Q_TOL_EV = 1.0e3
 # not luck: both numbers descend from the same mass evaluation.
 PATHWAY_Q_CHAIN_TOL = 1.0
 
-# Sentinel: the MF=10 section could not be read (endf crasher). Distinct from
+# Marker: the MF=10 section could not be read (endf crasher). Distinct from
 # ``None`` (fully attributed) so an unreadable section is never counted as clean.
 MF10_LOAD_ERROR = 'load_error'
 
@@ -487,26 +566,10 @@ def build_parser():
         help='Library pairing to use (see list below)'
     )
 
-    parser.add_argument(
-        '-m', '--map',
-        choices=['elis', 'lfs_order'],
-        default='elis',
-        help="Mapping mode: 'elis' (production, default) or 'lfs_order' (FISPACT validation)"
-    )
-
-    parser.add_argument(
-        '-r', '--rtol',
-        type=float,
-        default=0.50,
-        help='Relative tolerance for ELIS matching (default: 0.50 = 50%%)'
-    )
-
-    parser.add_argument(
-        '-a', '--atol',
-        type=float,
-        default=0.0,
-        help='Absolute tolerance for ELIS matching in eV (default: 0.0)'
-    )
+    parser.add_argument('-m', '--map',      choices=MAPPING_MODES,    default='elis_lfs_order', help="Mapping mode. 'elis_lfs_order' (hybrid, DEFAULT): match each GENDF level to a decay-library state by excitation energy first (unambiguous matches only), pair the levels left over positionally with the decay states left over, and keep any level with no decay partner at all as an ORPHAN state (disposition set by --orphan-policy) instead of discarding it. 'elis': excitation-energy matching only; unmatched levels are dropped and their sibling branching renormalized. 'lfs_order': FISPACT-like positional mapping (1st LFS -> _m1, 2nd -> _m2, ...), for validation runs.")
+    parser.add_argument('--orphan-policy',  choices=ORPHAN_POLICIES,  default='add-stable',     help="What to do with a reaction product that has no partner in the chain -- an excited state the mapper could not identify, or a whole product nuclide the decay library never carried. 'add-stable' (DEFAULT): keep the branch and add the product to the output chain as a new nuclide with no decay data (a stable pure sink). Its name is the lowest free _mN of that Z/A, allocated against the decay-library LISO indices and the existing chain names -- it is a placeholder ordinal, NOT a decay-library LISO; several parents feeding the same unidentified state share one nuclide. 'renorm': drop the product and redistribute its share pro-rata over the surviving targets (the historical behaviour). 'reattribute': fold the orphan's share DOWN into the kept isomer of the same product at the nearest lower rank (ground when none is below it) -- unrelated to --reattribute-mf10-noIZAP, which re-derives an unnamed IZAP=0 product. Placeholder LFS levels (unidentified excited states, 99/40) are never orphan-added under any policy. Every disposition is listed in the ORPHAN DISPOSITION and ORPHAN NUCLIDES ADDED TO CHAIN sections of the mapping log.")
+    parser.add_argument('-r', '--rtol',     type=float,               default=None,             help='Relative tolerance for ELIS matching. Default depends on the mapping mode: 0.15 (15%%) for elis_lfs_order, 0.50 (50%%) for elis and lfs_order. An explicit value always wins, so a tolerance study stays separable from a mode study.')
+    parser.add_argument('-a', '--atol',     type=float,               default=0.0,              help='Absolute tolerance for ELIS matching in eV (default: 0.0)')
 
     parser.add_argument(
         '-q', '--quiet',
@@ -547,7 +610,9 @@ def build_parser():
     parser.add_argument('--audit-emax',               type=float,          default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
     parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band has ratio-1 > X, over-summing ONLY; under-summing never rejects (it is the radioactive-products-only MF=10 signature: an absent stable ground or anonymous levels missing from the partials). Default: None = audit only, reject nothing. GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
     parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=True,  help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: on; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
-    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: on. ANY anonymous subsection failing the gate prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
+    parser.add_argument('--output-dir',               type=str,            default=None,  help='Write the output chain XML into this directory instead of the library pairing\'s own output directory. Use it for verification runs so they never overwrite a production chain. Default: the pairing\'s output_dir.')
+    parser.add_argument('--log-dir',                  type=str,            default=None,  help='Write the mapping log into this directory instead of the library pairing\'s own output directory. Use it for verification runs so they never overwrite a production log. Default: the pairing\'s output_dir.')
+    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: on. ANY anonymous subsection failing the gate prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere. NOT related to "--orphan-policy reattribute": this one NAMES a product the file left unnamed, that one FOLDS an identified-but-unmatchable state into a kept sibling.')
 
     return parser
 
@@ -986,18 +1051,18 @@ def _parse_no_metastable_decay_data_error(error_str):
     return result
 
 
-def _collect_lfs_sentinels(branching_data, elis_errors, duplicate_mapping_errors,
+def _collect_lfs_placeholders(branching_data, elis_errors, duplicate_mapping_errors,
                            lfs_order_dropped, mapping_mode):
-    """Report-only scan for LFS SENTINEL values (see :data:`SENTINEL_LFS`).
+    """Report-only scan for LFS PLACEHOLDER values (see :data:`PLACEHOLDER_LFS`).
 
     Returns a list of occurrence records drawn from BOTH the successfully mapped
     products (``branching_data`` -> ``IsomericBranching.lfs_mapping``) and the
     unmapped/skipped error channels (``lib.processing_errors``). No mapping
-    decision depends on this; it exists so a sentinel LFS -- which the
+    decision depends on this; it exists so a placeholder LFS -- which the
     flags-only writer would otherwise emit verbatim in ``gendf_lfs`` -- is never
     silently consumed as an isomer ordinal (``_m99`` / ``_m40``).
     """
-    sentinels = []
+    placeholders = []
     method = 'lfs_order' if mapping_mode == 'lfs_order' else 'elis'
 
     def _base(product, z, a):
@@ -1015,19 +1080,19 @@ def _collect_lfs_sentinels(branching_data, elis_errors, duplicate_mapping_errors
             elis_map = getattr(branching, 'elis_mapping', None) or {}
             mt = getattr(branching, 'mt', None)
             for product, lfs in lfs_map.items():
-                if lfs not in SENTINEL_LFS:
+                if lfs not in PLACEHOLDER_LFS:
                     continue
                 info = elis_map.get(product, {}) if isinstance(elis_map, dict) else {}
                 z, a = info.get('target_z'), info.get('target_a')
-                sentinels.append(dict(
+                placeholders.append(dict(
                     parent=parent, mt=mt, reaction=reaction_type, lfs=lfs,
-                    description=SENTINEL_LFS[lfs], target_z=z, target_a=a,
+                    description=PLACEHOLDER_LFS[lfs], target_z=z, target_a=a,
                     base_nuclide=_base(product, z, a), elis=info.get('elis'),
                     product=product, method=info.get('method', method),
                     outcome=f"mapped -> {product}"))
 
     # 2) Unmapped / skipped channels (completeness -- these are NOT written to
-    #    the chain, but are reported so every sentinel occurrence is visible).
+    #    the chain, but are reported so every placeholder occurrence is visible).
     for err in (elis_errors or []):
         lfs = err.get('lfs')
         parent = err.get('parent')
@@ -1038,7 +1103,7 @@ def _collect_lfs_sentinels(branching_data, elis_errors, duplicate_mapping_errors
             parent = parent or parsed.get('parent')
             reaction = reaction or parsed.get('reaction')
             err = {**parsed, **{k: v for k, v in err.items() if v is not None}}
-        if lfs not in SENTINEL_LFS:
+        if lfs not in PLACEHOLDER_LFS:
             continue
         etype = err.get('type', '')
         outcome = {
@@ -1047,9 +1112,9 @@ def _collect_lfs_sentinels(branching_data, elis_errors, duplicate_mapping_errors
             'zero_elis_metastables':    'DK-Lib ELIS=0 (unmapped)',
         }.get(etype, (etype or 'unmapped'))
         z, a = err.get('target_z'), err.get('target_a')
-        sentinels.append(dict(
+        placeholders.append(dict(
             parent=parent, mt=err.get('mt'), reaction=reaction, lfs=lfs,
-            description=SENTINEL_LFS[lfs], target_z=z, target_a=a,
+            description=PLACEHOLDER_LFS[lfs], target_z=z, target_a=a,
             base_nuclide=err.get('base_nuclide') or _base(None, z, a),
             elis=err.get('elis'), product=None, method=method, outcome=outcome))
 
@@ -1057,61 +1122,61 @@ def _collect_lfs_sentinels(branching_data, elis_errors, duplicate_mapping_errors
         z, a = err.get('target_z'), err.get('target_a')
         base = err.get('base_nuclide') or _base(None, z, a)
         for d in err.get('discarded', []):
-            if d.get('lfs') not in SENTINEL_LFS:
+            if d.get('lfs') not in PLACEHOLDER_LFS:
                 continue
-            sentinels.append(dict(
+            placeholders.append(dict(
                 parent=err.get('nuclide'), mt=err.get('mt'),
                 reaction=err.get('reaction'), lfs=d.get('lfs'),
-                description=SENTINEL_LFS[d.get('lfs')], target_z=z, target_a=a,
+                description=PLACEHOLDER_LFS[d.get('lfs')], target_z=z, target_a=a,
                 base_nuclide=base, elis=d.get('elis'), product=None,
                 method=method,
                 outcome=f"duplicate LFS discarded (kept LFS={err.get('kept_lfs')})"))
-        if err.get('kept_lfs') in SENTINEL_LFS:
-            sentinels.append(dict(
+        if err.get('kept_lfs') in PLACEHOLDER_LFS:
+            placeholders.append(dict(
                 parent=err.get('nuclide'), mt=err.get('mt'),
                 reaction=err.get('reaction'), lfs=err.get('kept_lfs'),
-                description=SENTINEL_LFS[err.get('kept_lfs')], target_z=z,
+                description=PLACEHOLDER_LFS[err.get('kept_lfs')], target_z=z,
                 target_a=a, base_nuclide=base, elis=err.get('kept_elis'),
                 product=None, method=method,
                 outcome=f"duplicate resolved: kept -> _m{err.get('liso')}"))
 
     for err in (lfs_order_dropped or []):
         lfs = err.get('lfs')
-        if lfs not in SENTINEL_LFS:
+        if lfs not in PLACEHOLDER_LFS:
             continue
         z, a = err.get('target_z'), err.get('target_a')
-        sentinels.append(dict(
+        placeholders.append(dict(
             parent=err.get('parent'), mt=err.get('mt'),
             reaction=err.get('reaction'), lfs=lfs,
-            description=SENTINEL_LFS[lfs], target_z=z, target_a=a,
+            description=PLACEHOLDER_LFS[lfs], target_z=z, target_a=a,
             base_nuclide=err.get('base_nuclide') or _base(None, z, a),
             elis=err.get('gendf_elis'), product=None, method='lfs_order',
             outcome='lfs_order dropped (unmapped)'))
 
-    return sentinels
+    return placeholders
 
 
-def _print_lfs_sentinel_warning(sentinels, mode):
-    """Loud console warning + per-value breakdown when LFS sentinels were seen.
+def _print_lfs_placeholder_warning(placeholders, mode):
+    """Loud console warning + per-value breakdown when LFS placeholders were seen.
 
     Report-only: no mapping decision or chain output depends on this. Under
-    'elis' mapping the sentinel rows are matched on their real GENDF-ELFS
+    'elis' mapping the placeholder rows are matched on their real GENDF-ELFS
     excitation energy and are SAFE; the risk is only a downstream POSITIONAL
     consumer (FISPACT-parity lfs_order tooling) that would mis-name them
     ``_m99`` / ``_m40``. Under 'lfs_order' the tool IS doing positional naming,
     so the warning is emphatic.
     """
-    if not sentinels:
+    if not placeholders:
         return
-    by_val = Counter(s['lfs'] for s in sentinels)
+    by_val = Counter(s['lfs'] for s in placeholders)
     bar = "!" * 70
     print("\n" + bar)
-    print(f"WARNING: {len(sentinels)} LFS SENTINEL occurrence(s) detected "
+    print(f"WARNING: {len(placeholders)} LFS PLACEHOLDER occurrence(s) detected "
           "(unspecified-level isomer tags)")
     print(bar)
     for val in sorted(by_val):
-        print(f"  LFS={val:<3d} x{by_val[val]:<4d} {SENTINEL_LFS[val]}")
-    print("  Sentinel LFS values are NOT level ordinals; they must never be")
+        print(f"  LFS={val:<3d} x{by_val[val]:<4d} {PLACEHOLDER_LFS[val]}")
+    print("  Placeholder LFS values are NOT level ordinals; they must never be")
     print("  interpreted as isomer ordinals (e.g. _m99 / _m40).")
     if mode == 'lfs_order':
         print("  MODE=lfs_order is ACTIVE: positional product naming is "
@@ -1123,27 +1188,27 @@ def _print_lfs_sentinel_warning(sentinels, mode):
         print("  and are SAFE here; the risk is only if the chain is later "
               "consumed ORDINALLY")
         print("  (e.g. FISPACT-parity lfs_order tooling).")
-    print("  See the 'LFS SENTINEL VALUES' section of the mapping log for "
+    print("  See the 'LFS PLACEHOLDER VALUES' section of the mapping log for "
           "every occurrence.")
     print(bar)
 
 
-def _write_lfs_sentinel_section(f, sentinels):
-    """LFS SENTINEL VALUES section: every GENDF partial carrying a sentinel LFS.
+def _write_lfs_placeholder_section(f, placeholders):
+    """LFS PLACEHOLDER VALUES section: every GENDF partial carrying a placeholder LFS.
 
     Report-only. Lists all occurrences (mapped + unmapped, all nuclides/targets)
-    so a sentinel LFS is never silently consumed as an isomer ordinal. Printed
+    so a placeholder LFS is never silently consumed as an isomer ordinal. Printed
     unconditionally (mirrors the other log sections), with a 'none found' line
     when empty.
     """
     f.write("\n\n" + "=" * 220 + "\n")
-    f.write('LFS SENTINEL VALUES ("unspecified isomer" conventions)\n')
+    f.write('LFS PLACEHOLDER VALUES (unidentified excited states)\n')
     f.write("=" * 220 + "\n\n")
     f.write("Some evaluations tag a product whose final-state LEVEL could not "
-            "be resolved with a SENTINEL LFS instead of a true level index:\n")
-    for val, desc in sorted(SENTINEL_LFS.items()):
+            "be resolved with a PLACEHOLDER LFS instead of a true level index:\n")
+    for val, desc in sorted(PLACEHOLDER_LFS.items()):
         f.write(f"    LFS={val:<3d} = {desc}\n")
-    f.write("These sentinels are NOT level ordinals. ELIS mapping (this tool's "
+    f.write("These placeholders are NOT level ordinals. ELIS mapping (this tool's "
             "default) is unaffected -- it matches the real GENDF-ELFS "
             "excitation energy (QM - QI), so the\n")
     f.write("CHAIN-Product carries the correct _m<liso>. A positional/lfs_order "
@@ -1151,12 +1216,12 @@ def _write_lfs_sentinel_section(f, sentinels):
             "reported here so such misuse is\n")
     f.write("caught; mapping decisions and the output chain XML are "
             "UNCHANGED.\n\n")
-    if not sentinels:
-        f.write("No LFS sentinel values found.\n")
+    if not placeholders:
+        f.write("No LFS placeholder values found.\n")
         return
-    by_val = Counter(s['lfs'] for s in sentinels)
+    by_val = Counter(s['lfs'] for s in placeholders)
     breakdown = ", ".join(f"LFS={v}: {by_val[v]}" for v in sorted(by_val))
-    f.write(f"Total sentinel occurrences: {len(sentinels)}  ({breakdown})\n\n")
+    f.write(f"Total placeholder occurrences: {len(placeholders)}  ({breakdown})\n\n")
     header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
               f"{'Convention':<22}  {'Target':<12}  {'GENDF-ELFS[eV]':>14}  "
               f"{'Method':<10}  {'Outcome':<46}")
@@ -1166,7 +1231,7 @@ def _write_lfs_sentinel_section(f, sentinels):
     def _k(x):
         return (str(x.get('parent') or ''), x.get('mt') or 0, x.get('lfs') or 0)
 
-    for s in sorted(sentinels, key=_k):
+    for s in sorted(placeholders, key=_k):
         elis = s.get('elis')
         elis_str = f"{elis:.1f}" if isinstance(elis, (int, float)) else "N/A"
         conv = (s.get('description') or '').split(':')[0]
@@ -1613,6 +1678,7 @@ def _print_emission_summary(summary, output_file):
     print(f"  Emitted metastable-direct (post):{summary['emitted_metastable_direct']:6d}")
     print(f"  Skipped (no MT_TO_REACTION):     {summary['emit_skipped_no_name']:6d}")
     print(f"  Skipped (target not in chain):   {summary['emit_skipped_no_target']:6d}")
+    print(f"  Skipped (orphan-added target):   {summary.get('emit_skipped_orphan_target', 0):6d}")
     print(f"  Skipped (multi-metastable):      {summary['emit_skipped_multi_metastable']:6d}")
     print(f"  Skipped (unrepaired IZAP=0):     {summary['emit_skipped_anonymous']:6d}")
     print(f"  Skipped (type already present):  {summary['emit_skipped_exists']:6d}")
@@ -1621,6 +1687,7 @@ def _print_emission_summary(summary, output_file):
     examined = (summary['emitted'] + summary['emitted_metastable_direct']
                 + summary['emit_skipped_no_name']
                 + summary['emit_skipped_no_target']
+                + summary.get('emit_skipped_orphan_target', 0)
                 + summary['emit_skipped_multi_metastable']
                 + summary['emit_skipped_anonymous']
                 + summary['emit_skipped_exists'])
@@ -1630,6 +1697,7 @@ def _print_emission_summary(summary, output_file):
     print(f"    = {summary['emitted']} ground + {summary['emitted_metastable_direct']} meta-direct "
           f"+ {summary['emit_skipped_no_name']} no-name "
           f"+ {summary['emit_skipped_no_target']} no-target "
+          f"+ {summary.get('emit_skipped_orphan_target', 0)} orphan-target "
           f"+ {summary['emit_skipped_multi_metastable']} multi-metastable "
           f"+ {summary['emit_skipped_anonymous']} unrepaired-IZAP=0 "
           f"+ {summary['emit_skipped_exists']} already-present "
@@ -1650,6 +1718,11 @@ def _print_emission_summary(summary, output_file):
         print("\n  Not emitted -- multi-metastable, no LFS=0 ground (parent, MT, LFS levels):")
         for parent, mt, lfs_levels in summary['skipped_multi_metastable_details']:
             print(f"    {parent:<10} MT={mt:<4} LFS={lfs_levels}")
+    if summary.get('skipped_orphan_target_details'):
+        print("\n  Not emitted -- target exists only as an orphan state added "
+              "by --orphan-policy add-stable (parent, MT, target):")
+        for parent, mt, target in summary['skipped_orphan_target_details']:
+            print(f"    {parent:<10} MT={mt:<4} -> {target}")
     if summary['skipped_anonymous_details']:
         print("\n  Not emitted -- unrepaired anonymous (IZAP=0) level, ground "
               "unnamed (parent, MT):")
@@ -1687,6 +1760,11 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
         'emitted_metastable_direct': 0,     # post-pass emissions (filled later)
         'emit_skipped_no_name': 0,
         'emit_skipped_no_target': 0,
+        # Post-pass only: the deferred target is a state the writer ADDED under
+        # --orphan-policy add-stable (a placeholder ordinal, not a decay-library
+        # state), so no static reaction is pointed at it.
+        'emit_skipped_orphan_target': 0,
+        'skipped_orphan_target_details': [],
         'emit_skipped_load_error': 0,
         'emit_ground_only': 0,
         'emit_skipped_exists': 0,     # idempotency: reaction type already present
@@ -1786,6 +1864,11 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
                     'qi': lv.get('QI', lv.get('QM')),
                 })
                 continue
+            # Ground residual by construction (LFS=0), so this membership test
+            # can never involve an orphan name: those are metastable ordinals
+            # minted later, in the writer, under --orphan-policy add-stable.
+            # The metastable-direct post-pass, which CAN meet one, screens for
+            # them explicitly.
             target = get_product_name(int(ground['IZAP']), 0)
             if target is None or target not in chain_names:
                 summary['emit_skipped_no_target'] += 1
@@ -1815,7 +1898,7 @@ def emit_mf10_only_prepass(lib, chain, base_chain_file, output_base_file,
     return summary
 
 
-def emit_metastable_direct_postpass(root, emit_summary):
+def emit_metastable_direct_postpass(root, emit_summary, orphan_names=None):
     """Emit plain static-target reactions for single-metastable MF=10-only
     channels deferred by the pre-pass (D2/D3).
 
@@ -1827,9 +1910,18 @@ def emit_metastable_direct_postpass(root, emit_summary):
     ``root`` in place and updates ``emit_summary`` counters; guards (name, target
     membership, idempotency) mirror the pre-pass but check the tree being
     mutated so re-runs on already-patched chains stay safe.
+
+    ``orphan_names`` are the states the writer has just ADDED under
+    ``--orphan-policy add-stable``. They are placeholder ordinals, not decay
+    library states, so they are not legitimate targets for a static emission:
+    the channel is skipped and reported rather than pointed at a name that
+    exists only because another reaction could not identify its product.
     """
     nuclide_map = {n.get('name'): n for n in root.findall('nuclide')}
-    chain_names = set(nuclide_map)
+    orphan_names = orphan_names or set()
+    chain_names = set(nuclide_map) - set(orphan_names)
+    emit_summary.setdefault('emit_skipped_orphan_target', 0)
+    emit_summary.setdefault('skipped_orphan_target_details', [])
 
     for entry in emit_summary['metastable_deferred']:
         nuc_elem = nuclide_map.get(entry['nuclide'])
@@ -1842,6 +1934,11 @@ def emit_metastable_direct_postpass(root, emit_summary):
             continue
         # Target is the metastable product itself (e.g. In115(n,n')->In115_m1).
         target = get_product_name(entry['izap'], entry['lfs'])
+        if target is not None and target in orphan_names:
+            emit_summary['emit_skipped_orphan_target'] += 1
+            emit_summary['skipped_orphan_target_details'].append(
+                (entry['nuclide'], entry['mt'], target))
+            continue
         if target is None or target not in chain_names:
             emit_summary['emit_skipped_no_target'] += 1
             continue
@@ -1864,10 +1961,91 @@ def emit_metastable_direct_postpass(root, emit_summary):
     return emit_summary
 
 
+def _add_stable_nuclide_element(root, nuclide_map, chain, chain_names, name,
+                                summary, source):
+    """Add an orphan product to the output chain as a stable nuclide.
+
+    ``<nuclide name="X_m3" reactions="0"/>`` carries no decay data, so the
+    chain reader treats it as STABLE: the branch is kept and its mass is
+    conserved, but the state's own activity is not modelled. Idempotent by
+    name -- several parents feeding the same unidentified state share one
+    nuclide and each records its own source row. The element is inserted after
+    the last sibling of the same base nuclide so the family stays grouped.
+    Registration in ``nuclide_map`` / ``chain_names`` / ``chain`` makes the new
+    name visible to every later reaction of this run.
+    """
+    summary['orphan_nuclides_added'].setdefault(name, []).append(source)
+    if name in chain_names or name in nuclide_map:
+        chain_names.add(name)
+        return False
+
+    elem = ET.Element('nuclide')
+    elem.set('name', name)
+    elem.set('reactions', '0')
+    base = name.split('_')[0]
+    children = list(root)
+    insert_at = len(children)
+    for i, child in enumerate(children):
+        if child.tag == 'nuclide' and child.get('name', '').split('_')[0] == base:
+            insert_at = i + 1
+    root.insert(insert_at, elem)
+
+    nuclide_map[name] = elem
+    chain_names.add(name)
+    chain.add_nuclide(Nuclide(name))
+    return True
+
+
+def _reattribution_recipient(orphan, valid_products, elis_map, lfs_map):
+    """Pick the kept isomer an orphan branch folds DOWN into.
+
+    The recipient is the kept isomeric sibling of the same product at the
+    nearest LOWER rank, ground when nothing is below it. Rank -- not energy --
+    decides: an orphan only reaches this point because its excitation energy
+    failed to identify it, so that energy is exactly the datum not to trust
+    again, and it is identically zero in the EAF/SCALE evaluations. A level
+    high in the band cascades DOWN into the isomer below it, never up.
+
+    Returns ``(recipient, siblings)`` where ``siblings`` lists every kept
+    isomer of the same product with its rank and energies (logged so a
+    large-energy fold stays visible), and ``recipient`` is None when the
+    reaction has no kept product at all to receive the share.
+    """
+    base = orphan.split('_')[0]
+    orphan_rank = (elis_map.get(orphan) or {}).get('position')
+
+    siblings, ground = [], None
+    for p in valid_products:
+        if p.split('_')[0] != base:
+            continue
+        info = elis_map.get(p) or {}
+        lfs = lfs_map.get(p)
+        if lfs == 0 or '_m' not in p:
+            ground = ground or p          # the reaction's ground slot
+            continue
+        if lfs in PLACEHOLDER_LFS:
+            continue                      # unidentified state: never a rank
+        siblings.append({
+            'product': p, 'position': info.get('position'),
+            'elis': info.get('elis'), 'dk_elis': info.get('dk_elis'),
+        })
+
+    below = [s for s in siblings
+             if s['position'] is not None and orphan_rank is not None
+             and s['position'] < orphan_rank]
+    if below:
+        return max(below, key=lambda s: s['position']), siblings
+    if ground is not None:
+        return {'product': ground, 'position': 0, 'elis': None,
+                'dk_elis': None}, siblings
+    return None, siblings
+
+
 def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                          chain, verbose=True, prune_nn_prime_self_loops=False,
                          suppress_single_target_yields=False,
                          mode='flags_only', mf10_emit_summary=None,
+                         orphan_policy='renorm',
                          repaired_keys=None):
     """Add branching data to chain XML.
 
@@ -1892,6 +2070,18 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         If True, suppress redundant single-target isomeric yields where
         the single target equals the original reaction target and all
         branching ratios are 1.0. Default is False (keep all).
+    orphan_policy : {'add-stable', 'renorm', 'reattribute'}, optional
+        What happens to a product that is not in the chain -- an excited state
+        the mapper could not identify, or a whole product nuclide the decay
+        library never carried. 'add-stable' adds it to the output chain as a
+        stable nuclide with no decay data and keeps the branch; 'renorm'
+        drops it and redistributes its share pro-rata over the surviving
+        targets; 'reattribute' folds its share into the kept isomer at the
+        nearest lower rank (ground when nothing is below it). Orthogonal to
+        the mapping mode: all three apply in every mode. Default here is
+        'renorm', the historical behaviour, as with the other writer switches;
+        the CLI's own default is ``--orphan-policy add-stable`` and ``main()``
+        always passes its choice explicitly.
     repaired_keys : dict, optional
         ``{(parent, reaction_type): ground_product}`` for reactions whose ground
         level was synthesized from the MF=3 remainder. The decoration is dropped
@@ -1910,7 +2100,9 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'single_target_suppressed', 'repaired_dropped_no_metastable',
         'pathway_q_corrections', 'pathway_q_qm_disagreements',
         'pathway_q_rejected', 'q_from_mf10', 'q_from_elis', 'q_replicated',
-        'q_chain_anchored', 'q_zero_anchor'
+        'q_chain_anchored', 'q_zero_anchor', 'orphan_policy',
+        'orphan_nuclides_added', 'orphan_products_kept', 'reattributions',
+        'reaction_type_missing', 'embedded_zero_rows'
     """
     tree = ET.parse(original_xml_file)
     root = tree.getroot()
@@ -1933,9 +2125,19 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
         'pathway_q_corrections': [],  # slots that differ from the legacy fold
         'pathway_q_qm_disagreements': [],  # non-uniform QM within one section
         'pathway_q_rejected': [],  # reactions whose file QM failed the gate
+        'orphan_policy': orphan_policy,
+        'orphan_nuclides_added': {},  # name -> [source reaction record, ...]
+        'orphan_products_kept': 0,    # branches kept by add-stable
+        'reattributions': [],         # orphan shares folded into a kept isomer
+        'reaction_type_missing': [],  # reaction absent from the chain nuclide
+        'embedded_zero_rows': 0,      # embedded rows with no surviving target
     }
 
     nuclide_map = {nuc.get('name'): nuc for nuc in root.findall('nuclide')}
+    # One membership set for the whole write: the per-product test below used
+    # to walk every chain nuclide, and add-stable needs a set it can register
+    # newly added names in so later reactions and other parents see them.
+    chain_names = {nuc.name for nuc in chain.nuclides}
 
     for nuclide_name, nuclide_reactions in branching_data.items():
         if nuclide_name not in nuclide_map:
@@ -1952,7 +2154,14 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 
         for reaction_type, branching in nuclide_reactions.items():
             if reaction_type not in reaction_map:
+                # The GENDF file has the channel, the chain nuclide does not
+                # carry that reaction at all -- nothing to decorate. Recorded
+                # with parent and MT so the drop is chaseable (F5e).
                 summary['skipped'] += 1
+                summary['reaction_type_missing'].append({
+                    'nuclide': nuclide_name, 'reaction': reaction_type,
+                    'mt': branching.mt,
+                })
                 continue
 
             # Convert to energy_yields format
@@ -1965,9 +2174,85 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
 
             # Validate products
             all_products = list(branching.products)
-            valid_products = [p for p in all_products
-                            if any(nuc.name == p for nuc in chain.nuclides)]
+            valid_products = [p for p in all_products if p in chain_names]
             missing_products = [p for p in all_products if p not in valid_products]
+
+            # Orphan disposition (mode-agnostic). Runs BEFORE the "nothing
+            # left" skip and the repaired-ground check, so add-stable also
+            # rescues a reaction whose every product was missing.
+            lfs_map_all = branching.lfs_mapping or {}
+            elis_map_all = getattr(branching, 'elis_mapping', None) or {}
+            if not isinstance(elis_map_all, dict):
+                elis_map_all = {}
+
+            if orphan_policy == 'add-stable':
+                # A state an EARLIER reaction already added is no longer
+                # "missing", but this parent still feeds it: record the source
+                # so the roll call shows every contributing pathway and the
+                # ELFS spread between them (wide spread = the parents do not
+                # agree on which state it is).
+                shared = [p for p in all_products
+                          if p not in missing_products
+                          and p in summary['orphan_nuclides_added']]
+                for orphan in list(missing_products) + shared:
+                    info = elis_map_all.get(orphan) or {}
+                    source = {
+                        'parent': nuclide_name, 'reaction': reaction_type,
+                        'mt': branching.mt, 'lfs': lfs_map_all.get(orphan),
+                        'elis': info.get('elis'),
+                        'position': info.get('position'),
+                        'method': info.get('method')}
+                    source['created'] = _add_stable_nuclide_element(
+                        root, nuclide_map, chain, chain_names, orphan, summary,
+                        source)
+                if missing_products:
+                    summary['orphan_products_kept'] += len(missing_products)
+                    valid_products = list(all_products)
+                    missing_products = []
+
+            elif missing_products and orphan_policy == 'reattribute':
+                # Fold each orphan's per-energy share DOWN into a kept isomer;
+                # the sums stay 1, so no renormalization follows. An orphan
+                # with no recipient at all stays in missing_products and takes
+                # the pro-rata path below (reported loudly).
+                stranded = []
+                for orphan in missing_products:
+                    kept = [p for p in all_products
+                            if p in chain_names and p != orphan]
+                    recipient, siblings = _reattribution_recipient(
+                        orphan, kept, elis_map_all, lfs_map_all)
+                    orphan_info = elis_map_all.get(orphan) or {}
+                    record = {
+                        'nuclide': nuclide_name, 'reaction': reaction_type,
+                        'mt': branching.mt, 'orphan': orphan,
+                        'lfs': lfs_map_all.get(orphan),
+                        'position': orphan_info.get('position'),
+                        'elis': orphan_info.get('elis'),
+                        'recipient': None, 'rank_distance': None,
+                        'delta_elfs': None, 'siblings': siblings,
+                    }
+                    if recipient is None:
+                        stranded.append(orphan)
+                        summary['reattributions'].append(record)
+                        continue
+                    for products_dict in energy_yields.values():
+                        products_dict[recipient['product']] = (
+                            products_dict.get(recipient['product'], 0.0)
+                            + products_dict.pop(orphan, 0.0))
+                    o_rank, r_rank = record['position'], recipient['position']
+                    o_elfs, r_elfs = record['elis'], recipient['elis']
+                    record.update({
+                        'recipient': recipient['product'],
+                        'recipient_position': r_rank,
+                        'rank_distance': (o_rank - r_rank
+                                          if None not in (o_rank, r_rank)
+                                          else None),
+                        'delta_elfs': (o_elfs - r_elfs
+                                       if None not in (o_elfs, r_elfs)
+                                       else None),
+                    })
+                    summary['reattributions'].append(record)
+                missing_products = stranded
 
             if not valid_products:
                 summary['skipped'] += 1
@@ -2024,7 +2309,13 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                         'elis': elis_info.get('elis'), 'dk_elis': elis_info.get('dk_elis'),
                         'liso': elis_info.get('liso'), 'method': elis_info.get('method', 'elis'),
                         'half_life': half_life if half_life else 'stable',
-                        'target_z': elis_info.get('target_z'), 'target_a': elis_info.get('target_a')
+                        'target_z': elis_info.get('target_z'), 'target_a': elis_info.get('target_a'),
+                        # Hybrid context: rank among the product's real levels,
+                        # why the level left Phase 1, and which decay states
+                        # Phase 1 had already claimed when Phase 2 ran.
+                        'position': elis_info.get('position'),
+                        'fallback_reason': elis_info.get('fallback_reason'),
+                        'phase1_claimed_lisos': elis_info.get('phase1_claimed_lisos'),
                     })
 
             # Detect single-target cases - ALWAYS log regardless of suppress flag
@@ -2277,7 +2568,19 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
                 rx_elem.attrib.pop('target', None)
                 rx_elem.attrib.pop('Q', None)
             else:
-                # Write full <isomeric_yields> (embedded/informational)
+                # Write full <isomeric_yields> (embedded/informational).
+                # An energy where every surviving target is zero carries no
+                # branching at all (the whole rate went to products that left
+                # with the orphan policy or the membership filter); such a row
+                # would only invite a divide-by-zero downstream, so it is
+                # dropped -- counted once, never row by row.
+                kept_energies = [
+                    e for e in energies
+                    if any(energy_yields[e].get(p, 0.0) for p in products)]
+                if kept_energies and len(kept_energies) != len(energies):
+                    summary['embedded_zero_rows'] += len(energies) - len(kept_energies)
+                    energies = kept_energies
+
                 yields_elem = ET.SubElement(rx_elem, 'isomeric_yields')
                 yields_elem.set('type', 'energy_dependent')
 
@@ -2334,7 +2637,9 @@ def add_branching_to_xml(original_xml_file, branching_data, output_xml_file,
     # A direct X->X_m1 is not an exact self-loop, so the prune above (already
     # done) leaves it alone.
     if mf10_emit_summary is not None:
-        emit_metastable_direct_postpass(root, mf10_emit_summary)
+        emit_metastable_direct_postpass(
+            root, mf10_emit_summary,
+            orphan_names=set(summary['orphan_nuclides_added']))
 
     # Recount 'reactions' per unfolded pathway to match the PENDF chains: a
     # branched reaction counts once per target (ground + each metastable), not
@@ -2519,18 +2824,407 @@ def _write_rejected_section(f, rejected, reject_band_ratio):
                 f"{o.get('criterion', '-'):<28}  {consequence:<40}\n")
 
 
+def _elfs_str(value, width=14):
+    """Right-aligned energy in eV, 'N/A' when the file gave none."""
+    return (f"{value:>{width}.1f}" if isinstance(value, (int, float))
+            else f"{'N/A':>{width}}")
+
+
+def _hybrid_crossings(isomer_mappings):
+    """Mark the Phase-2 pairings whose level order is inverted.
+
+    A crossing is not an error: a Phase-1 energy match is trusted absolutely,
+    so the level below it can legitimately end up in a HIGHER decay state than
+    a level above it. Detected by comparing rank against LISO across every
+    level of one product, and flagged only so an audit can look at them.
+    """
+    by_product = defaultdict(list)
+    for m in isomer_mappings:
+        product = str(m.get('product') or '')
+        base = product.split('_m')[0]
+        by_product[(m.get('parent'), m.get('mt'), base)].append(m)
+
+    crossed = set()
+    for rows in by_product.values():
+        for r in rows:
+            rank, liso = r.get('position'), r.get('liso')
+            if rank is None or liso is None:
+                continue
+            for s in rows:
+                s_rank, s_liso = s.get('position'), s.get('liso')
+                if s is r or s_rank is None or s_liso is None:
+                    continue
+                if ((s_rank < rank and s_liso > liso)
+                        or (s_rank > rank and s_liso < liso)):
+                    crossed.add(id(r))
+                    break
+    return crossed
+
+
+def _write_hybrid_mapping_section(f, hybrid_records, isomer_mappings):
+    """HYBRID MAPPING: how each level reached its state, phase by phase."""
+    fallbacks = [r for r in hybrid_records if r.get('type') == 'hybrid_fallback']
+    abstained = [r for r in fallbacks
+                 if r.get('fallback_reason') == 'elis_ambiguous']
+    requeued = [r for r in fallbacks
+                if r.get('fallback_reason') == 'duplicate_loser']
+    unusable = [r for r in fallbacks
+                if r.get('fallback_reason') in HYBRID_UNUSABLE_REASONS]
+    bound = [r for r in hybrid_records if r.get('type') == 'placeholder_bound']
+    unmapped = [r for r in hybrid_records
+                if r.get('type') == 'placeholder_unmapped']
+    phase2 = [m for m in isomer_mappings
+              if m.get('method') == 'lfs_order_fallback']
+
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("HYBRID MAPPING (elis_lfs_order) -- PHASE DETAIL\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("Phase 1 binds a level to the decay state whose excitation energy "
+            "matches its GENDF-ELFS, and only when that state is the single\n")
+    f.write("candidate within tolerance. Phase 2 takes the levels left over, "
+            "in level order, and pairs them with the decay metastables left\n")
+    f.write("over, in LISO order -- energies play no part there. Nothing on "
+            "this page was discarded: every row below is either mapped by\n")
+    f.write("position or reported as a placeholder that could not be placed.\n\n")
+
+    f.write("PHASE-1 ABSTENTIONS (two decay states within tolerance)\n")
+    f.write("-" * 150 + "\n")
+    if not abstained:
+        f.write("None.\n")
+    else:
+        f.write("The level's energy fits two states, so binding either one "
+                "would be a coin toss; the level is re-derived by position "
+                "instead.\n")
+        f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+                f"{'GENDF-ELFS[eV]':>14}  {'Nearest':<10}  "
+                f"{'DK-ELIS[eV]':>14}  {'Second':<10}  {'DK-ELIS[eV]':>14}\n")
+        f.write("-" * 150 + "\n")
+        for r in abstained:
+            f.write(f"{str(r.get('parent')):<12}  {str(r.get('mt')):>5}  "
+                    f"{str(r.get('reaction')):<12}  {str(r.get('lfs')):>4}  "
+                    f"{_elfs_str(r.get('elis'))}  "
+                    f"{'_m' + str(r.get('nearest_liso')):<10}  "
+                    f"{_elfs_str(r.get('nearest_dk_elis'))}  "
+                    f"{'_m' + str(r.get('second_liso')):<10}  "
+                    f"{_elfs_str(r.get('second_dk_elis'))}\n")
+    f.write("\n")
+
+    f.write("PHASE-1 LEVELS ROUTED TO PHASE 2 (energy unusable or unmatched)\n")
+    f.write("-" * 150 + "\n")
+    if not (unusable or requeued):
+        f.write("None.\n")
+    else:
+        f.write("None of these is a loss: each level is handed to the "
+                "positional phase, which is what the lfs_order mode would have "
+                "done with it from the start.\n")
+        f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+                f"{'Rank':>4}  {'GENDF-ELFS[eV]':>14}  {'Reason':<60}\n")
+        f.write("-" * 150 + "\n")
+        for r in sorted(unusable + requeued,
+                        key=lambda x: (str(x.get('parent')), x.get('mt') or 0,
+                                       x.get('lfs') or 0)):
+            reason = HYBRID_REASON_LABELS.get(r.get('fallback_reason'),
+                                              str(r.get('fallback_reason')))
+            rank = r.get('position')
+            f.write(f"{str(r.get('parent')):<12}  {str(r.get('mt')):>5}  "
+                    f"{str(r.get('reaction')):<12}  {str(r.get('lfs')):>4}  "
+                    f"{('-' if rank is None else str(rank)):>4}  "
+                    f"{_elfs_str(r.get('elis'))}  {reason:<60}\n")
+    f.write("\n")
+
+    f.write("PHASE-2 POSITIONAL ASSIGNMENTS\n")
+    f.write("-" * 190 + "\n")
+    if not phase2:
+        f.write("None.\n")
+    else:
+        f.write("Rank = the level's place among the product's real levels "
+                "(placeholder LFS values never take a rank). 'Phase-1 held' "
+                "lists the decay states already\n")
+        f.write("claimed by an energy match when this pairing was made -- "
+                "those are skipped, which is what keeps a fallback off a state "
+                "that is already spoken for. 'Crossing?'\n")
+        f.write("flags a pairing whose level order is inverted against an "
+                "energy-matched sibling: allowed by design (an energy match is "
+                "trusted absolutely), shown for audit.\n")
+        f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+                f"{'Rank':>4}  {'CHAIN-Product':<15}  {'GENDF-ELFS[eV]':>14}  "
+                f"{'DK-ELIS[eV]':>14}  {'Δ(ELFS-ELIS)':>22}  "
+                f"{'Phase-1 held':<16}  {'Crossing?':<9}  {'Routed by':<50}\n")
+        f.write("-" * 190 + "\n")
+        crossed = _hybrid_crossings(isomer_mappings)
+        for m in sorted(phase2, key=lambda x: (str(x.get('parent')),
+                                               x.get('mt') or 0,
+                                               x.get('lfs') or 0)):
+            elis, dk_elis = m.get('elis'), m.get('dk_elis')
+            if isinstance(elis, (int, float)) and dk_elis:
+                delta = f"{abs(elis - dk_elis):.0f}eV ({abs(elis - dk_elis)/abs(dk_elis)*100:.2f}%)"
+            else:
+                delta = "N/A"
+            claimed = m.get('phase1_claimed_lisos') or []
+            claimed_str = ", ".join(f"_m{i}" for i in claimed) or 'none'
+            rank = m.get('position')
+            reason = HYBRID_REASON_LABELS.get(m.get('fallback_reason'),
+                                              str(m.get('fallback_reason')))
+            f.write(f"{str(m.get('parent')):<12}  {str(m.get('mt')):>5}  "
+                    f"{str(m.get('reaction')):<12}  {str(m.get('lfs')):>4}  "
+                    f"{('-' if rank is None else str(rank)):>4}  "
+                    f"{str(m.get('product')):<15}  {_elfs_str(elis)}  "
+                    f"{_elfs_str(dk_elis)}  {delta:>22}  {claimed_str:<16}  "
+                    f"{('YES' if id(m) in crossed else 'no'):<9}  "
+                    f"{reason:<50}\n")
+    f.write("\n")
+
+    f.write("PLACEHOLDER LFS (unidentified excited states)\n")
+    f.write("-" * 150 + "\n")
+    f.write("A placeholder LFS says 'an isomer, level unidentified'. It never "
+            "takes a rank among the real levels and never displaces one. With "
+            "its energy unknown or\n")
+    f.write("unmatched it binds, after Phase 2, to the lowest decay state "
+            "still unclaimed; with no state left it is reported only, and the "
+            "share it would have carried\n")
+    f.write("stays with the reaction's other targets.\n")
+    if not (bound or unmapped):
+        f.write("None found.\n")
+    else:
+        surviving = defaultdict(list)
+        for m in isomer_mappings:
+            surviving[(m.get('parent'), m.get('mt'))].append(str(m.get('product')))
+        for r in bound:
+            f.write(f"  BOUND      {str(r.get('parent')):<10} "
+                    f"{str(r.get('reaction')):<12} MT={str(r.get('mt')):<4} "
+                    f"LFS={r.get('lfs')} -> {r.get('base_nuclide')}_m{r.get('liso')} "
+                    f"({'sole' if r.get('n_unclaimed') == 1 else 'lowest of ' + str(r.get('n_unclaimed'))}"
+                    f" unclaimed state, DK-ELIS={_elfs_str(r.get('dk_elis'), 1).strip()} eV, "
+                    f"{HYBRID_REASON_LABELS.get(r.get('energy_status'), r.get('energy_status'))})\n")
+        for r in unmapped:
+            kept = surviving.get((r.get('parent'), r.get('mt')), [])
+            dest = ", ".join(sorted(set(kept))) or 'the ground product'
+            f.write(f"  UNMAPPED   {str(r.get('parent')):<10} "
+                    f"{str(r.get('reaction')):<12} MT={str(r.get('mt')):<4} "
+                    f"LFS={r.get('lfs')} -> no state left to bind "
+                    f"({HYBRID_REASON_LABELS.get(r.get('energy_status'), r.get('energy_status'))}); "
+                    f"its share spreads pro-rata over ground + {dest}\n")
+    f.write("\n")
+
+
+def _write_orphan_disposition_section(f, orphan_levels, orphan_nuclides_added,
+                                      reattributions, renormalizations,
+                                      orphan_policy):
+    """ORPHAN DISPOSITION: every product that had no partner in the chain.
+
+    Written in every mapping mode. An orphan is a reaction product the decay
+    library cannot account for: an excited state whose identity did not
+    resolve, or a whole product nuclide the library never carried.
+    """
+    levels = {(o['parent'], o['reaction'], o['name']): o
+              for o in (orphan_levels or [])}
+    rows = {}
+
+    def _row(parent, reaction, mt, product):
+        key = (parent, reaction, product)
+        detail = levels.get(key, {})
+        return rows.setdefault(key, {
+            'parent': parent, 'reaction': reaction, 'mt': mt,
+            'product': product, 'lfs': detail.get('lfs'),
+            'position': detail.get('position'), 'elis': detail.get('elis'),
+            'reason': detail.get('fallback_reason'), 'disposition': None,
+            'extra': [],
+        })
+
+    for name, sources in (orphan_nuclides_added or {}).items():
+        for s in sources:
+            row = _row(s['parent'], s['reaction'], s['mt'], name)
+            row['disposition'] = (
+                f"ADDED to chain as {name} (stable, no decay)"
+                if s.get('created', True) else
+                f"kept -- shares the orphan nuclide {name} added for another "
+                "pathway")
+            if row['lfs'] is None:
+                row['lfs'] = s.get('lfs')
+            if row['elis'] is None:
+                row['elis'] = s.get('elis')
+            if row['position'] is None:
+                row['position'] = s.get('position')
+
+    for r in (reattributions or []):
+        row = _row(r['nuclide'], r['reaction'], r['mt'], r['orphan'])
+        if row['lfs'] is None:
+            row['lfs'] = r.get('lfs')
+        if row['elis'] is None:
+            row['elis'] = r.get('elis')
+        if row['position'] is None:
+            row['position'] = r.get('position')
+        if r.get('recipient') is None:
+            row['disposition'] = ("NO RECIPIENT -- share spread pro-rata "
+                                  "(renorm for this reaction)")
+        else:
+            dist = r.get('rank_distance')
+            delta = r.get('delta_elfs')
+            row['disposition'] = (
+                f"folded into {r['recipient']} "
+                f"(rank distance {'?' if dist is None else dist}, "
+                f"ΔELFS {'n/a' if delta is None else f'{delta:.0f} eV'})")
+        for s in r.get('siblings', []):
+            row['extra'].append(
+                f"kept isomer {s['product']} rank="
+                f"{'-' if s['position'] is None else s['position']} "
+                f"GENDF-ELFS={_elfs_str(s['elis'], 1).strip()} eV "
+                f"DK-ELIS={_elfs_str(s['dk_elis'], 1).strip()} eV")
+
+    for r in (renormalizations or []):
+        for dropped in r.get('dropped_products', []):
+            row = _row(r['nuclide'], r['reaction'], r['mt'], dropped)
+            kept = ", ".join(r.get('valid_products', [])) or 'nothing'
+            row['disposition'] = f"dropped, share pro-rata over {kept}"
+
+    for key, o in levels.items():
+        row = _row(o['parent'], o['reaction'], o['mt'], o['name'])
+        if row['disposition'] is None:
+            row['disposition'] = ("not written -- the reaction lost its "
+                                  "decoration elsewhere")
+
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("ORPHAN DISPOSITION\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("An ORPHAN is a reaction product with no partner in the chain: an "
+            "excited state whose identity did not resolve against the decay "
+            "library, or a whole\n")
+    f.write("product nuclide that library never carried. The reaction rate "
+            "into it is real either way, so the patcher never drops it "
+            "silently -- what happens to its\n")
+    f.write(f"share is chosen at patch time with --orphan-policy (this run: "
+            f"{orphan_policy}):\n\n")
+    f.write("  add-stable   the product is added to the output chain with no "
+            "decay data and the branch is kept. Mass is conserved and the "
+            "pathway stays visible;\n")
+    f.write("               the state's own activity is not modelled (see the "
+            "next section).\n")
+    f.write("  renorm       the product is dropped and its share is spread "
+            "pro-rata over the surviving targets of that reaction. The share "
+            "is not lost, but it is\n")
+    f.write("               attributed to states that did not produce it.\n")
+    f.write("  reattribute  the share is folded into the kept isomer of the "
+            "same product at the nearest LOWER rank (ground when nothing sits "
+            "below it). Rank, not\n")
+    f.write("               energy, decides: an orphan is here precisely "
+            "because its energy failed to identify it, and a high-lying state "
+            "cascades down, never up.\n\n")
+    f.write("Wording note for a mapping-only (ratio-free) chain: 'share' "
+            "means the reaction rate into that state. Where a chain carries no "
+            "branching ratios at all,\n")
+    f.write("'dropped' means the partial is never collapsed and the parent "
+            "under-burns by exactly that fraction -- a different outcome from "
+            "the pro-rata spread here.\n\n")
+
+    if not rows:
+        f.write("No orphan products: every reaction product had a partner in "
+                "the chain.\n")
+        return
+
+    f.write(f"Total orphan pathways: {len(rows)}\n\n")
+    f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'LFS':>4}  "
+            f"{'Rank':>4}  {'GENDF-ELFS[eV]':>14}  {'Orphan product':<15}  "
+            f"{'Why orphaned':<52}  {'Disposition'}\n")
+    f.write("-" * 220 + "\n")
+    for key in sorted(rows, key=lambda k: (str(k[0]), str(k[1]), str(k[2]))):
+        row = rows[key]
+        reason = HYBRID_REASON_LABELS.get(row['reason'],
+                                          row['reason'] or
+                                          'product not in the chain')
+        rank = row['position']
+        f.write(f"{str(row['parent']):<12}  {str(row['mt']):>5}  "
+                f"{str(row['reaction']):<12}  "
+                f"{('-' if row['lfs'] is None else str(row['lfs'])):>4}  "
+                f"{('-' if rank is None else str(rank)):>4}  "
+                f"{_elfs_str(row['elis'])}  {row['product']:<15}  "
+                f"{reason:<52}  {row['disposition']}\n")
+        for line in row['extra']:
+            f.write(f"{'':<12}  {'':>5}  {'':<12}  -> {line}\n")
+    f.write("\n")
+
+
+def _write_orphan_nuclides_section(f, orphan_nuclides_added):
+    """ORPHAN NUCLIDES ADDED TO CHAIN (--orphan-policy add-stable)."""
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("ORPHAN NUCLIDES ADDED TO CHAIN (--orphan-policy add-stable)\n")
+    f.write("=" * 220 + "\n\n")
+    if not orphan_nuclides_added:
+        f.write("No nuclides were added to the chain.\n")
+        return
+
+    f.write("Each nuclide below was written into the output chain as "
+            "<nuclide name=\"...\" reactions=\"0\"/> -- no decay data, so the "
+            "chain reads it as STABLE.\n")
+    f.write("What that buys and what it costs, plainly:\n")
+    f.write("  KEPT      the reaction pathway into the state survives, with "
+            "its own branching share; nothing is renormalized away.\n")
+    f.write("  SINK      the state never decays in the calculation. If the "
+            "real state is short-lived, its daughters are never produced and "
+            "its decay radiation\n")
+    f.write("            is missing from the results -- the inventory holds "
+            "material at a level that should have moved on.\n")
+    f.write("  NAME      the _mN suffix is a free ordinal for that Z/A, "
+            "allocated against the decay-library LISO indices and the existing "
+            "chain names. It is NOT a\n")
+    f.write("            decay-library isomeric state number and must not be "
+            "read as one.\n")
+    f.write("  SHARED    several parents feeding the same unidentified state "
+            "share one nuclide. A wide spread of GENDF-ELFS among those "
+            "parents means they do not\n")
+    f.write("            agree on which state it is; a narrow spread means "
+            "they do, and only the decay library is missing it.\n\n")
+    f.write("A documented limitation: the decay library is the ONLY authority "
+            "on state identity here. The chain filters names, it never "
+            "testifies to identity -- a\n")
+    f.write("state absent from the chain may be absent from the decay library, "
+            "or present under a different index. So an added nuclide can be "
+            "wrong in BOTH\n")
+    f.write("directions: a genuine isomer whose identity was lost (its real "
+            "decay is now missing) or a prompt, sub-second level held up as if "
+            "it were long-lived\n")
+    f.write("(mass parked where it should have flowed on within the first time "
+            "step). The remedy is a decay library that carries the state, not "
+            "a better guess here.\n\n")
+
+    f.write(f"Nuclides added: {len(orphan_nuclides_added)}\n\n")
+    for name in sorted(orphan_nuclides_added):
+        sources = orphan_nuclides_added[name]
+        energies = [s['elis'] for s in sources
+                    if isinstance(s.get('elis'), (int, float))]
+        if len(energies) > 1:
+            spread = (f"GENDF-ELFS {min(energies):.1f} .. {max(energies):.1f} eV "
+                      f"(spread {max(energies) - min(energies):.1f} eV)")
+        elif energies:
+            spread = f"GENDF-ELFS {energies[0]:.1f} eV"
+        else:
+            spread = "no GENDF-ELFS on file"
+        f.write(f"  {name:<14} from {len(sources)} pathway(s); {spread}\n")
+        for s in sorted(sources, key=lambda x: (str(x['parent']),
+                                                x.get('mt') or 0)):
+            f.write(f"      {str(s['parent']):<10} {str(s['reaction']):<12} "
+                    f"MT={str(s['mt']):<4} LFS="
+                    f"{'-' if s.get('lfs') is None else s['lfs']:<4} "
+                    f"ELFS={_elfs_str(s.get('elis'), 1).strip():<12} "
+                    f"mapper={s.get('method') or '-'}\n")
+    f.write("\n")
+
+
 def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=None,
                              duplicate_mapping_errors=None, lfs_order_dropped=None,
                              lfs_order_orphan_dk=None, single_target_cases=None,
-                             lfs_sentinels=None, audit_rows=None,
+                             lfs_placeholders=None, audit_rows=None,
                              rejected_rows=None, attribution_records=None,
                              attribution_counts=None,
-                             reattribute_mf10_noizap=False):
+                             reattribute_mf10_noizap=False,
+                             hybrid_records=None, orphan_levels=None,
+                             orphan_nuclides_added=None, reattributions=None,
+                             orphan_policy='renorm',
+                             reaction_type_missing=None):
     """Write comprehensive isomer mapping log."""
     if elis_errors is None:
         elis_errors = []
-    if lfs_sentinels is None:
-        lfs_sentinels = []
+    if lfs_placeholders is None:
+        lfs_placeholders = []
     if duplicate_mapping_errors is None:
         duplicate_mapping_errors = []
     if lfs_order_dropped is None:
@@ -2539,8 +3233,22 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         lfs_order_orphan_dk = []
     if single_target_cases is None:
         single_target_cases = []
+    hybrid_records = hybrid_records or []
+    orphan_levels = orphan_levels or []
+    orphan_nuclides_added = orphan_nuclides_added or {}
+    reattributions = reattributions or []
+    reaction_type_missing = reaction_type_missing or []
+
+    # A level handed to the positional phase, and a duplicate loser requeued
+    # with it, are MAPPED -- they must never appear in a not-mapped table or
+    # trigger a renormalization note, whatever the caller passed in.
+    elis_errors = [e for e in elis_errors if not e.get('routed_to_fallback')]
+    duplicate_mapping_errors = [e for e in duplicate_mapping_errors
+                                if not e.get('requeued')]
 
     mapping_mode = stats.get('mapping_mode', 'elis') if stats else 'elis'
+    hybrid = mapping_mode == 'elis_lfs_order'
+    renormalizations = stats.get('renormalizations', []) if stats else []
 
     with open(log_file, 'w') as f:
         f.write("=" * 220 + "\n")
@@ -2559,11 +3267,89 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
             f.write("           Use 'elis' mode for production calculations.\n")
             f.write("\n")
             f.write("  ELIS data shown below is for REFERENCE ONLY - not used for mapping.\n")
+        elif hybrid:
+            f.write("MODE: ELIS_LFS_ORDER (excitation energy first, then position)\n")
+            f.write("\n")
+            f.write("  Phase 1 -- energy. A level is bound to the decay state whose\n")
+            f.write("    excitation energy matches its GENDF-ELFS (QM - QI) within the\n")
+            f.write("    tolerance below, and ONLY when that state is the single\n")
+            f.write("    candidate within it. The level abstains, and waits for Phase 2,\n")
+            f.write("    when two decay states both fit (energy-degenerate isomers), when\n")
+            f.write("    the file gives no usable ELFS (no QM, zero or negative energy),\n")
+            f.write("    when every decay state of the product carries ELIS = 0, when the\n")
+            f.write("    nearest state lies outside tolerance, or when a closer level\n")
+            f.write("    claimed the same state (the loser is requeued, never dropped).\n")
+            f.write("  Phase 2 -- position. The levels left over, in level order, pair\n")
+            f.write("    with the decay metastables left over, in LISO order. States\n")
+            f.write("    already claimed in Phase 1 are skipped, so no pairing collides.\n")
+            f.write("    Energies play no part here; a large energy gap is flagged for\n")
+            f.write("    audit, not acted on.\n")
+            f.write("  Crossings are permitted. A Phase-1 energy match is trusted\n")
+            f.write("    absolutely, so a Phase-2 pairing may end up order-inverted\n")
+            f.write("    against it (level 5 to _m2 while level 10 takes _m1). The\n")
+            f.write("    PHASE-2 table marks those rows.\n")
+            f.write("  Placeholder LFS values (99 ENDF/JEFF, 40 TENDL) mean 'an isomer,\n")
+            f.write("    level unidentified'. They never take a rank among real levels\n")
+            f.write("    and never displace one. With a usable, distinct energy a\n")
+            f.write("    placeholder competes in Phase 1 like any level; otherwise it\n")
+            f.write("    binds AFTER Phase 2 to the lowest decay state still unclaimed,\n")
+            f.write("    and is reported only when none is left. A placeholder is never\n")
+            f.write("    made into an orphan nuclide and never named _m99 / _m40.\n")
+            f.write("  Phase 3 -- orphans. A level with no decay state left is kept as an\n")
+            f.write("    orphan; --orphan-policy decides its fate (ORPHAN DISPOSITION).\n")
         else:
             f.write("MODE: ELIS (decay library excitation energy matching)\n")
             f.write("\n")
             f.write("  Maps GENDF MF=10 products to OpenMC _m{n} naming based on\n")
             f.write("  excitation energy (ELIS) matching with decay library.\n")
+        f.write("\n")
+        f.write(f"ORPHAN POLICY: {orphan_policy}\n")
+        f.write("\n")
+
+        # What still leaves a pathway out, even at the most permissive
+        # settings. Named here so 'nothing is dropped' is never read as a
+        # blanket claim.
+        f.write("NOT COVERED BY THE ORPHAN POLICY -- pathways that still leave "
+                "the chain\n")
+        f.write("-" * 70 + "\n")
+        f.write("  1. Parent nuclide absent from the chain: the whole GENDF "
+                "nuclide has\n")
+        f.write("     nowhere to attach.\n")
+        f.write("  2. Reaction absent from the chain nuclide: the GENDF file "
+                "has the\n")
+        f.write("     channel, the chain nuclide carries no such reaction. "
+                "Listed below\n")
+        f.write("     by parent and MT.\n")
+        f.write("  3. Unrepaired anonymous (IZAP=0) MF=10 subsection: the "
+                "reaction loses\n")
+        f.write("     its ENTIRE isomeric decoration and keeps the plain MF=3 "
+                "route --\n")
+        f.write("     all-or-nothing, because decorating the named subset alone "
+                "would\n")
+        f.write("     invert the branching (--reattribute-mf10-noIZAP recovers "
+                "most).\n")
+        f.write("  4. MF=10-vs-MF=3 band rejection "
+                "(--mf10-reject-band-ratio, off by\n")
+        f.write("     default): the reaction is left stock.\n")
+        f.write("  5. Placeholder LFS with no decay state left to bind: "
+                "report-only. Its\n")
+        f.write("     share stays with the reaction's other targets, "
+                "pro-rata.\n")
+        f.write("  6. MF=10-only channels with TWO metastable levels and no "
+                "ground\n")
+        f.write("     subsection: not emitted at all -- one static target "
+                "would take the\n")
+        f.write("     whole rate, and with no MF=3 total the ground cannot be "
+                "synthesized.\n")
+        f.write("     The EAF-2010 (n,n') set: "
+                + ", ".join(EAF_DUAL_METASTABLE_NN) + ".\n")
+        if reaction_type_missing:
+            f.write("\n  Case 2 in this run "
+                    f"({len(reaction_type_missing)} reaction(s)):\n")
+            for rec in sorted(reaction_type_missing,
+                              key=lambda r: (str(r['nuclide']), r['mt'] or 0)):
+                f.write(f"    {str(rec['nuclide']):<10} "
+                        f"{str(rec['reaction']):<12} MT={rec['mt']}\n")
         f.write("\n\n")
 
         # Source files
@@ -2583,8 +3369,13 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
             f.write("\n\nMATCHING SETTINGS\n")
             f.write("-" * 70 + "\n")
             f.write(f"Mapping mode:    {mapping_mode}\n")
+            f.write(f"Orphan policy:   {orphan_policy}\n")
             f.write(f"ELIS tolerance:  rtol={stats.get('elis_rtol')} ({stats.get('elis_rtol', 0)*100:.0f}%), atol={stats.get('elis_atol')} eV\n")
-            if mapping_mode == 'elis':
+            if hybrid:
+                f.write("Default tolerance in this mode is 0.15; a Phase-1 match is trusted\n")
+                f.write("absolutely, so a level that misses it is re-derived by position\n")
+                f.write("rather than lost.\n\n")
+            elif mapping_mode == 'elis':
                 f.write("Products beyond tolerance or not in decay library are skipped.\n")
                 f.write("Skipped products trigger renormalization for isomeric branching to remaining isomers (constant reaction rate).\n\n")
             else:
@@ -2592,10 +3383,34 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                 f.write("Products dropped if GENDF LFS count > DK-Lib LISO count.\n\n")
 
         # Summary counts
-        err_types = ('elis_tol_exceeded', 'no_metastable_decay_data', 'zero_elis_metastables')
-        elis_matched_count = sum(1 for m in isomer_mappings if m.get('method') == 'elis')
-        lfs_order_mapped_count = sum(1 for m in isomer_mappings if m.get('method') == 'lfs_order')
-        mapped_count = elis_matched_count + lfs_order_mapped_count
+        err_types = ('elis_tol_exceeded', 'no_metastable_decay_data',
+                     'zero_elis_metastables', 'elis_incomputable')
+
+        def _n_method(name):
+            return sum(1 for m in isomer_mappings if m.get('method') == name)
+
+        def _n_hybrid(err_type, reason=None):
+            return sum(1 for r in hybrid_records
+                       if r.get('type') == err_type
+                       and (reason is None
+                            or r.get('fallback_reason') == reason))
+
+        elis_matched_count = _n_method('elis')
+        lfs_order_mapped_count = _n_method('lfs_order')
+        # Method census: a fallback, placeholder-bound or orphan row is MAPPED.
+        fallback_count = _n_method('lfs_order_fallback')
+        placeholder_bound_count = _n_method('placeholder_bound')
+        orphan_added_count = _n_method('orphan_added')
+        mapped_count = (elis_matched_count + lfs_order_mapped_count
+                        + fallback_count + placeholder_bound_count
+                        + orphan_added_count)
+        abstained_count = _n_hybrid('hybrid_fallback', 'elis_ambiguous')
+        requeued_count = _n_hybrid('hybrid_fallback', 'duplicate_loser')
+        unusable_count = sum(_n_hybrid('hybrid_fallback', r)
+                             for r in HYBRID_UNUSABLE_REASONS)
+        placeholder_unmapped_count = _n_hybrid('placeholder_unmapped')
+        incomputable_count = sum(1 for e in elis_errors
+                                 if e.get('type') == 'elis_incomputable')
         elis_exceeded_count = sum(1 for e in elis_errors if e.get('type') == 'elis_tol_exceeded')
         missing_meta_count = sum(1 for e in elis_errors if e.get('type') == 'no_metastable_decay_data')
         zero_elis_count = sum(1 for e in elis_errors if e.get('type') == 'zero_elis_metastables')
@@ -2613,16 +3428,30 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                 nuclides_with_branching.add(e.get('parent'))
         for e in lfs_order_dropped:
             nuclides_with_branching.add(e.get('parent'))
+        for e in hybrid_records:
+            nuclides_with_branching.add(e.get('parent'))
 
         gendf_total = stats.get('gendf_nuclides_total', 0) if stats else 0
 
         # Calculate totals based on mode
         if mapping_mode == 'elis':
-            total = mapped_count + elis_exceeded_count + missing_meta_count + zero_elis_count
+            total = (mapped_count + elis_exceeded_count + missing_meta_count
+                     + zero_elis_count + incomputable_count)
             total_gendf_lfs = total + dup_discarded_count
+        elif hybrid:
+            # Every level lands in exactly one of: Phase 1, Phase 2,
+            # placeholder-bound, orphan, placeholder-unmapped. The abstention
+            # and requeue counters below are memo lines: those levels are
+            # already counted in Phase 2, not alongside it.
+            total = mapped_count + placeholder_unmapped_count
+            total_gendf_lfs = total
         else:
             total = mapped_count + dropped_count
             total_gendf_lfs = total
+
+        def _count(label, value):
+            """Counter line, label right-aligned to the block's column."""
+            f.write(f"{label:>47}: {value:5d}\n")
 
         f.write(f"                      nuclides in GENDF library: {gendf_total:5d}\n")
         f.write(f"               nuclides in GENDF with branching: {len(nuclides_with_branching):5d}\n")
@@ -2630,8 +3459,37 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         f.write(f"                          Total GENDF-LFS found: {total_gendf_lfs:5d}\n")
         if mapping_mode == 'elis':
             f.write(f"                                   ELIS matched: {mapped_count:5d}\n")
+        elif hybrid:
+            _count('Phase-1 ELIS matched (unique)', elis_matched_count)
+            _count('Phase-2 positional fallback-mapped', fallback_count)
+            _count('Placeholder LFS bound', placeholder_bound_count)
+            _count('Phase-3 orphan levels', orphan_added_count)
+            _count('Placeholder LFS unmapped (report-only)',
+                   placeholder_unmapped_count)
+            f.write(f"{'(the five lines above sum to the total)':>54}\n")
+            _count('memo: Phase-1 abstained (ambiguous)', abstained_count)
+            _count('memo: Phase-1 unusable (QM/ELIS=0/rtol)', unusable_count)
+            _count('memo: duplicates requeued to Phase 2', requeued_count)
+            _count('Orphan nuclides ADDED to chain',
+                   len(orphan_nuclides_added))
+            _count('Branches reattributed (fold-down)',
+                   sum(1 for r in reattributions if r.get('recipient')))
+            _count('Branches renormalized (pro-rata)', len(renormalizations))
         else:
             f.write(f"                              LFS-order mapped: {mapped_count:5d}\n")
+        if not hybrid:
+            if orphan_nuclides_added:
+                _count('Orphan nuclides ADDED to chain',
+                       len(orphan_nuclides_added))
+            if reattributions:
+                _count('Branches reattributed (fold-down)',
+                       sum(1 for r in reattributions if r.get('recipient')))
+            if renormalizations:
+                _count('Branches renormalized (pro-rata)',
+                       len(renormalizations))
+        if incomputable_count:
+            _count('ELIS incomputable (no QM on the level)',
+                   incomputable_count)
         if elis_exceeded_count:
             f.write(f"                             ELIS rtol exceeded: {elis_exceeded_count:5d}\n")
         if missing_meta_count:
@@ -2644,8 +3502,8 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
             f.write(f"                     Orphan DK states (no LFS): {orphan_count:5d}\n")
         if dup_mapping_count:
             f.write(f"                    Duplicate mappings resolved: {dup_mapping_count:5d} ({dup_discarded_count} LFS discarded)\n")
-        if lfs_sentinels:
-            f.write(f"                       LFS sentinel occurrences: {len(lfs_sentinels):5d}\n")
+        if lfs_placeholders:
+            f.write(f"                    LFS placeholder occurrences: {len(lfs_placeholders):5d}\n")
         if audit_rows is not None and stats is not None:
             f.write(f"                          MF=10 audit offenders: {stats.get('audit_offenders', 0):5d}\n")
             f.write(f"                                 MF=10 rejected: {stats.get('mf10_rejected', 0):5d}\n")
@@ -2824,12 +3682,19 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         f.write("Δ(ELFS-ELIS)    = Discrepancy between GENDF-ELFS and DK-ELIS.\n")
         f.write("                  Shows absolute difference [eV] and relative difference [%].\n")
         f.write("\n")
-        f.write("Method          = 'ELIS' (matched via excitation energy), 'not-mapped' (failed to match)\n")
+        f.write("Method          = How this level got its chain product:\n")
+        f.write("                  - 'ELIS'        = matched on excitation energy (Phase 1 in the hybrid mode)\n")
+        f.write("                  - 'LFS_ORDER'   = positional mapping (lfs_order mode)\n")
+        f.write("                  - 'LFS-ORD(fb)' = hybrid Phase 2: paired by position after the energy match failed\n")
+        f.write("                  - 'PLACEHOLDER' = placeholder LFS (unidentified excited state) bound to the lowest unclaimed state\n")
+        f.write("                  - 'ORPHAN+'     = no decay partner at all; state kept under --orphan-policy add-stable\n")
+        f.write("                  - 'not-mapped'  = the level was not written to the chain\n")
         f.write("\n")
         f.write("Notes           = Additional information:\n")
-        f.write("                  - 'Renorm'd (X skipped)' = Branching renormalized because sibling skipped\n")
+        f.write("                  - 'Mass renorm (X omit→pro-rata)' = a sibling was omitted; its share went pro-rata to the rest\n")
         f.write("                  - 'ELIS rtol exceeded' = Product skipped, closest match shown\n")
         f.write("                  - 'Product not in DK-Lib' = No metastable data in decay library\n")
+        f.write("                  - 'No QM: ELFS incomputable' = the level's TAB1 head carries no QM, so QM - QI cannot be formed\n")
         f.write("\n")
         f.write("Further info:\n")
         f.write("  | LIS/LFS | Level number          | All excited states (short-lived + long-lived) |\n")
@@ -2928,6 +3793,10 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                     by_parent[parsed['parent']].append(parsed)
             elif err_type == 'zero_elis_metastables':
                 # Zero-ELIS metastables: structured data from gendf.py
+                by_parent[error.get('parent', '?')].append(error)
+            elif err_type == 'elis_incomputable':
+                # No QM on the level's TAB1 head, so ELFS = QM - QI cannot be
+                # formed at all: nothing to match on in this mode.
                 by_parent[error.get('parent', '?')].append(error)
 
         # Add duplicate_mapping discarded entries to by_parent
@@ -3028,6 +3897,20 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                         'rel_diff': float('inf'), 'notes': 'No product in DK-Lib',
                         'type': 'no_metastable_decay_data'
                     })
+            elif err.get('type') == 'elis_incomputable':
+                elem = _z_to_element(err.get('target_z', 0))
+                mass = err.get('target_a', '?')
+                lfs = err.get('lfs')
+                high_disc.append({
+                    'parent': err.get('parent'), 'mt': err.get('mt'),
+                    'reaction': err.get('reaction'), 'lfs': lfs,
+                    'product': f"{elem}{mass}_m{lfs}" if lfs else f"{elem}{mass}_m?",
+                    'liso': '-', 'elis': None, 'dk_elis': None,
+                    'half_life': '-', 'method': 'not-mapped',
+                    'rel_diff': float('inf'),
+                    'notes': 'No QM: ELFS incomputable',
+                    'type': 'elis_incomputable'
+                })
             elif err.get('type') == 'zero_elis_metastables':
                 # Zero-ELIS metastables: structured data from gendf.py
                 elem = _z_to_element(err.get('target_z', 0))
@@ -3071,10 +3954,14 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         # DUPLICATE MAPPING CONFLICTS section
         _write_duplicate_mapping_section(f, duplicate_mapping_errors)
 
-        # COUNT MISMATCH REPORT section (LFS-order mode only)
-        if mapping_mode == 'lfs_order' and (lfs_order_dropped or lfs_order_orphan_dk):
+        # COUNT MISMATCH REPORT: GENDF level count vs decay state count. Keyed
+        # on the records themselves -- the hybrid reports leftover decay states
+        # the same way, it simply never drops a level to get there.
+        orphan_dk_rows = list(lfs_order_orphan_dk) + [
+            r for r in hybrid_records if r.get('type') == 'hybrid_orphan_dk']
+        if lfs_order_dropped or orphan_dk_rows:
             f.write("\n\n" + "=" * 220 + "\n")
-            f.write("COUNT MISMATCH REPORT (LFS-ORDER MODE)\n")
+            f.write("COUNT MISMATCH REPORT (GENDF levels vs DK-Lib states)\n")
             f.write("=" * 220 + "\n\n")
 
             if lfs_order_dropped:
@@ -3097,13 +3984,15 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                             f"{would_be:>10}  {elis_str:>14}  {reason:<40}\n")
                 f.write("\n")
 
-            if lfs_order_orphan_dk:
+            if orphan_dk_rows:
                 f.write("ORPHAN DK-Lib STATES (DK-Lib LISO count > GENDF LFS count):\n")
+                f.write("Informational: the nuclide is already in the chain, it "
+                        "simply gains no production from this reaction.\n")
                 f.write("-" * 100 + "\n")
                 f.write(f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'DK-LISO':>10}  "
                         f"{'DK-ELIS':>14}  {'Reason':<40}\n")
                 f.write("-" * 100 + "\n")
-                for err in lfs_order_orphan_dk:
+                for err in orphan_dk_rows:
                     parent = err.get('parent', '?')
                     mt = err.get('mt', '?')
                     reaction = err.get('reaction', '?')
@@ -3187,8 +4076,23 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
         _write_consistency_audit_section(f, offenders, audit_clean, audit_emax)
         _write_rejected_section(f, rejected_rows or [], reject_band_ratio)
 
-        # LFS SENTINEL VALUES section (report-only safeguard)
-        _write_lfs_sentinel_section(f, lfs_sentinels)
+        # HYBRID MAPPING section (elis_lfs_order only): the phase detail behind
+        # every mapped row above.
+        if hybrid:
+            _write_hybrid_mapping_section(f, hybrid_records, isomer_mappings)
+
+        # ORPHAN sections. The disposition table is mode-agnostic (any mode can
+        # meet a product the chain does not carry); the added-nuclide roll call
+        # only exists under add-stable.
+        _write_orphan_disposition_section(f, orphan_levels,
+                                          orphan_nuclides_added,
+                                          reattributions, renormalizations,
+                                          orphan_policy)
+        if orphan_policy == 'add-stable':
+            _write_orphan_nuclides_section(f, orphan_nuclides_added)
+
+        # LFS PLACEHOLDER VALUES section (report-only safeguard)
+        _write_lfs_placeholder_section(f, lfs_placeholders)
 
         # ANONYMOUS (IZAP=0) MF=10 classification (R1-61)
         _write_attribution_section(f, attribution_records or [],
@@ -3236,6 +4140,11 @@ def _write_mapping_row(f, m):
             notes = 'DK-Lib has ELIS=0 (data quality)'
         if product == '?':
             product = m.get('base_nuclide', '?')
+    elif err_type == 'elis_incomputable':
+        method = 'not-mapped'
+        notes = 'No QM: ELFS incomputable'
+        if product == '?':
+            product = m.get('base_nuclide', '?')
     elif err_type == 'duplicate_mapping':
         # Duplicate mapping - this LFS was discarded because another LFS was closer
         method = 'not-mapped'
@@ -3254,6 +4163,8 @@ def _write_mapping_row(f, m):
         chain_product = '-'  # No product exists in decay library at all
     elif method == 'not-mapped' and err_type == 'zero_elis_metastables':
         chain_product = '-'  # Product has ELIS=0 in decay library (data quality issue)
+    elif method == 'not-mapped' and err_type == 'elis_incomputable':
+        chain_product = '-'  # No ELFS to match on: the level was never placed
     elif method == 'not-mapped':
         chain_product = 'OMITTED'
     else:
@@ -3283,12 +4194,13 @@ def _write_mapping_row(f, m):
             disc_str = "N/A"
 
     # Display method name appropriately
-    if method == 'elis':
-        method_display = 'ELIS'
-    elif method == 'lfs_order':
-        method_display = 'LFS_ORDER'
-    else:
-        method_display = method
+    method_display = {
+        'elis': 'ELIS',
+        'lfs_order': 'LFS_ORDER',
+        'lfs_order_fallback': 'LFS-ORD(fb)',   # hybrid Phase 2
+        'placeholder_bound': 'PLACEHOLDER',    # unidentified excited state
+        'orphan_added': 'ORPHAN+',             # no decay partner at all
+    }.get(method, method)
 
     f.write(f"{mt_str:>5}  {reaction:<12}  {lfs_str:>9}  {gendf_product:<15}  "
             f"{liso_str:>7}  {chain_product:<15}  {half_life_str:>12}  "
@@ -3390,8 +4302,9 @@ def write_renormalization_log(renormalizations, log_file):
 
 def main(endf_gxs_dir, base_chain_file, output_chain_file,
          decay_file,
-         mapping_mode='elis',
-         elis_rtol=0.50, elis_atol=0.0,
+         mapping_mode='elis_lfs_order',
+         orphan_policy='add-stable',
+         elis_rtol=None, elis_atol=0.0,
          skip_zero_elis_metastables=True,
          mt_list=None, verbose=True,
          isomer_mapping_log_file=None,
@@ -3418,12 +4331,21 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         ENDF decay library for ELIS mapping (REQUIRED for all modes)
     mapping_mode : str
         Isomeric state mapping mode:
-        - 'elis' (default): ELIS-based matching (production recommended)
+        - 'elis_lfs_order' (default): hybrid - ELIS matching first, positional
+          fallback for the levels left over, orphan states kept
+        - 'elis': ELIS-based matching only (unmatched levels dropped)
         - 'lfs_order': FISPACT-like positional mapping (validation)
-    elis_rtol : float
-        Relative tolerance for ELIS matching (default 0.50 = 50%).
-        In ELIS mode: products beyond rtol are skipped.
-        In LFS-order mode: used for ELIS reference warnings only.
+    orphan_policy : str
+        Disposition of a product with no partner in the chain: 'add-stable'
+        (default, add it to the chain as a stable pure sink and keep the
+        branch), 'renorm' (drop it, redistribute pro-rata) or 'reattribute'
+        (fold its share into the kept isomer at the nearest lower rank).
+    elis_rtol : float or None
+        Relative tolerance for ELIS matching. None (default) takes the
+        mode-dependent default: 0.15 for elis_lfs_order, 0.50 for the other
+        two. In ELIS mode products beyond rtol are skipped; in the hybrid they
+        fall through to the positional phase; in LFS-order mode the tolerance
+        drives ELIS reference warnings only.
     elis_atol : float
         Absolute tolerance in eV (default 0.0)
     reattribute_mf10_noizap : bool
@@ -3436,10 +4358,19 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         raise ValueError(
             "decay_file is required for isomeric branching (both modes)."
         )
-    if mapping_mode not in ('elis', 'lfs_order'):
+    if mapping_mode not in MAPPING_MODES:
         raise ValueError(
-            f"Invalid mapping_mode '{mapping_mode}'. Must be 'elis' or 'lfs_order'."
+            f"Invalid mapping_mode '{mapping_mode}'. Must be one of "
+            f"{', '.join(MAPPING_MODES)}."
         )
+    if orphan_policy not in ORPHAN_POLICIES:
+        raise ValueError(
+            f"Invalid orphan_policy '{orphan_policy}'. Must be one of "
+            f"{', '.join(ORPHAN_POLICIES)}."
+        )
+    # Mode-dependent tolerance default, resolved before the library is built so
+    # the mapper, the log header and the proximity check all see one value.
+    elis_rtol = resolve_elis_rtol(mapping_mode, elis_rtol)
 
     # Create output directories up front (first-run libraries have no GENDF/ dir)
     for out_file in (output_chain_file, isomer_mapping_log_file,
@@ -3457,8 +4388,19 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         print("  (FISPACT-like positional mapping for validation)")
         print("  WARNING: May produce incorrect results for nuclides where")
         print("           LFS order ≠ LISO order (e.g., Ag116)")
+    elif mapping_mode == 'elis_lfs_order':
+        print("  (hybrid: excitation-energy matching first, then position)")
+        print("    Phase 1: levels whose ELFS matches exactly one decay state")
+        print("             within tolerance are bound to it; an ambiguous or")
+        print("             unusable energy abstains instead of guessing")
+        print("    Phase 2: the levels left over are paired, in level order,")
+        print("             with the decay metastables left over (no energy")
+        print("             preference, states already claimed are skipped)")
+        print("    Phase 3: a level with no decay state left becomes an ORPHAN")
+        print(f"             state -- disposition: --orphan-policy {orphan_policy}")
     else:
-        print("  (ELIS-based matching - production recommended)")
+        print("  (ELIS-based matching only - unmatched levels dropped)")
+    print(f"ORPHAN POLICY: {orphan_policy}")
 
     # Step 1: Load chain
     print("\nStep 1: Loading base chain...")
@@ -3538,14 +4480,23 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         print(f"  Pruned {len(attrib_pruned)} reaction(s) with unrecovered "
               "anonymous (IZAP=0) MF=10 subsections (excluded from extraction)")
 
-    # Capture errors
+    # Capture errors. A hybrid record describes HOW a level was mapped, not a
+    # loss: a level routed to the positional fallback (and a duplicate loser
+    # requeued with it) is still mapped, so it must never reach the not-mapped
+    # tables or trigger a renormalization note.
     elis_errors = []
     duplicate_mapping_errors = []
     lfs_order_dropped = []
     lfs_order_orphan_dk = []
+    hybrid_records = []
     for err in lib.processing_errors:
         err_type = err.get('type')
-        if err_type in ('elis_tol_exceeded', 'no_metastable_decay_data', 'zero_elis_metastables'):
+        if err_type in HYBRID_ERROR_TYPES:
+            hybrid_records.append(err)
+        elif err.get('routed_to_fallback') or err.get('requeued'):
+            hybrid_records.append(err)
+        elif err_type in ('elis_tol_exceeded', 'no_metastable_decay_data',
+                          'zero_elis_metastables', 'elis_incomputable'):
             elis_errors.append(err)
         elif err_type == 'duplicate_mapping':
             duplicate_mapping_errors.append(err)
@@ -3553,6 +4504,7 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             lfs_order_dropped.append(err)
         elif err_type == 'lfs_order_orphan_dk':
             lfs_order_orphan_dk.append(err)
+    orphan_levels = lib.orphan_levels if hasattr(lib, 'orphan_levels') else []
 
     # Step 4b: MF=10-vs-MF=3 consistency audit (group-space). Always builds the
     # audit table; --mf10-reject-band-ratio (OFF by default) additionally leaves
@@ -3609,15 +4561,26 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     rtol_exceeded = sum(1 for e in elis_errors if e.get('type') == 'elis_tol_exceeded')
     no_dk_data = sum(1 for e in elis_errors if e.get('type') == 'no_metastable_decay_data')
     zero_elis = sum(1 for e in elis_errors if e.get('type') == 'zero_elis_metastables')
+    incomputable = sum(1 for e in elis_errors if e.get('type') == 'elis_incomputable')
     dup_mappings = len(duplicate_mapping_errors)
     # Count discarded LFS values (each duplicate_mapping error has 'discarded' list)
     dup_discarded = sum(len(e.get('discarded', [])) for e in duplicate_mapping_errors)
     dropped_count = len(lfs_order_dropped)
     orphan_count = len(lfs_order_orphan_dk)
+    hybrid_fallback_count = sum(1 for r in hybrid_records
+                                if r.get('type') == 'hybrid_fallback')
+    placeholder_unmapped = sum(1 for r in hybrid_records
+                               if r.get('type') == 'placeholder_unmapped')
 
     if mapping_mode == 'elis':
-        total_mappings = mapped_count + rtol_exceeded + no_dk_data
+        total_mappings = mapped_count + rtol_exceeded + no_dk_data + incomputable
         total_gendf_lfs = total_mappings + dup_discarded
+    elif mapping_mode == 'elis_lfs_order':
+        # Nothing is dropped except a placeholder with no state left to bind:
+        # every other level is written (Phase 1, Phase 2, placeholder-bound or
+        # orphan), so mapped_count already carries it.
+        total_mappings = mapped_count + placeholder_unmapped
+        total_gendf_lfs = total_mappings
     else:
         total_mappings = mapped_count + dropped_count
         total_gendf_lfs = total_mappings
@@ -3628,8 +4591,16 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     print(f"                          Total GENDF-LFS found: {total_gendf_lfs:5d}")
     if mapping_mode == 'elis':
         print(f"                                   ELIS matched: {mapped_count:5d}")
+    elif mapping_mode == 'elis_lfs_order':
+        print(f"                       Levels mapped (all phases): {mapped_count:5d}")
+        print(f"                Phase-2 positional fallback pool: {hybrid_fallback_count:5d}")
+        print(f"                          Phase-3 orphan levels: {len(orphan_levels):5d}")
+        if placeholder_unmapped:
+            print(f"          Placeholder LFS unmapped (report-only): {placeholder_unmapped:5d}")
     else:
         print(f"                              LFS-order mapped: {mapped_count:5d}")
+    if incomputable:
+        print(f"                    ELIS incomputable (no QM): {incomputable:5d}")
     if rtol_exceeded:
         print(f"                             ELIS rtol exceeded: {rtol_exceeded:5d}")
     if no_dk_data:
@@ -3644,17 +4615,17 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     print(f"                                 MF=10 rejected: {len(rejected_rows):5d}")
     print(f"          Band-reject exempt (self-loop ground): {band_reject_exempt:5d}")
 
-    # Report-only LFS sentinel scan (see SENTINEL_LFS): flag products/partials
-    # whose GENDF MF=10 LFS is a library "unspecified level" sentinel (99 / 40)
+    # Report-only LFS placeholder scan (see PLACEHOLDER_LFS): flag products/partials
+    # whose GENDF MF=10 LFS is a library "unspecified level" placeholder (99 / 40)
     # so it is never silently consumed as an isomer ordinal. The flags-only
-    # writer would otherwise emit the sentinel verbatim in gendf_lfs. This
+    # writer would otherwise emit the placeholder verbatim in gendf_lfs. This
     # changes no mapping decision and no byte of the output chain XML.
-    lfs_sentinels = _collect_lfs_sentinels(
+    lfs_placeholders = _collect_lfs_placeholders(
         branching_data, elis_errors, duplicate_mapping_errors,
         lfs_order_dropped, mapping_mode)
-    if lfs_sentinels:
-        print(f"                       LFS sentinel occurrences: {len(lfs_sentinels):5d}")
-    _print_lfs_sentinel_warning(lfs_sentinels, mapping_mode)
+    if lfs_placeholders:
+        print(f"                    LFS placeholder occurrences: {len(lfs_placeholders):5d}")
+    _print_lfs_placeholder_warning(lfs_placeholders, mapping_mode)
 
     # Step 5: Add to XML
     print("\nStep 5: Adding branching to chain XML...")
@@ -3670,9 +4641,35 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
         suppress_single_target_yields=suppress_single_target_yields,
         mode=mode,
         mf10_emit_summary=emit_summary,
+        orphan_policy=orphan_policy,
         repaired_keys={(r['nuclide'], r['reaction']): r['ground_product']
                        for r in ground_repaired}
     )
+
+    # Orphan disposition: what the writer did with the products that had no
+    # partner in the chain (see the ORPHAN sections of the mapping log).
+    if summary['orphan_nuclides_added']:
+        n_sources = sum(len(v) for v in summary['orphan_nuclides_added'].values())
+        print(f"\n  Orphan nuclides ADDED to the chain: "
+              f"{len(summary['orphan_nuclides_added'])} "
+              f"(from {n_sources} reaction pathway(s)); each is stable with no "
+              "decay data -- it conserves the branch but models no activity")
+        for name in sorted(summary['orphan_nuclides_added']):
+            sources = summary['orphan_nuclides_added'][name]
+            parents = ', '.join(sorted({s['parent'] for s in sources}))
+            print(f"    {name:<12} <- {parents}")
+    if summary['reattributions']:
+        folded = [r for r in summary['reattributions'] if r['recipient']]
+        stranded = len(summary['reattributions']) - len(folded)
+        print(f"  Branches reattributed (folded into a kept isomer): "
+              f"{len(folded)}")
+        if stranded:
+            print(f"  WARNING: {stranded} orphan branch(es) had no recipient at "
+                  "all and were renormalized instead; see ORPHAN DISPOSITION "
+                  "in the mapping log")
+    if summary['embedded_zero_rows']:
+        print(f"  Embedded mode: {summary['embedded_zero_rows']} energy row(s) "
+              "skipped -- every surviving target was zero there")
 
     # Only decorations the writer actually shipped count as repairs.
     ground_repaired = [r for r in ground_repaired
@@ -3778,6 +4775,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
             'decay_file': decay_file,
             'output_chain_file': output_chain_file,
             'mapping_mode': mapping_mode,
+            'orphan_policy': orphan_policy,
+            'renormalizations': summary['renormalizations'],
             'elis_rtol': elis_rtol,
             'elis_atol': elis_atol,
             'gendf_nuclides_total': len(lib.available_nuclides()),
@@ -3806,11 +4805,17 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
                                 lfs_order_dropped=lfs_order_dropped,
                                 lfs_order_orphan_dk=lfs_order_orphan_dk,
                                 single_target_cases=summary.get('single_target_cases', []),
-                                lfs_sentinels=lfs_sentinels,
+                                lfs_placeholders=lfs_placeholders,
                                 audit_rows=audit_rows, rejected_rows=rejected_rows,
                                 attribution_records=attrib_records,
                                 attribution_counts=attrib_counts,
-                                reattribute_mf10_noizap=reattribute_mf10_noizap)
+                                reattribute_mf10_noizap=reattribute_mf10_noizap,
+                                hybrid_records=hybrid_records,
+                                orphan_levels=orphan_levels,
+                                orphan_nuclides_added=summary['orphan_nuclides_added'],
+                                reattributions=summary['reattributions'],
+                                orphan_policy=orphan_policy,
+                                reaction_type_missing=summary['reaction_type_missing'])
 
     return chain
 
@@ -3829,17 +4834,27 @@ if __name__ == '__main__':
     # Verbose output is the default; --quiet is the opt-out
     verbose = not args.quiet
 
-    # Build output filenames with mapping suffix
-    suffix = '.elis_mapped' if args.map == 'elis' else '.lfs_order_mapped'
-    output_chain = f"{config['output_dir']}{config['output_prefix']}{suffix}.xml"
-    log_file = f"{config['output_dir']}{config['log_prefix']}{suffix}.txt"
+    # Build output filenames with mapping suffix. --output-dir / --log-dir
+    # override the pairing's directory so a verification run never writes over
+    # a production chain or log.
+    suffix = f".{args.map}_mapped"
+    out_dir = args.output_dir if args.output_dir is not None else config['output_dir']
+    log_dir = args.log_dir if args.log_dir is not None else config['output_dir']
+    output_chain = os.path.join(out_dir, f"{config['output_prefix']}{suffix}.xml")
+    log_file = os.path.join(log_dir, f"{config['log_prefix']}{suffix}.txt")
+
+    # An explicit -r wins; otherwise the mode decides (0.15 hybrid / 0.50 legacy)
+    elis_rtol = resolve_elis_rtol(args.map, args.rtol)
 
     print("=" * 70)
     print("GENDF Isomeric Branching Chain Patcher v12")
     print("=" * 70)
     print(f"\nLibrary:      {args.library} - {config['description']}")
     print(f"Mapping mode: {args.map}")
-    print(f"Tolerances:   rtol={args.rtol}, atol={args.atol}")
+    print(f"Orphan policy: {args.orphan_policy}")
+    print(f"Tolerances:   rtol={elis_rtol}"
+          f"{'' if args.rtol is not None else ' (mode default)'}, "
+          f"atol={args.atol}")
     if args.prune_nn_prime_self_loops:
         print("Prune (n,n') self-loops: ENABLED")
     if args.suppress_single_target_yields:
@@ -3866,7 +4881,8 @@ if __name__ == '__main__':
         output_chain_file=output_chain,
         decay_file=config['decay_file'],
         mapping_mode=args.map,
-        elis_rtol=args.rtol,
+        orphan_policy=args.orphan_policy,
+        elis_rtol=elis_rtol,
         elis_atol=args.atol,
         verbose=verbose,
         isomer_mapping_log_file=log_file,
