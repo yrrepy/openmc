@@ -15,6 +15,7 @@ Shared mocks/factories/fixtures come from ``gendf_testing`` / ``conftest``.
 
 import tempfile
 import types
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -207,6 +208,39 @@ def test_lookup_liso_multiple_states_best_match():
     assert result['status'] == 'matched'
     assert result['liso'] == 1  # Best match
     assert result['dk_elis'] == 50000.0
+
+
+def test_lookup_liso_reports_ambiguity():
+    """A second decay level inside tolerance is reported, warned or not.
+
+    In122 (UKDD-12) carries m1 and m2 at the SAME 200 keV, so the nearest
+    level is an arbitrary pick. The hybrid mapper abstains on exactly that
+    verdict with the console warning silenced, so the verdict has to travel
+    in the result dict rather than in the once-per-(Z, A) warning.
+    """
+    in122 = {(49, 122): [
+        DecayState(z=49, a=122, elis=0.0, liso=0),
+        DecayState(z=49, a=122, elis=200000.0, liso=1, half_life=10.8),
+        DecayState(z=49, a=122, elis=200000.0, liso=2, half_life=10.8)]}
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        quiet = lookup_liso(49, 122, 290000.0, in122, warn_ambiguity=False)
+    assert caught == []
+    assert quiet['status'] == 'matched' and quiet['liso'] == 1
+    assert quiet['ambiguous'] is True
+    assert (quiet['second_liso'], quiet['second_dk_elis']) == (2, 200000.0)
+
+    # The default caller still warns, with the same verdict attached.
+    with pytest.warns(UserWarning, match='Ambiguous ELIS match'):
+        loud = lookup_liso(49, 122, 290000.0, in122)
+    assert loud['ambiguous'] is True
+
+    # A sole candidate is unambiguous and has no second level to report.
+    single = lookup_liso(77, 192, 56720.0, {(77, 192): [
+        DecayState(z=77, a=192, elis=56720.0, liso=1)]})
+    assert single['ambiguous'] is False
+    assert (single['second_liso'], single['second_dk_elis']) == (None, None)
 
 
 def test_lookup_liso_zero_elis_only():
