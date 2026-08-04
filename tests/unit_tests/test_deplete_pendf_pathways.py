@@ -12,14 +12,22 @@ in-domain silence-fill of a placeholder ground, and the always-on expansion
 through :meth:`MicroXS.from_multigroup_flux`. Pathway rows come
 exclusively from MF=10 partial cross sections -- never from static branching
 ratios; the product *names* come from the chain, never from the library.
+
+The last section takes chains straight out of the patcher's ``--orphan-policy``
+triad and checks the collapse binds what the writer wrote: a kept orphan branch
+gets its own row, and a reattributed duplicate-target entry sums into its
+recipient's row.
 """
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import openmc.deplete
 from openmc.deplete.chain import Chain
 from openmc.deplete.nuclide import Nuclide
+from openmc.deplete.decay_elis import DecayState
 from openmc.deplete.microxs import (
     MicroXS,
     _build_xs_table_pendf,
@@ -27,6 +35,15 @@ from openmc.deplete.microxs import (
     _group_average,
     _liso_from_gnds,
     _silence_fill_ground,
+)
+
+# The chain patcher lives in the repo's tools/ directory (not an installed
+# package); the orphan-policy tests at the end of this module start from its
+# output rather than from a hand-written chain.
+sys.path.insert(0, str(Path(openmc.deplete.__file__).parents[2] / "tools"))
+
+from add_pendf_isomeric_branching_to_chain import (  # noqa: E402
+    MODE_DEFAULT_RTOL, decorate_chain, map_library,
 )
 
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
@@ -1548,3 +1565,133 @@ def test_partial_binding_real_jeff_np239():
         assert _row(on, "(n,gamma)")[0] < total_g[0]       # below the MF=3 total
     finally:
         lib.close()
+
+
+# ---------------------------------------------------------------------------
+# Orphan-policy chains meeting the collapse (--orphan-policy add-stable |
+# reattribute)
+#
+# These start at the PATCHER, not at a hand-written chain: the point is the
+# seam. The writer emits a kept orphan branch (add-stable) or a duplicate-target
+# entry folding the orphan's column onto its recipient (reattribute), and the
+# demand loop here has to bind what it wrote. Shape: Au186 (n,2n) -> Au185 with
+# LFS=0 and LFS=6, whose 14.1 MeV columns are 1.3312 b and 0.1682 b against an
+# MF=3 total of 1.4994 b (verified against the production HDF5 library).
+# ---------------------------------------------------------------------------
+
+_AU_GROUND, _AU_ORPHAN = 1.3312, 0.1682          # barns at 14.1 MeV
+_AU_TOTAL = _AU_GROUND + _AU_ORPHAN              # == the MF=3 total, 1.4994 b
+
+
+class _FakePatchSource:
+    """Minimal PENDF source adapter for the patcher (not the collapse)."""
+
+    kind, library, mapping = "fake", "synthetic", "elis"
+    nuclides = ["Au186"]
+
+    def reactions(self, nuclide):
+        return {16: dict(qm=-7928030.0, qi=-7928030.0, partials=[
+            dict(lfs=0, izap=79185, qi=-7928030.0, qm=-7928030.0, elfs=0.0),
+            dict(lfs=6, izap=79185, qi=-8128030.0, qm=-7928030.0,
+                 elfs=200000.0)])}
+
+    def total_xs(self, nuclide, mt):
+        raise KeyError("no MF=3 array on this fixture")
+
+    def pathway_xs(self, nuclide, mt, lfs, izap=None):
+        raise KeyError("no MF=10 array on this fixture")
+
+    def nuclide_elis(self, nuclide):
+        return None
+
+    def close(self):
+        pass
+
+
+def _au186_patched_chain(policy):
+    """Run the patcher over the Au186 shape and return the patched chain.
+
+    decay_2020 carries no Au185 metastable, so LFS=6 is a true orphan in every
+    mapping mode and the policy alone decides what its branch becomes.
+    """
+    chain = Chain()
+    au186 = Nuclide("Au186")
+    au186.add_reaction("(n,2n)", "Au185", -7928030.0, 1.0)
+    chain.add_nuclide(au186)
+    chain.add_nuclide(Nuclide("Au185"))
+    decay = {(79, 185): [DecayState(79, 185, 0.0, 0)],
+             (79, 186): [DecayState(79, 186, 0.0, 0)]}
+    mode = "elis_lfs_order"
+    branching, stats = map_library(_FakePatchSource(), chain, decay, mode,
+                                   MODE_DEFAULT_RTOL[mode], 0.0, verbose=False,
+                                   orphan_policy=policy)
+    decorate_chain(chain, branching, stats, orphan_policy=policy)
+    return chain
+
+
+def _au186_library():
+    return _FakePendf(
+        mf3={"Au186": {16: _const(_AU_TOTAL)}},
+        mf10={"Au186": {16: {0: ("Au185", _const(_AU_GROUND)),
+                             6: ("Au185_m1", _const(_AU_ORPHAN))}}})
+
+
+def test_add_stable_orphan_branch_binds_the_collapse_demand():
+    """A chain nuclide the decay library never carried still binds its column.
+
+    ``Au185_m1`` is a minted placeholder name, not a decay-library LISO, but
+    the demand loop only needs a chain reaction carrying the LFS -- so the
+    orphan's 0.168 b leaves the ground row and gets a row of its own, and the
+    two still sum to the MF=3 total.
+    """
+    edges = np.array([0.0, 2.0e7])
+    chain = _au186_patched_chain("add-stable")
+    assert "Au185_m1" in chain.nuclide_dict
+
+    table = _build_xs_table_pendf(["Au186"], ["(n,2n)"], edges,
+                                  _au186_library(), chain)
+
+    assert table.reactions == ["(n,2n)", "(n,2n)_m1"]
+    ground = table.xs_matrix[list(table.rxn_indices).index(0)]
+    orphan = table.xs_matrix[list(table.rxn_indices).index(1)]
+    np.testing.assert_allclose(ground, [_AU_GROUND])
+    np.testing.assert_allclose(orphan, [_AU_ORPHAN])
+    np.testing.assert_allclose(ground + orphan, [_AU_TOTAL])
+
+
+def test_reattribute_duplicate_target_sums_into_one_collapse_row():
+    """The fold is arithmetic the collapse already does.
+
+    ``reattribute`` writes two entries with the SAME target and distinct LFS,
+    which the demand loop keys separately and ``stage()`` sums into one row --
+    so the recipient's row is sigma(LFS=0) + sigma(folded) = 1.3312 + 0.1682 =
+    1.4994 b, exactly the MF=3 total. No collapse change was needed for the
+    policy, and the row count is unchanged from the stock chain, which is what
+    keeps the downstream row/stamp counts stable.
+    """
+    edges = np.array([0.0, 2.0e7])
+    chain = _au186_patched_chain("reattribute")
+    assert "Au185_m1" not in chain.nuclide_dict
+    assert [(rx.type, rx.target, rx.pendf_lfs)
+            for rx in chain["Au186"].reactions] == \
+        [("(n,2n)", "Au185", 0), ("(n,2n)", "Au185", 6)]
+
+    lib = _au186_library()
+    table = _build_xs_table_pendf(["Au186"], ["(n,2n)"], edges, lib, chain)
+
+    assert table.reactions == ["(n,2n)"]              # one row, not two
+    assert list(table.rxn_indices) == [0]             # nothing to clobber
+    np.testing.assert_allclose(table.xs_matrix[0], [_AU_TOTAL])
+    np.testing.assert_allclose(table.xs_matrix[0],
+                               _group_average(*lib.xs("Au186", 16), edges))
+
+    # Row count is identical to the stock (unpatched) chain's single MF=3 row.
+    stock = _build_xs_table_pendf(["Au186"], ["(n,2n)"], edges, lib, Chain())
+    assert len(table.reactions) == len(stock.reactions) == 1
+
+    # End to end through the public entry point.
+    micro = MicroXS.from_multigroup_flux(
+        energies=edges, multigroup_flux=[1.0], chain_file=chain,
+        nuclides=["Au186"], reactions=["(n,2n)"], pendf_library=lib)
+    assert list(micro.reactions) == ["(n,2n)"]
+    assert micro["Au186", "(n,2n)"] == pytest.approx([_AU_TOTAL])

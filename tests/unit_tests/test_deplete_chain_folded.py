@@ -154,17 +154,26 @@ def test_missing_per_pathway_Q_tolerated():
     }
 
 
-def test_lfs_gt0_without_suffix_raises():
-    """An lfs>0 entry whose target lacks an _m suffix is a format error."""
+def test_lfs_gt0_without_suffix_is_ground_recipient():
+    """An lfs>0 entry with a ground-named target is a ground-recipient member.
+
+    This is the shape --orphan-policy reattribute writes for a ground fold
+    (the entry repeats the recipient's ground name while keeping the orphan's
+    own LFS and QI), so it must parse as a second base-type member rather
+    than raise as it did before the orphan-policy triad.
+    """
     xml = (
         '<nuclide name="In115" reactions="1">'
         '<reaction type="(n,gamma)">'
-        '<isomeric_branching targets="In116 In117" pendf_lfs="0 1"/>'
+        '<isomeric_branching targets="In116 In116" pendf_lfs="0 1"/>'
         '</reaction>'
         '</nuclide>'
     )
-    with pytest.raises(ValueError):
-        _nuclide_from_xml(xml)
+    nuc = _nuclide_from_xml(xml)
+    assert [(rx.type, rx.target, rx.pendf_lfs) for rx in nuc.reactions] == [
+        ("(n,gamma)", "In116", 0),
+        ("(n,gamma)", "In116", 1),
+    ]
 
 
 _CHAIN = (

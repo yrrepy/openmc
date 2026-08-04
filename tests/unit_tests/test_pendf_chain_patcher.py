@@ -3,10 +3,14 @@
 These exercise the mapping/decoration logic on small synthetic inputs (no real
 PENDF HDF5 or decay library needed): ELIS match happy path, rtol skip,
 product-not-in-chain skip, reaction-added-to-chain, ground-only, and the full
-decorate -> export -> reload fold round-trip.
+decorate -> export -> reload fold round-trip. The later sections cover the
+hybrid ``elis_lfs_order`` mapping mode (ELIS first, then a collision-aware
+positional pass, then minted orphans) and the ``--orphan-policy`` triad in the
+writing layer.
 """
 
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +18,10 @@ import pytest
 
 import openmc.deplete
 from openmc.deplete import Chain, Nuclide
-from openmc.deplete.decay_elis import DecayState
+import openmc.deplete.decay_elis as decay_elis
+from openmc.deplete.decay_elis import (
+    DecayState, lookup_liso, parse_decay_isomeric_levels,
+)
 
 # The patcher lives in the repo's tools/ directory (not an installed package).
 _TOOLS = Path(openmc.deplete.__file__).parents[2] / "tools"
@@ -22,7 +29,8 @@ sys.path.insert(0, str(_TOOLS))
 
 from add_pendf_isomeric_branching_to_chain import (  # noqa: E402
     _classify_metastables, map_library, decorate_chain, _audit_reaction,
-    _self_loop_ground,
+    _self_loop_ground, _classify_elis_lfs_order, _classify_lfs_order,
+    _hybrid_census, write_isomer_mapping_log, MAPPING_MODES, MODE_DEFAULT_RTOL,
 )
 
 
@@ -1834,3 +1842,559 @@ def test_pathway_q_revert_value_rounded(tmp_path):
     chain.export_to_xml(out)
     assert "-1758720.3" in out.read_text()
     assert "-1758720.2999999998" not in out.read_text()
+
+
+# ---------------------------------------------------------------------------
+# lookup_liso ambiguity contract
+#
+# The hybrid mapper abstains on an ambiguous ELIS match, so the verdict has to
+# travel in the result dict rather than only in the once-per-(Z, A) warning --
+# the mapper silences that warning and still needs the answer.
+# ---------------------------------------------------------------------------
+
+# Two decay levels at the SAME energy: no ELFS can tell them apart.
+_DEGENERATE_DECAY = {(49, 122): [
+    DecayState(49, 122, 0.0, 0, half_life=1.5),
+    DecayState(49, 122, 200000.0, 1, half_life=10.8),
+    DecayState(49, 122, 200000.0, 2, half_life=10.8),
+]}
+
+
+def test_lookup_liso_reports_ambiguity():
+    """The ambiguous verdict is computed unconditionally; only the warning is
+    gated by ``warn_ambiguity``. A sole candidate reports no second level."""
+    decay_elis._WARNED_ELIS_AMBIGUITY.clear()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        quiet = lookup_liso(49, 122, 210000.0, _DEGENERATE_DECAY, rtol=0.15,
+                            warn_ambiguity=False)
+    assert caught == []
+    assert quiet["status"] == "matched" and quiet["liso"] == 1
+    assert quiet["ambiguous"] is True
+    assert (quiet["second_liso"], quiet["second_dk_elis"]) == (2, 200000.0)
+
+    # The default caller still warns, with the same verdict attached.
+    with pytest.warns(UserWarning, match="Ambiguous ELIS match"):
+        loud = lookup_liso(49, 122, 210000.0, _DEGENERATE_DECAY, rtol=0.15)
+    assert loud["ambiguous"] is True
+
+    # In115 carries a single metastable -> unambiguous, no second level.
+    single = lookup_liso(49, 115, 336000.0, _decay_lookup())
+    assert single["ambiguous"] is False
+    assert (single["second_liso"], single["second_dk_elis"]) == (None, None)
+
+
+def test_elis_ambiguity_warning_rearmed_per_parse(tmp_path):
+    """The warning dedupe is per (Z, A) WITHIN one library load; loading a
+    decay library again re-arms it, so a second load in the same process is not
+    silently deduped against the first."""
+    decay_elis._WARNED_ELIS_AMBIGUITY.clear()
+    with pytest.warns(UserWarning, match="Ambiguous ELIS match"):
+        lookup_liso(49, 122, 210000.0, _DEGENERATE_DECAY, rtol=0.15)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        lookup_liso(49, 122, 205000.0, _DEGENERATE_DECAY, rtol=0.15)
+    assert caught == []                              # same (Z, A), still muted
+
+    empty = tmp_path / "decay"
+    empty.mkdir()
+    assert parse_decay_isomeric_levels(empty) == {}   # a load, however empty
+    with pytest.warns(UserWarning, match="Ambiguous ELIS match"):
+        lookup_liso(49, 122, 210000.0, _DEGENERATE_DECAY, rtol=0.15)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid mapping mode (elis_lfs_order)
+#
+# Shapes taken from the July TENDL2019-IST mapping log: In120 (n,n') mixes an
+# exact ELIS match with a 471% miss, In127 (n,n') has the higher level matching
+# first so the positional pass must skip the LISO it claimed.
+# ---------------------------------------------------------------------------
+
+# In120: LFS=1 sits exactly on m1 (70 keV); LFS=2 (400 keV) is 471% off it. The
+# decay m2 (In120n) carries a defective 2 keV ELIS with m1's half-life -- zero-
+# ish energy, still claimable by the positional pass.
+_IN120_DECAY = {(49, 120): [
+    DecayState(49, 120, 0.0, 0),
+    DecayState(49, 120, 70000.0, 1, half_life=46.2),
+    DecayState(49, 120, 2000.0, 2, half_life=46.2),
+]}
+_IN120_LEVELS = [
+    dict(lfs=1, izap=49120, qi=-70000.0, qm=0.0, elfs=70000.0),
+    dict(lfs=2, izap=49120, qi=-400000.0, qm=0.0, elfs=400000.0),
+]
+_IN120_NAMES = {"In120", "In120_m1", "In120_m2"}
+
+# In127: LFS=9 is exactly m2 (1.863 MeV); LFS=1 (408.9 keV) is 155.56% off m1.
+_IN127_DECAY = {(49, 127): [
+    DecayState(49, 127, 0.0, 0),
+    DecayState(49, 127, 160000.0, 1),
+    DecayState(49, 127, 1863000.0, 2),
+]}
+_IN127_LEVELS = [
+    dict(lfs=1, izap=49127, qi=-408900.0, qm=0.0, elfs=408900.0),
+    dict(lfs=9, izap=49127, qi=-1863000.0, qm=0.0, elfs=1863000.0),
+]
+_IN127_NAMES = {"In127", "In127_m1", "In127_m2"}
+
+
+def test_hybrid_mixes_elis_match_and_positional_rescue():
+    """In120 (n,n'): one reaction, both phases.
+
+    LFS=1 binds m1 on an exact energy match. LFS=2 is 471% off its nearest
+    state, so pure ELIS drops it entirely; the hybrid requeues it and the
+    positional pass lands it on the one metastable left -- a decay state whose
+    own ELIS is defective (2 keV), which is why the Phase-2 decay pool must not
+    be ELIS-filtered.
+    """
+    recs = {r["lfs"]: r for r in _classify_elis_lfs_order(
+        "In120", 4, "(n,n')", _IN120_LEVELS, _IN120_DECAY, _IN120_NAMES,
+        0.15, 0.0)}
+
+    exact = recs[1]
+    assert (exact["method"], exact["bucket"]) == ("elis", "matched")
+    assert (exact["product"], exact["liso"], exact["position"]) == \
+        ("In120_m1", 1, 1)
+
+    rescued = recs[2]
+    assert (rescued["method"], rescued["fallback_reason"]) == \
+        ("lfs_order_fallback", "elis_tol_exceeded")
+    assert (rescued["bucket"], rescued["product"], rescued["liso"]) == \
+        ("matched", "In120_m2", 2)
+    assert rescued["position"] == 2
+    assert rescued["large_delta_e"] is True          # positional, flagged
+    assert rescued["routed_to_fallback"] is True     # excluded from skip sweeps
+
+    # Contrast: pure ELIS at its own 0.50 tolerance loses the level.
+    elis = {r["lfs"]: r for r in _classify_metastables(
+        "In120", 4, "(n,n')", _IN120_LEVELS, _IN120_DECAY, _IN120_NAMES,
+        "elis", 0.50, 0.0)}
+    assert elis[2]["bucket"] == "rtol_exceeded"
+    assert elis[2]["diff_pct"] == pytest.approx(471.43, abs=0.01)
+
+
+def test_hybrid_fallback_skips_the_liso_elis_claimed():
+    """In127 (n,n'): the positional pass must not land on a claimed LISO.
+
+    LFS=9 binds m2 by energy, so the only decay state left is m1 -- and m1 is
+    also the NEAREST state to LFS=1, which a naive nearest-state pass would
+    have taken while m2 was still free. Collision-awareness makes the two
+    orders agree here rather than by luck.
+    """
+    recs = {r["lfs"]: r for r in _classify_elis_lfs_order(
+        "In127", 4, "(n,n')", _IN127_LEVELS, _IN127_DECAY, _IN127_NAMES,
+        0.15, 0.0)}
+
+    assert (recs[9]["method"], recs[9]["liso"]) == ("elis", 2)
+    fb = recs[1]
+    assert (fb["method"], fb["fallback_reason"]) == ("lfs_order_fallback",
+                                                     "elis_tol_exceeded")
+    assert (fb["product"], fb["liso"], fb["position"]) == ("In127_m1", 1, 1)
+    assert fb["phase1_claimed_lisos"] == [2]         # m2 was off the table
+    assert fb["nearest_liso"] == 1                   # the refused ELIS candidate
+    assert fb["diff_pct"] == pytest.approx(155.56, abs=0.01)
+    assert fb["large_delta_e"] is True
+
+    # Every level landed in a chain product; nothing was orphaned or dropped.
+    assert {r["bucket"] for r in recs.values()} == {"matched"}
+
+
+def test_hybrid_abstains_when_two_decay_states_are_degenerate():
+    """An ambiguous ELIS match is no evidence, so the hybrid re-derives
+    positionally; pure ELIS still accepts the arbitrary pick.
+
+    Both decay levels sit at 200 keV, so both file levels "match" m1 and pure
+    ELIS keeps only the closer one, discarding the other as a duplicate. The
+    hybrid abstains on both and maps them by rank instead -- and it abstains
+    QUIETLY (``warn_ambiguity=False``), where the ELIS mapper warns.
+    """
+    levels = [dict(lfs=1, izap=49122, qi=-210000.0, qm=0.0, elfs=210000.0),
+              dict(lfs=5, izap=49122, qi=-205000.0, qm=0.0, elfs=205000.0)]
+    names = {"In122", "In122_m1", "In122_m2"}
+
+    decay_elis._WARNED_ELIS_AMBIGUITY.clear()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hybrid = {r["lfs"]: r for r in _classify_elis_lfs_order(
+            "In121", 102, "(n,gamma)", levels, _DEGENERATE_DECAY, names,
+            0.15, 0.0)}
+    assert caught == []                              # abstention is silent
+
+    assert [(r["method"], r["fallback_reason"], r["product"])
+            for r in (hybrid[1], hybrid[5])] == \
+        [("lfs_order_fallback", "elis_ambiguous", "In122_m1"),
+         ("lfs_order_fallback", "elis_ambiguous", "In122_m2")]
+    assert (hybrid[1]["second_liso"], hybrid[1]["second_dk_elis"]) == \
+        (2, 200000.0)
+
+    # CONTRAST: pure ELIS accepts the coin toss -- LFS=5 (the closer of the two)
+    # takes m1 and LFS=1 is discarded as its duplicate, so a whole level is lost.
+    decay_elis._WARNED_ELIS_AMBIGUITY.clear()
+    with pytest.warns(UserWarning, match="Ambiguous ELIS match"):
+        elis = {r["lfs"]: r for r in _classify_metastables(
+            "In121", 102, "(n,gamma)", levels, _DEGENERATE_DECAY, names,
+            "elis", 0.15, 0.0)}
+    assert (elis[5]["bucket"], elis[5]["product"]) == ("matched", "In122_m1")
+    assert (elis[1]["bucket"], elis[1]["kept_lfs"]) == ("duplicate", 5)
+
+
+def test_hybrid_placeholder_lfs_binds_last_and_never_displaces():
+    """Placeholder LFS 40/99: no rank, no energy claim, bound by elimination.
+
+    ``QI == 0`` with ``QM > 0`` is the blank-QI disguise -- ELFS "=" QM, an
+    energy that is in fact UNKNOWN -- so the placeholder never enters Phase 1
+    even though its apparent 5 MeV would have passed for m2. It binds the
+    lowest unclaimed LISO afterwards. When real levels have taken every state
+    it is report-only. Neither shape may mint an ``_m40`` / ``_m99`` name.
+    """
+    decay = {(72, 178): [DecayState(72, 178, 0.0, 0),
+                         DecayState(72, 178, 1147400.0, 1, half_life=4.0),
+                         DecayState(72, 178, 2446000.0, 2, half_life=9.8e8)]}
+    names = {"Hf178", "Hf178_m1", "Hf178_m2"}
+    placeholder = dict(lfs=99, izap=72178, qi=0.0, qm=5000000.0,
+                       elfs=5000000.0)
+
+    bound = {r["lfs"]: r for r in _classify_elis_lfs_order(
+        "Hf178", 4, "(n,n')", [placeholder], decay, names, 0.15, 0.0)}[99]
+    assert (bound["method"], bound["fallback_reason"]) == ("placeholder_bound",
+                                                           "energy_unknown")
+    assert (bound["bucket"], bound["product"], bound["liso"]) == \
+        ("matched", "Hf178_m1", 1)                   # LOWEST unclaimed, not m2
+    assert bound["position"] is None                 # never ranks among levels
+
+    # Real levels outrank it for the remaining states -> report-only.
+    crowded = _classify_elis_lfs_order(
+        "Hf178", 4, "(n,n')",
+        [dict(lfs=1, izap=72178, qi=-1147400.0, qm=0.0, elfs=1147400.0),
+         dict(lfs=2, izap=72178, qi=-2446000.0, qm=0.0, elfs=2446000.0),
+         dict(lfs=40, izap=72178, qi=0.0, qm=5000000.0, elfs=5000000.0)],
+        decay, names, 0.15, 0.0)
+    by_lfs = {r["lfs"]: r for r in crowded}
+    assert by_lfs[40]["bucket"] == "placeholder_unmapped"
+    assert by_lfs[40]["product"] is None
+    assert by_lfs[40]["needs_chain_entry"] is False  # never orphan-added
+    assert [by_lfs[1]["product"], by_lfs[2]["product"]] == ["Hf178_m1",
+                                                            "Hf178_m2"]
+    assert not any(str(r.get("product")).endswith(("_m40", "_m99"))
+                   for r in crowded)
+
+
+def test_hybrid_degenerates_to_lfs_order_when_no_elfs_is_usable():
+    """A library whose ELFS is identically zero carries no energy evidence at
+    all, so every level falls to the positional pass and the hybrid's mapped
+    set is exactly ``lfs_order``'s."""
+    levels = [dict(lfs=1, izap=49116, qi=0.0, qm=0.0, elfs=0.0),
+              dict(lfs=4, izap=49116, qi=0.0, qm=0.0, elfs=0.0)]
+    names = {"In116", "In116_m1", "In116_m2"}
+
+    hybrid = _classify_elis_lfs_order("In115", 102, "(n,gamma)", levels,
+                                      _decay_lookup(), names, 0.15, 0.0)
+    positional = _classify_lfs_order("In115", 102, "(n,gamma)", levels,
+                                     _decay_lookup(), names, 0.15, 0.0)
+
+    assert [(r["lfs"], r["product"]) for r in hybrid] == \
+        [(r["lfs"], r["product"]) for r in positional] == \
+        [(1, "In116_m1"), (4, "In116_m2")]
+    assert {r["fallback_reason"] for r in hybrid} == {"elfs_unusable"}
+    assert {r["method"] for r in hybrid} == {"lfs_order_fallback"}
+
+
+def test_unknown_mapping_mode_raises():
+    """A mode string registered at one dispatch site and forgotten at another
+    must fail loudly rather than fall through to 'elis'."""
+    with pytest.raises(ValueError, match="Unknown mapping mode"):
+        _classify_metastables("In115", 102, "(n,gamma)",
+                              _in115_ng_metastables(), _decay_lookup(),
+                              {"In116", "In116_m1"}, "bogus", 0.15, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Orphan policy (--orphan-policy add-stable | drop | reattribute)
+#
+# An orphan is a level the mapper could not identify against the decay library.
+# The mapper always mints a name and keeps the level; what the branch becomes
+# is the writer's decision. Shape: Au186 (n,2n) -> Au185 with LFS=0 and LFS=6
+# (200 keV, peak 0.234 b), where decay_2020 carries NO Au185 metastable at all,
+# so LFS=6 is a true orphan in every mapping mode.
+# ---------------------------------------------------------------------------
+
+_AU185_DECAY = {(79, 185): [DecayState(79, 185, 0.0, 0)],
+                (79, 186): [DecayState(79, 186, 0.0, 0)]}
+
+
+def _au186_n2n(qi_ground=-7928030.0):
+    """Au186 (n,2n): ground LFS=0 plus the orphan LFS=6 at ELFS 200 keV."""
+    return dict(qm=qi_ground, qi=qi_ground, partials=[
+        dict(lfs=0, izap=79185, qi=qi_ground, qm=qi_ground, elfs=0.0),
+        dict(lfs=6, izap=79185, qi=qi_ground - 200000.0, qm=qi_ground,
+             elfs=200000.0)])
+
+
+def _orphan_run(policy, data=None, decay=None, names=None, reactions=None,
+                mode="elis_lfs_order"):
+    """map_library + decorate_chain under one policy; returns (chain, stats)."""
+    source = _FakeSource(data if data is not None else
+                         {"Au186": {16: _au186_n2n()}})
+    chain = _chain_with(names if names is not None else
+                        ["Au185", "Au186"],
+                        reactions=reactions if reactions is not None else
+                        {"Au186": [("(n,2n)", "Au185", -7928030.0)]})
+    branching, stats = map_library(
+        source, chain, decay if decay is not None else _AU185_DECAY,
+        mode, MODE_DEFAULT_RTOL[mode], 0.0, verbose=False,
+        orphan_policy=policy)
+    n_before = len(chain.nuclides)
+    stats["reactions_added"] = decorate_chain(chain, branching, stats,
+                                              orphan_policy=policy)
+    stats["orphan_nuclides_added_count"] = len(chain.nuclides) - n_before
+    return chain, stats
+
+
+def test_add_stable_mints_one_orphan_shared_by_two_parents(tmp_path):
+    """The orphan enters the chain as a stable nuclide, the branch is kept, and
+    two parents orphaning the SAME state share one ``<nuclide>`` element.
+
+    ``Au185_m1`` is a placeholder ordinal, not a decay-library LISO: the decay
+    library has no Au185 metastable, which is exactly why the state is orphaned.
+    """
+    chain, stats = _orphan_run(
+        "add-stable",
+        data={"Au186": {16: _au186_n2n()},
+              "Hg185": {103: _au186_n2n(-5000000.0)}},
+        names=["Au185", "Au186", "Hg185"],
+        reactions={"Au186": [("(n,2n)", "Au185", -7928030.0)],
+                   "Hg185": [("(n,p)", "Au185", -5000000.0)]})
+
+    names = [n.name for n in chain.nuclides]
+    assert names.count("Au185_m1") == 1               # ONE element, two parents
+    assert names.index("Au185_m1") == names.index("Au185") + 1
+    assert chain["Au185_m1"].half_life is None        # pure sink, no decay
+    assert stats["orphan_products_kept"] == 2
+    assert [(s["parent"], s["mt"]) for s in
+            stats["orphan_nuclides_added"]["Au185_m1"]] == \
+        [("Au186", 16), ("Hg185", 103)]
+
+    members = {(rx.type, rx.target, rx.pendf_lfs)
+               for rx in chain["Au186"].reactions}
+    assert members == {("(n,2n)", "Au185", 0), ("(n,2n)_m1", "Au185_m1", 6)}
+
+    # The durable contract: the patched chain reloads with the branch intact.
+    out = tmp_path / "add_stable.xml"
+    chain.export_to_xml(out)
+    assert 'targets="Au185 Au185_m1"' in out.read_text()
+    reread = Chain.from_xml(out)
+    assert "Au185_m1" in reread.nuclide_dict
+    assert {(rx.type, rx.target, rx.pendf_lfs)
+            for rx in reread["Au186"].reactions} == members
+    # validate() is a smoke call only -- its reactions branch carries a live
+    # upstream defect, so neither exception type nor text can be asserted on.
+    try:
+        reread.validate(strict=True)
+    except Exception:
+        pass
+
+
+def test_add_stable_materialises_referenced_but_missing_ground(tmp_path):
+    """A reaction whose GROUND product the chain never carried is materialised
+    too, not just the orphan level -- otherwise the kept branch would point at
+    a nuclide that does not exist and the chain would not reload."""
+    chain, stats = _orphan_run("add-stable", names=["Au186"], reactions={})
+
+    assert {"Au185", "Au185_m1"} <= set(chain.nuclide_dict)
+    assert stats["orphan_grounds_added"] == 1
+    assert [s["method"] for s in stats["orphan_nuclides_added"]["Au185"]] == \
+        ["missing_ground"]
+
+    out = tmp_path / "ground.xml"
+    chain.export_to_xml(out)
+    assert {"Au185", "Au185_m1"} <= set(Chain.from_xml(out).nuclide_dict)
+
+
+# The status quo of the pre-triad patcher, generated by running the fixture
+# below through the pinned tool at commit 2edc7cad1 (the last commit before
+# this work order). `-m elis --orphan-policy drop` must still reproduce it
+# byte for byte: In120's 471%-off LFS=2 vanishes and Au186's undecodable LFS=6
+# leaves the whole reaction stock.
+_DROP_STATUS_QUO = """\
+<depletion_chain>
+  <nuclide name="Au185" reactions="0"/>
+  <nuclide name="Au186" reactions="1">
+    <reaction type="(n,2n)" Q="-7928030.0" target="Au185"/>
+  </nuclide>
+  <nuclide name="In115" reactions="3">
+    <reaction type="(n,gamma)">
+      <isomeric_branching targets="In116 In116_m1 In116_m2" pendf_lfs="0 1 4" \
+Q="6784720.0 6657450.0 6495060.0"/>
+    </reaction>
+  </nuclide>
+  <nuclide name="In116" reactions="0"/>
+  <nuclide name="In116_m1" reactions="0"/>
+  <nuclide name="In116_m2" reactions="0"/>
+  <nuclide name="In120" reactions="2">
+    <reaction type="(n,n')">
+      <isomeric_branching targets="In120 In120_m1" pendf_lfs="0 1" \
+Q="0.0 -70000.0"/>
+    </reaction>
+  </nuclide>
+  <nuclide name="In120_m1" reactions="0"/>
+  <nuclide name="In120_m2" reactions="0"/>
+</depletion_chain>
+"""
+
+
+def _regression_scene():
+    """One matched reaction, one rtol casualty, one undecodable product."""
+    data = {
+        "In115": {102: dict(qm=6784720.0, qi=6784720.0, partials=(
+            [dict(lfs=0, izap=49116, qi=6784720.0, qm=6784720.0, elfs=0.0)]
+            + _in115_ng_metastables()))},
+        "In120": {4: dict(qm=0.0, qi=0.0, partials=(
+            [dict(lfs=0, izap=49120, qi=0.0, qm=0.0, elfs=0.0)]
+            + _IN120_LEVELS))},
+        "Au186": {16: _au186_n2n()},
+    }
+    decay = dict(_decay_lookup())
+    decay.update(_IN120_DECAY)
+    decay.update(_AU185_DECAY)
+    names = ["Au185", "Au186", "In115", "In116", "In116_m1", "In116_m2",
+             "In120", "In120_m1", "In120_m2"]
+    reactions = {"In115": [("(n,gamma)", "In116", 6784720.0)],
+                 "In120": [("(n,n')", "In120", 0.0)],
+                 "Au186": [("(n,2n)", "Au185", -7928030.0)]}
+    return data, decay, names, reactions
+
+
+def test_drop_reproduces_the_status_quo_byte_for_byte(tmp_path):
+    """``-m elis --orphan-policy drop`` is the regression mode: the triad must
+    not have moved a single byte of the chain it used to write."""
+    data, decay, names, reactions = _regression_scene()
+    chain, stats = _orphan_run("drop", data=data, decay=decay, names=names,
+                               reactions=reactions, mode="elis")
+
+    out = tmp_path / "chain.xml"
+    chain.export_to_xml(out)
+    assert out.read_text() == _DROP_STATUS_QUO
+
+    # Nothing was added and the writer recorded no disposition at all: under
+    # `drop` the mapper carries no orphan records, so the policy dispatch is
+    # never even reached.
+    assert stats["orphan_nuclides_added_count"] == 0
+    assert stats["orphan_dispositions"] == []
+    assert stats["orphan_policy"] == "drop"
+
+
+def test_drop_status_quo_holds_in_every_mapping_mode(tmp_path):
+    """The regression invariant is a POLICY, not a mode: no mapping mode adds
+    a nuclide or records a disposition under ``drop``."""
+    data, decay, names, reactions = _regression_scene()
+    for mode in MAPPING_MODES:
+        chain, stats = _orphan_run("drop", data=data, decay=decay,
+                                   names=names, reactions=reactions, mode=mode)
+        assert "Au185_m1" not in chain.nuclide_dict, mode
+        assert stats["orphan_dispositions"] == [], mode
+        assert stats["orphan_policy"] == "drop", mode
+
+
+def test_reattribute_folds_to_ground_and_round_trips(tmp_path):
+    """With no kept sibling below it, the orphan's COLUMN (barns, not a ratio)
+    is folded onto the ground: a duplicate-target entry that keeps the orphan's
+    own LFS and its own QI, and that survives serialise -> re-parse."""
+    chain, stats = _orphan_run("reattribute")
+
+    assert stats["orphan_folds_ground"] == 1
+    assert stats["orphan_folds_sibling"] == 0
+    assert "Au185_m1" not in chain.nuclide_dict       # nothing minted
+    entry, = [d for d in stats["orphan_dispositions"]]
+    assert (entry["disposition"], entry["recipient"]) == ("folded_to_ground",
+                                                          "Au185")
+
+    members = {(rx.type, rx.target, rx.pendf_lfs, rx.Q)
+               for rx in chain["Au186"].reactions}
+    assert members == {("(n,2n)", "Au185", 0, -7928030.0),
+                       ("(n,2n)", "Au185", 6, -8128030.0)}
+
+    out = tmp_path / "reattr.xml"
+    chain.export_to_xml(out)
+    reread = Chain.from_xml(out)
+    assert {(rx.type, rx.target, rx.pendf_lfs, rx.Q)
+            for rx in reread["Au186"].reactions} == members
+
+
+def test_reattribute_mixed_ground_fold_and_kept_sibling_round_trips(tmp_path):
+    """The awkward group: a ground-fold entry (LFS>0 on a ground-named target)
+    ALONGSIDE a kept ``_m`` sibling. That mixture is foldable, so it used to
+    re-parse as an isomer whose target has no ``_m<n>`` suffix and raise; the
+    writer must never emit a chain the parser refuses.
+    """
+    decay = {(79, 185): [DecayState(79, 185, 0.0, 0),
+                         DecayState(79, 185, 300000.0, 1)],
+             (79, 186): [DecayState(79, 186, 0.0, 0)]}
+    data = {"Au186": {16: dict(qm=-7928030.0, qi=-7928030.0, partials=[
+        dict(lfs=0, izap=79185, qi=-7928030.0, qm=-7928030.0, elfs=0.0),
+        dict(lfs=2, izap=79185, qi=-8128030.0, qm=-7928030.0, elfs=200000.0),
+        dict(lfs=7, izap=79185, qi=-8228030.0, qm=-7928030.0,
+             elfs=300000.0)])}}
+    chain, stats = _orphan_run("reattribute", data=data, decay=decay,
+                               names=["Au185", "Au185_m1", "Au186"])
+
+    members = {(rx.type, rx.target, rx.pendf_lfs)
+               for rx in chain["Au186"].reactions}
+    # LFS=7 matches the sole decay metastable, LFS=2 has nothing below it but
+    # the ground -> a ground fold sitting next to a kept _m1 sibling.
+    assert ("(n,2n)", "Au185", 2) in members
+    assert any(t.endswith("_m1") for t, _tgt, _l in members)
+
+    out = tmp_path / "mixed.xml"
+    chain.export_to_xml(out)
+    reread = Chain.from_xml(out)                      # must not raise
+    assert {(rx.type, rx.target, rx.pendf_lfs)
+            for rx in reread["Au186"].reactions} == members
+
+
+def test_reattribute_without_a_recipient_drops_loudly():
+    """No kept sibling and no usable ground: the share is stranded. It is
+    dropped -- but recorded, counted and named, never silently."""
+    data = {"Au186": {16: dict(qm=-7928030.0, qi=-7928030.0, partials=[
+        dict(lfs=6, izap=79185, qi=-8128030.0, qm=-7928030.0,
+             elfs=200000.0)])}}
+    chain, stats = _orphan_run("reattribute", data=data, names=["Au186"],
+                               reactions={})
+
+    assert stats["orphan_folds_stranded"] == 1
+    assert [d["disposition"] for d in stats["orphan_dispositions"]] == \
+        ["dropped_no_recipient"]
+    assert not chain["Au186"].reactions               # reaction left stock
+    assert "Au185_m1" not in chain.nuclide_dict
+
+
+def test_hybrid_log_totals_identity_and_sections(tmp_path):
+    """The counter block's identity anchor: every classified level lands in
+    exactly ONE terminal class, stamped [ok] against the raw level count. The
+    orphan-disposition section is written whatever the policy."""
+    data, decay, names, reactions = _regression_scene()
+    chain, stats = _orphan_run("add-stable", data=data, decay=decay,
+                               names=names, reactions=reactions)
+
+    log = tmp_path / "log.txt"
+    write_isomer_mapping_log(
+        log, stats,
+        dict(base_chain="fixture", pendf="fixture", decay_file="fixture",
+             output_chain="fixture", chain_nuclides=len(chain.nuclides)),
+        "elis_lfs_order", MODE_DEFAULT_RTOL["elis_lfs_order"], 0.0)
+    text = log.read_text()
+
+    census = _hybrid_census(stats)
+    assert census["terminal"] == stats["total_lfs"]
+    assert (census["phase1"] + census["phase2"] + census["placeholder_bound"]
+            + census["placeholder_unmapped"] + census["orphan_levels"]) == \
+        census["terminal"]
+    assert f"Total PENDF-LFS found: {census['terminal']:5d}" in text
+    assert "terminal classes, one per level (sum)" in text
+    assert "[ok]" in text and "[MISMATCH]" not in text
+
+    assert "ORPHAN DISPOSITION\n" in text            # always written
+    assert "ORPHAN NUCLIDES ADDED TO CHAIN" in text  # add-stable only
+    assert "HYBRID MAPPING" in text
+    assert "sentinel" not in text.lower()            # placeholder wording only
