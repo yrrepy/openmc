@@ -287,6 +287,43 @@ def test_mt5_mf10_skipped_silently(tmp_path, capfd):
          (0, 0, _endf_floats(_MF10_L1))], mt=5) == []
 
 
+def test_mt18_mf10_discarded_silently(tmp_path, capfd):
+    """MF=10 MT=18 (fission) is dropped silently at parse, like MT=5.
+
+    IZAP=0 is the ENDF convention there (fission names no single residual;
+    products belong to the fission yields), so the section is a placeholder,
+    not a data defect -- no 'Retaining anonymous' warning. JEFF-3.3 CCFE-709
+    stores 46 sub-actinide threshold-fission channels exactly this way (MF=10
+    MT=18 only, no MF=3 MT=18); the PENDF pipeline drops them alike. Anonymous
+    subsections of other MTs must still warn and be retained."""
+    from openmc.exceptions import OpenMCError
+
+    gfile = tmp_path / 'Al27g.asc'
+    _write_gendf_mf10(gfile, _FULL_MF3, [
+        (18, _MF10_L0, 0, 0),        # fission placeholder: dropped
+        (102, _MF10_L1, 0, 1)])      # control: anonymous non-fission
+    lib = lib_gendf.GENDFLibrary(str(tmp_path), ENERGY_BOUNDS, 'test-3g')
+    assert lib._get_production_xs('Al27', 18) == []         # dropped at parse
+    cap = capfd.readouterr()
+    flat = ' '.join((cap.err + cap.out).split())            # undo line wrapping
+    assert 'MT=18' not in flat                              # fission: silent
+    assert 'Retaining anonymous (IZAP=0) MF=10 level' in flat   # control fires
+    assert 'MT=102 LFS=1' in flat
+
+    # Nothing served: no MF=3 MT=18 and the MF=10 section was discarded, so
+    # the Sigma(MF=10) fallback has nothing to sum (parity with PENDF, which
+    # never synthesizes an MT=18 total).
+    with pytest.raises(OpenMCError):
+        lib.get_xs('Al27', 18, ENERGY_BOUNDS)
+
+    # The anonymous control level is retained: LFS=1 under MT=102.
+    levels102 = lib._get_production_xs('Al27', 102)
+    assert [(lfs, izap) for lfs, izap, _ in levels102] == [(1, 0)]
+
+    # Python backend parity: MT=18 also returns [] (early return, like MT=5).
+    assert _python_production_xs([(0, 0, _endf_floats(_MF10_L0))], mt=18) == []
+
+
 def test_mf10_key_collision_drops_both(tmp_path, capfd):
     """Two MF=10 subsections of one MT sharing an LFS key warn once and are BOTH
     dropped -- never last-wins, which would silently pick an arbitrary product.

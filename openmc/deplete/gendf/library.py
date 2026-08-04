@@ -2505,8 +2505,10 @@ class _PythonGENDFLibrary:
         reactions carry partial-range MF=10 sections).
         """
         # MT=5 (lumped) carries many products sharing an LFS, so LFS-keyed
-        # retention is meaningless and no depletion pathway consumes it.
-        if mt == 5:
+        # retention is meaningless and no depletion pathway consumes it. MT=18
+        # (fission) names no single residual (IZAP=0 placeholder; products
+        # come from the fission yields); the PENDF pipeline drops both alike.
+        if mt in (5, 18):
             return []
 
         mf10_result = self._load_mf10_data(nuclide_name, mt)

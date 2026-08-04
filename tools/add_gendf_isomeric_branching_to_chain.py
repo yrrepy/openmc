@@ -78,8 +78,8 @@ SENTINEL_LFS = {
 # A few evaluations (JEFF-3.3 Am241 MT=102, Al27 MT=16/107) tag an MF=10
 # production subsection with IZAP=0, leaving the product nuclide unnamed while
 # the level itself stays keyed by LFS. The residual can be RE-DERIVED from the
-# reaction's deterministic (dA, dZ) shift, but only under the opt-in
-# --reattribute-mf10-noIZAP flag and only when EVERY anonymous subsection of the
+# reaction's deterministic (dA, dZ) shift, but only under the
+# --reattribute-mf10-noIZAP flag (default: on) and only when EVERY anonymous subsection of the
 # reaction clears the C1-C4 evidence gate below. Otherwise the reaction's ENTIRE
 # isomeric decoration is pruned and the plain MF=3 route to the default target
 # is kept: decorating the attributed subset alone would hand 100% of the rate to
@@ -546,8 +546,8 @@ def build_parser():
 
     parser.add_argument('--audit-emax',               type=float,          default=2.0e7, help='Cap the MF=10-vs-MF=3 consistency audit at E <= this many eV (default: 2.0e7; MF=10 partials legitimately stop near 30 MeV while MF=3 runs higher)')
     parser.add_argument('--mf10-reject-band-ratio',   type=float,          default=None,  help='Leave a reaction stock (no isomeric branching) when any DEFINED lethargy band has ratio-1 > X, over-summing ONLY; under-summing never rejects (it is the radioactive-products-only MF=10 signature: an absent stable ground or anonymous levels missing from the partials). Default: None = audit only, reject nothing. GENDF-SPECIFIC NOTE: band-ratio deviations are HARMLESS if common-mode (small BR-spread) on the GENDF ratio path, since the runtime applies partial/Sum(partials) ratios to an MF=3 rate; this gate stays OFF by default.')
-    parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=True,  help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: off; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
-    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: off. OFF, or ANY anonymous subsection failing the gate, prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
+    parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=True,  help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: on; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
+    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: on. ANY anonymous subsection failing the gate prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere.')
 
     return parser
 

@@ -497,9 +497,11 @@ GENDFParseResult parse_gendf_validated(
 
           // MT=5 (lumped (n,anything)) carries many products that all have
           // LFS=0 — they would collide on the MT*1000+LFS key — and no
-          // depletion pathway consumes MT=5. Expected library structure, not
-          // a data defect: discard silently.
-          if (current_mt == 5) {
+          // depletion pathway consumes MT=5. MT=18 (fission) names no single
+          // residual (IZAP=0 placeholder; products belong to the fission
+          // yields), and the PENDF pipeline drops both alike. Expected library
+          // structure, not a data defect: discard silently.
+          if (current_mt == 5 || current_mt == 18) {
             mf10_discard = true;
           } else if (mf10_current_izap == 0) {
             // Anonymous product: reaction+LFS is still a complete key, so keep
