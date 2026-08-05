@@ -378,20 +378,40 @@ def _dedupe_mf10_partials(partials, source_name, name, mt):
     return unique
 
 
-def _synthesize_mf10_total(unique):
+# How far an LFS=0 partial's own QI may sit from its section QM (eV) before the
+# ground-state invariant ELFS = QM - QI = 0 counts as violated. The gate is
+# tight because a clean subsection head carries the SAME number in both fields
+# -- one record, no cross-file rounding to absorb (every JEFF-4.0 MT=4 LFS=0
+# stores ELFS exactly 0.0). The smallest genuine defect in the TENDL-2019 fleet
+# is U235_m1 MT=4 at 76.77 eV, the U-235 first level standing in as parent, so a
+# looser gate would miss a whole shape. Deliberately NOT the GENDF twin's 1 keV
+# C4 tolerance: that one measures QM - QI against the DECAY library's ELIS, a
+# cross-source comparison with real rounding to tolerate.
+_LFS0_QI_QM_TOL_EV = 1.0
+
+
+def _synthesize_mf10_total(unique, context=None):
     """Synthesize a reaction total from its MF=10 partials alone.
 
     Used for an MF=10 section that has **no MF=3 sibling**: each event of the
     reaction ends in exactly one final state, so the sum over the (aligned)
     MF=10 partials *is* the reaction total. ``unique`` is the deduplicated
-    ``(QM, QI, IZAP, LFS, tab)`` sequence from :func:`_dedupe_mf10_partials`.
+    ``(QM, QI, IZAP, LFS, tab)`` sequence from :func:`_dedupe_mf10_partials`;
+    ``context`` labels the validation warning with the tape/nuclide/MT.
 
     Returns ``(energy, xs, QM, QI)``: the union of every partial's energy grid,
     the pointwise sum of the partials interpolated onto it with zero fill
     outside their own range (exact -- every partial is lin-lin, see
     :func:`_check_lin_lin`), and the section-sourced Q values. QM is the
-    partials' shared section QM; QI is the LFS=0 partial's QI when the section
-    has one (ELFS = 0 there, so QI == QM) and QM otherwise -- **no Q value is
+    section QM read off the LFS=0 partial when the section has one (the ground
+    subsection is the section's zero reference -- the same head the patcher's
+    ground-route Q and pathway-Q gate probe read) and off the first partial
+    otherwise; QI is that same QM by the ground-state definition
+    ELFS = QM - QI = 0. The LFS=0 partial's own QM/QI pair is VALIDATED
+    (:data:`_LFS0_QI_QM_TOL_EV`, warned on violation) and its QI never
+    inherited -- TENDL-2019 MT=4 writes the reaction QI there on ground targets
+    and a blank QI on isomer targets, either of which would put the ground route
+    on a different energy zero than the level it is the base of. **No Q value is
     ever fabricated**, there being no MF=3 HEAD to read them from.
 
     Shared verbatim by the HDF5 build (:meth:`PendfLibrary.from_endf_directory`)
@@ -407,10 +427,16 @@ def _synthesize_mf10_total(unique):
                             np.asarray(ptab.y, dtype=np.float64),
                             left=0.0, right=0.0)
 
-    qm = float(unique[0][0])
-    qi = next((float(pqi) for _pqm, pqi, _izap, lfs, _pt in unique if lfs == 0),
-              qm)
-    return energy, xs, qm, qi
+    lfs0 = next(((float(pqm), float(pqi))
+                 for pqm, pqi, _izap, lfs, _pt in unique if lfs == 0), None)
+    qm = lfs0[0] if lfs0 is not None else float(unique[0][0])
+    if lfs0 is not None and abs(lfs0[0] - lfs0[1]) > _LFS0_QI_QM_TOL_EV:
+        warn(f"{context or 'MF=10 total synthesis'}: LFS=0 partial QI="
+             f"{lfs0[1]} disagrees with section QM={qm}; using QM as the "
+             f"ground-route Q, a ground-state subsection having ELFS = 0 "
+             f"(TENDL-2019 MT=4 convention: reaction QI on ground targets, "
+             f"blank QI on isomer targets).")
+    return energy, xs, qm, qm
 
 
 def _write_mf10_partials(mtg, ev, mt, name, path, unique=None):
@@ -1086,7 +1112,8 @@ class PendfLibrary:
                                      f"MF=3 section and no usable partial; "
                                      f"nothing stored.")
                                 continue
-                            energy, xs, QM, QI = _synthesize_mf10_total(unique)
+                            energy, xs, QM, QI = _synthesize_mf10_total(
+                                unique, f"{path.name}: {name} MT={mt}")
                             mtg = nuc.create_group(f'MT{mt}')
                             mtg.attrs['QM'] = QM
                             mtg.attrs['QI'] = QI
@@ -1614,7 +1641,8 @@ class PendfTapeLibrary:
                     list(_iter_mf10_partials(ev, mt, name)), path.name, name, mt)
                 if not unique:
                     continue
-                energy, xs, _qm, _qi = _synthesize_mf10_total(unique)
+                energy, xs, _qm, _qi = _synthesize_mf10_total(
+                    unique, f"{path.name}: {name} MT={mt}")
                 partials = {}
                 for _pqm, _pqi, izap, lfs, ptab in unique:
                     partials[(int(lfs), int(izap))] = (
