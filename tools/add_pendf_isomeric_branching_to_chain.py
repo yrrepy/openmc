@@ -391,18 +391,57 @@ def _h5_attr_text(attrs, key):
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def _mf10_only_qm_qi(partials):
+# How far an LFS=0 partial's own QI may sit from its section QM (eV) before the
+# ground-state invariant ELFS = QM - QI = 0 counts as violated. The gate is
+# tight because a clean subsection head carries the SAME number in both fields
+# -- one record, no cross-file rounding to absorb (every JEFF-4.0 MT=4 LFS=0
+# stores ELFS exactly 0.0). The smallest genuine defect in the TENDL-2019 fleet
+# is U235_m1 MT=4 at 76.77 eV, the U-235 first level standing in as parent, so a
+# looser gate would miss a whole shape. Deliberately NOT the GENDF twin's 1 keV
+# C4 tolerance: that one measures QM - QI against the DECAY library's ELIS, a
+# cross-source comparison with real rounding to tolerate.
+_LFS0_QI_QM_TOL_EV = 1.0
+
+
+def _ground_route_q(ground, context):
+    """The ground-route Q of an MF=10 reaction: its LFS=0 partial's section QM.
+
+    A ground-state subsection is the product's own zero level, so ELFS = QM - QI
+    = 0 holds there by definition and QM *is* the route's Q. The partial's
+    tabulated QI is VALIDATED against QM (:data:`_LFS0_QI_QM_TOL_EV`) and warned
+    about on violation rather than trusted: TENDL-2019 MT=4 writes the reaction
+    QI in that field on ground targets and leaves it blank on isomer targets,
+    either of which would put the ground route on a different energy zero than
+    the metastable levels measured from it. Both numbers come out of the same
+    subsection head, so nothing is fabricated either way.
+    """
+    qm = float(ground['qm'])
+    qi = float(ground['qi'])
+    if abs(qm - qi) > _LFS0_QI_QM_TOL_EV:
+        print(f"  WARNING: {context}: LFS=0 partial QI={qi} disagrees with "
+              f"section QM={qm}; using QM as the ground-route Q, a "
+              f"ground-state subsection having ELFS = 0 (TENDL-2019 MT=4 "
+              f"convention: reaction QI on ground targets, blank QI on isomer "
+              f"targets).", file=sys.stderr)
+    return qm
+
+
+def _mf10_only_qm_qi(partials, context=None):
     """``(QM, QI)`` of a reaction whose Q values must come from MF=10 itself.
 
     An MF=10 section with no MF=3 sibling has no HEAD record to read Q values
     from, so they are taken from the partials, matching what the HDF5 builder
-    stores (``openmc.data.pendf._synthesize_mf10_total``): QM is the partials'
-    shared section QM and QI is the LFS=0 partial's QI when the section has one
-    (ELFS = 0 there, so QI == QM), else QM. No Q value is ever fabricated.
+    stores (``openmc.data.pendf._synthesize_mf10_total``): QM is the section
+    QM, read off the LFS=0 partial when the section has one and off the first
+    partial otherwise, and QI is that same QM -- a ground-state subsection has
+    ELFS = QM - QI = 0, so the two are one number. The LFS=0 partial's own QI is
+    validated by :func:`_ground_route_q` and never inherited. No Q value is ever
+    fabricated.
     """
-    qm = float(partials[0]['qm'])
-    qi = next((float(p['qi']) for p in partials if p['lfs'] == 0), qm)
-    return qm, qi
+    ground = next((p for p in partials if p['lfs'] == 0), None)
+    qm = (_ground_route_q(ground, context or 'MF=10-only section')
+          if ground is not None else float(partials[0]['qm']))
+    return qm, qm
 
 
 class _H5Source:
@@ -615,7 +654,7 @@ class _AscSource:
                         self._record_mf10_without_mf3(ev, name, mt)
                         continue
                     # No MF=3 HEAD to read Q from: MF=10 sources them.
-                    qm, qi = _mf10_only_qm_qi(partials)
+                    qm, qi = _mf10_only_qm_qi(partials, f"{name} MT={mt}")
                 reactions[mt] = dict(qm=float(qm), qi=float(qi),
                                      partials=partials, mf3_less=mf3_less)
             self._data[name] = reactions
@@ -2207,9 +2246,11 @@ def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row,
 
     Target resolution follows the existing synthesized-ground path (the
     reaction's ``(dA, dZ)`` shift, :func:`_ground_product`) and Q is the LFS=0
-    partial's QI -- section-sourced, never fabricated. Returns 1 when a reaction
-    was appended, else 0 (an already-present reaction type or an unresolvable /
-    off-chain target is skipped and counted).
+    partial's QM -- equally section-sourced, never fabricated, and the only
+    field a ground state's ELFS = 0 leaves defined; the partial's own QI is
+    validated by :func:`_ground_route_q` and written nowhere. Returns 1 when a
+    reaction was appended, else 0 (an already-present reaction type or an
+    unresolvable / off-chain target is skipped and counted).
 
     ``orphan_names`` is the ``--orphan-policy add-stable`` roll call. A target
     present ONLY because the policy materialised it for some OTHER reaction is
@@ -2232,7 +2273,8 @@ def _emit_mf10_only_ground(nuc, chain, z, a, r_name, info, book, row,
         _mf10_only_note(book, row, 'skipped_orphan_only_target',
                         target=daughter)
         return 0
-    q = float(info['ground']['qi'])
+    q = _ground_route_q(info['ground'],
+                        f"{nuc.name} {r_name} MT={info.get('mt')}")
     nuc.add_reaction(r_name, daughter, q, 1.0)
     _mf10_only_note(book, row, 'emitted_ground_only', target=daughter, q=q)
     return 1
@@ -2653,7 +2695,19 @@ def decorate_chain(chain, branching, stats=None, orphan_policy='drop'):
                         # (still folds -- Phase 1 tolerates no LFS 0 entry).
                         ground = None
                     else:
-                        gq = info['ground']['qi'] if info['ground'] else info['qm']
+                        # A ground route's Q is the section QM: the LFS=0
+                        # subsection IS the product's zero level, so ELFS = 0
+                        # there and QI carries no independent information. The
+                        # (n,n') branch above writes the literal 0.0 for the
+                        # same reason, and the pathway-Q gate probes this same
+                        # QM (:func:`_pathway_q_file_ground_qm`). The tabulated
+                        # QI is validated, not trusted -- TENDL-2019 MT=4 puts
+                        # the reaction QI there on ground targets and a blank QI
+                        # on isomer targets.
+                        gq = (_ground_route_q(
+                                  info['ground'],
+                                  f"{parent} {r_name} MT={info.get('mt')}")
+                              if info['ground'] else info['qm'])
                         ground = ReactionTuple(r_name, daughter, float(gq),
                                                1.0, 0)
                 reactions_added += 1
