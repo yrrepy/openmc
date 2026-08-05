@@ -1326,7 +1326,7 @@ def _emit_shapes_source():
 
 def test_emit_flag_on_three_shapes(tmp_path):
     # Flag ON: the ground-only MT becomes a PLAIN reaction (no branching child,
-    # Q = the LFS=0 partial's QI), the ground+metastable MT decorates normally
+    # Q = the LFS=0 partial's QM), the ground+metastable MT decorates normally
     # with real section-sourced Q values, and the metastable-only MT folds with
     # metastable members only. Counters reconcile.
     chain = _chain_with(["In115", "In113", "In114", "In114_m1", "Ag111",
@@ -1442,7 +1442,7 @@ def test_emit_flag_on_tape_source_serves_and_audits_vacuously(tmp_path,
     rxns = source.reactions("In115")
     assert sorted(rxns) == [16, 17, 102]             # both MF=10-only MTs served
     assert rxns[16]["mf3_less"] is True and rxns[102]["mf3_less"] is False
-    # QM = section QM, QI = the LFS=0 partial's QI; never fabricated.
+    # Both are the section QM (ELFS = 0 at the ground state); never fabricated.
     assert (rxns[16]["qm"], rxns[16]["qi"]) == (-9.0e6, -9.0e6)
 
     energy, xs = source.total_xs("In115", 16)
@@ -1572,6 +1572,198 @@ def test_emit_name_colliding_mts_reconcile(tmp_path):
     assert "MISMATCH" not in text
     assert "= 2 = 1 + 1" in text
     assert "superseded by another MT (MT=875)" in text
+
+
+# ---------------------------------------------------------------------------
+# Ground-state invariant on the LFS=0 partial (ELFS = QM - QI = 0)
+# ---------------------------------------------------------------------------
+
+# Real MF=10 MT=4 subsection heads, read 2026-08-04 from the production
+# libraries in data/byPerry_v1: TENDL2019-IST_decay2020.293K.PENDF.h5 and
+# JEFF40-IST.293K.PENDF.h5. TENDL-2019 breaks the ground-state invariant in two
+# shapes -- the reaction QI written into an LFS=0 head on a ground target
+# (Ag107), a blank QI on an isomer target (Ag107_m1, and U235_m1 at the fleet's
+# smallest genuine offset, 76.77 eV) -- while U235 and the whole JEFF-4.0 MT=4
+# fleet (Ir191, 146 LFS=0 partials, every one storing ELFS exactly 0.0) are
+# clean. A clean head repeats ONE number in both fields, which is why the guard
+# tolerance is 1 eV rather than the GENDF twin's 1 keV C4 value.
+_MT4_HEADS = {
+    "Ag107":    [dict(lfs=0, izap=47107, qm=0.0, qi=-93125.0, elfs=93125.0),
+                 dict(lfs=1, izap=47107, qm=0.0, qi=-93125.0, elfs=93125.0)],
+    "Ag107_m1": [dict(lfs=0, izap=47107, qm=93124.9, qi=0.0, elfs=93124.9),
+                 dict(lfs=1, izap=47107, qm=93124.9, qi=-0.13411,
+                      elfs=93125.03411)],
+    "U235_m1":  [dict(lfs=0, izap=92235, qm=76.7708, qi=0.0, elfs=76.7708),
+                 dict(lfs=1, izap=92235, qm=76.7708, qi=-0.229214,
+                      elfs=77.000014)],
+    "U235":     [dict(lfs=0, izap=92235, qm=0.0, qi=0.0, elfs=0.0),
+                 dict(lfs=1, izap=92235, qm=0.0, qi=-77.0, elfs=77.0)],
+    "Ir191":    [dict(lfs=0, izap=77191, qm=0.0, qi=0.0, elfs=0.0),
+                 dict(lfs=3, izap=77191, qm=0.0, qi=-171290.0, elfs=171290.0),
+                 dict(lfs=72, izap=77191, qm=0.0, qi=-2201000.0,
+                      elfs=2201000.0)],
+}
+_MT4_DEFECTIVE = ("Ag107", "Ag107_m1", "U235_m1")
+_QI_COMPLAINT = "LFS=0 partial QI="
+
+# The defect shape used wherever a test needs a reaction that actually REACHES
+# the ground-route code: on real data all 1069 offenders sit on MT=4, which
+# decorate_chain routes through its (n,n') branches instead, so the Ag107_m1
+# head is transplanted onto another MT. Its QM and its tabulated QI are 93 keV
+# apart, so the two candidate Q values can never be confused.
+_DEFECTIVE_GROUND_QM = 93124.9
+
+
+def _defective_ground(izap):
+    """An LFS=0 partial carrying the real Ag107_m1 MT=4 head on ``izap``."""
+    return dict(lfs=0, izap=izap, qm=_DEFECTIVE_GROUND_QM, qi=0.0,
+                elfs=_DEFECTIVE_GROUND_QM)
+
+
+@pytest.mark.parametrize("name", list(_MT4_HEADS))
+def test_mf10_only_qm_qi_ground_state_invariant(name, capsys):
+    # Both Q values of an MF=3-less reaction are the section QM: a ground-state
+    # subsection has ELFS = 0, so QM is the ground route's Q. On the TENDL-2019
+    # defectives the tabulated QI is warned about and dropped; on the clean
+    # tapes nothing is said because the two fields hold one number.
+    from add_pendf_isomeric_branching_to_chain import _mf10_only_qm_qi
+
+    partials = _MT4_HEADS[name]
+    qm, qi = _mf10_only_qm_qi(partials, f"{name} MT=4")
+    err = capsys.readouterr().err
+
+    assert (qm, qi) == (partials[0]["qm"], partials[0]["qm"])
+    assert (_QI_COMPLAINT in err) is (name in _MT4_DEFECTIVE)
+    if name in _MT4_DEFECTIVE:
+        assert f"{name} MT=4" in err
+        assert f"QI={partials[0]['qi']}" in err and f"QM={qm}" in err
+        assert "ground-route Q" in err and "ELFS = 0" in err
+
+
+def test_mf10_only_qm_qi_tolerance_floor(capsys):
+    # U235_m1 is 76.77 eV out -- the smallest genuine defect in the fleet, and
+    # the reason the gate is 1 eV: a regression to the GENDF C4 1 keV value
+    # would pass this section silently.
+    from add_pendf_isomeric_branching_to_chain import (_mf10_only_qm_qi,
+                                                       _LFS0_QI_QM_TOL_EV)
+
+    assert abs(76.7708 - 0.0) > _LFS0_QI_QM_TOL_EV
+    qm, qi = _mf10_only_qm_qi(_MT4_HEADS["U235_m1"], "U235_m1 MT=4")
+    assert (qm, qi) == (76.7708, 76.7708)
+    assert _QI_COMPLAINT in capsys.readouterr().err
+
+
+def _ground_only_emit_source(ground):
+    """Emit-lane source serving one ground-only MF=10-only MT: In115 (n,3n)."""
+    source = _FakeSource({"In115": {
+        _MF10_ONLY_MT: dict(qm=ground["qm"], qi=ground["qm"], mf3_less=True,
+                            partials=[ground])}})
+    source.emit_mf10_only = True
+    return source
+
+
+@pytest.mark.parametrize("ground, expect_warning", [
+    (_defective_ground(49113), True),
+    (dict(lfs=0, izap=49113, qm=_MF10_ONLY_Q, qi=_MF10_ONLY_Q, elfs=0.0),
+     False),
+])
+def test_emit_mf10_only_ground_writes_section_qm(ground, expect_warning,
+                                                 capsys):
+    # The plain ground reaction the emit lane appends carries the LFS=0
+    # partial's QM. Equally section-sourced as the QI it replaces, and the only
+    # one of the two a ground state leaves defined.
+    chain = _chain_with(["In115", "In113"])
+    source = _ground_only_emit_source(ground)
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    capsys.readouterr()                              # discard mapping chatter
+    stats["reactions_added"] = decorate_chain(chain, branching, stats)
+    err = capsys.readouterr().err
+
+    n3n = {rx.type: rx for rx in chain["In115"].reactions}["(n,3n)"]
+    assert (n3n.target, n3n.Q, n3n.pendf_lfs) == ("In113", ground["qm"], None)
+    assert stats["mf10_only"]["emitted_ground_only"] == 1
+    assert (_QI_COMPLAINT in err) is expect_warning
+    if expect_warning:
+        assert "In115 (n,3n) MT=17" in err
+
+
+def _synthesized_ground_scene(ground_qi):
+    """In115 (n,gamma) ABSENT from the base chain, with one mapped metastable.
+
+    The ground head is the real Ag107_m1 MT=4 defect (QM=93124.9, QI blank); the
+    m1 partial keeps In115's own 127270 eV ELFS -- the quantity that decides the
+    ELIS match -- re-based onto that QM, so the level still maps to In116_m1.
+    """
+    qm = _DEFECTIVE_GROUND_QM
+    return _FakeSource({"In115": {
+        102: dict(qm=qm, qi=qm, partials=[
+            dict(lfs=0, izap=49116, qm=qm, qi=ground_qi, elfs=qm - ground_qi),
+            dict(lfs=1, izap=49116, qm=qm, qi=qm - 127270.0,
+                 elfs=127270.0)])}})
+
+
+def test_decorate_synthesized_ground_uses_section_qm(capsys):
+    # decorate_chain's synthesized-ground branch: a reaction the base chain does
+    # not carry gets its ground member's Q from the LFS=0 partial's QM, so the
+    # ground route and the metastable levels measured off it share one energy
+    # zero. The mapped metastable's own QI is untouched.
+    chain = _chain_with(["In115", "In116", "In116_m1", "In116_m2"])
+    source = _synthesized_ground_scene(0.0)
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    capsys.readouterr()
+    added = decorate_chain(chain, branching, stats)
+    err = capsys.readouterr().err
+
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    assert added == 1
+    assert (rxns["(n,gamma)"].target, rxns["(n,gamma)"].Q,
+            rxns["(n,gamma)"].pendf_lfs) == ("In116", _DEFECTIVE_GROUND_QM, 0)
+    assert (rxns["(n,gamma)_m1"].target, rxns["(n,gamma)_m1"].Q) == \
+        ("In116_m1", _DEFECTIVE_GROUND_QM - 127270.0)
+    assert _QI_COMPLAINT in err
+    assert "In115 (n,gamma) MT=102" in err
+
+
+def test_decorate_synthesized_ground_clean_section_silent(capsys):
+    # Same scene with a sound LFS=0 head (QI == QM): identical ground Q, and
+    # not a word on stderr -- the guard costs a clean library nothing.
+    chain = _chain_with(["In115", "In116", "In116_m1", "In116_m2"])
+    source = _synthesized_ground_scene(_DEFECTIVE_GROUND_QM)
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    capsys.readouterr()
+    decorate_chain(chain, branching, stats)
+
+    rxns = {rx.type: rx for rx in chain["In115"].reactions}
+    assert rxns["(n,gamma)"].Q == _DEFECTIVE_GROUND_QM
+    assert _QI_COMPLAINT not in capsys.readouterr().err
+
+
+def test_clean_library_scenes_stay_silent(capsys):
+    # Regression sweep over the pre-existing clean scenes: the full fold
+    # round-trip, the three MF=10-only shapes and the orphan triad's Au186
+    # (n,2n) must not gain a single ground-state complaint.
+    chain = _chain_with(["In115", "In116", "In116_m1", "In116_m2"],
+                        reactions={"In115": [("(n,gamma)", "In116",
+                                              6784720.0)]})
+    source = _FakeSource({"In115": {
+        102: dict(qm=6784720.0, qi=6784720.0, partials=(
+            [dict(lfs=0, izap=49116, qi=6784720.0, qm=6784720.0, elfs=0.0)]
+            + _in115_ng_metastables()))}})
+    branching, stats = map_library(source, chain, _decay_lookup(),
+                                   "elis", 0.50, 0.0)
+    decorate_chain(chain, branching, stats)
+
+    shapes = _chain_with(["In115", "In113", "In114", "In114_m1", "Ag111",
+                          "Ag111_m1"])
+    branching, stats = map_library(_emit_shapes_source(), shapes,
+                                   _emit_decay_lookup(), "elis", 0.50, 0.0)
+    decorate_chain(shapes, branching, stats)
+
+    _orphan_run("add-stable")
+    assert _QI_COMPLAINT not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from openmc.data.pendf import (PendfLibrary, PendfTapeLibrary,
                                _iter_mf10_partials, _synthesize_mf10_total,
                                _write_mf10_partials,
                                _identity_from_evaluation, tape_identity,
-                               _TENDL_RE)
+                               _LFS0_QI_QM_TOL_EV, _TENDL_RE)
 
 _CHAIN_SIMPLE = Path(__file__).parents[1] / "chain_simple.xml"
 from openmc.data.endf import Evaluation, get_head_record, get_tab1_record
@@ -1115,7 +1115,8 @@ def _spliced_tape_dir(tmp_path, name, dirname="spliced", **splice):
 def test_synthesize_mf10_total_union_grid():
     # The synthesized total is the sum of the partials on the UNION of their
     # grids, each partial zero-filled outside its own range, with Q values taken
-    # from the section (QM shared; QI from the LFS=0 partial) -- never fabricated.
+    # from the section (the shared QM, which is also QI at the ground state where
+    # ELFS = 0) -- never fabricated.
     subs = [
         (7.0, 7.0, 49116, 0, [(1.0, 2.0), (3.0, 4.0)]),          # ground
         (7.0, 5.0, 49116, 1, [(2.0, 1.0), (4.0, 1.0)]),          # starts later
@@ -1136,6 +1137,81 @@ def test_synthesize_mf10_total_union_grid():
         "Xx100", 102)
     _e, _xs, qm_m, qi_m = _synthesize_mf10_total(unique_m)
     assert (qm_m, qi_m) == (7.0, 7.0)
+
+
+# Real MF=10 MT=4 subsection heads (QM, QI, IZAP, LFS), read 2026-08-04 from the
+# production libraries in data/byPerry_v1: TENDL2019-IST_decay2020.293K.PENDF.h5
+# and JEFF40-IST.293K.PENDF.h5. TENDL-2019 violates the ground-state invariant
+# ELFS = QM - QI = 0 in two shapes -- the reaction QI written on a ground target
+# (Ag107) and a blank QI on an isomer target (Ag107_m1, and U235_m1 at the
+# fleet's smallest genuine offset, 76.77 eV) -- while U235 and the whole JEFF-4.0
+# MT=4 fleet (Ir191, 146 LFS=0 partials, every one storing ELFS exactly 0.0) are
+# clean. A clean head repeats ONE number in both fields, which is why the guard
+# tolerance is 1 eV rather than the GENDF twin's 1 keV.
+_MT4_HEADS = {
+    "Ag107":    [(0.0, -93125.0, 47107, 0), (0.0, -93125.0, 47107, 1)],
+    "Ag107_m1": [(93124.9, 0.0, 47107, 0), (93124.9, -0.13411, 47107, 1)],
+    "U235_m1":  [(76.7708, 0.0, 92235, 0), (76.7708, -0.229214, 92235, 1)],
+    "U235":     [(0.0, 0.0, 92235, 0), (0.0, -77.0, 92235, 1)],
+    "Ir191":    [(0.0, 0.0, 77191, 0), (0.0, -171290.0, 77191, 3),
+                 (0.0, -2201000.0, 77191, 72)],
+}
+_MT4_DEFECTIVE = ("Ag107", "Ag107_m1", "U235_m1")
+
+
+def _mt4_partials(name):
+    """The named tape's MT=4 heads as ``_synthesize_mf10_total`` input.
+
+    Each partial gets a two-point lin-lin grid offset by its LFS, so the union
+    grid and the summed xs stay a property of the SHAPE and not of the Q values
+    under test.
+    """
+    return [(qm, qi, izap, lfs,
+             Tabulated1D([1.0 + lfs, 10.0 + lfs], [2.0, 3.0]))
+            for qm, qi, izap, lfs in _MT4_HEADS[name]]
+
+
+@pytest.mark.parametrize("name", list(_MT4_HEADS))
+def test_synthesize_mf10_total_qi_is_ground_qm(name):
+    # A ground-state subsection has ELFS = QM - QI = 0, so the synthesized QI is
+    # the section QM -- on the clean tapes because the two ARE one number, on the
+    # TENDL-2019 MT=4 defectives because the tabulated QI is validated and
+    # warned about rather than inherited. The energy/xs synthesis is untouched.
+    unique = _mt4_partials(name)
+    defective = name in _MT4_DEFECTIVE
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        energy, xs, qm, qi = _synthesize_mf10_total(unique, f"{name} MT=4")
+    complaints = [w for w in records
+                  if "disagrees with section QM" in str(w.message)]
+    assert bool(complaints) is defective
+    if defective:
+        assert issubclass(complaints[0].category, UserWarning)
+        message = str(complaints[0].message)
+        assert message.startswith(f"{name} MT=4: ")
+        assert f"QI={unique[0][1]}" in message and f"QM={qm}" in message
+
+    assert qm == _MT4_HEADS[name][0][0]
+    assert qi == qm                                  # never the tabulated QI
+
+    expected_e = np.unique(np.concatenate(
+        [np.asarray(p[4].x, dtype=float) for p in unique]))
+    expected_xs = np.zeros_like(expected_e)
+    for p in unique:
+        expected_xs = expected_xs + np.interp(
+            expected_e, np.asarray(p[4].x, dtype=float),
+            np.asarray(p[4].y, dtype=float), left=0.0, right=0.0)
+    np.testing.assert_array_equal(energy, expected_e)
+    np.testing.assert_array_equal(xs, expected_xs)
+
+
+def test_synthesize_mf10_total_tolerance_floor():
+    # The 1 eV gate is what catches the fleet's smallest genuine defect: U235_m1
+    # is 76.77 eV out, so a regression to the GENDF twin's 1 keV C4 tolerance
+    # would let a whole shape through silently.
+    assert abs(76.7708 - 0.0) > _LFS0_QI_QM_TOL_EV
+    with pytest.warns(UserWarning, match=r"U235_m1 MT=4: LFS=0 partial QI=0\.0"):
+        _synthesize_mf10_total(_mt4_partials("U235_m1"), "U235_m1 MT=4")
 
 
 def test_mf10_only_total_stored(tmp_path, evaluations):
