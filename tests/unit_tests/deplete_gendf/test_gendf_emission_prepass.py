@@ -21,6 +21,7 @@ NukeData paths.
 
 import copy
 import importlib.util
+import io
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -351,6 +352,31 @@ def test_izap0_gate_failure_prunes_all_or_nothing(tmp_path, kwargs, condition):
     # so no partially-attributed decoration can be written.
     mt = records[0]["mt"]
     assert [lv["IZAP"] for lv in lib._sd["Am241"][(10, mt)]["levels"]] == [0, 0]
+
+
+def test_q55_census_flags_defective_ground_heads(tmp_path):
+    chain, _base = _anon_chain(tmp_path)
+
+    # Clean head (QM == QI exactly): censused, no violation.
+    lib = _ToyLib(_anon_sections(), _anon_decay_lookup())
+    rows, counts = tool.census_lfs0_ground_heads(lib, chain)
+    assert rows == []
+    assert counts["lfs0_heads"] == 1 and counts["sections"] == 1
+
+    # Blank-QI shape (QI=0, QM=+ELIS): the TENDL-2019 isomer-target defect.
+    lib = _ToyLib(_anon_sections(ground_qi_offset=_AM241_QM),
+                  _anon_decay_lookup())
+    rows, counts = tool.census_lfs0_ground_heads(lib, chain)
+    assert [r["shape"] for r in rows] == ["blank-QI"]
+    assert rows[0]["elfs"] == pytest.approx(_AM241_QM)
+    assert rows[0]["parent"] == "Am241" and rows[0]["mt"] == 102
+
+    # Report-only log section: summary counts plus the verbatim row.
+    buf = io.StringIO()
+    tool._write_q55_ground_head_section(buf, rows, counts)
+    out = buf.getvalue()
+    assert "Q-55" in out and "blank-QI: 1" in out
+    assert "Am241" in out and "(n,gamma)" in out
 
 
 def _anon_emit_chain(tmp_path):

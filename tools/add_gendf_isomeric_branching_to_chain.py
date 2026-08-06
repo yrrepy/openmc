@@ -393,6 +393,59 @@ def unrepaired_anonymous_mts(records):
             if r['status'] != 'reattributed'}
 
 
+def census_lfs0_ground_heads(lib, chain, tol=REATTRIB_Q_TOL_GROUND_EV):
+    """Q-55 census: MF=10 LFS=0 heads whose QM and QI disagree (report-only).
+
+    A ground product's level energy is zero by definition, so a LFS=0 TAB1
+    head must carry QM == QI. TENDL-2019 and JEFF-3.3 instead write the
+    reaction QI on ground-target tapes (QM=0, QI=-E(level)) or a blank QI on
+    isomer-target tapes (QI=0, QM=+ELIS). Nothing in this tool consumes an
+    LFS=0 QI -- every ground-route Q write is QM-sourced -- so violating
+    heads are logged for observability, never repaired or acted on. Runs
+    after ``scan_mf10_attribution`` so every material is already cached.
+    Returns ``(rows, counts)``.
+    """
+    counts = Counter()
+    rows = []
+    for parent in sorted({nuc.name for nuc in chain.nuclides}
+                         & set(lib.available_nuclides_set())):
+        try:
+            material = lib._load_material(parent, require_full_parser=True)
+        except Exception:
+            counts['load_error'] += 1
+            continue
+        for mt in sorted(mt for (mf, mt) in material.section_data if mf == 10):
+            counts['sections'] += 1
+            levels = material.section_data[10, mt].get('levels', []) or []
+            for lv in levels:
+                try:
+                    if int(lv.get('LFS')) != 0:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                qm, qi = lv.get('QM'), lv.get('QI')
+                if qm is None or qi is None:
+                    counts['q_missing'] += 1
+                    continue
+                counts['lfs0_heads'] += 1
+                qm, qi = float(qm), float(qi)
+                elfs = qm - qi
+                if abs(elfs) <= tol:
+                    continue
+                if qm == 0.0:
+                    shape = 'ground-target'   # QM=0, QI=-E(level): reaction QI
+                elif qi == 0.0:
+                    shape = 'blank-QI'        # QI=0, QM=+ELIS
+                else:
+                    shape = 'other'
+                counts[shape] += 1
+                rows.append({'parent': parent, 'mt': mt,
+                             'reaction': MT_TO_REACTION.get(mt),
+                             'izap': int(lv.get('IZAP', 0) or 0),
+                             'qm': qm, 'qi': qi, 'elfs': elfs, 'shape': shape})
+    return rows, counts
+
+
 def prune_unattributed_decoration(branching_data, pruned):
     """Drop the isomeric decoration of every reaction flagged by the scan.
 
@@ -625,7 +678,7 @@ def build_parser():
     parser.add_argument('--emit-mf10-only-reactions', action='store_true', default=True,  help='Emit plain <reaction> elements for GENDF MF=10-only channels (residual has a tabulated isomer => stored in MF=8/10 with no MF=3, e.g. EAF-2010 Al27(n,a)Na24) before isomeric decoration. Default: on; general-purpose libraries (TENDL/JEFF/ENDF) have none, so the pass emits nothing there.')
     parser.add_argument('--output-dir',               type=str,            default=None,  help='Write the output chain XML into this directory instead of the library pairing\'s own output directory. Use it for verification runs so they never overwrite a production chain. Default: the pairing\'s output_dir.')
     parser.add_argument('--log-dir',                  type=str,            default=None,  help='Write the mapping log into this directory instead of the library pairing\'s own output directory. Use it for verification runs so they never overwrite a production log. Default: the pairing\'s output_dir.')
-    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: on. ANY anonymous subsection failing the gate prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere. NOT related to "--orphan-policy reattribute": this one NAMES a product the file left unnamed, that one FOLDS an identified-but-unmatchable state into a kept sibling.')
+    parser.add_argument('--reattribute-mf10-noIZAP',  action='store_true', default=True,  help='Recover MF=10 subsections written with IZAP=0 (product nuclide unnamed) by re-deriving the residual from the reaction dA/dZ, gated on evidence C1 (deterministic-residual depletion MT), C2 (valid, section-unique LFS), C3 (derived product in the decay library) and C4 (Q consistency: QM==QI within 1 eV for LFS=0, QM-QI == a decay level ELIS within 1 keV). Default: on. ANY anonymous subsection failing the gate prunes that reaction\'s ENTIRE isomeric decoration (all-or-nothing) and keeps the plain MF=3 route -- decorating the attributed subset alone would invert the branching. Only JEFF-3.3 needs this (Am241, Al27); a no-op elsewhere. NOT related to "--orphan-policy reattribute": this one NAMES a product the file left unnamed, that one FOLDS an identified-but-unmatchable state into a kept sibling.')
 
     return parser
 
@@ -1676,6 +1729,48 @@ def _write_attribution_section(f, records, counts, reattribute):
         return
     for record in sorted(records, key=lambda r: (r['parent'], r['mt'])):
         f.write(_attribution_line(record) + "\n")
+
+
+def _write_q55_ground_head_section(f, rows, counts):
+    """MF=10 LFS=0 GROUND-HEAD Q CONSISTENCY (Q-55) section of the mapping log."""
+    rows = rows or []
+    counts = counts or Counter()
+    f.write("\n\n" + "=" * 220 + "\n")
+    f.write("MF=10 LFS=0 GROUND-HEAD Q CONSISTENCY (Q-55)\n")
+    f.write("=" * 220 + "\n\n")
+    f.write("A ground product's level energy is zero by definition, so an "
+            "MF=10 LFS=0 TAB1 head must carry QM == QI (ELFS = QM - QI = 0). "
+            "TENDL-2019 and JEFF-3.3 instead write\n")
+    f.write("the reaction QI on ground-target tapes (QM=0, QI=-E(level)) or a "
+            "blank QI on isomer-target tapes (QI=0, QM=+ELIS) -- either way "
+            "the ground head reads as excited.\n")
+    f.write("Report-only: no code path consumes an LFS=0 QI (every "
+            "ground-route Q write is QM-sourced), so mapping decisions and "
+            "the output chain XML are UNCHANGED. Rows are\n")
+    f.write("listed so a defective library announces itself instead of "
+            "carrying the defect silently into a future consumer.\n\n")
+    f.write(f"  MF=10 sections scanned:              {counts['sections']:6d}\n")
+    f.write(f"  LFS=0 heads with QM and QI:          {counts['lfs0_heads']:6d}\n")
+    f.write(f"  LFS=0 heads missing QM or QI:        {counts['q_missing']:6d}\n")
+    f.write(f"  Violations (|QM - QI| > "
+            f"{REATTRIB_Q_TOL_GROUND_EV:.1f} eV):     {len(rows):6d}"
+            f"  (ground-target: {counts['ground-target']}, "
+            f"blank-QI: {counts['blank-QI']}, other: {counts['other']})\n")
+    f.write(f"  Load errors (endf crashers):         {counts['load_error']:6d}\n\n")
+    if not rows:
+        f.write("No violating LFS=0 ground heads found.\n")
+        return
+    devs = sorted(abs(r['elfs']) for r in rows)
+    f.write(f"Deviation span: {devs[0]:.2f} eV to {devs[-1]:.2f} eV\n\n")
+    header = (f"{'Parent':<12}  {'MT':>5}  {'Reaction':<12}  {'IZAP':>6}  "
+              f"{'QM[eV]':>14}  {'QI[eV]':>14}  {'QM-QI[eV]':>14}  "
+              f"{'Shape':<14}")
+    f.write(header + "\n" + "-" * len(header) + "\n")
+    for r in sorted(rows, key=lambda x: (x['parent'], x['mt'])):
+        f.write(f"{r['parent']:<12}  {r['mt']:>5}  "
+                f"{str(r['reaction'] or '?'):<12}  {r['izap']:>6}  "
+                f"{r['qm']:>14.4f}  {r['qi']:>14.4f}  {r['elfs']:>14.4f}  "
+                f"{r['shape']:<14}\n")
 
 
 def _print_emission_summary(summary, output_file):
@@ -3233,7 +3328,8 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                              hybrid_records=None, orphan_levels=None,
                              orphan_nuclides_added=None, reattributions=None,
                              orphan_policy='renorm',
-                             reaction_type_missing=None):
+                             reaction_type_missing=None,
+                             q55_rows=None, q55_counts=None):
     """Write comprehensive isomer mapping log."""
     if elis_errors is None:
         elis_errors = []
@@ -4113,6 +4209,9 @@ def write_isomer_mapping_log(isomer_mappings, log_file, stats=None, elis_errors=
                                    Counter(attribution_counts or {}),
                                    reattribute_mf10_noizap)
 
+        # MF=10 LFS=0 ground-head Q consistency census (Q-55, report-only)
+        _write_q55_ground_head_section(f, q55_rows, q55_counts)
+
     print(f"Isomer mapping log written to: {log_file}")
 
 
@@ -4456,6 +4555,16 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     _print_attribution_summary(attrib_records, attrib_counts,
                                reattribute_mf10_noizap)
     attrib_anonymous = unrepaired_anonymous_mts(attrib_records)
+
+    # Q-55 census (report-only): materials are cached by the scan above, so
+    # this second walk costs only dictionary lookups.
+    q55_rows, q55_counts = census_lfs0_ground_heads(lib, chain)
+    if q55_rows:
+        print(f"  WARNING: {len(q55_rows)} of {q55_counts['lfs0_heads']} MF=10 "
+              f"LFS=0 ground heads violate QM == QI (Q-55) -- see mapping log")
+    else:
+        print(f"  MF=10 LFS=0 ground heads: all {q55_counts['lfs0_heads']} "
+              f"consistent (|QM - QI| <= {REATTRIB_Q_TOL_GROUND_EV:.1f} eV)")
 
     # MF=10-only channel emission (opt-in). EAF-2010 stores isomer-daughter
     # reactions only in MF=8/10 (no MF=3), so Chain.from_endf never harvested
@@ -4830,7 +4939,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
                                 orphan_nuclides_added=summary['orphan_nuclides_added'],
                                 reattributions=summary['reattributions'],
                                 orphan_policy=orphan_policy,
-                                reaction_type_missing=summary['reaction_type_missing'])
+                                reaction_type_missing=summary['reaction_type_missing'],
+                                q55_rows=q55_rows, q55_counts=q55_counts)
 
     return chain
 
