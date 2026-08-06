@@ -208,15 +208,18 @@ _AM242M_ELIS = 48600.0     # JEFF-3.3 Am241(n,gamma): QM - QI = 48.6 keV
 _AM241_QM = 5537800.0
 
 
-def _anon_sections(mt=102, elfs_meta=_AM242M_ELIS, meta_izap=0, mf3=True):
+def _anon_sections(mt=102, elfs_meta=_AM242M_ELIS, meta_izap=0, mf3=True,
+                   ground_qi_offset=0.0):
     """JEFF-3.3 shape: an Am241 pair whose ground MF=10 level carries IZAP=0.
 
     ``meta_izap=0`` (default) makes both levels anonymous; a non-zero value
     gives the MIXED section -- anonymous ground, attributed metastable -- whose
     partial decoration is exactly the R1-61 inversion. ``mf3=False`` drops the
     MF=3 section, making the channel MF=10-only (emission-pass territory).
+    ``ground_qi_offset`` shifts the ground QI below QM (the Q-55 defect shape).
     """
-    sections = {(10, mt): {"levels": [_level(0, 0, _AM241_QM, _AM241_QM),
+    sections = {(10, mt): {"levels": [_level(0, 0, _AM241_QM,
+                                             _AM241_QM - ground_qi_offset),
                                       _level(1, meta_izap, _AM241_QM,
                                              _AM241_QM - elfs_meta)]}}
     if mf3:
@@ -329,6 +332,9 @@ def test_izap0_reattribution_on_recovers_and_writes_flags(tmp_path, capsys):
 
 @pytest.mark.parametrize("kwargs, condition", [
     ({"elfs_meta": 200000.0}, "C4_q"),        # QM-QI 151 keV off the real ELIS
+    ({"ground_qi_offset": 500.0}, "C4_q"),    # ground QM-QI 500 eV: inside the
+                                              # 1 keV ELIS leg, outside the
+                                              # 1 eV within-head ground leg
     ({"mt": 16}, "C3_product"),               # (n,2n) -> Am240: not in decay lib
 ])
 def test_izap0_gate_failure_prunes_all_or_nothing(tmp_path, kwargs, condition):

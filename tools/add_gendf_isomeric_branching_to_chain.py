@@ -171,8 +171,15 @@ def resolve_elis_rtol(mapping_mode, rtol=None):
 MT_TO_DADZ = {mt: openmc.data.DADZ[name]
               for name, info in REACTIONS.items() for mt in info.mts}
 
-# C4 Q-consistency tolerance; the real JEFF-3.3 cases match ELIS to < 0.1 keV.
+# C4 Q-consistency tolerances, one per leg. LFS>0 matches QM-QI to a decay
+# level's ELIS across two independent sources (the real JEFF-3.3 cases sit
+# 30-95 eV off: 1 keV). LFS=0 compares QM and QI inside one TAB1 head, where
+# both descend from the same mass evaluation, so 1 eV -- wide enough for
+# rounding, tight enough to reject the defective TENDL-2019/JEFF-3.3 ground
+# heads (Q-55: QI = -E(level) or blank, 76.77 eV at the smallest) that a
+# shared 1 keV gate would pass.
 REATTRIB_Q_TOL_EV = 1.0e3
+REATTRIB_Q_TOL_GROUND_EV = 1.0
 
 # Pathway-Q sanity gate (eV, absolute): how far a non-MT=4 section's own ground
 # QM may sit from the chain's scalar Q before the file value is refused and the
@@ -190,7 +197,8 @@ MF10_LOAD_ERROR = 'load_error'
 
 
 def _gate_anonymous_level(lib, parent, mt, level, lfs_counts,
-                          q_tol=REATTRIB_Q_TOL_EV):
+                          q_tol=REATTRIB_Q_TOL_EV,
+                          q_tol_ground=REATTRIB_Q_TOL_GROUND_EV):
     """Evidence gate C1-C4 for ONE anonymous (IZAP=0) MF=10 subsection.
 
     Returns ``(izap, verdicts)``: the DADZ-derived IZAP when every condition
@@ -231,16 +239,17 @@ def _gate_anonymous_level(lib, parent, mt, level, lfs_counts,
     if not ok:
         return None, verdicts
 
-    # C4: Q consistency. LFS=0 needs QM == QI; LFS>0 needs QM-QI to land on a
-    # decay-library level's ELIS. ELIS lives at patch time only.
+    # C4: Q consistency. LFS=0 needs QM == QI (within-head: q_tol_ground);
+    # LFS>0 needs QM-QI to land on a decay-library level's ELIS (cross-source:
+    # q_tol). ELIS lives at patch time only.
     qm, qi = level.get('QM'), level.get('QI')
     if qm is None or qi is None:
         verdicts.append(('C4_q', False, 'QM/QI missing from the MF=10 subsection'))
         return None, verdicts
     elfs = float(qm) - float(qi)
     if lfs == 0:
-        ok = abs(elfs) <= q_tol
-        detail = f"QM-QI={elfs/1e3:.3f} keV (ground, tol {q_tol/1e3:.1f} keV)"
+        ok = abs(elfs) <= q_tol_ground
+        detail = f"QM-QI={elfs:.3f} eV (ground, tol {q_tol_ground:.1f} eV)"
     else:
         match = lookup_liso(z_prod, a_prod, elfs, decay_lookup,
                             rtol=0.0, atol=q_tol)
@@ -256,7 +265,8 @@ def _gate_anonymous_level(lib, parent, mt, level, lfs_counts,
 
 
 def classify_mf10_attribution(lib, parent, mt, reattribute=False,
-                              q_tol=REATTRIB_Q_TOL_EV):
+                              q_tol=REATTRIB_Q_TOL_EV,
+                              q_tol_ground=REATTRIB_Q_TOL_GROUND_EV):
     """Classify -- and optionally repair -- one MF=10 section's IZAP attribution.
 
     Returns ``None`` when the section is fully attributed (nothing to report),
@@ -289,7 +299,8 @@ def classify_mf10_attribution(lib, parent, mt, reattribute=False,
     recovered, failures = [], []
     for lv in anonymous:
         izap, verdicts = _gate_anonymous_level(lib, parent, mt, lv, lfs_counts,
-                                               q_tol=q_tol)
+                                               q_tol=q_tol,
+                                               q_tol_ground=q_tol_ground)
         (failures if izap is None else recovered).append((lv, izap, verdicts))
 
     record = {
@@ -326,7 +337,8 @@ def classify_mf10_attribution(lib, parent, mt, reattribute=False,
 
 
 def scan_mf10_attribution(lib, chain, reattribute=False,
-                          q_tol=REATTRIB_Q_TOL_EV):
+                          q_tol=REATTRIB_Q_TOL_EV,
+                          q_tol_ground=REATTRIB_Q_TOL_GROUND_EV):
     """Gate every MF=10 section of every chain nuclide for anonymous levels.
 
     Must run BEFORE the emission pre-pass and the branching extraction so a
@@ -352,7 +364,8 @@ def scan_mf10_attribution(lib, chain, reattribute=False,
         for mt in sorted(mt for (mf, mt) in material.section_data if mf == 10):
             record = classify_mf10_attribution(lib, parent, mt,
                                                reattribute=reattribute,
-                                               q_tol=q_tol)
+                                               q_tol=q_tol,
+                                               q_tol_ground=q_tol_ground)
             if record is MF10_LOAD_ERROR:
                 counts['load_error'] += 1
                 continue
@@ -1636,7 +1649,8 @@ def _write_attribution_section(f, records, counts, reattribute):
     f.write("reaction's deterministic (dA, dZ) shift under a four-part "
             "evidence gate: C1 deterministic-residual depletion MT, C2 valid "
             "and section-unique LFS, C3 derived product present in the\n")
-    f.write("decay library, C4 Q consistency (QM == QI for LFS=0; QM-QI equal "
+    f.write("decay library, C4 Q consistency (QM == QI within "
+            f"{REATTRIB_Q_TOL_GROUND_EV:.1f} eV for LFS=0; QM-QI equal "
             f"to a decay level's ELIS within {REATTRIB_Q_TOL_EV/1e3:.1f} keV "
             "for LFS>0 -- level identity comes from ELIS, never from an "
             "LFS<->m-number\n")
@@ -4432,7 +4446,8 @@ def main(endf_gxs_dir, base_chain_file, output_chain_file,
     print("\nStep 3a: Classifying anonymous (IZAP=0) MF=10 subsections...")
     if reattribute_mf10_noizap:
         print("  Re-attribution ENABLED (evidence gate C1-C4, Q tolerance "
-              f"{REATTRIB_Q_TOL_EV/1e3:.1f} keV)")
+              f"{REATTRIB_Q_TOL_GROUND_EV:.1f} eV ground / "
+              f"{REATTRIB_Q_TOL_EV/1e3:.1f} keV isomer ELIS)")
     else:
         print("  Re-attribution OFF: affected reactions lose ALL isomeric "
               "decoration (--reattribute-mf10-noIZAP)")
