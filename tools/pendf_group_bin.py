@@ -48,9 +48,11 @@ from openmc.deplete.chain import REACTIONS
 from openmc.deplete.microxs import (
     CONSISTENCY_ABS_FLOOR,
     CONSISTENCY_RTOL,
-    SILENCE_EPS,
     _group_average,
     _partials_total_max_deviation,
+)
+from openmc.deplete.pendf.ground import (
+    SILENCE_EPS,
     _silence_fill_ground,
 )
 from openmc.mgxs import GROUP_STRUCTURES

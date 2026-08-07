@@ -34,8 +34,8 @@ from openmc.deplete.microxs import (
     _check_pathway_consistency,
     _group_average,
     _liso_from_gnds,
-    _silence_fill_ground,
 )
+from openmc.deplete.pendf.ground import _silence_fill_ground
 
 # The chain patcher lives in the repo's tools/ directory (not an installed
 # package); the orphan-policy tests at the end of this module start from its
