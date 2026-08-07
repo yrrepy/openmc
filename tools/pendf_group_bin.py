@@ -45,10 +45,10 @@ import h5py
 import numpy as np
 
 from openmc.deplete.chain import REACTIONS
-from openmc.deplete.microxs import (
+from openmc.deplete.microxs import _group_average
+from openmc.deplete.pendf.chain_check import (
     CONSISTENCY_ABS_FLOOR,
     CONSISTENCY_RTOL,
-    _group_average,
     _partials_total_max_deviation,
 )
 from openmc.deplete.pendf.ground import (

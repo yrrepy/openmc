@@ -31,8 +31,10 @@ from openmc.deplete.decay_elis import DecayState
 from openmc.deplete.microxs import (
     MicroXS,
     _build_xs_table_pendf,
-    _check_pathway_consistency,
     _group_average,
+)
+from openmc.deplete.pendf.chain_check import (
+    _check_pathway_consistency,
     _liso_from_gnds,
 )
 from openmc.deplete.pendf.ground import _silence_fill_ground
@@ -454,7 +456,7 @@ def test_reaction_list_sanitation():
     drops channels with no REACTION_MT mapping (one warning); an EXPLICIT unknown
     still raises KeyError; and a qualified input builds the SAME table as the base
     name (qualified names are outputs, not inputs)."""
-    from openmc.deplete.microxs import _default_pendf_reactions
+    from openmc.deplete.pendf.chain_check import _default_pendf_reactions
 
     edges = np.array([0.0, 2.0e7])
 

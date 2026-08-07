@@ -43,7 +43,7 @@ from openmc.deplete.chain import REACTIONS, _invalidate_chain_cache
 from openmc.deplete.decay_elis import (
     parse_decay_isomeric_levels, lookup_liso, ELIS_RTOL, ELIS_ATOL,
 )
-from openmc.deplete.microxs import (
+from openmc.deplete.pendf.chain_check import (
     _partials_total_max_deviation, CONSISTENCY_ABS_FLOOR, CONSISTENCY_RTOL,
 )
 

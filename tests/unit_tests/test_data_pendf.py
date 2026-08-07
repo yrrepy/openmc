@@ -904,7 +904,7 @@ def test_tape_adapter_chain_stamp_verifies_silently(tmp_path):
     # nuclide count) verifies silently against the adapter -- the stamp compares
     # against the adapter's tape-derived source_identity.
     from openmc.deplete.chain import Chain
-    from openmc.deplete.microxs import _verify_pendf_chain_stamp
+    from openmc.deplete.pendf.chain_check import _verify_pendf_chain_stamp
 
     src = _tape_dir(tmp_path, ("Fe56", "In115"))
     with PendfTapeLibrary(src) as lib:

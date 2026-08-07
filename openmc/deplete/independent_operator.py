@@ -18,7 +18,8 @@ from openmc.mpi import comm
 from .abc import ReactionRateHelper, OperatorResult
 from .openmc_operator import OpenMCOperator
 from .pool import _distribute
-from .microxs import MicroXS, _check_pathway_consistency
+from .microxs import MicroXS
+from .pendf.chain_check import _check_pathway_consistency
 from .nuclide import _ISOMER_SUFFIX
 from .results import Results
 from .helpers import ChainFissionHelper, ConstantFissionYieldHelper, SourceRateHelper

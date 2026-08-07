@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..microxs import CONSISTENCY_ABS_FLOOR
+from .chain_check import CONSISTENCY_ABS_FLOOR
 
 
 # Below this Sigma(all MF=10 partials)/total the isomeric branching is a
