@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-import os
 import re
 import shutil
 from tempfile import TemporaryDirectory
@@ -20,8 +19,8 @@ import numpy as np
 
 from openmc.checkvalue import check_type, check_value, check_iterable_type, PathLike
 from openmc import StatePoint
-from openmc.mgxs import GROUP_STRUCTURES, _canonical_group_structure_name
-from openmc.data import REACTION_MT, open_pendf_library
+from openmc.mgxs import GROUP_STRUCTURES
+from openmc.data import REACTION_MT
 import openmc
 from .chain import Chain, REACTIONS, _get_chain
 from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
@@ -848,192 +847,11 @@ class MicroXS:
             one entry per flux for a 2-D input (a 1-row batch returns a
             1-element list, not an unwrapped :class:`MicroXS`).
         """
-        from .pendf.chain_check import (
-            _default_pendf_reactions,
-            _get_pendf_chain,
-            _verify_pendf_chain_stamp,
-        )
-        from .pendf.collapse import (
-            _build_xs_table_pendf,
-            _clamp_negative_pendf_microxs,
-        )
-
-        check_type("temperature", temperature, (int, float, type(None)))
-
-        # ``multigroup_flux`` is required; it only carries a default so that
-        # ``energies`` (which precedes it positionally) can default to None.
-        if multigroup_flux is None:
-            raise ValueError('multigroup_flux is a required argument')
-
-        # ``pendf_library`` may be an already-opened reader or a path: a
-        # grouped/pointwise .h5 file, a directory of .h5 files, or a directory
-        # of raw ASC PENDF tapes (routed to the cross-validation tape adapter).
-        # A path is opened here and closed after the collapse; a passed object
-        # is left to the caller. Only a grouped .h5 is self-describing (carries
-        # its own group_edges); the pointwise .h5 and the tape adapter both
-        # require the caller's ``energies``.
-        _owned_pendf = None
-        if isinstance(pendf_library, (str, os.PathLike)):
-            pendf_library = open_pendf_library(pendf_library)
-            _owned_pendf = pendf_library
-
-        # Fuse the URR dilution toggle with its composition: normalize
-        # ``urr_material_dilution`` to a local ``densities`` mapping (or None
-        # when off) here, before any collapse work, so the impossible "on but no
-        # composition" state cannot be represented.
-        if urr_material_dilution is False or urr_material_dilution is None:
-            densities = None
-        elif urr_material_dilution is True:
-            raise ValueError(
-                'urr_material_dilution=True is under-specified: the URR '
-                'self-shielding sigma_0 background needs a composition. Pass '
-                'the openmc.Material being depleted, or a {nuclide: '
-                'density-or-fraction} mapping, instead of True')
-        elif isinstance(urr_material_dilution, openmc.Material):
-            densities = urr_material_dilution.get_nuclide_atom_densities()
-        elif isinstance(urr_material_dilution, Mapping):
-            if not urr_material_dilution:
-                raise ValueError(
-                    'urr_material_dilution mapping is empty: with no diluters '
-                    'the sigma_0 background is zero and every flagged nuclide '
-                    'silently degrades to f=1. Pass the depleted composition, '
-                    'or omit the argument to disable the correction')
-            densities = urr_material_dilution
-        else:
-            raise ValueError(
-                'urr_material_dilution must be an openmc.Material, a {nuclide: '
-                'density-or-fraction} mapping, or False; got '
-                f'{type(urr_material_dilution).__name__}')
-
-        # The correction is defined only on the PENDF path -- it is built from
-        # the library's probability tables.
-        if densities is not None and pendf_library is None:
-            raise ValueError(
-                'urr_material_dilution requires a pendf_library; the URR '
-                'self-shielding correction is built from its probability '
-                'tables and is not available on the continuous-energy path')
-
-        # The raw ASC tape adapter serves no probability tables; reject URR on it
-        # loudly rather than silently skipping the correction.
-        if densities is not None and getattr(pendf_library, 'is_tape_source',
-                                             False):
-            if _owned_pendf is not None:
-                _owned_pendf.close()
-            raise ValueError(
-                'urr_material_dilution is not supported on the raw ASC PENDF '
-                'tape adapter (a deterministic-collapse cross-validation path); '
-                'build a pointwise .h5 with PendfLibrary.from_endf_directory for '
-                'URR self-shielding')
-
-        # Default the group structure to a grouped PENDF library's own edges
-        # when the caller omits ``energies``. A grouped library is duck-detected
-        # exactly as in ``_build_xs_table_pendf`` -- by exposing ``group_edges``.
-        # A grouped library carries no pointwise data to rebin, so its edges are
-        # the only structure it can be collapsed on.
-        if energies is None:
-            energies = getattr(pendf_library, 'group_edges', None)
-            if energies is None:
-                raise ValueError(
-                    'energies must be provided unless pendf_library is a grouped '
-                    'PENDF library (openmc.data.GroupedPendfLibrary), whose '
-                    'group_edges then define the group structure')
-
-        # if energy is string then use group structure of that name
-        if isinstance(energies, str):
-            energies = GROUP_STRUCTURES[_canonical_group_structure_name(energies)]
-        else:
-            # if user inputs energies check they are ascending (low to high) as
-            # some depletion codes use high energy to low energy.
-            if not np.all(np.diff(energies) > 0):
-                raise ValueError('Energy group boundaries must be in ascending order')
-
-        single = _flux_is_single(multigroup_flux)
-        fluxes = [np.asarray(multigroup_flux, dtype=float)] if single else multigroup_flux
-
-        # check dimension consistency per flux
-        n_groups = len(energies) - 1
-        for flux in fluxes:
-            if len(flux) != n_groups:
-                raise ValueError('Length of flux array should be len(energies)-1')
-
-        # Validate the pendf_library argument combination before loading any
-        # data (the chain below), so an invalid CE-vs-PENDF mix raises its own
-        # clear error rather than a downstream "requires chain_file".
-        if pendf_library is not None:
-            # The pointwise PENDF path is mutually exclusive with the
-            # continuous-energy openmc.lib session path
-            if cross_sections is not None or init_kwargs:
-                raise ValueError(
-                    'cross_sections and openmc.lib init arguments configure the '
-                    'continuous-energy path and cannot be combined with '
-                    'pendf_library')
-            # temperature selects a continuous-energy evaluation; the PENDF
-            # library carries its own preprocessed temperature
-            if temperature is not None:
-                raise ValueError(
-                    'temperature configures the continuous-energy path and '
-                    'cannot be combined with pendf_library')
-
-        # Resolve the depletion chain. The PENDF collapse ALWAYS needs it (it is
-        # the isomer<->LFS row-naming authority; see _build_xs_table_pendf); the
-        # continuous-energy path needs it only to default nuclides/reactions.
-        # Load it once here and share it with both defaulting and the table build.
-        if pendf_library is not None:
-            chain = _get_pendf_chain(chain_file)
-            # Verify the chain's PENDF provenance stamp against the library
-            # actually in use (no-op for unstamped chains / identity-less
-            # libraries); a wrong chain<->library pairing warns once here.
-            _verify_pendf_chain_stamp(chain, pendf_library)
-        elif not nuclides or reactions is None:
-            chain = _get_chain(chain_file)
-        else:
-            chain = None
-
-        if chain is not None:
-            if not nuclides:
-                nuclides = [nuc.name for nuc in chain.nuclides]
-            if reactions is None:
-                # A chain-defaulted reaction list carries qualified reaction
-                # types and channels the pointwise collapse cannot map; sanitize
-                # it for the PENDF path (strip _mN, dedupe, drop unmappable).
-                reactions = (_default_pendf_reactions(chain)
-                             if pendf_library is not None else chain.reactions)
-
-        # Build the group cross section table once and collapse every flux
-        if pendf_library is not None:
-            table = _build_xs_table_pendf(
-                nuclides, reactions, energies, pendf_library, chain,
-                partial_binding=partial_binding)
-            # URR material-dilution self-shielding: multiply the capture/fission
-            # rows of flagged resonant nuclides by their per-group factor in the
-            # URR-overlapping groups (in place). The =False path is untouched.
-            if densities is not None:
-                from .mat_ssf import _apply_mat_ssf
-                _apply_mat_ssf(table, pendf_library, energies, densities,
-                               mat_ssf_nuclides)
-            # Close a library we opened from a path; a caller-passed object is
-            # left to the caller. The library is no longer used below.
-            if _owned_pendf is not None:
-                _owned_pendf.close()
-        else:
-            # None selects the continuous-energy default (293.6 K); resolve it
-            # here, the sole place temperature is consumed (passed to group_xs).
-            temperature = 293.6 if temperature is None else temperature
-            # Resolve the library once; data availability is derived from it
-            if cross_sections is None:
-                cross_sections = _find_cross_sections(model=None)
-            nuclides_with_data = _get_nuclides_with_data(cross_sections)
-            table = _build_xs_table_ce(
-                nuclides, reactions, energies, temperature, nuclides_with_data,
-                cross_sections=cross_sections, **init_kwargs)
-
-        micros = _collapse_fluxes(table, fluxes)
-        # PENDF-only always-on backstop: clamp any negative FINAL collapsed
-        # value to zero with one summary warning. Gated on pendf_library so the
-        # continuous-energy path (pendf_library is None) stays untouched.
-        if pendf_library is not None:
-            _clamp_negative_pendf_microxs(micros)
-        return micros[0] if single else micros
+        from .pendf.collapse import _from_multigroup_flux
+        return _from_multigroup_flux(
+            energies, multigroup_flux, chain_file, temperature, nuclides,
+            reactions, cross_sections, pendf_library, urr_material_dilution,
+            mat_ssf_nuclides, partial_binding, init_kwargs)
 
     @classmethod
     def from_csv(cls, csv_file, **kwargs):
