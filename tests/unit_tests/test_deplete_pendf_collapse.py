@@ -18,9 +18,9 @@ from openmc.deplete.microxs import (
     MicroXS,
     _SparseXSTable,
     _group_average,
-    _build_xs_table_pendf,
     _collapse_fluxes,
 )
+from openmc.deplete.pendf.collapse import _build_xs_table_pendf
 
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
 PENDF_DIR = Path(os.environ.get(

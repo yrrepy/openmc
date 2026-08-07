@@ -1002,7 +1002,7 @@ def test_tape_vs_h5_collapse_bit_identical(tmp_path):
     # THE cross-validation: collapsing from the ASC tape directory gives a
     # bit-identical MicroXS to collapsing from a pointwise h5 built from the same
     # tapes, driven by the same chain (In115 carries MF=10 metastable pathways).
-    from openmc.deplete.microxs import _build_xs_table_pendf
+    from openmc.deplete.pendf.collapse import _build_xs_table_pendf
 
     src = _tape_dir(tmp_path, ("Fe56", "In115"))
     out = tmp_path / "tendl.h5"
@@ -1346,7 +1346,7 @@ def test_tape_vs_h5_synthesized_total_bit_identical(tmp_path):
     # from the tape directory stays bit-identical to one from an h5 built from
     # it with an MF=3-less reaction in play (In115(n,gamma), whose MF=3 section
     # is spliced out, expands into ground + m1/m2 off the synthesized total).
-    from openmc.deplete.microxs import _build_xs_table_pendf
+    from openmc.deplete.pendf.collapse import _build_xs_table_pendf
 
     src = _spliced_tape_dir(tmp_path, "In115", drop_mf3=(102,))
     out = tmp_path / "spliced.h5"

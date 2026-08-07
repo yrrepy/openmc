@@ -11,6 +11,7 @@ from .openmc_operator import *
 from .coupled_operator import *
 from .independent_operator import *
 from .microxs import *
+from .pendf.collapse import get_pendf_microxs_and_flux
 from .reaction_rates import *
 from .atom_number import *
 from .stepresult import *

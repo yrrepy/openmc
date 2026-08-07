@@ -30,9 +30,9 @@ from openmc.deplete.nuclide import Nuclide
 from openmc.deplete.decay_elis import DecayState
 from openmc.deplete.microxs import (
     MicroXS,
-    _build_xs_table_pendf,
     _group_average,
 )
+from openmc.deplete.pendf.collapse import _build_xs_table_pendf
 from openmc.deplete.pendf.chain_check import (
     _check_pathway_consistency,
     _liso_from_gnds,

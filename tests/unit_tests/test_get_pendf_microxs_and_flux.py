@@ -156,7 +156,7 @@ def _run_wrapper_with_canned_flux(model, domains, lib, canned, **kwargs):
     fake_tally = _FakeFluxTally(canned)
     fake_sp = _FakeStatePoint(fake_tally)
     with patch.object(model, 'run', return_value='sp.h5'), \
-            patch('openmc.deplete.microxs.StatePoint', return_value=fake_sp):
+            patch('openmc.deplete.pendf.collapse.StatePoint', return_value=fake_sp):
         return get_pendf_microxs_and_flux(
             model, domains, pendf_library=lib, chain_file=CHAIN_FILE,
             nuclides=["U238"], reactions=["(n,gamma)"],
@@ -220,7 +220,7 @@ def test_dilution_material_resolution_and_cell_fill_domain():
     """``_pendf_dilution_material`` resolves a domain's shielding composition, and
     a Cell filled with a single Material drives the collapse -- its MicroXS equals
     the direct dilution call with that fill (the tally domain stays the Cell)."""
-    from openmc.deplete.microxs import _pendf_dilution_material
+    from openmc.deplete.pendf.collapse import _pendf_dilution_material
 
     mat = _uo2_material(12.5)
     cell = openmc.Cell(fill=mat)

@@ -22,7 +22,7 @@ from openmc.data.pendf import GROUPED_FORMAT
 from openmc.deplete import MicroXS
 from openmc.deplete.chain import Chain
 from openmc.deplete.nuclide import Nuclide
-from openmc.deplete.microxs import _build_xs_table_pendf
+from openmc.deplete.pendf.collapse import _build_xs_table_pendf
 
 # Load the writer CLI module (tools/ is not a package) by path.
 _TOOLS = Path(__file__).parents[2] / "tools" / "pendf_group_bin.py"
