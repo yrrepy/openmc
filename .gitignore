@@ -109,3 +109,9 @@ CMakeSettings.json
 
 # Python pickle files
 *.pkl
+
+# Local CMake install prefix (make install into the repo root)
+/bin/
+/include/
+/lib64/
+/share/
