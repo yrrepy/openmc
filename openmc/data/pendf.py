@@ -1228,10 +1228,25 @@ class GroupedPendfLibrary:
     source_identity : str or None
         Tape-derived provenance identity carried from the pointwise source (root
         ``source_identity`` attr), or ``None``.
+
+    Notes
+    -----
+    The data accessors (:meth:`reactions`, :meth:`pathways`, :meth:`xs_g`,
+    :meth:`pathway_xs_g`) are served from a one-nuclide index built in a single
+    HDF5 walk on first access to a nuclide; accessing a different nuclide evicts
+    it, so handles are never held for more than one nuclide at a time. This
+    matches the nuclide-major read order of the depletion collapse and keeps the
+    per-object-open cost of h5py/HDF5 (a small Python and native allocation that
+    is never returned) proportional to the library rather than to the number of
+    accessor calls.
     """
 
     def __init__(self, path: PathLike):
         self._path = Path(path)
+        # One-nuclide accessor index: name of the indexed nuclide and its
+        # ``{mt: (xs_g dataset, [(lfs, izap, xs_g dataset), ...])}`` map.
+        self._index_nuclide = None
+        self._index_cache = {}
         self._file = h5py.File(self._path, 'r')
         # Any failure while validating/reading the just-opened file must close
         # the handle before propagating, otherwise a caller that catches the
@@ -1265,7 +1280,13 @@ class GroupedPendfLibrary:
             raise
 
     def close(self):
-        """Close the backing HDF5 file."""
+        """Close the backing HDF5 file.
+
+        The one-nuclide accessor index is dropped first so that no cached h5py
+        object outlives the file it was read from.
+        """
+        self._index_nuclide = None
+        self._index_cache = {}
         self._file.close()
 
     def __enter__(self):
@@ -1306,11 +1327,79 @@ class GroupedPendfLibrary:
             return _attr_str(self._file.attrs, 'source_identity')
         return None
 
+    def _index(self, nuclide: str) -> dict:
+        """Return the accessor index for ``nuclide``, building it if needed.
+
+        The index is a ``{mt: (xs_g dataset, partials)}`` map, where ``partials``
+        is a list of ``(lfs, izap, xs_g dataset)`` tuples sorted by
+        ``(lfs, izap)``. It is built in one walk of the nuclide's group, reading
+        each ``LFS*`` subgroup's ``LFS``/``IZAP`` attributes exactly once, and
+        holds the open ``xs_g`` datasets so that no accessor call re-opens an
+        HDF5 object by path.
+
+        Only one nuclide is indexed at a time: indexing a different nuclide
+        evicts the previous index and drops every handle it held.
+
+        Parameters
+        ----------
+        nuclide : str
+            GNDS name of the nuclide.
+
+        Returns
+        -------
+        dict
+            The index described above.
+
+        Raises
+        ------
+        KeyError
+            If ``nuclide`` is not present in the library.
+        """
+        if self._index_nuclide == nuclide:
+            return self._index_cache
+
+        group = self._file[nuclide]
+        index = {}
+        for name in group:
+            if not name.startswith('MT'):
+                continue
+            mt_group = group[name]
+            partials = []
+            for sub in mt_group:
+                if not sub.startswith('LFS'):
+                    continue
+                lfs_group = mt_group[sub]
+                partials.append((int(lfs_group.attrs['LFS']),
+                                 int(lfs_group.attrs['IZAP']),
+                                 lfs_group['xs_g']))
+            partials.sort(key=lambda p: (p[0], p[1]))
+            index[int(name[2:])] = (mt_group['xs_g'], partials)
+
+        # Swap in only once the walk has finished, so a failure part-way leaves
+        # no half-built index behind.
+        self._index_nuclide = nuclide
+        self._index_cache = index
+        return index
+
+    def _reaction(self, nuclide: str, mt: int):
+        """Return the indexed ``(xs_g dataset, partials)`` entry for a reaction.
+
+        Raises
+        ------
+        KeyError
+            If the nuclide is absent from the library or carries no ``MT<mt>``
+            group.
+        """
+        index = self._index(nuclide)
+        try:
+            return index[mt]
+        except KeyError:
+            raise KeyError(
+                f"Nuclide {nuclide!r} has no MT={mt} reaction.") from None
+
     def reactions(self, nuclide: str) -> list[int]:
         """Return the MT numbers with grouped MF=3 data for ``nuclide``."""
-        return sorted(
-            int(name[2:]) for name in self._file[nuclide]
-            if name.startswith('MT'))
+        return sorted(self._index(nuclide))
 
     def pathways(self, nuclide: str, mt: int) -> list[tuple[int, int]]:
         """Return the ``(LFS, IZAP)`` pairs of the MF=10 partials for a reaction.
@@ -1319,35 +1408,31 @@ class GroupedPendfLibrary:
         reaction repeats an LFS: an LFS shared by several product nuclides is
         stored as ``LFS<l>_ZAP<izap>`` subgroups, one per product.
         """
-        group = self._file[f'{nuclide}/MT{mt}']
-        return sorted(
-            (int(group[name].attrs['LFS']), int(group[name].attrs['IZAP']))
-            for name in group if name.startswith('LFS'))
+        _total, partials = self._reaction(nuclide, mt)
+        return [(lfs, izap) for lfs, izap, _ds in partials]
 
     def _partial(self, nuclide: str, mt: int, lfs: int, izap):
-        """Return the single MF=10 subgroup matching ``lfs`` (and ``izap``).
+        """Return the ``xs_g`` dataset of the MF=10 partial matching ``lfs``.
 
-        Scans the reaction's ``LFS*`` subgroups for one whose ``LFS`` attribute
-        equals ``lfs`` and, when ``izap`` is not ``None``, whose ``IZAP`` equals
-        it. Raises ``KeyError`` if none match and ``ValueError`` if an LFS shared
-        by several products is requested without an ``izap`` to disambiguate.
+        Selects from the indexed partials the one whose ``LFS`` equals ``lfs``
+        and, when ``izap`` is not ``None``, whose ``IZAP`` equals it. Raises
+        ``KeyError`` if none match and ``ValueError`` if an LFS shared by
+        several products is requested without an ``izap`` to disambiguate.
         """
-        group = self._file[f'{nuclide}/MT{mt}']
-        matches = [group[name] for name in group
-                   if name.startswith('LFS')
-                   and int(group[name].attrs['LFS']) == lfs
-                   and (izap is None or int(group[name].attrs['IZAP']) == izap)]
+        _total, partials = self._reaction(nuclide, mt)
+        matches = [(p_izap, dset) for p_lfs, p_izap, dset in partials
+                   if p_lfs == lfs and (izap is None or p_izap == izap)]
         if not matches:
             extra = f', IZAP={izap}' if izap is not None else ''
             raise KeyError(
                 f"Nuclide {nuclide!r} MT={mt} has no MF=10 partial "
                 f"LFS={lfs}{extra}.")
         if len(matches) > 1:
-            izaps = sorted(int(g.attrs['IZAP']) for g in matches)
+            izaps = sorted(p_izap for p_izap, _ds in matches)
             raise ValueError(
                 f"Nuclide {nuclide!r} MT={mt} LFS={lfs} is shared by products "
                 f"with IZAP {izaps}; pass izap to select one.")
-        return matches[0]
+        return matches[0][1]
 
     def has_ptables(self, nuclide: str) -> bool:
         """Return whether the nuclide carries URR probability tables.
@@ -1392,19 +1477,23 @@ class GroupedPendfLibrary:
         return ProbabilityTables.from_hdf5(urr[tkey])
 
     def xs_g(self, nuclide: str, mt: int) -> np.ndarray:
-        """Return the MF=3 group cross section [b], length ``n_groups``."""
-        return np.asarray(
-            self._file[f'{nuclide}/MT{mt}/xs_g'][()], dtype=np.float64)
+        """Return the MF=3 group cross section [b], length ``n_groups``.
+
+        A fresh array each call -- callers mutate the returned row in place.
+        """
+        total, _partials = self._reaction(nuclide, mt)
+        return np.asarray(total[()], dtype=np.float64)
 
     def pathway_xs_g(self, nuclide: str, mt: int, lfs: int,
                      izap=None) -> np.ndarray:
         """Return an MF=10 partial group cross section [b], length ``n_groups``.
 
         ``izap`` selects among the products of a lumped LFS; omit it for a
-        non-lumped reaction (a unique LFS).
+        non-lumped reaction (a unique LFS). A fresh array each call -- callers
+        mutate the returned row in place.
         """
         return np.asarray(
-            self._partial(nuclide, mt, lfs, izap)['xs_g'][()], dtype=np.float64)
+            self._partial(nuclide, mt, lfs, izap)[()], dtype=np.float64)
 
 
 class PendfTapeLibrary:

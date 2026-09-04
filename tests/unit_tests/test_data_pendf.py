@@ -1,6 +1,9 @@
 """Tests for openmc.data.pendf against real TENDL-2017 PENDF fixtures."""
 
+import gc
 import io
+import re
+import sys
 import types
 import warnings
 from pathlib import Path
@@ -12,6 +15,8 @@ import pytest
 import openmc.data
 from openmc.data import Tabulated1D
 from openmc.data.pendf import (PendfLibrary, PendfTapeLibrary,
+                               GroupedPendfLibrary, GROUPED_FORMAT,
+                               GROUPED_VERSION,
                                open_pendf_library, _attr_str, _check_lin_lin,
                                _dedupe_mf10_partials, _discover_pendf_files,
                                _iter_mf10_partials, _synthesize_mf10_total,
@@ -1385,3 +1390,249 @@ def test_tape_mf10_only_totals_disabled(tmp_path):
     src = _spliced_tape_dir(tmp_path, "In115", drop_mf3=(102,))
     with PendfTapeLibrary(src, mf10_only_totals=False) as lib:
         assert 102 not in lib.reactions("In115")
+
+
+# ---------------------------------------------------------------------------
+# GroupedPendfLibrary one-nuclide accessor index.
+#
+# The accessors used to re-open every HDF5 object by path on each call (and
+# _partial rescanned every LFS* subgroup's attributes per partial); they are now
+# served from a one-nuclide index built in a single walk. These tests pin the
+# returned values against a plain per-call re-implementation written below (the
+# way the old accessors walked the file), the exact error texts, the eviction
+# behaviour of the one-entry cache, bounded allocator growth over many reads,
+# and that every returned row is a fresh copy.
+#
+# No PENDF fixtures are parsed here -- the grouped file is built in-test with
+# h5py -- though the module skipif still gates them, matching the rest of
+# the file.
+
+_GROUPED_EDGES = np.array([1e-5, 1.0, 1e3, 1e6, 2e7])
+_GROUPED_NG = len(_GROUPED_EDGES) - 1
+
+# nuclide -> {mt: [(subgroup name, LFS, IZAP), ...]}. "Aa100" MT=5 is the lumped
+# case (one LFS shared by two products, stored as LFS<l>_ZAP<izap>); "Bb200"
+# MT=102 carries unique LFS values whose alphabetical subgroup order (LFS0,
+# LFS10, LFS2) differs from the (lfs, izap) sort order, so the sort is exercised.
+_GROUPED_LAYOUT = {
+    "Aa100": {
+        102: [("LFS0", 0, 47108), ("LFS2", 2, 47108)],
+        5: [("LFS0_ZAP47108", 0, 47108), ("LFS0_ZAP48108", 0, 48108)],
+        16: [],
+    },
+    "Bb200": {
+        102: [("LFS0", 0, 50200), ("LFS2", 2, 50200), ("LFS10", 10, 50200)],
+        103: [],
+    },
+}
+
+
+def _grouped_row(seed):
+    """Return a distinct length-``n_groups`` row for the given integer seed."""
+    return np.arange(_GROUPED_NG, dtype=np.float64) + 100.0 * seed
+
+
+def _write_grouped_h5(path):
+    """Write a minimal grouped PENDF library matching ``_GROUPED_LAYOUT``."""
+    seed = 0
+    with h5py.File(path, "w") as f:
+        f.attrs["format"] = GROUPED_FORMAT
+        f.attrs["version"] = GROUPED_VERSION
+        f.attrs["library"] = np.bytes_("TENDL-2017")
+        f.attrs["temperature"] = 293.16
+        f.create_dataset("group_edges", data=_GROUPED_EDGES)
+        for nuclide, reactions in _GROUPED_LAYOUT.items():
+            nuc_group = f.create_group(nuclide)
+            for mt, partials in reactions.items():
+                mt_group = nuc_group.create_group(f"MT{mt}")
+                seed += 1
+                mt_group.create_dataset("xs_g", data=_grouped_row(seed))
+                for name, lfs, izap in partials:
+                    sub = mt_group.create_group(name)
+                    sub.attrs["LFS"] = np.int64(lfs)
+                    sub.attrs["IZAP"] = np.int64(izap)
+                    seed += 1
+                    sub.create_dataset("xs_g", data=_grouped_row(seed))
+        # A non-MT child of a nuclide group: the index must step over it.
+        f["Bb200"].create_group("urr")
+    return path
+
+
+# -- per-call reference: the file walked by path, the way the old code did ----
+
+def _ref_reactions(path, nuclide):
+    with h5py.File(path, "r") as f:
+        return sorted(int(name[2:]) for name in f[nuclide]
+                      if name.startswith("MT"))
+
+
+def _ref_pathways(path, nuclide, mt):
+    with h5py.File(path, "r") as f:
+        group = f[f"{nuclide}/MT{mt}"]
+        return sorted(
+            (int(group[name].attrs["LFS"]), int(group[name].attrs["IZAP"]))
+            for name in group if name.startswith("LFS"))
+
+
+def _ref_xs_g(path, nuclide, mt):
+    with h5py.File(path, "r") as f:
+        return np.asarray(f[f"{nuclide}/MT{mt}/xs_g"][()], dtype=np.float64)
+
+
+def _ref_pathway_xs_g(path, nuclide, mt, lfs, izap=None):
+    with h5py.File(path, "r") as f:
+        group = f[f"{nuclide}/MT{mt}"]
+        matches = [group[name] for name in group
+                   if name.startswith("LFS")
+                   and int(group[name].attrs["LFS"]) == lfs
+                   and (izap is None or int(group[name].attrs["IZAP"]) == izap)]
+        assert len(matches) == 1
+        return np.asarray(matches[0]["xs_g"][()], dtype=np.float64)
+
+
+@pytest.fixture
+def grouped_lib(tmp_path):
+    """Return ``(GroupedPendfLibrary, path)`` over an in-test grouped file."""
+    path = _write_grouped_h5(tmp_path / "grouped.h5")
+    lib = GroupedPendfLibrary(path)
+    try:
+        yield lib, path
+    finally:
+        lib.close()
+
+
+def _read_all(lib, nuclide):
+    """Read every row of a nuclide; return ``{(mt, lfs, izap): row}`` plus totals."""
+    rows = {}
+    for mt in lib.reactions(nuclide):
+        rows[(mt, None, None)] = lib.xs_g(nuclide, mt)
+        for lfs, izap in lib.pathways(nuclide, mt):
+            rows[(mt, lfs, izap)] = lib.pathway_xs_g(nuclide, mt, lfs, izap)
+    return rows
+
+
+def test_grouped_index_matches_per_call_reference(grouped_lib):
+    # Every accessor returns exactly what a per-call path walk returns.
+    lib, path = grouped_lib
+    for nuclide in _GROUPED_LAYOUT:
+        assert lib.reactions(nuclide) == _ref_reactions(path, nuclide)
+        for mt in _ref_reactions(path, nuclide):
+            assert lib.pathways(nuclide, mt) == _ref_pathways(path, nuclide, mt)
+            assert np.array_equal(lib.xs_g(nuclide, mt),
+                                  _ref_xs_g(path, nuclide, mt))
+            assert lib.xs_g(nuclide, mt).dtype == np.float64
+            for lfs, izap in _ref_pathways(path, nuclide, mt):
+                got = lib.pathway_xs_g(nuclide, mt, lfs, izap)
+                assert np.array_equal(
+                    got, _ref_pathway_xs_g(path, nuclide, mt, lfs, izap))
+                assert got.dtype == np.float64
+
+    # Unique-LFS reactions resolve without an izap, exactly as before; the
+    # subgroups' alphabetical order (LFS0, LFS10, LFS2) is not the sort order.
+    assert lib.pathways("Bb200", 102) == [(0, 50200), (2, 50200), (10, 50200)]
+    for lfs in (0, 2, 10):
+        assert np.array_equal(lib.pathway_xs_g("Bb200", 102, lfs),
+                              _ref_pathway_xs_g(path, "Bb200", 102, lfs))
+
+    # The lumped LFS: izap picks the product, and each product's row differs.
+    assert lib.pathways("Aa100", 5) == [(0, 47108), (0, 48108)]
+    ag = lib.pathway_xs_g("Aa100", 5, 0, izap=47108)
+    cd = lib.pathway_xs_g("Aa100", 5, 0, izap=48108)
+    assert np.array_equal(ag, _ref_pathway_xs_g(path, "Aa100", 5, 0, 47108))
+    assert np.array_equal(cd, _ref_pathway_xs_g(path, "Aa100", 5, 0, 48108))
+    assert not np.array_equal(ag, cd)
+
+    # A reaction with no MF=10 partials still answers with an empty list.
+    assert lib.pathways("Aa100", 16) == []
+
+
+def test_grouped_index_error_messages_preserved(grouped_lib):
+    # The KeyError/ValueError texts are byte-identical to the pre-index ones.
+    lib, _path = grouped_lib
+
+    missing = "Nuclide 'Bb200' MT=102 has no MF=10 partial LFS=9."
+    with pytest.raises(KeyError, match=re.escape(missing)) as exc:
+        lib.pathway_xs_g("Bb200", 102, 9)
+    assert exc.value.args[0] == missing
+
+    missing_izap = "Nuclide 'Aa100' MT=5 has no MF=10 partial LFS=0, IZAP=999."
+    with pytest.raises(KeyError, match=re.escape(missing_izap)) as exc:
+        lib.pathway_xs_g("Aa100", 5, 0, izap=999)
+    assert exc.value.args[0] == missing_izap
+
+    ambiguous = ("Nuclide 'Aa100' MT=5 LFS=0 is shared by products with IZAP "
+                 "[47108, 48108]; pass izap to select one.")
+    with pytest.raises(ValueError, match=re.escape(ambiguous)) as exc:
+        lib.pathway_xs_g("Aa100", 5, 0)
+    assert exc.value.args[0] == ambiguous
+
+    # A missing nuclide or a missing MT still raises KeyError.
+    with pytest.raises(KeyError):
+        lib.reactions("Zz999")
+    with pytest.raises(KeyError):
+        lib.xs_g("Zz999", 102)
+    with pytest.raises(KeyError):
+        lib.xs_g("Aa100", 999)
+    with pytest.raises(KeyError):
+        lib.pathways("Aa100", 999)
+
+
+def test_grouped_index_evicts_previous_nuclide(grouped_lib):
+    # The cache holds exactly one nuclide: reading another evicts the first,
+    # and alternating reads keep returning the right rows.
+    lib, path = grouped_lib
+    assert lib._index_nuclide is None
+
+    expected = {nuc: {mt: _ref_xs_g(path, nuc, mt)
+                      for mt in _ref_reactions(path, nuc)}
+                for nuc in _GROUPED_LAYOUT}
+
+    for _ in range(4):
+        for nuclide in ("Aa100", "Bb200", "Aa100"):
+            rows = _read_all(lib, nuclide)
+            for mt, row in expected[nuclide].items():
+                assert np.array_equal(rows[(mt, None, None)], row)
+            # Only the nuclide just read is indexed.
+            assert lib._index_nuclide == nuclide
+            assert sorted(lib._index_cache) == sorted(
+                _GROUPED_LAYOUT[nuclide])
+
+    # After reading B, A's index is gone (its MTs are not in the cache).
+    lib.reactions("Aa100")
+    lib.reactions("Bb200")
+    assert lib._index_nuclide == "Bb200"
+    assert 16 not in lib._index_cache      # Aa100-only MT
+    assert 103 in lib._index_cache         # Bb200-only MT
+
+    lib.close()
+    assert lib._index_nuclide is None
+    assert lib._index_cache == {}
+
+
+def test_grouped_index_bounded_block_growth(grouped_lib):
+    # Repeated reads of one nuclide must not grow the Python allocator: the
+    # index is built once and every call is served from it.
+    lib, _path = grouped_lib
+    _read_all(lib, "Aa100")
+    gc.collect()
+    before = sys.getallocatedblocks()
+    for _ in range(2000):
+        _read_all(lib, "Aa100")
+    gc.collect()
+    growth = sys.getallocatedblocks() - before
+    assert growth < 200, f"allocated blocks grew by {growth}"
+
+
+def test_grouped_index_returns_fresh_copies(grouped_lib):
+    # Callers mutate the returned rows in place, so every call must hand back a
+    # fresh array rather than a view onto a cached one.
+    lib, path = grouped_lib
+    row = lib.xs_g("Aa100", 102)
+    row += 1.0e6
+    assert np.array_equal(lib.xs_g("Aa100", 102),
+                          _ref_xs_g(path, "Aa100", 102))
+
+    part = lib.pathway_xs_g("Aa100", 5, 0, izap=47108)
+    part[:] = -1.0
+    assert np.array_equal(lib.pathway_xs_g("Aa100", 5, 0, izap=47108),
+                          _ref_pathway_xs_g(path, "Aa100", 5, 0, 47108))
