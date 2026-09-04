@@ -534,7 +534,7 @@ LIBRARY_CONFIGS = {
     },
     'tendl2017b': {
         'description': 'TENDL-2017 + decay2012 - CCFE-709',
-        'endf_gxs_dir': '/home/perry/NukeData/Activation/PENDF/Pipeline-Produced/tendl2017b/gxs-709/',
+        'endf_gxs_dir': '/home/perry/Projects/OMC_Development/PREPRO_production-pipeline_GENDF-PENDF/Pipeline-Produced/ref-IST/tendl2017b/gxs-709/',
         'decay_file': '/home/perry/NukeData/Activation/DecayData/ukdd-12_decay.dat',
         'base_chain': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017b/Chain_TENDL2017.xml',
         'output_dir': '/home/perry/NukeData/openmc_data/src/openmc_data/depletion/TENDL2017b/GENDF/',
