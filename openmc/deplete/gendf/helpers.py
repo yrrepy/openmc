@@ -34,6 +34,12 @@ if TYPE_CHECKING:
     from ..chain import Chain
 
 
+# Materials collapsed per streaming pass. The cached result holds
+# ``64 * n_nuclides * n_reactions`` floats, far under the (nnz, n_groups)
+# table it replaces, and the GENDF rows are re-read once per chunk per cycle.
+_MATERIAL_CHUNK = 64
+
+
 class DirectWithFluxHelper(_GENDFMT4FallbackMixin, ReactionRateHelper):
     """Direct reaction rates with flux tallying for isomeric branching.
 
@@ -178,8 +184,10 @@ class GENDFFluxCollapseHelper(ReactionRateHelper):
 
     This class tallies a multigroup flux in the GENDF library's energy group
     structure (CCFE-709 or UKAEA-1102) and collapses it with GENDF group-wise
-    cross sections using a sparse table (one matrix-vector product per
-    material). GENDF MF=3 data includes lumped reactions such as (n,n') that
+    cross sections by streaming: the group XS rows are staged 256 at a time
+    and contracted against a chunk of material fluxes with one matrix-matrix
+    product, once per transport cycle, so no cross-section table is held
+    between cycles. GENDF MF=3 data includes lumped reactions such as (n,n') that
     are absent from most continuous-energy HDF5 libraries, so those rates are
     obtained natively. Select reactions can still be treated with a direct
     continuous-energy reaction rate tally; fission is direct-tallied by
@@ -227,10 +235,12 @@ class GENDFFluxCollapseHelper(ReactionRateHelper):
         self._reactions_direct = (
             ['fission'] if reactions is None else list(reactions))
         self._nuclides_direct = list(nuclides) if nuclides is not None else None
-        self._xs_table = None
+        self._table_nucs = []
         self._table_index = {}
         self._table_nuclides = None
         self._missing = frozenset()
+        # (chunk index, collapsed (n_chunk, n_table_nucs, n_rxn) array)
+        self._collapse_cache = None
 
     @ReactionRateHelper.nuclides.setter
     def nuclides(self, nuclides):
@@ -312,6 +322,7 @@ class GENDFFluxCollapseHelper(ReactionRateHelper):
                 This step must be performed after each transport cycle
         """
         self._flux_tally_means_cache = None
+        self._collapse_cache = None
         if self._reactions_direct:
             self._rate_tally_means_cache = None
 
@@ -336,11 +347,10 @@ class GENDFFluxCollapseHelper(ReactionRateHelper):
         shape = (len(self._materials), len(self._energies) - 1)
         return self.flux_tally_means.reshape(shape)[mat_index]
 
-    def _ensure_xs_table(self):
-        """Build the sparse GENDF XS table; rebuild if the nuclide set grew."""
+    def _ensure_nuclide_index(self):
+        """Index the nuclides with GENDF data; rebuild if the nuclide set grew."""
         if self._table_nuclides == self.nuclides:
             return
-        from ..microxs import _build_sparse_xs_table
 
         available = self._gendf_library.available_nuclides_set()
         table_nucs = [n for n in self.nuclides if n in available]
@@ -352,10 +362,11 @@ class GENDFFluxCollapseHelper(ReactionRateHelper):
                 f"{len(missing)} nuclides not in GENDF library will have "
                 f"zero reaction rates unless directly tallied: {names}{more}")
         self._missing = missing
-        self._xs_table = _build_sparse_xs_table(
-            self._gendf_library, table_nucs, self._scores, self._mts)
+        self._table_nucs = table_nucs
         self._table_index = {n: i for i, n in enumerate(table_nucs)}
         self._table_nuclides = list(self.nuclides)
+        # The nuclide set grew, so any cached collapse has the wrong shape
+        self._collapse_cache = None
 
     def get_material_rates(self, mat_index, nuc_index, react_index):
         """Return an array of reaction rates for a material
@@ -378,13 +389,25 @@ class GENDFFluxCollapseHelper(ReactionRateHelper):
 
         """
         self._results_cache.fill(0.0)
-        self._ensure_xs_table()
+        self._ensure_nuclide_index()
 
-        # Collapse GENDF group XS with this material's flux spectrum. Result
-        # is sigma [b] times volume-integrated flux [particle-cm/src] -- the
+        # Collapse GENDF group XS with the flux spectra of this material's
+        # chunk, streaming the rows once per chunk per cycle. Result is
+        # sigma [b] times volume-integrated flux [particle-cm/src] -- the
         # same convention as direct tallies with multiply_density=False.
-        flux = self.get_flux_spectrum(mat_index)
-        collapsed = self._xs_table.collapse(flux)
+        chunk, local = divmod(mat_index, _MATERIAL_CHUNK)
+        if self._collapse_cache is None or self._collapse_cache[0] != chunk:
+            from ..microxs import _collapse_gendf_streaming
+
+            n_mats = len(self._materials)
+            fluxes = self.flux_tally_means.reshape(
+                n_mats, len(self._energies) - 1)[
+                    chunk * _MATERIAL_CHUNK:(chunk + 1) * _MATERIAL_CHUNK]
+            collapsed_chunk = _collapse_gendf_streaming(
+                self._gendf_library, self._table_nucs, self._scores,
+                self._mts, fluxes)
+            self._collapse_cache = (chunk, collapsed_chunk)
+        collapsed = self._collapse_cache[1][local]
 
         for name, i_nuc in zip(self.nuclides, nuc_index):
             i_table = self._table_index.get(name)

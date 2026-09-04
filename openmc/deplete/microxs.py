@@ -457,6 +457,66 @@ def get_microxs_and_flux(
     return fluxes, micros
 
 
+# Number of fluxes collapsed per GEMM; bounds working memory to the dense
+# scatter buffer of ``chunk * n_nuclides * n_reactions`` floats regardless of
+# the total flux count.
+_COLLAPSE_CHUNK_SIZE = 1024
+
+
+def _normalize_flux_batch(
+    fluxes: Sequence[np.ndarray],
+    start: int,
+    n_groups: int,
+) -> np.ndarray:
+    """Stack, validate and row-normalize one batch of multigroup fluxes.
+
+    The shape / finite / non-negative guards and the sum-to-1 normalization,
+    factored out so the streaming GENDF collapse normalizes its flux batch
+    exactly the same way -- same error messages, same *global* flux index in
+    them.
+
+    Parameters
+    ----------
+    fluxes : sequence of numpy.ndarray
+        The batch itself (already sliced out of the full flux list).
+    start : int
+        Index of ``fluxes[0]`` in the full flux list, so a validation error
+        names the offending flux by its global index.
+    n_groups : int
+        Expected number of groups per flux.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_batch, n_groups)`` array whose rows sum to 1; an all-zero flux is
+        left all-zero (divided by 1, hence no NaN).
+    """
+    phi = np.asarray(fluxes, dtype=float)
+    if phi.ndim != 2 or phi.shape[1] != n_groups:
+        raise ValueError(f'Each multigroup flux must have length {n_groups}')
+
+    # Vectorized equivalents of the per-flux finite / non-negative checks,
+    # reporting the first offending flux in iteration order. As in the
+    # per-flux path, the finite check takes precedence for a flux that
+    # fails both.
+    not_finite = ~np.isfinite(phi).all(axis=1)
+    negative = (phi < 0).any(axis=1)
+    bad = not_finite | negative
+    if bad.any():
+        local = int(np.argmax(bad))
+        index = start + local
+        if not_finite[local]:
+            raise ValueError(
+                f'Multigroup flux {index} contains non-finite values')
+        raise ValueError(
+            f'Multigroup flux {index} contains negative values')
+
+    # Row-normalize to sum 1; zero-sum rows (all zeros) divide by 1 and
+    # stay all-zero instead of producing NaN.
+    flux_sum = phi.sum(axis=1)
+    return phi / np.where(flux_sum > 0, flux_sum, 1.0)[:, np.newaxis]
+
+
 @dataclass
 class _SparseXSTable:
     """Sparse storage of GENDF cross-sections for vectorized flux collapse.
@@ -483,6 +543,56 @@ class _SparseXSTable:
         return result
 
 
+def _stage_gendf_rows(gendf_library, nuclides, reactions, mts, emit) -> None:
+    """Read the GENDF group XS rows one nuclide at a time, handing each to ``emit``.
+
+    Rows are read once per call; the caller decides whether to keep them (the
+    sparse table) or contract them against the flux and drop them (the
+    streaming collapse).
+
+    Parameters
+    ----------
+    gendf_library : _PythonGENDFLibrary or _CppGENDFLibrary
+        GENDF library instance
+    nuclides : list of str
+        Nuclide names to include
+    reactions : list of str
+        Reaction names (parallel to mts)
+    mts : list of int
+        MT numbers corresponding to reactions
+    emit : callable
+        Called as ``emit(nuc_idx, rxn_idx, xs_arr)`` for every group XS row
+        found, in nuclide-then-MT order.
+    """
+    if len(reactions) != len(mts):
+        raise ValueError(
+            f"reactions ({len(reactions)}) and mts ({len(mts)}) "
+            f"must have same length")
+
+    # Each MT maps to exactly one table column; duplicate MTs would collapse
+    # in mt_to_rxn_idx and silently zero one reaction's column. Fail loudly.
+    if len(set(mts)) != len(mts):
+        seen = {}
+        dups = []
+        for name, mt in zip(reactions, mts):
+            if mt in seen:
+                dups.append(f"'{seen[mt]}' and '{name}' (MT={mt})")
+            else:
+                seen[mt] = name
+        raise ValueError(
+            "Duplicate reaction MT numbers requested for the GENDF sparse "
+            "table; each MT maps to a single column: " + "; ".join(dups))
+
+    mt_to_rxn_idx = {mt: i for i, mt in enumerate(mts)}
+
+    for nuc_idx, nuc in enumerate(nuclides):
+        all_xs = gendf_library.get_all_xs(nuc, mts=mts)
+        for mt, xs_arr in all_xs.items():
+            if mt not in mt_to_rxn_idx:
+                continue
+            emit(nuc_idx, mt_to_rxn_idx[mt], xs_arr)
+
+
 def _build_sparse_xs_table(
     gendf_library,
     nuclides: list[str],
@@ -507,39 +617,16 @@ def _build_sparse_xs_table(
     _SparseXSTable
         Sparse table ready for vectorized collapse
     """
-    if len(reactions) != len(mts):
-        raise ValueError(
-            f"reactions ({len(reactions)}) and mts ({len(mts)}) "
-            f"must have same length")
-
-    # Each MT maps to exactly one table column; duplicate MTs would collapse
-    # in mt_to_rxn_idx and silently zero one reaction's column. Fail loudly.
-    if len(set(mts)) != len(mts):
-        seen = {}
-        dups = []
-        for name, mt in zip(reactions, mts):
-            if mt in seen:
-                dups.append(f"'{seen[mt]}' and '{name}' (MT={mt})")
-            else:
-                seen[mt] = name
-        raise ValueError(
-            "Duplicate reaction MT numbers requested for the GENDF sparse "
-            "table; each MT maps to a single column: " + "; ".join(dups))
-
     rows = []
     nuc_idx_list = []
     rxn_idx_list = []
 
-    mt_to_rxn_idx = {mt: i for i, mt in enumerate(mts)}
+    def emit(nuc_idx, rxn_idx, xs_arr):
+        rows.append(xs_arr)
+        nuc_idx_list.append(nuc_idx)
+        rxn_idx_list.append(rxn_idx)
 
-    for nuc_idx, nuc in enumerate(nuclides):
-        all_xs = gendf_library.get_all_xs(nuc, mts=mts)
-        for mt, xs_arr in all_xs.items():
-            if mt not in mt_to_rxn_idx:
-                continue
-            rows.append(xs_arr)
-            nuc_idx_list.append(nuc_idx)
-            rxn_idx_list.append(mt_to_rxn_idx[mt])
+    _stage_gendf_rows(gendf_library, nuclides, reactions, mts, emit)
 
     if rows:
         xs_matrix = np.vstack(rows)
@@ -553,6 +640,89 @@ def _build_sparse_xs_table(
         nuc_indices=np.array(nuc_idx_list, dtype=np.int32),
         rxn_indices=np.array(rxn_idx_list, dtype=np.int32),
     )
+
+
+# Group XS rows accumulated before each GEMM against the flux batch.
+_DEFAULT_BLOCK_ROWS = 256
+
+
+def _collapse_gendf_streaming(
+    gendf_library,
+    nuclides: list[str],
+    reactions: list[str],
+    mts: list[int],
+    phi: np.ndarray,
+    block_rows: int = _DEFAULT_BLOCK_ROWS,
+) -> np.ndarray:
+    """Collapse GENDF group XS against a batch of fluxes without a table.
+
+    Rows are staged ``block_rows`` at a time, contracted against the whole
+    flux batch with one GEMM, scattered into the dense result and dropped, so
+    the ``(nnz, n_groups)`` matrix and its ``vstack`` copy are never
+    materialized. Peak working memory is ``block_rows * n_groups`` floats
+    (2.2 MB at 1102 groups), independent of the number of non-zero rows.
+
+    The arithmetic is that of :meth:`_SparseXSTable.collapse` -- the same rows
+    and the same dot products, only grouped ``block_rows`` at a time. Each
+    (nuclide, MT) row appears once, so the scatter into the result never
+    collides. Values are not bit-identical to the table path: BLAS accumulates
+    a row block in a different order than it accumulates the whole matrix, so
+    the two agree only to a few ULP (~1e-15 relative), for a single flux as
+    much as for a batch, unless every row fits in one block.
+
+    Parameters
+    ----------
+    gendf_library : _PythonGENDFLibrary or _CppGENDFLibrary
+        GENDF library instance
+    nuclides : list of str
+        Nuclide names to include
+    reactions : list of str
+        Reaction names (parallel to mts)
+    mts : list of int
+        MT numbers corresponding to reactions
+    phi : numpy.ndarray
+        ``(n_flux, n_groups)`` array of group weights, taken as given:
+        normalized rows give one-group cross sections, raw group fluxes give
+        reaction rates. No validation is applied here -- callers normalize
+        with :func:`_normalize_flux_batch` or pass a raw tally flux.
+    block_rows : int, optional
+        Number of group XS rows accumulated per GEMM.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_flux, n_nuclides, n_reactions)`` collapsed values
+    """
+    phi = np.asarray(phi, dtype=float)
+    if phi.ndim != 2:
+        raise ValueError('phi must be a 2D (n_flux, n_groups) array')
+    if block_rows < 1:
+        raise ValueError('block_rows must be at least 1')
+
+    result = np.zeros((phi.shape[0], len(nuclides), len(reactions)))
+
+    block = []
+    block_keys = []
+
+    def flush():
+        if not block:
+            return
+        values = phi @ np.vstack(block).T
+        for j, (i, r) in enumerate(block_keys):
+            result[:, i, r] = values[:, j]
+        block.clear()
+        block_keys.clear()
+
+    def emit(nuc_idx, rxn_idx, xs_arr):
+        block.append(np.asarray(xs_arr, dtype=float))
+        block_keys.append((nuc_idx, rxn_idx))
+        if len(block) >= block_rows:
+            flush()
+
+    _stage_gendf_rows(gendf_library, nuclides, reactions, mts, emit)
+    flush()
+
+    return result
 
 
 class MicroXS:

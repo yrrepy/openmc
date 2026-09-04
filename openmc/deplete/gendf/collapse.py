@@ -28,7 +28,8 @@ import openmc.lib
 from openmc.mpi import comm
 from ..chain import Chain, _get_chain
 from .. import microxs as _microxs
-from ..microxs import DomainTypes, Flux, MicroXS, _build_sparse_xs_table
+from ..microxs import (DomainTypes, Flux, MicroXS, _COLLAPSE_CHUNK_SIZE,
+                       _collapse_gendf_streaming, _normalize_flux_batch)
 from .library import GENDFLibrary
 
 
@@ -192,23 +193,20 @@ def get_gendfxs_and_flux(
     # Create list where each item corresponds to one domain
     fluxes = list(flux.squeeze((1, 2)))
 
-    # Build sparse XS table once (GENDF XS are domain-independent)
+    # Collapse every domain flux against the GENDF rows in one streaming
+    # pass per chunk; the (nnz, n_groups) table is never built. A zero-sum
+    # flux stays all-zero through the normalizer and yields an all-zero
+    # MicroXS, as the per-domain zero check used to.
     mts = [REACTION_MT[name] for name in reactions]
-    table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
-
-    # Collapse per domain
+    n_groups = len(energies) - 1
     micros = []
-    for flux_i in fluxes:
-        flux_arr = np.asarray(flux_i, dtype=float)
-        flux_sum = flux_arr.sum()
-        if flux_sum == 0.0:
-            micros.append(MicroXS(
-                np.zeros((len(nuclides), len(reactions), 1)),
-                nuclides, reactions))
-            continue
-        collapsed = table.collapse(flux_arr / flux_sum)
-        micros.append(MicroXS(collapsed[:, :, np.newaxis],
-                               nuclides, reactions))
+    for start in range(0, len(fluxes), _COLLAPSE_CHUNK_SIZE):
+        phi = _normalize_flux_batch(
+            fluxes[start:start + _COLLAPSE_CHUNK_SIZE], start, n_groups)
+        collapsed = _collapse_gendf_streaming(
+            gendf_library, nuclides, reactions, mts, phi)
+        micros.extend(MicroXS(c[:, :, np.newaxis], nuclides, reactions)
+                      for c in collapsed)
 
     # Reset tallies
     model.tallies = original_tallies
@@ -299,17 +297,15 @@ def _from_multigroup_flux_with_gendf(
 
     # Get reaction MT values
     if reactions is None:
-        reactions = chain.reactions
+        reactions = list(chain.reactions)
+    else:
+        reactions = list(reactions)
     mts = [REACTION_MT[name] for name in reactions]
 
-    # If flux is zero, safely return zero cross sections
-    multigroup_flux = np.asarray(multigroup_flux, dtype=float)
-    if (flux_sum := multigroup_flux.sum()) == 0.0:
-        return cls(np.zeros((len(nuclides), len(mts), 1)),
-                   nuclides, reactions)
-
-    # Build sparse table and collapse with normalized flux
-    table = _build_sparse_xs_table(gendf_library, nuclides, reactions, mts)
-    collapsed = table.collapse(multigroup_flux / flux_sum)
+    # Normalize the flux (a zero flux stays all-zero, giving zero cross
+    # sections) and collapse the GENDF rows in one streaming pass
+    phi = _normalize_flux_batch([multigroup_flux], 0, len(energies) - 1)
+    collapsed = _collapse_gendf_streaming(
+        gendf_library, nuclides, reactions, mts, phi)[0]
 
     return cls(collapsed[:, :, np.newaxis], nuclides, reactions)
