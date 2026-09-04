@@ -563,6 +563,60 @@ _ISOMER_SUFFIX = re.compile(r'_m\d+$')
 _COLLAPSE_CHUNK_SIZE = 1024
 
 
+def _normalize_flux_batch(
+    fluxes: Sequence[np.ndarray],
+    start: int,
+    n_groups: int,
+) -> np.ndarray:
+    """Stack, validate and row-normalize one batch of multigroup fluxes.
+
+    The shape / finite / non-negative guards and the sum-to-1 normalization of
+    :func:`_collapse_fluxes`, factored out so the block PENDF collapse
+    (:mod:`openmc.deplete.pendf.collapse`) normalizes its flux batch exactly the
+    same way -- same error messages, same *global* flux index in them.
+
+    Parameters
+    ----------
+    fluxes : sequence of numpy.ndarray
+        The batch itself (already sliced out of the full flux list).
+    start : int
+        Index of ``fluxes[0]`` in the full flux list, so a validation error
+        names the offending flux by its global index.
+    n_groups : int
+        Expected number of groups per flux.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(n_batch, n_groups)`` array whose rows sum to 1; an all-zero flux is
+        left all-zero (divided by 1, hence no NaN).
+    """
+    phi = np.asarray(fluxes, dtype=float)
+    if phi.ndim != 2 or phi.shape[1] != n_groups:
+        raise ValueError(f'Each multigroup flux must have length {n_groups}')
+
+    # Vectorized equivalents of the per-flux finite / non-negative checks,
+    # reporting the first offending flux in iteration order. As in the
+    # per-flux path, the finite check takes precedence for a flux that
+    # fails both.
+    not_finite = ~np.isfinite(phi).all(axis=1)
+    negative = (phi < 0).any(axis=1)
+    bad = not_finite | negative
+    if bad.any():
+        local = int(np.argmax(bad))
+        index = start + local
+        if not_finite[local]:
+            raise ValueError(
+                f'Multigroup flux {index} contains non-finite values')
+        raise ValueError(
+            f'Multigroup flux {index} contains negative values')
+
+    # Row-normalize to sum 1; zero-sum rows (all zeros) divide by 1 and
+    # stay all-zero instead of producing NaN.
+    flux_sum = phi.sum(axis=1)
+    return phi / np.where(flux_sum > 0, flux_sum, 1.0)[:, np.newaxis]
+
+
 def _collapse_fluxes(
     table: _SparseXSTable,
     fluxes: Sequence[np.ndarray],
@@ -587,30 +641,8 @@ def _collapse_fluxes(
     n_groups = table.xs_matrix.shape[1]
     micros = []
     for start in range(0, len(fluxes), chunk_size):
-        phi = np.asarray(fluxes[start:start + chunk_size], dtype=float)
-        if phi.ndim != 2 or phi.shape[1] != n_groups:
-            raise ValueError(f'Each multigroup flux must have length {n_groups}')
-
-        # Vectorized equivalents of the per-flux finite / non-negative checks,
-        # reporting the first offending flux in iteration order. As in the
-        # per-flux path, the finite check takes precedence for a flux that
-        # fails both.
-        not_finite = ~np.isfinite(phi).all(axis=1)
-        negative = (phi < 0).any(axis=1)
-        bad = not_finite | negative
-        if bad.any():
-            local = int(np.argmax(bad))
-            index = start + local
-            if not_finite[local]:
-                raise ValueError(
-                    f'Multigroup flux {index} contains non-finite values')
-            raise ValueError(
-                f'Multigroup flux {index} contains negative values')
-
-        # Row-normalize to sum 1; zero-sum rows (all zeros) divide by 1 and
-        # stay all-zero instead of producing NaN.
-        flux_sum = phi.sum(axis=1)
-        phi = phi / np.where(flux_sum > 0, flux_sum, 1.0)[:, np.newaxis]
+        phi = _normalize_flux_batch(
+            fluxes[start:start + chunk_size], start, n_groups)
 
         collapsed = table.collapse_batch(phi)
         for result in collapsed:
@@ -690,8 +722,32 @@ class MicroXS:
         is not found.
 
         Multiple fluxes can be collapsed at once by passing a 2-D array (or a
-        list of 1-D arrays); the group cross section table is then built only
-        once and reused for every flux.
+        list of 1-D arrays); the group cross sections are then read from the
+        library only once and reused for every flux. Any number of fluxes is
+        accepted, processed in chunks of :data:`_COLLAPSE_CHUNK_SIZE` (1024).
+
+        On the continuous-energy path the chunk is collapsed against a
+        ``(nnz, n_groups)`` cross section table built once up front. **The PENDF
+        path never builds that table**: its rows are staged one nuclide at a time
+        and contracted against the normalized fluxes in blocks of 256 rows, so
+        the peak row buffer is ``256 x n_groups x 8 B`` (33 MB at 16000 groups)
+        no matter how many non-zero rows the library carries. Beyond that a
+        chunk holds its flux array, ``n_flux x n_groups x 8 B`` (131 MB at
+        1024 x 16000), and the results,
+        ``n_flux x n_nuclides x n_reactions x 8 B`` (365 kB per flux at 481
+        nuclides x 95 reactions). PENDF rows are re-staged per chunk -- one pass
+        over the library per 1024 fluxes -- so the collapse's summary warnings
+        may be raised once per chunk; Python's default warning filter shows
+        identical messages once.
+
+        Each PENDF flux is contracted per block with the same matrix-vector
+        product a single-flux call uses, so a batch equals the corresponding
+        single-flux calls exactly, whatever the chunk split. The default 256-row
+        block reproduces the former full-matrix contraction bit for bit under
+        single-threaded BLAS (the validated configuration); a multithreaded BLAS
+        moves the last bit for the former path as well as this one, and other
+        block sizes may move it too, because the BLAS kernel picks its summation
+        order from the operand shape.
 
         It is recommended to make repeated calls to this method within a context
         manager using the :class:`openmc.lib.TemporarySession` class to avoid

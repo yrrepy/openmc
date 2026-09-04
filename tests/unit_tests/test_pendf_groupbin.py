@@ -22,7 +22,11 @@ from openmc.data.pendf import GROUPED_FORMAT
 from openmc.deplete import MicroXS
 from openmc.deplete.chain import Chain
 from openmc.deplete.nuclide import Nuclide
-from openmc.deplete.pendf.collapse import _build_xs_table_pendf
+from openmc.deplete.microxs import _collapse_fluxes, _normalize_flux_batch
+from openmc.deplete.pendf.collapse import (
+    _build_xs_table_pendf,
+    _collapse_pendf_blocks,
+)
 
 # Load the writer CLI module (tools/ is not a package) by path.
 _TOOLS = Path(__file__).parents[2] / "tools" / "pendf_group_bin.py"
@@ -202,6 +206,41 @@ def test_bit_exact_table(libs):
     assert np.array_equal(got.xs_matrix, ref.xs_matrix)
     # Sanity: the isomeric expansion actually happened (In116_m1 row present).
     assert "(n,gamma)_m1" in ref.reactions
+
+
+def test_block_collapse_matches_table_grouped(libs):
+    """The block contraction of a GROUPED library reproduces, bit for bit, the
+    table path ``_collapse_fluxes(_build_xs_table_pendf(...), fluxes)`` -- both
+    through the public ``from_multigroup_flux`` entry point and through a direct
+    ``_collapse_pendf_blocks`` call on the normalized flux batch."""
+    _, grouped, _ = libs
+    nucs = ["In115", "Fe56"]
+    chain = _groupbin_chain()
+    fluxes = [np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+              np.array([6.0, 0.0, 4.0, 3.0, 2.0, 1.0])]
+
+    # The table path called the way production calls it: one flux at a time.
+    # BLAS picks its summation order from the operand shape, so a multi-row
+    # flux matrix is a different operation and is not the reference.
+    table = _build_xs_table_pendf(nucs, REACTIONS, EDGES, grouped, chain)
+    ref = [_collapse_fluxes(table, [flux])[0] for flux in fluxes]
+
+    got = MicroXS.from_multigroup_flux(
+        energies=EDGES, multigroup_flux=fluxes, chain_file=chain,
+        nuclides=nucs, reactions=REACTIONS, pendf_library=grouped)
+
+    phi = _normalize_flux_batch(fluxes, 0, len(EDGES) - 1)
+    direct = _collapse_pendf_blocks(
+        nucs, REACTIONS, EDGES, grouped, chain, phi)
+
+    for other in (got, direct):
+        assert len(other) == len(ref)
+        for a, b in zip(other, ref):
+            assert a.nuclides == b.nuclides
+            assert a.reactions == b.reactions
+            assert np.array_equal(a.data, b.data)
+    # Sanity: the isomeric expansion is present, so qualified rows are covered.
+    assert "(n,gamma)_m1" in ref[0].reactions
 
 
 def test_reader_api(libs):

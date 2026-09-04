@@ -2,8 +2,11 @@
 
 Holds the pointwise-PENDF counterparts extracted from
 :mod:`openmc.deplete.microxs`: the transport-plus-collapse driver
-:func:`get_pendf_microxs_and_flux`, the PENDF cross section table builder
-:func:`_build_xs_table_pendf`, and their domain / dilution / clamp helpers.
+:func:`get_pendf_microxs_and_flux`, the shared row-staging engine
+:func:`_stage_pendf_rows` with its two consumers -- the block contraction
+:func:`_collapse_pendf_blocks` (the production collapse) and the table builder
+:func:`_build_xs_table_pendf` (its reference form) -- and their domain /
+dilution / clamp helpers.
 
 This submodule is never imported at ``openmc.deplete`` package-init time, so it
 may import from :mod:`openmc.deplete.microxs` at module level.
@@ -13,6 +16,7 @@ may import from :mod:`openmc.deplete.microxs` at module level.
 
 from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
+import ctypes
 import os
 import shutil
 from tempfile import TemporaryDirectory
@@ -29,6 +33,7 @@ import openmc.lib
 from openmc.mpi import comm
 from ..chain import Chain, _get_chain
 from ..coupled_operator import _find_cross_sections, _get_nuclides_with_data
+from .. import microxs as _microxs
 from ..microxs import (
     DomainTypes,
     MicroXS,
@@ -36,6 +41,7 @@ from ..microxs import (
     _collapse_fluxes,
     _flux_is_single,
     _group_average,
+    _normalize_flux_batch,
 )
 from .chain_check import (
     CONSISTENCY_ABS_FLOOR,
@@ -55,6 +61,33 @@ from .ground import (
     _partial_binding_veto_grouped,
     _silence_fill_ground,
 )
+
+
+# Rows per contraction in the PENDF block collapse. Staged rows are buffered
+# this many at a time and contracted against each already-normalized flux, so
+# the peak row storage is
+# ``block_rows * n_groups`` floats (33 MB at 256 x 16000) instead of the whole
+# ``(nnz, n_groups)`` table (~1.4 GB at 11800 x 16000, doubled by the vstack).
+_DEFAULT_BLOCK_ROWS = 256
+
+
+def _trim_heap() -> None:
+    """Return free heap arenas to the OS with glibc ``malloc_trim(0)``.
+
+    Linux/glibc only: the call is made through :mod:`ctypes` and is a silent
+    no-op everywhere else (musl, macOS, Windows), so every failure is swallowed.
+
+    Why it is needed. A 16000-group float64 row is 128,000 B -- just under
+    glibc's 128 KiB mmap threshold -- so the staged rows are served from the brk
+    heap rather than by mmap, and freeing them leaves fragmented free heap
+    inside the process instead of returning memory to the OS (~1.5 GB retained,
+    growing with each further collapse). ``malloc_trim(0)`` hands that back. It
+    never lowers the collapse peak, only the retained footprint.
+    """
+    try:
+        ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _pendf_dilution_material(domain) -> openmc.Material:
@@ -144,6 +177,21 @@ def get_pendf_microxs_and_flux(
     flux, each returned :class:`MicroXS` is exactly the direct
     :meth:`MicroXS.from_multigroup_flux` call for that domain -- the point of the
     design.
+
+    With ``urr_material_dilution`` off, every domain's flux goes into a **single**
+    :meth:`MicroXS.from_multigroup_flux` call, so the library is staged once per
+    chunk of 1024 domains rather than once per domain. With it on, each domain
+    shields with its own composition and a single self-shielding scaler cannot
+    serve a mixed batch, so that case stays one collapse per domain.
+
+    Memory. The collapse itself never materializes the ``(nnz, n_groups)`` cross
+    section table: rows are staged one nuclide at a time and contracted against
+    each normalized flux in blocks of 256 rows, so the peak row buffer is
+    ``256 x n_groups x 8 B`` (33 MB at 16000 groups) whatever the number of
+    non-zero rows. Beyond that, one batch holds its flux array,
+    ``n_flux x n_groups x 8 B`` (131 MB at 1024 x 16000), and the results,
+    ``n_flux x n_nuclides x n_reactions x 8 B`` (365 kB per domain at 481
+    nuclides x 95 reactions).
 
     .. versionadded:: 0.15.4
 
@@ -414,24 +462,36 @@ def get_pendf_microxs_and_flux(
         flux = np.moveaxis(flux_tally.get_reshaped_data(), 1, -1)
         fluxes.extend(flux.squeeze((1, 2)))
 
-    # Per-domain collapse against the PENDF library. When dilution is on, each
-    # domain shields with its own composition (a Material, or a material-filled
-    # Cell's fill -- resolved above); off passes False, an exact no-op relative
-    # to the plain flux-supplied collapse. The chain resolved up front is shared
+    # Collapse against the PENDF library. The chain resolved up front is shared
     # across every domain (loaded once).
     if urr_material_dilution:
-        dilution_per_domain = dilution_materials
+        # Each domain shields with its OWN composition (a Material, or a
+        # material-filled Cell's fill -- resolved above), and one self-shielding
+        # scaler cannot serve a mixed batch, so this case stays one collapse per
+        # domain: simplest, and exact.
+        micros = [
+            MicroXS.from_multigroup_flux(
+                energies=energies, multigroup_flux=flux_i, chain_file=chain,
+                nuclides=nuclides, reactions=reactions,
+                pendf_library=pendf_library, urr_material_dilution=material,
+                mat_ssf_nuclides=mat_ssf_nuclides,
+                partial_binding=partial_binding)
+            for flux_i, material in zip(fluxes, dilution_materials)
+        ]
+    elif len(fluxes) > 0:
+        # Dilution off: ONE batched collapse carrying every domain's flux, so
+        # the library is staged once per chunk of 1024 domains instead of once
+        # per domain. A 2-D (n_domains, n_groups) input always returns a list --
+        # even for a single domain -- but normalize defensively so ``micros`` is
+        # a list of MicroXS in domain order either way.
+        micros = MicroXS.from_multigroup_flux(
+            energies=energies, multigroup_flux=np.asarray(fluxes, dtype=float),
+            chain_file=chain, nuclides=nuclides, reactions=reactions,
+            pendf_library=pendf_library, urr_material_dilution=False,
+            mat_ssf_nuclides=mat_ssf_nuclides, partial_binding=partial_binding)
+        micros = [micros] if isinstance(micros, MicroXS) else list(micros)
     else:
-        dilution_per_domain = [False] * len(fluxes)
-
-    micros = [
-        MicroXS.from_multigroup_flux(
-            energies=energies, multigroup_flux=flux_i, chain_file=chain,
-            nuclides=nuclides, reactions=reactions, pendf_library=pendf_library,
-            urr_material_dilution=dilution, mat_ssf_nuclides=mat_ssf_nuclides,
-            partial_binding=partial_binding)
-        for flux_i, dilution in zip(fluxes, dilution_per_domain)
-    ]
+        micros = []
 
     # Reset tallies
     model.tallies = original_tallies
@@ -459,7 +519,30 @@ def _from_multigroup_flux(
     partial_binding,
     init_kwargs,
 ) -> MicroXS | list[MicroXS]:
-    """Implementation behind :meth:`openmc.deplete.MicroXS.from_multigroup_flux`."""
+    """Implementation behind :meth:`openmc.deplete.MicroXS.from_multigroup_flux`.
+
+    The continuous-energy branch builds a ``(nnz, n_groups)`` table once and
+    collapses every flux against it. The **PENDF branch never builds that
+    table**: rows are staged one nuclide at a time by :func:`_stage_pendf_rows`
+    and contracted against each flux of the normalized batch in blocks of
+    :data:`_DEFAULT_BLOCK_ROWS` (256) rows (:func:`_collapse_pendf_blocks`), so
+    its peak row storage is a ``256 x n_groups x 8 B`` buffer -- 33 MB at 16000
+    groups -- independent of how many non-zero rows the library carries. Each
+    flux is contracted with the same matrix-vector product a single-flux call
+    uses, so a batch equals the corresponding single-flux calls exactly.
+
+    Any number of fluxes is accepted. The batch is processed in chunks of
+    :data:`~openmc.deplete.microxs._COLLAPSE_CHUNK_SIZE` (1024) fluxes, read off
+    the module at call time; ``phi`` for one chunk is ``n_flux x n_groups x 8 B``
+    (131 MB at 1024 x 16000). Rows are re-staged per chunk, i.e. one pass over
+    the library per 1024 fluxes, so the summary warnings raised by
+    :func:`_stage_pendf_rows` may fire once per chunk (Python's default warning
+    filter shows identical messages once). The URR self-shielding scaler is
+    flux independent and is built once for the whole call.
+
+    The clamp :func:`_clamp_negative_pendf_microxs` runs once over the finished
+    list, so a batch yields a single summary warning.
+    """
     check_type("temperature", temperature, (int, float, type(None)))
 
     # ``multigroup_flux`` is required; it only carries a default so that
@@ -601,128 +684,105 @@ def _from_multigroup_flux(
             reactions = (_default_pendf_reactions(chain)
                          if pendf_library is not None else chain.reactions)
 
-    # Build the group cross section table once and collapse every flux
+    # PENDF: contract the staged rows against the flux in blocks, in chunks of
+    # at most _COLLAPSE_CHUNK_SIZE fluxes. The (nnz, n_groups) table is never
+    # materialized on this path.
     if pendf_library is not None:
-        table = _build_xs_table_pendf(
-            nuclides, reactions, energies, pendf_library, chain,
-            partial_binding=partial_binding)
-        # URR material-dilution self-shielding: multiply the capture/fission
-        # rows of flagged resonant nuclides by their per-group factor in the
-        # URR-overlapping groups (in place). The =False path is untouched.
+        # URR material-dilution self-shielding. The scaler is FLUX INDEPENDENT
+        # (it depends only on the library, the group structure and the
+        # composition), so build it once and reuse it across every chunk --
+        # which also keeps its warn-once state to one warning per call.
+        scaler = None
         if densities is not None:
-            from ..mat_ssf import _apply_mat_ssf
-            _apply_mat_ssf(table, pendf_library, energies, densities,
-                           mat_ssf_nuclides)
-        # Close a library we opened from a path; a caller-passed object is
-        # left to the caller. The library is no longer used below.
+            from ..mat_ssf import _MatSsfRowScaler
+            scaler = _MatSsfRowScaler(pendf_library, energies, densities,
+                                      mat_ssf_nuclides)
+
+        # Read the chunk size off the module at CALL time (never bound into a
+        # local constant at import) so a test can monkeypatch
+        # ``openmc.deplete.microxs._COLLAPSE_CHUNK_SIZE``.
+        chunk_size = _microxs._COLLAPSE_CHUNK_SIZE
+        micros: list[MicroXS] = []
+        for start in range(0, len(fluxes), chunk_size):
+            # The whole chunk is normalized up front: the rows are contracted
+            # against it and dropped, so they are gone before the next chunk
+            # re-stages them.
+            phi = _normalize_flux_batch(
+                fluxes[start:start + chunk_size], start, n_groups)
+            micros.extend(_collapse_pendf_blocks(
+                nuclides, reactions, energies, pendf_library, chain, phi,
+                partial_binding=partial_binding, scaler=scaler))
+            del phi
+        del scaler
+
+        # Close a library we opened from a path; a caller-passed object is left
+        # to the caller. The library is no longer used below.
         if _owned_pendf is not None:
             _owned_pendf.close()
-    else:
-        from ..microxs import _build_xs_table_ce
-        # None selects the continuous-energy default (293.6 K); resolve it
-        # here, the sole place temperature is consumed (passed to group_xs).
-        temperature = 293.6 if temperature is None else temperature
-        # Resolve the library once; data availability is derived from it
-        if cross_sections is None:
-            cross_sections = _find_cross_sections(model=None)
-        nuclides_with_data = _get_nuclides_with_data(cross_sections)
-        table = _build_xs_table_ce(
-            nuclides, reactions, energies, temperature, nuclides_with_data,
-            cross_sections=cross_sections, **init_kwargs)
+
+        # PENDF-only always-on backstop: clamp any negative FINAL collapsed
+        # value to zero with ONE summary warning over the whole batch. The
+        # continuous-energy path below stays untouched.
+        _clamp_negative_pendf_microxs(micros)
+        # Hand the freed row storage back to the OS now that the rows, the
+        # block buffers, the flux batch and the scaler are all out of scope.
+        # PENDF only -- the continuous-energy path never stages 128 kB rows.
+        _trim_heap()
+        return micros[0] if single else micros
+
+    from ..microxs import _build_xs_table_ce
+    # None selects the continuous-energy default (293.6 K); resolve it
+    # here, the sole place temperature is consumed (passed to group_xs).
+    temperature = 293.6 if temperature is None else temperature
+    # Resolve the library once; data availability is derived from it
+    if cross_sections is None:
+        cross_sections = _find_cross_sections(model=None)
+    nuclides_with_data = _get_nuclides_with_data(cross_sections)
+    table = _build_xs_table_ce(
+        nuclides, reactions, energies, temperature, nuclides_with_data,
+        cross_sections=cross_sections, **init_kwargs)
 
     micros = _collapse_fluxes(table, fluxes)
-    # PENDF-only always-on backstop: clamp any negative FINAL collapsed
-    # value to zero with one summary warning. Gated on pendf_library so the
-    # continuous-energy path (pendf_library is None) stays untouched.
-    if pendf_library is not None:
-        _clamp_negative_pendf_microxs(micros)
     return micros[0] if single else micros
 
 
-def _build_xs_table_pendf(
+def _stage_pendf_rows(
     nuclides: Sequence[str],
     reactions: Sequence[str],
     energies: Sequence[float],
     pendf_library,
     chain: Chain,
-    partial_binding: bool | Collection[tuple[str, str]] = False,
-) -> _SparseXSTable:
-    """Build a sparse group cross section table from a pointwise PENDF library.
+    partial_binding,
+    emit,
+) -> tuple[list[str], dict[int, set[int]]]:
+    """Stage the PENDF group cross section rows, one nuclide at a time.
 
-    Mirrors :func:`_build_xs_table_ce` but sources group cross sections from a
-    preprocessed pointwise PENDF library instead of a continuous-energy
-    openmc.lib session. Each requested ``(nuclide, reaction)`` present in the
-    library has its MF=3 cross section flat-weighted onto the group structure
-    via :func:`_group_average`; all-zero MF=3-total rows (nuclide or reaction
-    absent, or a threshold above the group structure) are skipped.
-
-    When the library exposes isomeric pathway data (MF=10 partial cross
-    sections, per the ORIGEN-style "Option A" scheme), a reaction is expanded
-    into one row per product isomer instead of the single MF=3 total. **The
-    depletion** ``chain`` **is the row-naming authority**: for base reaction
-    ``R`` (MT) and each ``(lfs, izap)`` from ``pathways(nuclide, mt)``, the
-    partial is bound to ``nuclide``'s chain reaction whose base type is ``R`` and
-    whose ``pendf_lfs`` equals ``lfs``; the row name is that reaction's ``type``
-    (the ground ``LFS 0`` keeps the canonical name ``R``, a metastable is
-    ``R_m{n}``). Rows come exclusively from the MF=10 partials -- never from
-    static branching ratios.
-
-    **The chain is the demand side.** For each ``(nuclide, R)`` the chain is
-    consulted first: a reaction left *stock* (no ``pendf_lfs`` pathway) emits the
-    single MF=3 total row silently, regardless of any MF=10 partials the library
-    carries. A *qualified* reaction emits one pathway row per **demanded** ``LFS``,
-    bound to its library partial; ``LFS`` the library carries but the chain does
-    not demand are ignored silently (the chain is the source of truth). When a
-    demanded ``LFS`` is *missing* from the library the reaction falls back to the
-    MF=3 total and is collected into one summary warning per build -- except
-    **ground-by-balance**: if the ONLY missing demanded ``LFS`` is the ground
-    (``missing == {0}``, the JEFF In113/In115 ``(n,n')`` class and every
-    radioactive-products-only evaluation), the ground row is served implicitly as
-    ``max(0, MF=3 total - Sigma(ALL library metastable partials))`` (see
-    :func:`_balance_ground`) and the demanded metastable rows come from their
-    partials as usual. That is a complete, self-consistent emission -- rows sum to
-    the total -- so it is not a chain<->library disagreement; it is reported in a
-    separate informational summary with the clamp count. A chain whose *qualified*
-    reactions carry ``pendf_lfs=None`` (built without LFS recording) is a hard
-    error (see :func:`_chain_lfs_reactions`).
-
-    The result's ``reactions`` axis is the expanded list: for each base reaction
-    in input order, the base name first then its ``_m{n}`` variants in ascending
-    isomer order. Unlike MF=3-total rows, a pathway-expanded partial row is
-    staged even when it group-averages to zero (a metastable threshold above the
-    group structure), so a product-qualified name in the reaction axis reliably
-    marks that the collapse resolved pathways for that reaction.
+    The shared engine behind :func:`_build_xs_table_pendf` (which accumulates
+    every row into a dense ``xs_matrix``) and :func:`_collapse_pendf_blocks`
+    (which contracts each block of rows against the flux and drops them). All of
+    the
+    row-naming, chain-demand, ground-by-balance, silence-fill, partial-binding
+    and summary-warning behaviour documented on :func:`_build_xs_table_pendf`
+    lives here; only the disposal of the finished rows differs.
 
     Parameters
     ----------
-    nuclides : sequence of str
-        Nuclide names defining the result's nuclide axis.
-    reactions : sequence of str
-        Reaction names. Product ``_mN`` qualifiers are stripped and the list is
-        deduped (qualified names are expansion outputs, not inputs); the result's
-        reaction axis contains the base names plus any product-qualified names
-        emitted from MF=10 partials.
-    energies : sequence of float
-        Ascending energy group boundaries in [eV], length ``n_groups + 1``.
-    pendf_library : openmc.data.PendfLibrary
-        Pointwise PENDF library, duck-typed with ``nuclides`` (list of GNDS
-        names), ``reactions(nuclide)`` (list of MTs with MF=3 data) and
-        ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple). Isomeric
-        pathway expansion additionally uses ``pathways(nuclide, mt)``
-        (sorted ``(lfs, izap)`` int pairs, ``[]`` if none) and
-        ``pathway_xs(nuclide, mt, lfs, izap=None)`` (``(energy, xs)`` of a
-        partial; ``izap`` selects one product of a shared/lumped LFS).
-    chain : openmc.deplete.Chain
-        Depletion chain supplying isomeric row names (see above). Each MF=10
-        ``LFS`` partial is bound to the chain reaction carrying that
-        ``pendf_lfs``.
-    partial_binding : bool or collection of (str, str), optional
-        Opt-in switch (default ``False`` = today's behaviour exactly) that lets a
-        chain-**stock** reaction bind its ground row to the library's MF=10 LFS=0
-        partial and DROP the unmapped metastables, instead of routing the MF=3
-        total into ground. ``True`` binds every surviving candidate; a collection
-        of ``(nuclide, base-reaction)`` pairs binds only those. See the veto and
-        cost notes on :func:`get_pendf_microxs_and_flux`.
+    nuclides, reactions, energies, pendf_library, chain, partial_binding
+        As on :func:`_build_xs_table_pendf` (``partial_binding`` is normalized
+        here, so the raw argument may be passed through).
+    emit : callable
+        Called at each nuclide boundary (once per nuclide the library carries,
+        possibly with no rows) as ``emit(nuc_idx, rows)``, with ``rows`` a list
+        of ``(nuc_idx, base_idx, row_name, xs_g)`` tuples in staging order. The
+        list is reused between nuclides and must be consumed, not retained.
+
+    Returns
+    -------
+    reactions : list of str
+        The deduped base reaction list the row ``base_idx`` values index.
+    meta_by_base : dict
+        Base reaction index -> set of metastable isomer ordinals emitted for
+        it, the input to :func:`_expanded_reaction_axis`.
     """
     # Qualified names are expansion outputs, not inputs; reduce to distinct base
     # reactions so a qualified name never reaches ``REACTION_MT`` (KeyError).
@@ -789,14 +849,19 @@ def _build_xs_table_pendf(
     pb_vetoed: list[str] = []
     pb_kept: list[str] = []
 
-    # Stage rows as (nuc_idx, base_idx, row_name, xs_g). Metastable isomer
-    # ordinals seen per base reaction are collected to build the expanded axis.
-    staged: list[tuple[int, int, str, np.ndarray]] = []
-    # Position of each (nuc_idx, row_name) in ``staged`` so a duplicate row sums
+    # Stage rows as (nuc_idx, base_idx, row_name, xs_g) into a PER-NUCLIDE
+    # buffer, handed to ``emit`` at each nuclide boundary. Metastable isomer
+    # ordinals seen per base reaction are collected across the whole build to
+    # build the expanded axis.
+    buf: list[tuple[int, int, str, np.ndarray]] = []
+    # Position of each (nuc_idx, row_name) in ``buf`` so a duplicate row sums
     # into the existing one instead of appending a second row that would be
     # silently clobbered by the last-wins fancy-index assignment in
-    # ``_SparseXSTable.collapse`` (result[nuc, rxn] = ...).
-    staged_pos: dict[tuple[int, str], int] = {}
+    # ``_SparseXSTable.collapse`` (result[nuc, rxn] = ...). A duplicate can only
+    # ever arise within ONE nuclide's iteration -- nuc_idx is the outer loop
+    # variable -- so per-nuclide buffering sums duplicates exactly as a
+    # whole-build buffer would.
+    buf_pos: dict[tuple[int, str], int] = {}
     meta_by_base: dict[int, set[int]] = {i: set() for i in range(len(reactions))}
     available = set(pendf_library.nuclides)
 
@@ -811,17 +876,17 @@ def _build_xs_table_pendf(
         if not (keep_zero or xs_g.any()):
             return
         key = (nuc_idx, row_name)
-        pos = staged_pos.get(key)
+        pos = buf_pos.get(key)
         if pos is None:
-            staged_pos[key] = len(staged)
-            staged.append((nuc_idx, base_idx, row_name, xs_g))
+            buf_pos[key] = len(buf)
+            buf.append((nuc_idx, base_idx, row_name, xs_g))
         else:
             # Two MF=10 levels (LFS is a level index, not the observable final
             # state) can map to the same product isomer; production of that
             # isomer sums over the levels rather than the later partial silently
             # overwriting the earlier one at collapse time.
-            n_i, b_i, r_i, prev = staged[pos]
-            staged[pos] = (n_i, b_i, r_i, prev + xs_g)
+            n_i, b_i, r_i, prev = buf[pos]
+            buf[pos] = (n_i, b_i, r_i, prev + xs_g)
         liso = _liso_from_gnds(row_name)
         if liso > 0:
             meta_by_base[base_idx].add(liso)
@@ -1051,6 +1116,15 @@ def _build_xs_table_pendf(
                     key=lambda t: _liso_from_gnds(t[0].type)):
                 stage(nuc_idx, base_idx, rx.type, xs_g, keep_zero=True)
 
+        # Nuclide boundary: hand this nuclide's rows to the consumer and reset
+        # the buffer. ``buf`` is reused, so ``emit`` must consume (not retain)
+        # it. The table builder extends its own list; the block collapse
+        # scales the rows and buffers them for the next contraction here, which
+        # is what keeps the (nnz, n_groups) matrix from ever existing.
+        emit(nuc_idx, buf)
+        buf.clear()
+        buf_pos.clear()
+
     # One summary warning when the chain demanded MF=10 pathways the library did
     # not exactly match (emitted once per build, not per reaction/group). The
     # staged values are unaffected (the MF=3 total was used); only the chain <->
@@ -1114,9 +1188,19 @@ def _build_xs_table_pendf(
              'library MF=10 ground and drop unmapped metastables (a '
              'library-dependent choice; see get_pendf_microxs_and_flux).')
 
-    # Build the expanded reaction axis: every base name (always present, so the
-    # dense result keeps a column for each requested reaction) followed by its
-    # emitted metastable variants in ascending isomer order.
+    return reactions, meta_by_base
+
+
+def _expanded_reaction_axis(
+    reactions: Sequence[str],
+    meta_by_base: dict[int, set[int]],
+) -> tuple[list[str], dict[str, int]]:
+    """Build the expanded reaction axis and its name -> column index map.
+
+    Every base name is always present (so the dense result keeps a column for
+    each requested reaction), followed by the metastable variants emitted for it
+    in ascending isomer order.
+    """
     expanded: list[str] = []
     name_to_idx: dict[str, int] = {}
     for base_idx, name in enumerate(reactions):
@@ -1126,16 +1210,247 @@ def _build_xs_table_pendf(
             qname = f'{name}_m{liso}'
             name_to_idx[qname] = len(expanded)
             expanded.append(qname)
+    return expanded, name_to_idx
+
+
+def _build_xs_table_pendf(
+    nuclides: Sequence[str],
+    reactions: Sequence[str],
+    energies: Sequence[float],
+    pendf_library,
+    chain: Chain,
+    partial_binding: bool | Collection[tuple[str, str]] = False,
+) -> _SparseXSTable:
+    """Build a sparse group cross section table from a pointwise PENDF library.
+
+    The production collapse does **not** go through here: it blocks the staged
+    rows straight against the flux (:func:`_collapse_pendf_blocks`) and never
+    materializes the ``(nnz, n_groups)`` matrix. This function is the *table
+    form of the very same staged rows* -- both call :func:`_stage_pendf_rows` --
+    and is kept as the reference the block path is checked against, for the
+    continuous-energy parity checks that need a :class:`_SparseXSTable`, and for
+    the tests that inspect the matrix and its index arrays directly.
+
+    Mirrors :func:`_build_xs_table_ce` but sources group cross sections from a
+    preprocessed pointwise PENDF library instead of a continuous-energy
+    openmc.lib session. Each requested ``(nuclide, reaction)`` present in the
+    library has its MF=3 cross section flat-weighted onto the group structure
+    via :func:`_group_average`; all-zero MF=3-total rows (nuclide or reaction
+    absent, or a threshold above the group structure) are skipped.
+
+    When the library exposes isomeric pathway data (MF=10 partial cross
+    sections, per the ORIGEN-style "Option A" scheme), a reaction is expanded
+    into one row per product isomer instead of the single MF=3 total. **The
+    depletion** ``chain`` **is the row-naming authority**: for base reaction
+    ``R`` (MT) and each ``(lfs, izap)`` from ``pathways(nuclide, mt)``, the
+    partial is bound to ``nuclide``'s chain reaction whose base type is ``R`` and
+    whose ``pendf_lfs`` equals ``lfs``; the row name is that reaction's ``type``
+    (the ground ``LFS 0`` keeps the canonical name ``R``, a metastable is
+    ``R_m{n}``). Rows come exclusively from the MF=10 partials -- never from
+    static branching ratios.
+
+    **The chain is the demand side.** For each ``(nuclide, R)`` the chain is
+    consulted first: a reaction left *stock* (no ``pendf_lfs`` pathway) emits the
+    single MF=3 total row silently, regardless of any MF=10 partials the library
+    carries. A *qualified* reaction emits one pathway row per **demanded** ``LFS``,
+    bound to its library partial; ``LFS`` the library carries but the chain does
+    not demand are ignored silently (the chain is the source of truth). When a
+    demanded ``LFS`` is *missing* from the library the reaction falls back to the
+    MF=3 total and is collected into one summary warning per build -- except
+    **ground-by-balance**: if the ONLY missing demanded ``LFS`` is the ground
+    (``missing == {0}``, the JEFF In113/In115 ``(n,n')`` class and every
+    radioactive-products-only evaluation), the ground row is served implicitly as
+    ``max(0, MF=3 total - Sigma(ALL library metastable partials))`` (see
+    :func:`_balance_ground`) and the demanded metastable rows come from their
+    partials as usual. That is a complete, self-consistent emission -- rows sum to
+    the total -- so it is not a chain<->library disagreement; it is reported in a
+    separate informational summary with the clamp count. A chain whose *qualified*
+    reactions carry ``pendf_lfs=None`` (built without LFS recording) is a hard
+    error (see :func:`_chain_lfs_reactions`).
+
+    The result's ``reactions`` axis is the expanded list: for each base reaction
+    in input order, the base name first then its ``_m{n}`` variants in ascending
+    isomer order. Unlike MF=3-total rows, a pathway-expanded partial row is
+    staged even when it group-averages to zero (a metastable threshold above the
+    group structure), so a product-qualified name in the reaction axis reliably
+    marks that the collapse resolved pathways for that reaction.
+
+    Parameters
+    ----------
+    nuclides : sequence of str
+        Nuclide names defining the result's nuclide axis.
+    reactions : sequence of str
+        Reaction names. Product ``_mN`` qualifiers are stripped and the list is
+        deduped (qualified names are expansion outputs, not inputs); the result's
+        reaction axis contains the base names plus any product-qualified names
+        emitted from MF=10 partials.
+    energies : sequence of float
+        Ascending energy group boundaries in [eV], length ``n_groups + 1``.
+    pendf_library : openmc.data.PendfLibrary
+        Pointwise PENDF library, duck-typed with ``nuclides`` (list of GNDS
+        names), ``reactions(nuclide)`` (list of MTs with MF=3 data) and
+        ``xs(nuclide, mt)`` (returning an ``(energy, xs)`` tuple). Isomeric
+        pathway expansion additionally uses ``pathways(nuclide, mt)``
+        (sorted ``(lfs, izap)`` int pairs, ``[]`` if none) and
+        ``pathway_xs(nuclide, mt, lfs, izap=None)`` (``(energy, xs)`` of a
+        partial; ``izap`` selects one product of a shared/lumped LFS).
+    chain : openmc.deplete.Chain
+        Depletion chain supplying isomeric row names (see above). Each MF=10
+        ``LFS`` partial is bound to the chain reaction carrying that
+        ``pendf_lfs``.
+    partial_binding : bool or collection of (str, str), optional
+        Opt-in switch (default ``False`` = today's behaviour exactly) that lets a
+        chain-**stock** reaction bind its ground row to the library's MF=10 LFS=0
+        partial and DROP the unmapped metastables, instead of routing the MF=3
+        total into ground. ``True`` binds every surviving candidate; a collection
+        of ``(nuclide, base-reaction)`` pairs binds only those. See the veto and
+        cost notes on :func:`get_pendf_microxs_and_flux`.
+    """
+    # Whole-build accumulation: every staged row is kept, then stacked into the
+    # dense ``xs_matrix``. This is the memory cost the block collapse avoids
+    # (nnz x n_groups float64, doubled during the vstack).
+    staged: list[tuple[int, int, str, np.ndarray]] = []
+    reactions, meta_by_base = _stage_pendf_rows(
+        nuclides, reactions, energies, pendf_library, chain, partial_binding,
+        lambda nuc_idx, rows: staged.extend(rows))
+
+    expanded, name_to_idx = _expanded_reaction_axis(reactions, meta_by_base)
 
     rows = [xs_g for _, _, _, xs_g in staged]
     nuc_idx_list = [nuc_idx for nuc_idx, _, _, _ in staged]
     rxn_idx_list = [name_to_idx[row_name] for _, _, row_name, _ in staged]
 
-    xs_matrix = np.vstack(rows) if rows else np.empty((0, n_groups))
+    xs_matrix = (np.vstack(rows) if rows
+                 else np.empty((0, len(energies) - 1)))
 
     return _SparseXSTable(
         list(nuclides), expanded, xs_matrix,
         np.array(nuc_idx_list, np.int32), np.array(rxn_idx_list, np.int32))
+
+
+def _collapse_pendf_blocks(
+    nuclides: Sequence[str],
+    reactions: Sequence[str],
+    energies: Sequence[float],
+    pendf_library,
+    chain: Chain,
+    phi: np.ndarray,
+    partial_binding: bool | Collection[tuple[str, str]] = False,
+    scaler=None,
+    block_rows: int = _DEFAULT_BLOCK_ROWS,
+) -> list[MicroXS]:
+    """Collapse a PENDF library against a flux batch without building the table.
+
+    Same rows, same names and same warnings as
+    ``_collapse_fluxes(_build_xs_table_pendf(...), fluxes)`` -- the rows come
+    from the shared :func:`_stage_pendf_rows` engine -- but a staged row is
+    buffered only until its block is full, contracted against the flux and then
+    dropped, so the ``(nnz, n_groups)`` matrix (and the ``np.vstack`` copy of
+    it) never exists. At 16000 groups and ~11800 rows that is 1.41 GB never
+    allocated and 1.41 GB never copied; what remains is the
+    ``block_rows x n_groups x 8 B`` buffer (33 MB at 256 x 16000), which does
+    not grow with the number of rows.
+
+    Rows are buffered per nuclide by :func:`_stage_pendf_rows` (the only scope a
+    duplicate row can arise in), so duplicate-row summing and the URR
+    self-shielding scale are applied to the finished row exactly as the table
+    path applies them to the finished matrix.
+
+    Floating-point reproducibility. Each flux is contracted per block with the
+    same matrix-vector product a single-flux call uses, so a batch equals the
+    corresponding single-flux calls exactly, for any chunk split. The default
+    256-row block reproduces the former full-matrix contraction bit for bit
+    under single-threaded BLAS -- the validated configuration; a multithreaded
+    BLAS moves the last bit for the former path as well as this one. Other
+    ``block_rows`` values may move the last bit, because the BLAS kernel picks
+    its summation order from the operand shape. The cost of contracting per flux
+    rather than with one batch GEMM is ``n_flux`` matrix-vector products per
+    block, which is negligible against the HDF5 staging that dominates the
+    collapse (and multi-flux batches are not a production shape today).
+
+    Parameters
+    ----------
+    nuclides, reactions, energies, pendf_library, chain, partial_binding
+        As on :func:`_build_xs_table_pendf`.
+    phi : numpy.ndarray
+        ``(n_flux, n_groups)`` flux batch, ALREADY validated and row-normalized
+        by :func:`~openmc.deplete.microxs._normalize_flux_batch` (this function
+        does no flux checking of its own).
+    scaler : openmc.deplete.mat_ssf._MatSsfRowScaler, optional
+        URR material-dilution self-shielding applicator; each staged row is
+        passed through :meth:`~..mat_ssf._MatSsfRowScaler.scale` before it is
+        contracted. ``None`` (default) applies no correction.
+    block_rows : int, optional
+        Rows buffered per contraction (default :data:`_DEFAULT_BLOCK_ROWS`,
+        256).
+
+    Returns
+    -------
+    list of MicroXS
+        One ``(n_nuclides, n_reactions, 1)`` :class:`MicroXS` per flux, matching
+        what :func:`~openmc.deplete.microxs._collapse_fluxes` returns for the
+        equivalent table.
+    """
+    phi = np.asarray(phi, dtype=float)
+    n_flux = phi.shape[0]
+    nuclide_names = list(nuclides)
+
+    # Collapsed values only: (nuc_idx, row_name, (n_flux,) values).
+    collected: list[tuple[int, str, np.ndarray]] = []
+    block: list[np.ndarray] = []
+    block_keys: list[tuple[int, str]] = []
+
+    def flush_block():
+        """Contract the buffered rows against each flux in turn and release them.
+
+        Every flux is contracted with the SAME expression -- a
+        ``(1, n_groups) x (n_groups, n_block)`` product -- that a one-flux call
+        would use, rather than one ``(n_flux, n_groups)`` GEMM over the whole
+        batch. BLAS picks its summation order from the operand shape, so a batch
+        collapsed with a single GEMM would not agree to the last bit with the
+        same fluxes collapsed one at a time; contracting per flux makes a batch
+        equal the corresponding single-flux calls by construction.
+        """
+        if not block:
+            return
+        block_arr = np.vstack(block)
+        values = np.empty((n_flux, len(block)))
+        for i in range(n_flux):
+            values[i] = (phi[i:i + 1] @ block_arr.T)[0]
+        for j, key in enumerate(block_keys):
+            collected.append((key[0], key[1], values[:, j]))
+        block.clear()
+        block_keys.clear()
+
+    def consume(nuc_idx, rows):
+        nuc = nuclide_names[nuc_idx]
+        for _n, _b, row_name, xs_g in rows:
+            if scaler is not None:
+                # Scale a private copy: unlike the table path (which scales the
+                # vstacked matrix), the staged row may be an array the library
+                # or a cache still owns, and the scale is in place.
+                xs_g = np.array(xs_g, dtype=float)
+                scaler.scale(nuc, row_name, xs_g)
+            block.append(xs_g)
+            block_keys.append((nuc_idx, row_name))
+            if len(block) >= block_rows:
+                flush_block()
+
+    reactions, meta_by_base = _stage_pendf_rows(
+        nuclides, reactions, energies, pendf_library, chain, partial_binding,
+        consume)
+    flush_block()
+
+    expanded, name_to_idx = _expanded_reaction_axis(reactions, meta_by_base)
+
+    # Same dense scatter as _SparseXSTable.collapse_batch: a staged row is
+    # unique per (nuclide, row name), so assignment never collides.
+    result = np.zeros((n_flux, len(nuclide_names), len(expanded)))
+    for nuc_idx, row_name, values in collected:
+        result[:, nuc_idx, name_to_idx[row_name]] = values
+
+    return [MicroXS(result[i][:, :, np.newaxis], nuclide_names, expanded)
+            for i in range(n_flux)]
 
 
 def _clamp_negative_pendf_microxs(micros: list[MicroXS]) -> None:

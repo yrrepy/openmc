@@ -13,14 +13,19 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import openmc.deplete.microxs as microxs_module
 from openmc.deplete.chain import Chain
 from openmc.deplete.microxs import (
     MicroXS,
     _SparseXSTable,
     _group_average,
     _collapse_fluxes,
+    _normalize_flux_batch,
 )
-from openmc.deplete.pendf.collapse import _build_xs_table_pendf
+from openmc.deplete.pendf.collapse import (
+    _build_xs_table_pendf,
+    _collapse_pendf_blocks,
+)
 
 CHAIN_FILE = Path(__file__).parents[1] / "chain_simple.xml"
 PENDF_DIR = Path(os.environ.get(
@@ -189,6 +194,176 @@ def test_from_multigroup_flux_pendf_dispatch_and_guards():
     assert table.rxn_indices.dtype == np.int32
     assert table.xs_matrix.dtype == np.float64
     assert table.xs_matrix[0] == pytest.approx([4.0, 4.0])
+
+
+# ---------------------------------------------------------------------------
+# Block contraction: same numbers as the table path, for any block/chunk size
+# ---------------------------------------------------------------------------
+
+# Five reactions with distinct MTs, so one nuclide can carry several rows and a
+# block boundary can fall inside a nuclide as well as between nuclides.
+_MANY_REACTIONS = ["(n,gamma)", "(n,2n)", "(n,p)", "(n,a)", "fission"]
+_MANY_MTS = {"(n,gamma)": 102, "(n,2n)": 16, "(n,p)": 103, "(n,a)": 107,
+             "fission": 18}
+_MANY_EDGES = np.array([0.0, 1.0e3, 1.0e5, 1.0e7, 2.0e7])
+_MANY_NUCLIDES = ["H1", "O16", "Fe56", "Gd157", "Xe135", "I135", "Cs133",
+                  "U235", "U238", "Pu239"]
+
+
+def _fake_many(seed=7):
+    """A fake pointwise library with 50 distinct, non-trivial rows.
+
+    Every (nuclide, reaction) pair carries its own random piecewise-linear
+    tabulation, so no two staged rows are equal and a wrong row-to-column
+    mapping cannot pass unnoticed.
+    """
+    rng = np.random.default_rng(seed)
+    energy = np.array([0.0, 5.0e2, 1.0e3, 1.0e5, 1.0e6, 1.0e7, 2.0e7])
+    data = {}
+    for nuc in _MANY_NUCLIDES:
+        data[nuc] = {_MANY_MTS[rxn]: (energy, rng.random(len(energy)) + 0.1)
+                     for rxn in _MANY_REACTIONS}
+    return _FakePendf(data)
+
+
+def _table_reference(fake, fluxes, chain=None, **kwargs):
+    """The former table path, called the way production calls it: ONE flux at a
+    time through ``_collapse_fluxes(_build_xs_table_pendf(...), [flux])``.
+
+    The table form of exactly the same staged rows the block collapse contracts.
+    Every flux is collapsed on its own because that is the only shape any
+    production caller uses on the PENDF path (the activator and the transport
+    wrapper both collapse per domain), and it is the shape the block path is
+    required to reproduce bit for bit: BLAS picks its summation order from the
+    operand shape, so a multi-row flux matrix is a different operation.
+    """
+    table = _build_xs_table_pendf(
+        _MANY_NUCLIDES, _MANY_REACTIONS, _MANY_EDGES, fake,
+        Chain() if chain is None else chain, **kwargs)
+    return [_collapse_fluxes(table, [flux])[0] for flux in fluxes]
+
+
+def _assert_micros_equal(got, ref):
+    """Bit-for-bit equality of two MicroXS lists (values AND both axes)."""
+    assert len(got) == len(ref)
+    for g, r in zip(got, ref):
+        assert g.nuclides == r.nuclides
+        assert g.reactions == r.reactions
+        assert np.array_equal(g.data, r.data)
+
+
+def _assert_micros_close(got, ref, rtol=1e-12):
+    """Axes bit-identical, values equal to within ``rtol``.
+
+    Used for ONE case only: a ``block_rows`` that changes the shape of the
+    contracted row block, where BLAS picks a different summation order. Every
+    other comparison in this file is exact (``_assert_micros_equal``).
+    """
+    assert len(got) == len(ref)
+    for g, r in zip(got, ref):
+        assert g.nuclides == r.nuclides
+        assert g.reactions == r.reactions
+        np.testing.assert_allclose(g.data, r.data, rtol=rtol)
+
+
+@pytest.mark.parametrize("partial_binding", [False, True])
+def test_pendf_block_collapse_matches_table_pointwise(partial_binding):
+    """The block contraction reproduces the table path bit for bit on a
+    pointwise library -- both as the public ``from_multigroup_flux`` call and as
+    a direct ``_collapse_pendf_blocks`` call on the normalized flux."""
+    fake = _fake_many()
+    fluxes = [np.array([1.0, 2.0, 3.0, 4.0]), np.array([4.0, 0.0, 1.0, 1.0])]
+
+    ref = _table_reference(fake, fluxes, partial_binding=partial_binding)
+
+    got = MicroXS.from_multigroup_flux(
+        energies=_MANY_EDGES, multigroup_flux=fluxes, chain_file=CHAIN_FILE,
+        nuclides=_MANY_NUCLIDES, reactions=_MANY_REACTIONS, pendf_library=fake,
+        partial_binding=partial_binding)
+    _assert_micros_equal(got, ref)
+
+    phi = _normalize_flux_batch(fluxes, 0, len(_MANY_EDGES) - 1)
+    direct = _collapse_pendf_blocks(
+        _MANY_NUCLIDES, _MANY_REACTIONS, _MANY_EDGES, fake, Chain(), phi,
+        partial_binding=partial_binding)
+    _assert_micros_equal(direct, ref)
+
+
+@pytest.mark.parametrize("block_rows", [1, 7, 256, 10_000])
+def test_pendf_block_collapse_independent_of_block_rows(block_rows):
+    """``block_rows`` sets only how many rows share one contraction, never the result --
+    from one row per contraction to more rows than the library has (50).
+
+    The default 256-row block reproduces the former full-matrix contraction bit
+    for bit, and so does every block size that still spans all 50 rows in one
+    product. A 1-row block changes the operand shape, and BLAS then sums over
+    the groups in a different order, so that one value is checked to 1 ULP.
+    """
+    fake = _fake_many()
+    fluxes = [np.array([1.0, 2.0, 3.0, 4.0]), np.array([0.5, 0.5, 2.0, 7.0])]
+    phi = _normalize_flux_batch(fluxes, 0, len(_MANY_EDGES) - 1)
+
+    ref = _table_reference(fake, fluxes)
+    got = _collapse_pendf_blocks(
+        _MANY_NUCLIDES, _MANY_REACTIONS, _MANY_EDGES, fake, Chain(), phi,
+        block_rows=block_rows)
+    if block_rows == 1:
+        _assert_micros_close(got, ref)
+    else:
+        _assert_micros_equal(got, ref)
+
+
+def test_pendf_batch_equals_single_flux_calls():
+    """An N-flux batch is exactly N single-flux calls, one MicroXS per flux."""
+    fake = _fake_many()
+    rng = np.random.default_rng(11)
+    fluxes = [rng.random(len(_MANY_EDGES) - 1) for _ in range(5)]
+    fluxes[2][:] = 0.0                       # a zero flux stays all-zero
+
+    batch = MicroXS.from_multigroup_flux(
+        energies=_MANY_EDGES, multigroup_flux=fluxes, chain_file=CHAIN_FILE,
+        nuclides=_MANY_NUCLIDES, reactions=_MANY_REACTIONS, pendf_library=fake)
+    assert isinstance(batch, list) and len(batch) == 5
+
+    singles = [
+        MicroXS.from_multigroup_flux(
+            energies=_MANY_EDGES, multigroup_flux=flux, chain_file=CHAIN_FILE,
+            nuclides=_MANY_NUCLIDES, reactions=_MANY_REACTIONS,
+            pendf_library=fake)
+        for flux in fluxes
+    ]
+    # Exact by construction: the batch contracts every flux with the same
+    # matrix-vector product the single-flux call uses.
+    _assert_micros_equal(batch, singles)
+    _assert_micros_equal(batch, _table_reference(fake, fluxes))
+
+
+def test_pendf_batch_larger_than_chunk_matches_unchunked(monkeypatch):
+    """A batch spanning several chunks equals the unchunked run.
+
+    The chunk size is read off ``openmc.deplete.microxs._COLLAPSE_CHUNK_SIZE``
+    at call time, so patching that module attribute (to 3 here, against 7
+    fluxes -> chunks of 3/3/1) is what forces the multi-chunk path.
+    """
+    fake = _fake_many()
+    rng = np.random.default_rng(23)
+    fluxes = [rng.random(len(_MANY_EDGES) - 1) for _ in range(7)]
+
+    kwargs = dict(
+        energies=_MANY_EDGES, multigroup_flux=fluxes, chain_file=CHAIN_FILE,
+        nuclides=_MANY_NUCLIDES, reactions=_MANY_REACTIONS, pendf_library=fake)
+
+    unchunked = MicroXS.from_multigroup_flux(**kwargs)
+    assert microxs_module._COLLAPSE_CHUNK_SIZE > 7   # one chunk above
+
+    monkeypatch.setattr(microxs_module, "_COLLAPSE_CHUNK_SIZE", 3)
+    chunked = MicroXS.from_multigroup_flux(**kwargs)
+
+    assert len(chunked) == 7
+    # Exact: each flux is contracted on its own, so how the batch is split into
+    # chunks cannot move a bit.
+    _assert_micros_equal(chunked, unchunked)
+    _assert_micros_equal(chunked, _table_reference(fake, fluxes))
 
 
 # ---------------------------------------------------------------------------

@@ -107,6 +107,44 @@ def _collapse(**dilution):
         pendf_library=_fake_library(), **dilution)
 
 
+def _table_reference(**dilution):
+    """``_apply_mat_ssf`` on a built table + ``_collapse_fluxes`` -- the table
+    form of the rows the collapse now contracts in blocks."""
+    from openmc.deplete.microxs import _collapse_fluxes
+    from openmc.deplete.pendf.chain_check import _get_pendf_chain
+    from openmc.deplete.pendf.collapse import _build_xs_table_pendf
+    from openmc.deplete.mat_ssf import _apply_mat_ssf
+
+    chain = _get_pendf_chain(CHAIN_FILE)
+    table = _build_xs_table_pendf(
+        ["U238"], ["(n,gamma)"], EDGES, _fake_library(), chain)
+    if dilution:
+        _apply_mat_ssf(table, _fake_library(), EDGES, dilution['densities'],
+                       None)
+    return _collapse_fluxes(table, [np.asarray(FLUX, dtype=float)])[0]
+
+
+def test_block_collapse_matches_table_with_dilution():
+    """With the URR correction ON, the block collapse equals the table path
+    (``_apply_mat_ssf`` on the built table, then ``_collapse_fluxes``) bit for
+    bit -- the row scaler is the same object applied to the same finished rows.
+    The OFF case is checked alongside so the comparison is not vacuous."""
+    densities = {"U238": 1.0, "O16": 12.5}
+
+    on = _collapse(urr_material_dilution=densities)
+    ref_on = _table_reference(densities=densities)
+    assert on.nuclides == ref_on.nuclides
+    assert on.reactions == ref_on.reactions
+    assert np.array_equal(on.data, ref_on.data)
+
+    off = _collapse()
+    ref_off = _table_reference()
+    assert np.array_equal(off.data, ref_off.data)
+
+    # The correction actually fired, so the ON comparison has content.
+    assert not np.array_equal(on.data, off.data)
+
+
 # ---------------------------------------------------------------------------
 # Normalization: impossible states are rejected
 # ---------------------------------------------------------------------------

@@ -295,8 +295,38 @@ def test_geq_goff_equal_direct_per_domain():
         energies=EDGES, multigroup_flux=flux1, chain_file=CHAIN_FILE,
         nuclides=["U238"], reactions=["(n,gamma)"],
         pendf_library=_fake_library(), urr_material_dilution=False)
+    # G-OFF now goes through ONE batched (2-D) collapse for both domains, so the
+    # per-domain axes and ordering are its responsibility too.
+    assert isinstance(micros_off, list) and len(micros_off) == 2
     np.testing.assert_array_equal(micros_off[0].data, off0.data)
     np.testing.assert_array_equal(micros_off[1].data, off1.data)
+    assert micros_off[0].nuclides == off0.nuclides == ["U238"]
+    assert micros_off[0].reactions == off0.reactions == ["(n,gamma)"]
 
     # Flag off must differ from flag on for the shielded domain (correction fires).
     assert not np.array_equal(micros_off[0].data, micros_on[0].data)
+
+
+def test_single_domain_dilution_off_returns_list_of_one():
+    """A single domain with dilution OFF still takes the batched (2-D) path: the
+    wrapper must hand back a ONE-ELEMENT LIST (never a bare MicroXS), equal to
+    the direct per-domain ``from_multigroup_flux`` call."""
+    lib = _fake_library()
+    mat = _uo2_material(12.5)
+    flux0 = [1.0, 2.0, 3.0]
+    canned = np.array([flux0]).reshape(1, N_GROUPS, 1, 1)
+
+    fluxes, micros = _run_wrapper_with_canned_flux(
+        _bare_model(), [mat], lib, canned, urr_material_dilution=False)
+
+    assert isinstance(micros, list) and len(micros) == 1
+    assert isinstance(micros[0], MicroXS)
+    assert len(fluxes) == 1
+
+    direct = MicroXS.from_multigroup_flux(
+        energies=EDGES, multigroup_flux=flux0, chain_file=CHAIN_FILE,
+        nuclides=["U238"], reactions=["(n,gamma)"],
+        pendf_library=_fake_library(), urr_material_dilution=False)
+    np.testing.assert_array_equal(micros[0].data, direct.data)
+    assert micros[0].nuclides == direct.nuclides
+    assert micros[0].reactions == direct.reactions
