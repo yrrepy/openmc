@@ -211,6 +211,7 @@ total system energy.
    helpers.EnergyScoreHelper
    helpers.FissionYieldCutoffHelper
    helpers.FluxCollapseHelper
+   pendf.helpers.PendfFluxCollapseHelper
 
 The :class:`openmc.deplete.IndependentOperator` uses inner classes subclassed
 from those listed above to perform similar calculations.

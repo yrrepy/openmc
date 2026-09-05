@@ -5,6 +5,9 @@ raw-flux contraction, the per-chunk collapse cache, the nuclide index and its
 warnings, the product-qualified (``_mN``) columns, the direct continuous-energy
 overlay, the fission-row guard and the flux sanity check -- and the pure option
 resolver :func:`~openmc.deplete.pendf.operators._resolve_pendf_flux_options`.
+It also covers the :class:`~openmc.deplete.CoupledOperator` wiring: the mode
+building the helper, the folded chain the other modes still reject, the
+mode/library cross-check and the group structure a grouped library imposes.
 
 Everything runs on duck-typed libraries and hand-made flux rows: no data files,
 no transport, no ``openmc.lib`` session. The helper is wired the way
@@ -13,12 +16,16 @@ setting the attributes ``generate_tallies`` would have set.
 """
 
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 
+import openmc
+import openmc.deplete
+import openmc.deplete.coupled_operator as coupled_operator
 import openmc.deplete.microxs as microxs_mod
 import openmc.deplete.pendf.chain_check as chain_check_mod
 import openmc.deplete.pendf.collapse as collapse_mod
@@ -590,3 +597,160 @@ def test_scatter_under_permuted_indices():
     expected[5, 3] = 2.0 * phi[0].sum()         # U235 fission
     np.testing.assert_allclose(rates, expected, rtol=1e-12)
 
+
+# ---------------------------------------------------------------------------
+# Operator wiring (11-14)
+#
+# Building a CoupledOperator never enters an ``openmc.lib`` session: it only
+# reads the cross section listing named by OPENMC_CROSS_SECTIONS and the chain,
+# exactly as ``test_deplete_coupled_operator.py::test_operator_init`` does. The
+# duck libraries are never read at construction either.
+# ---------------------------------------------------------------------------
+
+CHAIN_PATH = Path(__file__).parents[1] / "chain_simple.xml"
+
+
+@pytest.fixture(scope="module")
+def model():
+    """Pin cell with three materials, enough to construct an operator."""
+    openmc.reset_auto_ids()
+
+    fuel = openmc.Material(name="uo2")
+    fuel.add_element("U", 1, percent_type="ao", enrichment=4.25)
+    fuel.add_element("O", 2)
+    fuel.set_density("g/cc", 10.4)
+
+    clad = openmc.Material(name="clad")
+    clad.add_element("Zr", 1)
+    clad.set_density("g/cc", 6)
+
+    water = openmc.Material(name="water")
+    water.add_element("O", 1)
+    water.add_element("H", 2)
+    water.set_density("g/cc", 1.0)
+    water.add_s_alpha_beta("c_H_in_H2O")
+
+    radii = [0.42, 0.45]
+    fuel.volume = np.pi * radii[0] ** 2
+    clad.volume = np.pi * (radii[1] ** 2 - radii[0] ** 2)
+    water.volume = 1.24 ** 2 - (np.pi * radii[1] ** 2)
+
+    materials = openmc.Materials([fuel, clad, water])
+
+    pin_surfaces = [openmc.ZCylinder(r=r) for r in radii]
+    pin_univ = openmc.model.pin(pin_surfaces, materials)
+    bound_box = openmc.model.RectangularPrism(
+        1.24, 1.24, boundary_type="reflective")
+    root_cell = openmc.Cell(fill=pin_univ, region=-bound_box)
+    geometry = openmc.Geometry([root_cell])
+
+    settings = openmc.Settings()
+    settings.particles = 1000
+    settings.inactive = 10
+    settings.batches = 50
+
+    return openmc.Model(geometry, materials, settings)
+
+
+def _folded_chain():
+    """chain_simple with one product-qualified (n,gamma)_m1 reaction on U235.
+
+    ``Chain.reactions`` is only collected in :meth:`Chain.add_nuclide`, so an
+    in-place addition has to register the new type by hand.
+    """
+    chain = Chain.from_xml(CHAIN_PATH)
+    chain['U235'].add_reaction('(n,gamma)_m1', 'U236_m1', 0.0, 1.0,
+                               pendf_lfs=1)
+    chain.reactions.append('(n,gamma)_m1')
+    return chain
+
+
+# ---------------------------------------------------------------------------
+# 11. pendf-flux accepts a folded chain and builds the PENDF helper
+# ---------------------------------------------------------------------------
+
+def test_operator_pendf_flux_builds_helper(model, monkeypatch):
+    """'pendf-flux' with a pointwise library and explicit energies builds a
+    PendfFluxCollapseHelper on those edges, and the isomeric chain guard that
+    every other mode applies is not reached."""
+    guard = mock.MagicMock(wraps=coupled_operator._check_chain_not_isomeric)
+    monkeypatch.setattr(coupled_operator, '_check_chain_not_isomeric', guard)
+
+    op = openmc.deplete.CoupledOperator(
+        model, _folded_chain(),
+        reaction_rate_mode='pendf-flux',
+        pendf_library=_basic_fake(),
+        reaction_rate_opts={'energies': EDGES})
+
+    assert isinstance(op._rate_helper, PendfFluxCollapseHelper)
+    np.testing.assert_array_equal(op._rate_helper.energies, EDGES)
+    assert '(n,gamma)_m1' in op.chain.reactions
+    guard.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 12. Every other mode still rejects a folded chain
+# ---------------------------------------------------------------------------
+
+def test_operator_direct_mode_rejects_folded_chain(model):
+    """A continuous-energy mode cannot resolve isomer partials, so the folded
+    chain is refused with a message naming the alternatives."""
+    with pytest.raises(ValueError, match='product-qualified'):
+        openmc.deplete.CoupledOperator(
+            model, _folded_chain(), reaction_rate_mode='direct')
+
+
+# ---------------------------------------------------------------------------
+# 13. Mode/library cross-check through the constructor, and the stamp check
+# ---------------------------------------------------------------------------
+
+def test_operator_mode_library_cross_check(model, monkeypatch):
+    """The mode and the library imply each other (E1/E2), and a pendf-flux
+    operator verifies the chain's PENDF provenance stamp exactly once."""
+    # E1: the mode without a library
+    with pytest.raises(ValueError, match='requires the pendf_library'):
+        openmc.deplete.CoupledOperator(
+            model, _folded_chain(), reaction_rate_mode='pendf-flux')
+
+    # E2: a library without the mode
+    with pytest.raises(ValueError, match='requires reaction_rate_mode'):
+        openmc.deplete.CoupledOperator(
+            model, CHAIN_PATH, pendf_library=_basic_fake())
+
+    # The stamp check runs once at construction; the operator imports it
+    # lazily, so patching the module attribute is enough to see the call.
+    spy = mock.MagicMock(wraps=chain_check_mod._verify_pendf_chain_stamp)
+    monkeypatch.setattr(chain_check_mod, '_verify_pendf_chain_stamp', spy)
+
+    library = _basic_fake()
+    op = openmc.deplete.CoupledOperator(
+        model, _folded_chain(),
+        reaction_rate_mode='pendf-flux',
+        pendf_library=library,
+        reaction_rate_opts={'energies': EDGES})
+
+    assert spy.call_count == 1
+    assert spy.call_args.args[1] is library
+    assert op._pendf_library is library
+
+
+# ---------------------------------------------------------------------------
+# 14. A grouped library brings its own group structure
+# ---------------------------------------------------------------------------
+
+def test_operator_grouped_library_group_structure(model):
+    """A grouped library needs no 'energies': its own edges become the flux
+    tally structure, and a different structure is refused rather than rebinned."""
+    op = openmc.deplete.CoupledOperator(
+        model, _folded_chain(),
+        reaction_rate_mode='pendf-flux',
+        pendf_library=_GroupedDuck(EDGES))
+
+    np.testing.assert_array_equal(op._rate_helper.energies, EDGES)
+
+    with pytest.raises(ValueError, match='cannot be rebinned'):
+        openmc.deplete.CoupledOperator(
+            model, _folded_chain(),
+            reaction_rate_mode='pendf-flux',
+            pendf_library=_GroupedDuck(EDGES),
+            reaction_rate_opts={'energies': [0.0, 1.0, 2.0e7]})

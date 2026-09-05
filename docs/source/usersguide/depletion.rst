@@ -102,6 +102,62 @@ As with the ``power`` argument, you can provide a different source rate for each
 timestep in the calculation. A zero source rate for a given timestep will result
 in a decay-only step, where all reaction rates are zero.
 
+.. _pendf-flux-mode:
+
+Reaction Rates from a PENDF Library
+-----------------------------------
+
+By default the :class:`~openmc.deplete.CoupledOperator` tallies every
+transmutation reaction rate directly, one score per nuclide and reaction. The
+``"pendf-flux"`` reaction rate mode replaces those tallies with one multigroup
+flux tally per burnable material and collapses that flux with the cross
+sections of a preprocessed PENDF library after each transport solve. The result
+is a one-group rate for every reaction in the depletion chain, including the
+isomer-resolved reactions such as ``(n,gamma)_m1`` that a folded PENDF chain
+carries and that continuous-energy tallies cannot resolve. Fission is collapsed
+from the library like every other reaction.
+
+The mode requires the ``pendf_library`` argument: an opened
+:class:`~openmc.data.PendfLibrary` or :class:`~openmc.data.GroupedPendfLibrary`,
+or a path to one. A grouped library is collapsed on its own group edges, so no
+energy structure is given::
+
+    op = openmc.deplete.CoupledOperator(
+        model, chain_file,
+        reaction_rate_mode='pendf-flux',
+        pendf_library='tendl2017_pendf_293K_fomg16k.h5')
+
+A pointwise library needs the tally group structure in ``reaction_rate_opts``,
+given as a group structure name or as an array of edges in eV::
+
+    op = openmc.deplete.CoupledOperator(
+        model, chain_file,
+        reaction_rate_mode='pendf-flux',
+        pendf_library='tendl2017_pendf_293K.h5',
+        reaction_rate_opts={'energies': 'FOMG-16k'})
+
+Selected reactions can still be tallied directly with continuous-energy data,
+for all nuclides or for a subset, with the same ``reactions`` and ``nuclides``
+keys the ``"flux"`` mode uses::
+
+    reaction_rate_opts={'reactions': ['fission'], 'nuclides': ['U235', 'Pu239']}
+
+A reaction that the chain resolves into isomer products, such as ``(n,gamma)``
+next to ``(n,gamma)_m1``, cannot be tallied directly for those nuclides: the
+direct tally would carry the total while the isomer column keeps its PENDF
+partial, and the operator rejects that combination.
+
+Isomer-resolved rates need a chain patched with
+``tools/add_pendf_isomeric_branching_to_chain.py`` from the same PENDF source.
+The chain's PENDF provenance stamp is compared with the library when the
+operator is built, and a mismatch warns. Nuclides in the burnable materials
+that the library does not carry get zero reaction rates, with one warning. A
+burnable material whose temperature differs from the library temperature by
+more than 1 K also warns once; its rates are still collapsed with the library
+as given. URR self-shielding and per-temperature libraries are not available
+in this mode yet, so the ``urr_material_dilution`` and ``mat_ssf_nuclides``
+keys raise :exc:`NotImplementedError`.
+
 Caveats
 -------
 

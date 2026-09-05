@@ -29,6 +29,8 @@ from .helpers import (
     DirectReactionRateHelper, ChainFissionHelper, ConstantFissionYieldHelper,
     FissionYieldCutoffHelper, AveragedFissionYieldHelper, EnergyScoreHelper,
     SourceRateHelper, FluxCollapseHelper)
+from .pendf.helpers import PendfFluxCollapseHelper
+from .pendf.operators import _resolve_pendf_flux_options
 
 
 __all__ = ["CoupledOperator", "Operator", "OperatorResult"]
@@ -88,9 +90,11 @@ def _check_chain_not_isomeric(chain):
     """Reject a product-qualified isomeric depletion chain.
 
     A folded PENDF chain unfolds into reaction types such as ``(n,gamma)_m1``
-    that continuous-energy transport cannot tally as isomer-resolved partials.
-    Raise a :class:`ValueError` naming an offending type and pointing at the
-    transport-independent (MicroXS + IndependentOperator) workflow.
+    that continuous-energy tallies cannot resolve into isomer partials. Such a
+    chain is accepted only by the "pendf-flux" reaction rate mode, which
+    collapses the rates from a PENDF library; every other mode raises a
+    :class:`ValueError` naming an offending type and pointing at that mode and
+    at the transport-independent (MicroXS + IndependentOperator) workflow.
 
     Parameters
     ----------
@@ -102,9 +106,10 @@ def _check_chain_not_isomeric(chain):
         if _ISOMER_SUFFIX.search(rx):
             raise ValueError(
                 f"The depletion chain carries product-qualified isomeric "
-                f"reaction types (e.g. '{rx}'); transport-coupled depletion "
-                f"cannot tally isomer-resolved partials. Use the "
-                f"transport-independent workflow (MicroXS + IndependentOperator) "
+                f"reaction types (e.g. '{rx}'); continuous-energy reaction rate "
+                f"tallies cannot resolve isomer partials. Use "
+                f"reaction_rate_mode='pendf-flux' with a pendf_library, the "
+                f"transport-independent workflow (MicroXS + IndependentOperator), "
                 f"or a chain without <isomeric_branching> decoration.")
 
 
@@ -163,20 +168,35 @@ class CoupledOperator(OpenMCOperator):
         ``fission_yield_mode``. Will be passed directly on to the
         helper. Passing a value of None will use the defaults for
         the associated helper.
-    reaction_rate_mode : {"direct", "flux"}, optional
+    reaction_rate_mode : {"direct", "flux", "pendf-flux"}, optional
         Indicate how one-group reaction rates should be calculated. The "direct"
         method tallies transmutation reaction rates directly. The "flux" method
         tallies a multigroup flux spectrum and then collapses one-group reaction
         rates after a transport solve (with an option to tally some reaction
-        rates directly).
+        rates directly). The "pendf-flux" method tallies a multigroup flux
+        spectrum in the group structure of a PENDF library and collapses it
+        with the library's pointwise or grouped cross sections after each
+        transport solve, fission included. Every reaction in the depletion
+        chain gets a rate this way, including the isomer-resolved reactions
+        (for example ``(n,gamma)_m1``) of a folded PENDF chain that
+        continuous-energy tallies cannot resolve. Selected reactions can still
+        be tallied directly. Requires the ``pendf_library`` argument.
 
         .. versionadded:: 0.12.1
+
+        .. versionchanged:: 0.15.4
+            Added the "pendf-flux" mode.
     reaction_rate_opts : dict, optional
         Keyword arguments that are passed to the reaction rate helper class.
         When ``reaction_rate_mode`` is set to "flux", energy group boundaries
         can be set using the "energies" key. See the
         :class:`~openmc.deplete.helpers.FluxCollapseHelper` class for all
-        options.
+        options. When it is set to "pendf-flux", the accepted keys are
+        "energies" (required for a pointwise library, given as a group
+        structure name or an array of edges in eV; a grouped library uses its
+        own edges and rejects a different structure), "reactions" and
+        "nuclides" (the direct-tally override pair) and "partial_binding". See
+        :class:`~openmc.deplete.pendf.helpers.PendfFluxCollapseHelper`.
 
         .. versionadded:: 0.12.1
     reduce_chain_level : int, optional
@@ -191,6 +211,13 @@ class CoupledOperator(OpenMCOperator):
         material to volume of the cell they fill.
 
         .. versionadded:: 0.14.0
+    pendf_library : openmc.data.PendfLibrary or openmc.data.GroupedPendfLibrary or PathLike, optional
+        PENDF library whose cross sections are collapsed against the tallied
+        flux in "pendf-flux" mode. A path is opened with
+        :func:`openmc.data.open_pendf_library` and kept open for the life of
+        the operator. Only valid with ``reaction_rate_mode="pendf-flux"``.
+
+        .. versionadded:: 0.15.4
 
     Attributes
     ----------
@@ -233,7 +260,7 @@ class CoupledOperator(OpenMCOperator):
                  normalization_mode="fission-q", fission_q=None,
                  fission_yield_mode="constant", fission_yield_opts=None,
                  reaction_rate_mode="direct", reaction_rate_opts=None,
-                 reduce_chain_level=None):
+                 reduce_chain_level=None, pendf_library=None):
 
         # check for old call to constructor
         if isinstance(model, openmc.Geometry):
@@ -269,6 +296,15 @@ class CoupledOperator(OpenMCOperator):
             reaction_rate_opts = {}
         if fission_yield_opts is None:
             fission_yield_opts = {}
+
+        # Cross-checks the mode against the library, opens a library given as a
+        # path and settles the group structure. Everything is None unless the
+        # mode is 'pendf-flux'. Done before super().__init__ because that call
+        # builds the reaction rate helper.
+        self._pendf_library, self._pendf_energies, self._pendf_helper_opts = \
+            _resolve_pendf_flux_options(
+                pendf_library, reaction_rate_mode, reaction_rate_opts)
+
         helper_kwargs = {
             'reaction_rate_mode': reaction_rate_mode,
             'normalization_mode': normalization_mode,
@@ -291,7 +327,12 @@ class CoupledOperator(OpenMCOperator):
             helper_kwargs=helper_kwargs,
             reduce_chain_level=reduce_chain_level)
 
-        _check_chain_not_isomeric(self.chain)
+        if reaction_rate_mode == "pendf-flux":
+            # Lazy import: chain_check reaches microxs, which imports this module
+            from .pendf.chain_check import _verify_pendf_chain_stamp
+            _verify_pendf_chain_stamp(self.chain, self._pendf_library)
+        else:
+            _check_chain_not_isomeric(self.chain)
 
     def _differentiate_burnable_mats(self):
         """Assign distribmats for each burnable material"""
@@ -365,6 +406,11 @@ class CoupledOperator(OpenMCOperator):
                 self.reaction_rates.n_react,
                 **reaction_rate_opts
             )
+        elif reaction_rate_mode == "pendf-flux":
+            self._rate_helper = PendfFluxCollapseHelper(
+                self.reaction_rates.n_nuc, self.reaction_rates.n_react,
+                self._pendf_library, self.chain, self._pendf_energies,
+                **self._pendf_helper_opts)
         else:
             raise ValueError("Invalid reaction rate mode.")
 
