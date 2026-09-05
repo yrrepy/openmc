@@ -15,6 +15,7 @@ no transport, no ``openmc.lib`` session. The helper is wired the way
 setting the attributes ``generate_tallies`` would have set.
 """
 
+import copy
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,8 @@ import openmc.deplete.coupled_operator as coupled_operator
 import openmc.deplete.microxs as microxs_mod
 import openmc.deplete.pendf.chain_check as chain_check_mod
 import openmc.deplete.pendf.collapse as collapse_mod
+import openmc.deplete.pendf.helpers as pendf_helpers_mod
+import openmc.lib
 from openmc.deplete.chain import Chain
 from openmc.deplete.microxs import _group_average
 from openmc.deplete.nuclide import Nuclide
@@ -665,6 +668,12 @@ def _folded_chain():
     return chain
 
 
+class _GroupedLibDuck(_GroupedDuck):
+    """``_GroupedDuck`` plus the nuclide listing every real library exposes."""
+
+    nuclides = []
+
+
 # ---------------------------------------------------------------------------
 # 11. pendf-flux accepts a folded chain and builds the PENDF helper
 # ---------------------------------------------------------------------------
@@ -744,7 +753,7 @@ def test_operator_grouped_library_group_structure(model):
     op = openmc.deplete.CoupledOperator(
         model, _folded_chain(),
         reaction_rate_mode='pendf-flux',
-        pendf_library=_GroupedDuck(EDGES))
+        pendf_library=_GroupedLibDuck(EDGES))
 
     np.testing.assert_array_equal(op._rate_helper.energies, EDGES)
 
@@ -752,5 +761,117 @@ def test_operator_grouped_library_group_structure(model):
         openmc.deplete.CoupledOperator(
             model, _folded_chain(),
             reaction_rate_mode='pendf-flux',
-            pendf_library=_GroupedDuck(EDGES),
+            pendf_library=_GroupedLibDuck(EDGES),
             reaction_rate_opts={'energies': [0.0, 1.0, 2.0e7]})
+
+
+# ---------------------------------------------------------------------------
+# PENDF-only rate nuclides (20-22)
+#
+# In 'pendf-flux' the rate source is the PENDF library, so a chain nuclide the
+# library carries but ``cross_sections.xml`` does not still gets a rate row and
+# a collapsed rate -- while staying out of everything transport-side.
+# ---------------------------------------------------------------------------
+
+def _pendf_only_fake():
+    """Duck library carrying a chain nuclide with no continuous-energy data."""
+    return _FakePendf(mf3={
+        'U235': {102: _const(5.0), 18: _const(2.0)},
+        'Fe56': {102: (_FE56_GRID, _FE56_XS)},
+        'U236_m1': {102: _const(3.0)},
+    })
+
+
+def _chain_with_pendf_only(folded=True):
+    """chain_simple (optionally folded) plus a burnable U236_m1."""
+    chain = _folded_chain() if folded else Chain.from_xml(CHAIN_PATH)
+    nuclide = Nuclide('U236_m1')
+    nuclide.add_reaction('(n,gamma)', 'U237', 0.0, 1.0)
+    chain.add_nuclide(nuclide)
+    return chain
+
+
+# ---------------------------------------------------------------------------
+# 20. A PENDF-only nuclide is burnable in 'pendf-flux' and decay-only elsewhere
+# ---------------------------------------------------------------------------
+
+def test_operator_pendf_only_nuclide_is_burnable(model):
+    """'pendf-flux' widens the rate nuclides with the PENDF library: U236_m1
+    has no continuous-energy data yet gets a reaction rate row, a tallied entry
+    and the collapse's continuous-energy gate; every other mode leaves it
+    decay-only."""
+    op = openmc.deplete.CoupledOperator(
+        model, _chain_with_pendf_only(),
+        reaction_rate_mode='pendf-flux',
+        pendf_library=_pendf_only_fake(),
+        reaction_rate_opts={'energies': EDGES})
+
+    assert 'U236_m1' not in op.nuclides_with_data
+    assert 'U236_m1' in op.reaction_rates.index_nuc
+    assert 'U236_m1' in op._burnable_nucs
+    assert 'U236_m1' not in op._decay_nucs
+    assert 'U236_m1' in op._get_reaction_nuclides()
+    assert op._rate_helper._ce_nuclides is op.nuclides_with_data
+
+    # Unchanged behaviour without the PENDF rate source
+    op_direct = openmc.deplete.CoupledOperator(
+        model, _chain_with_pendf_only(folded=False),
+        reaction_rate_mode='direct')
+
+    assert 'U236_m1' in op_direct._decay_nucs
+    assert 'U236_m1' not in op_direct.reaction_rates.index_nuc
+
+
+# ---------------------------------------------------------------------------
+# 21. A PENDF-only nuclide never reaches the transport model
+# ---------------------------------------------------------------------------
+
+def test_operator_pendf_only_nuclide_stays_out_of_materials_xml(
+        model, run_in_tmpdir):
+    """A rate nuclide with no continuous-energy data is ignored when the
+    materials are written, even though it sits in a burnable material."""
+    model = copy.deepcopy(model)
+    model.materials[0].add_nuclide('U236_m1', 1.0e-8)
+
+    op = openmc.deplete.CoupledOperator(
+        model, _chain_with_pendf_only(),
+        reaction_rate_mode='pendf-flux',
+        pendf_library=_pendf_only_fake(),
+        reaction_rate_opts={'energies': EDGES})
+
+    op._generate_materials_xml()
+
+    written = Path('materials.xml').read_text()
+    assert 'U236_m1' not in written
+    assert 'U235' in written
+
+
+# ---------------------------------------------------------------------------
+# 22. The direct tally only ever sees nuclides with continuous-energy data
+# ---------------------------------------------------------------------------
+
+def test_direct_tally_gated_on_continuous_energy_data(monkeypatch):
+    """A rate nuclide outside ``ce_nuclides`` is neither loaded nor scored
+    by the direct tally, and naming one in the ``nuclides`` override is
+    refused."""
+    loader = mock.MagicMock()
+    monkeypatch.setattr(pendf_helpers_mod, 'load_nuclide', loader)
+    monkeypatch.setattr(openmc.lib, 'nuclides', {})
+
+    fake = _basic_fake()
+    helper = PendfFluxCollapseHelper(
+        2, 1, fake, _fission_chain(['U235']), EDGES,
+        reactions=['fission'], ce_nuclides={'U235'})
+    helper._rate_tally = SimpleNamespace(nuclides=[])
+    helper._scores = ['fission']
+
+    helper.nuclides = ['U235', 'U236_m1']
+
+    loader.assert_called_once_with('U235')
+    assert helper._rate_tally.nuclides == ['U235']
+
+    with pytest.raises(ValueError, match='no continuous-energy'):
+        PendfFluxCollapseHelper(
+            1, 1, fake, _fission_chain(['U235']), EDGES,
+            reactions=['fission'], nuclides=['U236_m1'],
+            ce_nuclides={'U235'})

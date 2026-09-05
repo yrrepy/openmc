@@ -77,6 +77,8 @@ class OpenMCOperator(TransportOperator):
         Total number of atoms in simulation.
     nuclides_with_data : set of str
         A set listing all unique nuclides available from cross_sections.xml.
+        This is the transport data set: it decides which nuclides reach the
+        transport model, and by default which ones can receive a reaction rate.
     chain : openmc.deplete.Chain
         The depletion chain information necessary to form matrices and tallies.
     reaction_rates : openmc.deplete.ReactionRates
@@ -147,13 +149,17 @@ class OpenMCOperator(TransportOperator):
         self.nuclides_with_data = self._get_nuclides_with_data(
             self.cross_sections)
 
+        # Nuclides that can be given a reaction rate. Only a mode whose rates
+        # come from somewhere other than the transport data widens this.
+        self._rate_nuclides_with_data = self._get_rate_nuclides_with_data()
+
         # Select nuclides with data that are also in the chain
         self._burnable_nucs = [nuc.name for nuc in self.chain.nuclides
-                               if nuc.name in self.nuclides_with_data]
+                               if nuc.name in self._rate_nuclides_with_data]
 
         # Select nuclides without data that are also in the chain
         self._decay_nucs = [nuc.name for nuc in self.chain.nuclides
-                            if nuc.name not in self.nuclides_with_data]
+                            if nuc.name not in self._rate_nuclides_with_data]
 
         self.burnable_mats, volumes, all_nuclides = self._get_burnable_mats()
         self.local_mats = _distribute(self.burnable_mats)
@@ -249,6 +255,18 @@ class OpenMCOperator(TransportOperator):
     @abstractmethod
     def _get_nuclides_with_data(self, cross_sections):
         """Find nuclides with cross section data."""
+
+    def _get_rate_nuclides_with_data(self):
+        """Nuclides that can receive a reaction rate
+
+        Returns
+        -------
+        set of str
+            Nuclides that can receive a reaction rate; the transport data set
+            by default.
+
+        """
+        return self.nuclides_with_data
 
     def _extract_number(self, local_mats, volume, all_nuclides, prev_res=None):
         """Construct AtomNumber using geometry
@@ -386,7 +404,10 @@ class OpenMCOperator(TransportOperator):
         nuclides = self._get_reaction_nuclides()
         self._rate_helper.nuclides = nuclides
         self._normalization_helper.nuclides = nuclides
-        self._yield_helper.update_tally_nuclides(nuclides)
+        # The yield helper builds an ``openmc.lib`` tally, so it only ever sees
+        # nuclides that carry continuous-energy data.
+        self._yield_helper.update_tally_nuclides(
+            [nuc for nuc in nuclides if nuc in self.nuclides_with_data])
 
     @abstractmethod
     def _update_materials(self):
@@ -426,7 +447,7 @@ class OpenMCOperator(TransportOperator):
         # Create the set of all nuclides in the decay chain in materials marked
         # for burning in which the number density is greater than zero.
         for nuc in self.number.nuclides:
-            if nuc in self.nuclides_with_data:
+            if nuc in self._rate_nuclides_with_data:
                 nuc_set.add(nuc)
 
         # Communicate which nuclides have nonzeros to rank 0

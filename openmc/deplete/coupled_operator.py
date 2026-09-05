@@ -232,6 +232,9 @@ class CoupledOperator(OpenMCOperator):
         Total number of atoms in simulation.
     nuclides_with_data : set of str
         A set listing all unique nuclides available from cross_sections.xml.
+        This is the transport data set; in "pendf-flux" mode a chain
+        nuclide the PENDF library carries can still receive a reaction rate
+        without being in it.
     chain : openmc.deplete.Chain
         The depletion chain information necessary to form matrices and tallies.
     reaction_rates : openmc.deplete.ReactionRates
@@ -304,6 +307,7 @@ class CoupledOperator(OpenMCOperator):
         self._pendf_library, self._pendf_energies, self._pendf_helper_opts = \
             _resolve_pendf_flux_options(
                 pendf_library, reaction_rate_mode, reaction_rate_opts)
+        self._reaction_rate_mode = reaction_rate_mode
 
         helper_kwargs = {
             'reaction_rate_mode': reaction_rate_mode,
@@ -373,6 +377,26 @@ class CoupledOperator(OpenMCOperator):
         """
         return _get_nuclides_with_data(cross_sections)
 
+    def _get_rate_nuclides_with_data(self):
+        """Nuclides that can receive a reaction rate
+
+        In "pendf-flux" mode the rates come from the PENDF library rather than
+        from the continuous-energy data, so a chain nuclide the library carries
+        gets a rate row and a collapsed rate even with no entry in
+        ``cross_sections.xml``. It stays out of the transport model all the
+        same: no materials.xml entry, no ``openmc.lib`` density, no tally.
+
+        Returns
+        -------
+        set of str
+            Nuclides that can receive a reaction rate; the transport data set
+            widened by the PENDF library in "pendf-flux" mode.
+
+        """
+        if self._reaction_rate_mode == "pendf-flux":
+            return self.nuclides_with_data | set(self._pendf_library.nuclides)
+        return super()._get_rate_nuclides_with_data()
+
     def _get_helper_classes(self, helper_kwargs):
         """Create the ``_rate_helper``, ``_normalization_helper``, and
         ``_yield_helper`` objects.
@@ -410,6 +434,7 @@ class CoupledOperator(OpenMCOperator):
             self._rate_helper = PendfFluxCollapseHelper(
                 self.reaction_rates.n_nuc, self.reaction_rates.n_react,
                 self._pendf_library, self.chain, self._pendf_energies,
+                ce_nuclides=self.nuclides_with_data,
                 **self._pendf_helper_opts)
         else:
             raise ValueError("Invalid reaction rate mode.")
@@ -470,7 +495,13 @@ class CoupledOperator(OpenMCOperator):
         for mat in self.materials:
             mat._nuclides.sort(key=lambda x: nuclides.index(x[0]))
 
-        self.materials.export_to_xml(nuclides_to_ignore=self._decay_nucs)
+        # Everything the transport model cannot represent stays out of the XML.
+        # Outside "pendf-flux" this is exactly ``self._decay_nucs``; in that
+        # mode a nuclide with a PENDF rate but no continuous-energy data is
+        # burnable yet still has no place in the transport model.
+        self.materials.export_to_xml(nuclides_to_ignore=[
+            nuc for nuc in self.chain.nuclide_dict
+            if nuc not in self.nuclides_with_data])
 
     def __call__(self, vec, source_rate) -> OperatorResult:
         """Runs a simulation.

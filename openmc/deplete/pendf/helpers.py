@@ -96,6 +96,11 @@ class PendfFluxCollapseHelper(ReactionRateHelper):
     nuclides : iterable of str, optional
         Nuclides for which some reaction rates should be directly tallied. If
         None, then ``reactions`` will be used for all nuclides.
+    ce_nuclides : set of str, optional
+        Nuclides that have continuous-energy data. Only these can be loaded and
+        direct-tallied; the collapse itself needs no continuous-energy data, so
+        a nuclide outside this set still gets its collapsed rates. Defaults to
+        None, meaning every nuclide.
     partial_binding : bool or collection of (str, str), optional
         Opt-in binding of stock reactions to the MF=10 ground partial, passed
         through to the collapse engine. Defaults to False.
@@ -110,7 +115,8 @@ class PendfFluxCollapseHelper(ReactionRateHelper):
     """
 
     def __init__(self, n_nucs, n_reacts, pendf_library, chain, energies,
-                 reactions=None, nuclides=None, partial_binding=False):
+                 reactions=None, nuclides=None, ce_nuclides=None,
+                 partial_binding=False):
         super().__init__(n_nucs, n_reacts)
         self._pendf_library = pendf_library
         self._chain = chain
@@ -118,7 +124,19 @@ class PendfFluxCollapseHelper(ReactionRateHelper):
         self._reactions_direct = (
             list(reactions) if reactions is not None else [])
         self._nuclides_direct = list(nuclides) if nuclides is not None else None
+        self._ce_nuclides = ce_nuclides
         self._partial_binding = partial_binding
+
+        # A direct tally is a continuous-energy tally, so an override naming a
+        # nuclide the transport data set does not carry can never be served.
+        if ce_nuclides is not None and self._nuclides_direct is not None:
+            for name in self._nuclides_direct:
+                if name not in ce_nuclides:
+                    raise ValueError(
+                        f"Direct-tally nuclide {name!r} has no "
+                        "continuous-energy data and cannot be direct-tallied; "
+                        "drop it from reaction_rate_opts['nuclides'] and let "
+                        'the PENDF collapse serve it.')
 
         # A direct tally is a continuous-energy tally, so it can only score
         # canonical reaction names; the product-qualified ones exist in PENDF
@@ -195,10 +213,14 @@ class PendfFluxCollapseHelper(ReactionRateHelper):
         # Only the direct tally needs continuous-energy data loaded; the PENDF
         # collapse never touches it.
         if self._reactions_direct and self._nuclides_direct is None:
-            for nuclide in nuclides:
+            # A rate nuclide with no continuous-energy data cannot be loaded or
+            # scored; it keeps the rates the collapse gives it.
+            direct = [n for n in nuclides
+                      if self._ce_nuclides is None or n in self._ce_nuclides]
+            for nuclide in direct:
                 if nuclide not in openmc.lib.nuclides:
                     load_nuclide(nuclide)
-            self._rate_tally.nuclides = nuclides
+            self._rate_tally.nuclides = direct
         # The operator sets this before the transport solve of every step, and
         # ``generate_tallies`` (which fills ``_scores``) has run by then, so
         # building the index here makes the fission-row guard and the

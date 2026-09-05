@@ -151,7 +151,10 @@ Isomer-resolved rates need a chain patched with
 ``tools/add_pendf_isomeric_branching_to_chain.py`` from the same PENDF source.
 The chain's PENDF provenance stamp is compared with the library when the
 operator is built, and a mismatch warns. Nuclides in the burnable materials
-that the library does not carry get zero reaction rates, with one warning. A
+that the library does not carry get zero reaction rates, with one warning. The
+reverse case is served: a chain nuclide that the PENDF library carries but the
+continuous-energy library does not still gets its collapsed reaction rates; it
+only stays out of the transport model. A
 burnable material whose temperature differs from the library temperature by
 more than 1 K also warns once; its rates are still collapsed with the library
 as given. URR self-shielding and per-temperature libraries are not available
