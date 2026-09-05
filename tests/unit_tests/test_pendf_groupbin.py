@@ -149,6 +149,10 @@ class _PointwiseShim:
         self._f = h5py.File(path, "r")
 
     @property
+    def temperature(self):
+        return float(self._f.attrs["temperature"])
+
+    @property
     def nuclides(self):
         return [k for k, v in self._f.items() if isinstance(v, h5py.Group)]
 
@@ -491,3 +495,19 @@ def test_cli_unwritable_out_is_clean_error(tmp_path, monkeypatch, capsys):
         _run_main(monkeypatch, src, out)
     err = capsys.readouterr().err
     assert "cannot open output file" in err
+
+
+def test_grouped_library_carries_the_temperature(libs, tmp_path):
+    """The grouped reader exposes the library temperature the writer copied
+    from the pointwise source, and ``None`` for a file with no such attr."""
+    pointwise, grouped, _ = libs
+    assert grouped.temperature == pointwise.temperature
+
+    bare = tmp_path / "bare.h5"
+    with h5py.File(bare, "w") as f:
+        f.attrs["format"] = pgb.GROUPED_FORMAT
+        f.attrs["version"] = pgb.GROUPED_VERSION
+        f.create_dataset("group_edges", data=EDGES)
+
+    with GroupedPendfLibrary(bare) as lib:
+        assert lib.temperature is None

@@ -1228,6 +1228,9 @@ class GroupedPendfLibrary:
     source_identity : str or None
         Tape-derived provenance identity carried from the pointwise source (root
         ``source_identity`` attr), or ``None``.
+    temperature : float or None
+        Preprocessed library temperature in [K] carried from the pointwise
+        source (root ``temperature`` attr), or ``None`` when the file has none.
 
     Notes
     -----
@@ -1275,6 +1278,9 @@ class GroupedPendfLibrary:
             self._nuclides = [
                 name for name, obj in self._file.items()
                 if isinstance(obj, h5py.Group)]
+            temperature = self._file.attrs.get('temperature')
+            self.temperature = (
+                None if temperature is None else float(temperature))
         except Exception:
             self._file.close()
             raise
