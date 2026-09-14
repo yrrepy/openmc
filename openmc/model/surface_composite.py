@@ -1586,7 +1586,8 @@ class RectangularPrism(CompositeSurface):
 
 
 class HexagonalPrism(CompositeSurface):
-    """Hexagonal prism comoposed of six planar surfaces
+    """Hexagonal prism composed of six planar surfaces, optionally bounded
+    along z
 
     .. versionadded:: 0.14.0
 
@@ -1610,6 +1611,27 @@ class HexagonalPrism(CompositeSurface):
         'periodic', or 'white'.
     corner_radius : float
         Prism corner radius in units of [cm].
+    zmin : float, optional
+        Minimum z coordinate of the prism in [cm]. When not specified, the
+        prism is infinite along z. Must be given together with ``zmax``.
+
+        .. versionadded:: 0.16.1
+    zmax : float, optional
+        Maximum z coordinate of the prism in [cm]. When not specified, the
+        prism is infinite along z. Must be given together with ``zmin``.
+
+        .. versionadded:: 0.16.1
+
+    Attributes
+    ----------
+    plane_max, plane_min : openmc.XPlane or openmc.YPlane
+        Sides of the prism perpendicular to x ('y' orientation) or y ('x'
+        orientation)
+    upper_right, upper_left, lower_right, lower_left : openmc.Plane
+        Remaining sides of the prism
+    bottom, top : openmc.ZPlane
+        Ends of the prism at ``zmin`` and ``zmax``. Only present when
+        ``zmin`` and ``zmax`` are given.
 
     """
     _surface_names = ('plane_max', 'plane_min', 'upper_right', 'upper_left',
@@ -1622,13 +1644,22 @@ class HexagonalPrism(CompositeSurface):
             origin: Sequence[float] = (0., 0.),
             boundary_type: str = 'transmission',
             albedo: float = 1.,
-            corner_radius: float = 0.
+            corner_radius: float = 0.,
+            zmin: float | None = None,
+            zmax: float | None = None
     ):
         check_type('edge_length', edge_length, Real)
         check_type('albedo', albedo, Real)
         check_type('corner_radius', corner_radius, Real)
         check_value('orientation', orientation, ('x', 'y'))
         check_type('origin', origin, Iterable, Real)
+        if (zmin is None) != (zmax is None):
+            raise ValueError('zmin and zmax must be given together')
+        if zmin is not None:
+            check_type('zmin', zmin, Real)
+            check_type('zmax', zmax, Real)
+            if zmin >= zmax:
+                raise ValueError('zmin must be less than zmax')
 
         l = edge_length
         x, y = origin
@@ -1671,11 +1702,19 @@ class HexagonalPrism(CompositeSurface):
             # Upper-left surface: y = sqrt(3)*(x + a)
             self.upper_left = openmc.Plane(a=-c, b=1., d=c*l-x*c+y, **bc_args)
 
+        # Close the ends of the prism if bounds along z were given
+        if zmin is not None:
+            self.bottom = openmc.ZPlane(zmin, **bc_args)
+            self.top = openmc.ZPlane(zmax, **bc_args)
+            self._surface_names += ('bottom', 'top')
+
         # Handle periodic boundary conditions
         if boundary_type == 'periodic':
             self.plane_min.periodic_surface = self.plane_max
             self.upper_right.periodic_surface = self.lower_left
             self.lower_right.periodic_surface = self.upper_left
+            if zmin is not None:
+                self.bottom.periodic_surface = self.top
 
         # Handle rounded corners if given
         if corner_radius > 0.:
@@ -1733,6 +1772,10 @@ class HexagonalPrism(CompositeSurface):
             -self.upper_right & -self.upper_left &
             +self.lower_right & +self.lower_left
         )
+
+        # Close the ends of the prism if bounds along z were given
+        if hasattr(self, 'top'):
+            prism &= +self.bottom & -self.top
 
         # Cut out corners if a corner radius was given
         if hasattr(self, 'min_in'):

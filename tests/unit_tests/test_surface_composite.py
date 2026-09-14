@@ -570,6 +570,54 @@ def test_box():
     assert (0., 0., 3.) not in +s
 
 
+def test_hexagonal_prism():
+    # Infinite prism
+    s = openmc.model.HexagonalPrism(edge_length=2.0)
+    assert len(s.component_surfaces) == 6
+    assert not hasattr(s, 'top')
+    assert (0., 0., 100.) in -s
+    ll, ur = (-s).bounding_box
+    assert np.all(np.isinf((ll[2], ur[2])))
+
+    # Prism bounded along z
+    s = openmc.model.HexagonalPrism(edge_length=2.0, zmin=-1.0, zmax=1.0)
+    assert len(s.component_surfaces) == 8
+    assert isinstance(s.bottom, openmc.ZPlane)
+    assert isinstance(s.top, openmc.ZPlane)
+    ll, ur = (-s).bounding_box
+    assert ll[2] == pytest.approx(-1.0)
+    assert ur[2] == pytest.approx(1.0)
+
+    # Make sure boundary condition propagates to the end planes
+    s.boundary_type = 'reflective'
+    assert s.bottom.boundary_type == 'reflective'
+    assert s.top.boundary_type == 'reflective'
+
+    # __contains__ on associated half-spaces
+    assert (0., 0., 0.) in -s
+    assert (0., 0., 1.01) in +s
+    assert (0., 0., -1.01) in +s
+    assert (1.9, 0., 0.) in +s
+
+    # translate and rotate methods move the end planes
+    s_t = s.translate((0., 0., 5.))
+    assert s_t.top.z0 == pytest.approx(6.0)
+    assert (0., 0., 5.5) in -s_t
+    s_r = s.rotate((0., 90., 0.))
+    assert (0., 0., 1.5) in -s_r
+    assert (1.5, 0., 0.) in +s_r
+
+    # Periodic end planes are paired
+    s = openmc.model.HexagonalPrism(boundary_type='periodic', zmin=-1., zmax=1.)
+    assert s.bottom.periodic_surface is s.top
+
+    # zmin and zmax must be given together and ordered
+    with pytest.raises(ValueError):
+        openmc.model.HexagonalPrism(zmin=0.0)
+    with pytest.raises(ValueError):
+        openmc.model.HexagonalPrism(zmin=1.0, zmax=-1.0)
+
+
 def test_conical_frustum():
     center_base = (0.0, 0.0, -3)
     axis = (0., 0., 3.)
