@@ -138,7 +138,8 @@ _THERMAL_NAMES = {
     'c_H_in_YH2': ('hyh2', 'h-yh2', 'h(yh2)'),
     'c_H_in_ZrH': ('hzrh', 'h-zrh', 'h-zr', 'h/zr', 'hzr', 'hzr00', 'h(zrh)'),
     'c_H_in_ZrH2': ('hzrh2', 'h(zrh2)', 'h(zrh2) in'),
-    'c_H_in_ZrHx': ('hzrhx', 'h(zrhx)', 'h(zrh15) i'),
+    'c_H_in_ZrH15': ('h(zrh15) i'),
+    'c_H_in_ZrHx': ('hzrhx', 'h(zrhx)'),
     'c_I_in_NaI': ('i(nai)', 'inai'),
     'c_K': ('k',),
     'c_K_in_KOH': ('k(koh)', 'kkoh'),
@@ -244,6 +245,7 @@ _THERMAL_NAMES = {
     'c_Zr_in_ZrC': ('zrzrc', 'zr(zrc)'),
     'c_Zr_in_ZrH': ('zrzrh', 'zr-zrh', 'zr-h', 'zr/h', 'zr(zrh)'),
     'c_Zr_in_ZrH2': ('zrzrh2', 'zr(zrh2)', 'zr(zrh2) i'),
+    'c_Zr_in_ZrH15': ('zr(zrh15)'),
     'c_Zr_in_ZrHx': ('zrzrhx', 'zr(zrhx)', 'zr(zrh15)'),
 }
 
