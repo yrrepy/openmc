@@ -246,7 +246,7 @@ _THERMAL_NAMES = {
     'c_Zr_in_ZrH': ('zrzrh', 'zr-zrh', 'zr-h', 'zr/h', 'zr(zrh)'),
     'c_Zr_in_ZrH2': ('zrzrh2', 'zr(zrh2)', 'zr(zrh2) i'),
     'c_Zr_in_ZrH15': ('zr(zrh15)'),
-    'c_Zr_in_ZrHx': ('zrzrhx', 'zr(zrhx)', 'zr(zrh15)'),
+    'c_Zr_in_ZrHx': ('zrzrhx', 'zr(zrhx)'),
 }
 
 
