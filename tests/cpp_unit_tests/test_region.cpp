@@ -100,6 +100,35 @@ public:
   }
 };
 
+// Helper class for testing accumulated distance through virtual crossings
+class AccumulatedDistanceFixture {
+public:
+  AccumulatedDistanceFixture()
+  {
+    pugi::xml_document doc;
+    auto plane = doc.append_child("surface");
+    plane.append_attribute("id") = 1;
+    plane.append_attribute("type") = "x-plane";
+    plane.append_attribute("coeffs") = 0.0;
+
+    const double offsets[] {-57452.33336021505, 43403.32187479845,
+      62125.04976135607, 62125.04976135607};
+    for (int i = 0; i < 4; ++i) {
+      plane.attribute("id") = i + 1;
+      plane.attribute("coeffs") = offsets[i];
+      openmc::model::surfaces.push_back(
+        std::make_unique<openmc::SurfaceXPlane>(plane));
+      openmc::model::surface_map[i + 1] = i;
+    }
+  }
+
+  ~AccumulatedDistanceFixture()
+  {
+    openmc::model::surfaces.clear();
+    openmc::model::surface_map.clear();
+  }
+};
+
 } // anonymous namespace
 
 TEST_CASE("Test region simplification")
@@ -222,4 +251,23 @@ TEST_CASE("Ignore roundoff-scale virtual surface crossings")
 
   REQUIRE(distance == Catch::Approx(603.9161175466262));
   REQUIRE(surface == 1);
+}
+
+TEST_CASE("Maintain position consistency through virtual surface crossings")
+{
+  AccumulatedDistanceFixture fixture;
+  openmc::Region source("-1 | -2 | -3", 0);
+  openmc::Region destination("4", 0);
+
+  // The first two planes are virtual crossings and the third is the true
+  // boundary. Surface 4 represents the same geometric boundary with a
+  // different ID, as may occur in the destination cell.
+  openmc::Position r {-85626.45049221347, 0.0, 0.0};
+  openmc::Direction u {0.9182609440159194, 0.39597580569397484, 0.0};
+
+  auto [distance, surface] = source.distance(r, u, 0);
+  r += distance * u;
+
+  REQUIRE(surface == 3);
+  REQUIRE(destination.contains(r, u, surface));
 }

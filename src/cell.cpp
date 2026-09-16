@@ -999,6 +999,7 @@ std::pair<double, int32_t> Region::distance_to_nearest_surface(Position r,
 std::pair<double, int32_t> Region::distance_complex(
   Position r, Direction u, int32_t on_surface) const
 {
+  const Position r_initial {r};
   const bool in_region = contains_complex(r, u, on_surface);
   double total_distance {0.0};
 
@@ -1009,12 +1010,16 @@ std::pair<double, int32_t> Region::distance_complex(
       return {INFTY, std::numeric_limits<int32_t>::max()};
     }
 
-    // Move to the candidate surface and determine which side of it the ray is
-    // entering. The surface normal is used instead of evaluating the surface
-    // equation because accumulated roundoff may place the point slightly to
-    // the wrong side of a curved surface.
-    r += distance * u;
+    // Move to the candidate surface using the same operation that will later
+    // advance the particle. This ensures that region membership is evaluated
+    // at the position where the particle will actually be transported.
     total_distance += distance;
+    r = r_initial + total_distance * u;
+
+    // Determine which side of the surface the ray is entering. The surface
+    // normal is used instead of evaluating the surface equation because
+    // roundoff may place the point slightly to the wrong side of a curved
+    // surface.
     i_surf = std::abs(i_surf);
     const auto& surf {*model::surfaces[i_surf - 1]};
     if (u.dot(surf.normal(r)) <= 0.0) {
