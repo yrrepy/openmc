@@ -1013,7 +1013,15 @@ std::pair<double, int32_t> Region::distance_complex(
     // Move to the candidate surface using the same operation that will later
     // advance the particle. This ensures that region membership is evaluated
     // at the position where the particle will actually be transported.
+    const double previous_distance = total_distance;
     total_distance += distance;
+    if (total_distance == previous_distance) {
+      // The step is smaller than the resolution of the accumulated distance,
+      // so the recomputed position would not move and the search could
+      // alternate forever between coincident surfaces. Take the smallest
+      // representable step instead so that the search always advances.
+      total_distance = std::nextafter(total_distance, INFTY);
+    }
     r = r_initial + total_distance * u;
 
     // Determine which side of the surface the ray is entering. The surface
