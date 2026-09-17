@@ -1010,9 +1010,12 @@ std::pair<double, int32_t> Region::distance_complex(
       return {INFTY, std::numeric_limits<int32_t>::max()};
     }
 
-    // Move to the candidate surface using the same operation that will later
-    // advance the particle. This ensures that region membership is evaluated
-    // at the position where the particle will actually be transported.
+    // Move to the candidate surface. The position is recomputed from the
+    // starting point with the same arithmetic as GeometryState::move_distance
+    // rather than accumulated step by step. When the true boundary is found,
+    // region membership has therefore been evaluated at the position where the
+    // particle will actually be transported. Positions at virtual crossings
+    // are used only within this search.
     const double previous_distance = total_distance;
     total_distance += distance;
     if (total_distance == previous_distance) {

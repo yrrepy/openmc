@@ -292,12 +292,18 @@ TEST_CASE("Maintain position consistency through virtual surface crossings")
   // The first two planes are virtual crossings and the third is the true
   // boundary. Surface 4 represents the same geometric boundary with a
   // different ID, as may occur in the destination cell.
+  //
+  // The coordinates are deliberate. With these values a position accumulated
+  // step by step lands four floating-point steps short of surface 3, while a
+  // position computed in one step lands on it. Rounder numbers or an
+  // axis-aligned direction do not separate the two.
   openmc::Position r {-85626.45049221347, 0.0, 0.0};
   openmc::Direction u {0.9182609440159194, 0.39597580569397484, 0.0};
 
   auto [distance, surface] = source.distance(r, u, 0);
   r += distance * u;
 
+  REQUIRE(distance == Catch::Approx(160903.60938949839));
   REQUIRE(surface == 3);
   REQUIRE(destination.contains(r, u, surface));
 }
