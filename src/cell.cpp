@@ -1019,18 +1019,14 @@ std::pair<double, int32_t> Region::distance_complex(
     const double previous_distance = total_distance;
     total_distance += distance;
     if (total_distance == previous_distance) {
-      // The step is smaller than the resolution of the accumulated distance,
-      // so the recomputed position would not move and the search could
-      // alternate forever between coincident surfaces. Take the smallest
-      // representable step instead so that the search always advances.
+      // The step was lost to roundoff, so the position would not move. Take
+      // the smallest representable step so that the search always advances.
       total_distance = std::nextafter(total_distance, INFTY);
     }
     r = r_initial + total_distance * u;
 
-    // Determine which side of the surface the ray is entering. The surface
-    // normal is used instead of evaluating the surface equation because
-    // roundoff may place the point slightly to the wrong side of a curved
-    // surface.
+    // Determine which side of the surface the ray is entering. Use the surface
+    // normal, because roundoff may place the point on the wrong side.
     i_surf = std::abs(i_surf);
     const auto& surf {*model::surfaces[i_surf - 1]};
     if (u.dot(surf.normal(r)) <= 0.0) {

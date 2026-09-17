@@ -289,14 +289,11 @@ TEST_CASE("Maintain position consistency through virtual surface crossings")
   openmc::Region source("-1 | -2 | -3", 0);
   openmc::Region destination("4", 0);
 
-  // The first two planes are virtual crossings and the third is the true
-  // boundary. Surface 4 represents the same geometric boundary with a
-  // different ID, as may occur in the destination cell.
+  // Planes 1 and 2 are virtual crossings and plane 3 is the true boundary.
+  // Surface 4 is the same plane as seen from the destination cell.
   //
-  // The coordinates are deliberate. With these values a position accumulated
-  // step by step lands four floating-point steps short of surface 3, while a
-  // position computed in one step lands on it. Rounder numbers or an
-  // axis-aligned direction do not separate the two.
+  // The coordinates are deliberate: a position accumulated step by step lands
+  // short of surface 3, and rounder values do not show the difference.
   openmc::Position r {-85626.45049221347, 0.0, 0.0};
   openmc::Direction u {0.9182609440159194, 0.39597580569397484, 0.0};
 
@@ -312,11 +309,9 @@ TEST_CASE("Find boundary at coincident surfaces within one region")
 {
   CoincidentPlaneFixture fixture;
 
-  // The ray reaches the coincident planes after about 166 m. With these
-  // coordinates the first candidate crossing lands short of both planes, and
-  // the remaining step is smaller than the resolution of the accumulated
-  // distance. The search must still advance and return, and the returned
-  // distance must carry the particle across both planes.
+  // After about 166 m the first candidate crossing lands short of both planes,
+  // and the remaining step is lost to roundoff. The search must still return a
+  // distance that carries the particle across both planes.
   const openmc::Position r_start {-9948.187586907628, 0.0, 0.0};
   const openmc::Direction u {0.7623218202875262, 0.6471981476437588, 0.0};
 
