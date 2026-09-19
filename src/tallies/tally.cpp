@@ -1000,16 +1000,15 @@ void read_tallies_xml(pugi::xml_node root)
 
   // Check for user filters and allocate
   for (auto node_filt : root.children("filter")) {
-    auto f = Filter::create(node_filt);
+    Filter::create(node_filt);
   }
 
   // ==========================================================================
   // READ TALLY DATA
 
   // Check for user tallies
-  int n = 0;
-  for (auto node : root.children("tally"))
-    ++n;
+  auto tally_nodes = root.children("tally");
+  int n = std::distance(tally_nodes.begin(), tally_nodes.end());
   if (n == 0 && mpi::master) {
     warning("No tallies present in tallies.xml file.");
   }
