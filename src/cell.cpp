@@ -1018,17 +1018,12 @@ std::pair<double, int32_t> Region::distance_complex(
     // are used only within this search.
     const double previous_distance = total_distance;
     total_distance += distance;
-    r = r_initial + total_distance * u;
-    if (r == r_initial) {
-      // Take the smallest representable step so that the search always
-      // advances.
-      if (u.x != 0.0)
-        r.x = std::nextafter(r.x, u.x > 0 ? INFTY : -INFTY);
-      if (u.y != 0.0)
-        r.y = std::nextafter(r.y, u.y > 0 ? INFTY : -INFTY);
-      if (u.z != 0.0)
-        r.z = std::nextafter(r.z, u.z > 0 ? INFTY : -INFTY);
+    if (total_distance == previous_distance) {
+      // The step was lost to roundoff, so the position would not move. Take
+      // the smallest representable step so that the search always advances.
+      total_distance = std::nextafter(total_distance, INFTY);
     }
+    r = r_initial + total_distance * u;
 
     // Determine which side of the surface the ray is entering. Use the surface
     // normal, because roundoff may place the point on the wrong side.
