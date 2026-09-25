@@ -9,7 +9,7 @@ convergence) and G-B (mono / inert-diluter no-op) gates.
 import numpy as np
 import pytest
 
-from openmc.deplete.calendf import (
+from openmc.deplete.gendf.calendf import (
     SIGMA0_ITER_MAX, SIGMA0_ITER_TOL,
     TpeTable, _BandGroup,
     material_dilution_sigma0, mat_ssf_factors_gendf,
@@ -138,7 +138,7 @@ def test_sigma0_iteration_gendf_warns_on_nonconvergence(monkeypatch):
     group_totals = {'A': np.full(_N_GROUPS, 50.0),
                     'B': np.full(_N_GROUPS, 50.0)}
 
-    monkeypatch.setattr('openmc.deplete.calendf.SIGMA0_ITER_MAX', 1)
+    monkeypatch.setattr('openmc.deplete.gendf.calendf.SIGMA0_ITER_MAX', 1)
     with pytest.warns(UserWarning, match="did not converge"):
         _, info = iterate_material_dilution_sigma0_gendf(
             densities, group_totals, coupling, _N_GROUPS)

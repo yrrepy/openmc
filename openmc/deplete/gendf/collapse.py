@@ -13,7 +13,7 @@ so it may import from :mod:`openmc.deplete.microxs` at module level.
 """
 
 from __future__ import annotations
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
@@ -31,6 +31,7 @@ from .. import microxs as _microxs
 from ..microxs import (DomainTypes, Flux, MicroXS, _COLLAPSE_CHUNK_SIZE,
                        _collapse_gendf_streaming, _normalize_flux_batch)
 from .library import GENDFLibrary
+from .calendf import _CalendfRowScaler
 
 
 def get_gendfxs_and_flux(
@@ -263,8 +264,52 @@ def _from_multigroup_flux_with_gendf(
     chain_file: PathLike | Chain | None = None,
     nuclides: Sequence[str] | None = None,
     reactions: Sequence[str] | None = None,
+    *,
+    urr_material_dilution: openmc.Material | Mapping[str, float] | bool = False,
+    calendf_path: PathLike | None = None,
+    mat_ssf_nuclides: Sequence[str] | None = None,
 ) -> MicroXS:
-    """Implementation of :meth:`MicroXS.from_multigroup_flux_with_gendf`."""
+    """Implementation of :meth:`MicroXS.from_multigroup_flux_with_gendf`.
+
+    URR material dilution is applied row by row in the streaming collapse
+    through a :class:`~openmc.deplete.gendf.calendf._CalendfRowScaler`.
+    """
+    # Fuse the URR dilution toggle with its composition: normalize
+    # ``urr_material_dilution`` to a local ``densities`` mapping (or None
+    # when off) here, before any expensive work, so the impossible "on but
+    # no composition" state cannot be represented.
+    if urr_material_dilution is False or urr_material_dilution is None:
+        densities = None
+    elif urr_material_dilution is True:
+        raise ValueError(
+            'urr_material_dilution=True is under-specified: the URR '
+            'self-shielding sigma0_mat background needs a composition. Pass '
+            'the openmc.Material being depleted, or a {nuclide: '
+            'density-or-fraction} mapping, instead of True')
+    elif isinstance(urr_material_dilution, openmc.Material):
+        densities = urr_material_dilution.get_nuclide_atom_densities()
+    elif isinstance(urr_material_dilution, Mapping):
+        if not urr_material_dilution:
+            raise ValueError(
+                'urr_material_dilution mapping is empty: with no diluters '
+                'the sigma0_mat background is zero and every flagged nuclide '
+                'silently degrades to f=1. Pass the depleted composition, '
+                'or omit the argument to disable the correction')
+        densities = urr_material_dilution
+    else:
+        raise ValueError(
+            'urr_material_dilution must be an openmc.Material, a {nuclide: '
+            'density-or-fraction} mapping, or False; got '
+            f'{type(urr_material_dilution).__name__}')
+
+    # The correction needs the CALENDF probability tables; the GENDF path
+    # takes an explicit CALENDF path.
+    if densities is not None and calendf_path is None:
+        raise ValueError(
+            "urr_material_dilution requires `calendf_path` (the directory "
+            "of CALENDF .tpe probability tables); the GENDF path uses an "
+            "explicit CALENDF path")
+
     # Handle GENDF library input
     if isinstance(gendf_library, (str, Path)):
         gendf_library = GENDFLibrary(gendf_library)
@@ -302,10 +347,15 @@ def _from_multigroup_flux_with_gendf(
         reactions = list(reactions)
     mts = [REACTION_MT[name] for name in reactions]
 
+    # URR material dilution: one scaler per composition, applied to each row
+    # as the streaming collapse stages it
+    scaler = None if densities is None else _CalendfRowScaler(
+        gendf_library, calendf_path, densities, mat_ssf_nuclides)
+
     # Normalize the flux (a zero flux stays all-zero, giving zero cross
     # sections) and collapse the GENDF rows in one streaming pass
     phi = _normalize_flux_batch([multigroup_flux], 0, len(energies) - 1)
     collapsed = _collapse_gendf_streaming(
-        gendf_library, nuclides, reactions, mts, phi)[0]
+        gendf_library, nuclides, reactions, mts, phi, scaler=scaler)[0]
 
     return cls(collapsed[:, :, np.newaxis], nuclides, reactions)

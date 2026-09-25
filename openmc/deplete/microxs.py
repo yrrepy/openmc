@@ -5,7 +5,7 @@ IndependentOperator class for depletion.
 """
 
 from __future__ import annotations
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -653,6 +653,7 @@ def _collapse_gendf_streaming(
     mts: list[int],
     phi: np.ndarray,
     block_rows: int = _DEFAULT_BLOCK_ROWS,
+    scaler=None,
 ) -> np.ndarray:
     """Collapse GENDF group XS against a batch of fluxes without a table.
 
@@ -687,6 +688,11 @@ def _collapse_gendf_streaming(
         with :func:`_normalize_flux_batch` or pass a raw tally flux.
     block_rows : int, optional
         Number of group XS rows accumulated per GEMM.
+    scaler : openmc.deplete.gendf.calendf._CalendfRowScaler, optional
+        Per-row correction applied before buffering, as
+        ``scaler.scale(nuclide, reaction, row)`` on a private copy of each
+        row (the library's own arrays are never modified). ``None`` (default)
+        buffers the rows unchanged, with no copy.
 
     Returns
     -------
@@ -714,7 +720,14 @@ def _collapse_gendf_streaming(
         block_keys.clear()
 
     def emit(nuc_idx, rxn_idx, xs_arr):
-        block.append(np.asarray(xs_arr, dtype=float))
+        if scaler is None:
+            block.append(np.asarray(xs_arr, dtype=float))
+        else:
+            # Scale a private copy: the library may still own xs_arr (the
+            # Python backend caches parsed materials).
+            row = np.array(xs_arr, dtype=float)
+            scaler.scale(nuclides[nuc_idx], reactions[rxn_idx], row)
+            block.append(row)
         block_keys.append((nuc_idx, rxn_idx))
         if len(block) >= block_rows:
             flush()
@@ -878,6 +891,10 @@ class MicroXS:
         chain_file: PathLike | Chain | None = None,
         nuclides: Sequence[str] | None = None,
         reactions: Sequence[str] | None = None,
+        *,
+        urr_material_dilution: openmc.Material | Mapping[str, float] | bool = False,
+        calendf_path: PathLike | None = None,
+        mat_ssf_nuclides: Sequence[str] | None = None,
     ) -> MicroXS:
         """Generate one group microscopic cross sections by collapsing
         multigroup flux with multigroup cross-sections from a GENDF library.
@@ -905,6 +922,44 @@ class MicroXS:
         reactions : list of str, optional
             Reactions to get cross sections for. If not specified, all neutron
             reactions listed in the depletion chain file are used.
+        urr_material_dilution : openmc.Material or dict or False, optional
+            Apply an unresolved-resonance-range (URR) self-shielding correction
+            by **material dilution** before the collapse: the infinite-dilution
+            capture (and, for fissile nuclides, fission) group cross sections of
+            the flagged nuclides are multiplied by a per-group self-shielding
+            factor folded from CALENDF probability tables against the material
+            background cross section ``sigma0_mat``. This is the exact analogue
+            of FISPACT-II ``PROBTABLE multxs=1``. The CALENDF tables span the
+            resolved range as well as the URR, so the correction acts across
+            both. Requires ``calendf_path``. Accepts either an
+            :class:`openmc.Material` (its
+            :meth:`~openmc.Material.get_nuclide_atom_densities` supplies the
+            composition) or a ``{nuclide: density-or-fraction}`` mapping used to
+            build the background cross section
+            ``sigma0_mat,g = sum_{j != p} N_j sigma_t,j(g) / N_p`` (only density
+            ratios matter, so number densities or atom/weight fractions are
+            equivalent). A flagged nuclide with zero / absent density is left
+            infinite-dilution (self-shielding factor 1). The composition must be
+            given explicitly because this is the transport-free collapse path --
+            no live session exists, and a model has many materials, so one
+            :class:`MicroXS` is built per material composition. ``False``
+            (default) or ``None`` leaves the collapse unchanged (infinite
+            dilution, byte-identical to prior behaviour); bare ``True`` and an
+            empty mapping raise ``ValueError``. Keyword-only. The Bondarenko fold
+            uses the temperature baked into the chosen CALENDF ``tp-...``
+            directory (``calendf_path``); no cross-check against the material or
+            transport temperature is performed, so ensure the CALENDF temperature
+            matches the conditions modelled.
+        calendf_path : path-like, optional
+            Directory of per-temperature CALENDF ``<Nuclide>-<T>.tpe`` probability
+            tables (e.g. ``.../tp-709-294``). Required when
+            ``urr_material_dilution`` is enabled (the GENDF path takes an
+            explicit CALENDF path). Keyword-only.
+        mat_ssf_nuclides : list of str, optional
+            Restrict the material-dilution correction to this subset of nuclides.
+            ``None`` (default) uses the built-in flagged set (bulk
+            self-shielders: W, Ta, Re, Hf, Os isotopes and U/Pu). When given it
+            is intersected with the built-in set (restrict-only). Keyword-only.
 
         Returns
         -------
@@ -921,12 +976,22 @@ class MicroXS:
         where σ_g is the group-averaged cross-section from GENDF and φ_g is the
         multigroup flux.
 
+        When ``urr_material_dilution`` is enabled, each flagged nuclide's capture
+        (MT=102) and fission (MT=18) group cross sections σ_g are first replaced
+        by ``mat_ssf(nuclide, g; sigma0_mat) * σ_g``, where ``mat_ssf`` is the
+        narrow-resonance self-shielding factor folded from the CALENDF
+        probability tables (FISPACT-II ``PROBTABLE multxs=1`` with a homogeneous
+        ``sigma0_mat`` background from the material composition; no geometry /
+        Dancoff). The tables cover the resolved resonance range as well as the
+        URR.
+
         """
         from .gendf.collapse import _from_multigroup_flux_with_gendf
 
         return _from_multigroup_flux_with_gendf(
             cls, multigroup_flux, gendf_library, chain_file, nuclides,
-            reactions)
+            reactions, urr_material_dilution=urr_material_dilution,
+            calendf_path=calendf_path, mat_ssf_nuclides=mat_ssf_nuclides)
 
     @classmethod
     def from_csv(cls, csv_file, **kwargs):
