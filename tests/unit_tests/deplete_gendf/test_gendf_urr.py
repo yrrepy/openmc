@@ -57,15 +57,17 @@ _MID = 1
 
 
 def _band_tpe(total_lo, total_hi, index=_MID,
-              capture_lo=0.0, capture_hi=0.0):
+              capture_lo=0.0, capture_hi=0.0, *,
+              fission_lo=0.0, fission_hi=0.0):
     """A synthetic two-equiprobable-band CALENDF table, band totals [lo, hi]."""
     prob = np.array([0.5, 0.5])
     total = np.array([float(total_lo), float(total_hi)])
     capture = np.array([float(capture_lo), float(capture_hi)])
+    fission = np.array([float(fission_lo), float(fission_hi)])
     zeros = np.zeros(2)
     g = _BandGroup(ig=0, index=index, elo=1.0, ehi=2.0, prob=prob,
                    total=total, elastic=zeros.copy(),
-                   capture=capture, fission=zeros.copy())
+                   capture=capture, fission=fission)
     return TpeTable(za=0, mat=0, teff=294.0, ip=1,
                     group_structure='CCFE-709', span=(1.0, 2.0),
                     groups={index: g})
@@ -277,11 +279,15 @@ def _install_stub_scaler(monkeypatch):
 
     class _StubScaler:
         def __init__(self, gendf_library, calendf_path, densities,
-                     mat_ssf_nuclides=None, tpe_cache=None):
+                     mat_ssf_nuclides=None, tpe_cache=None,
+                     totals_cache=None):
             built.append({'densities': dict(densities),
                           'calendf_path': calendf_path})
             self.factor = 1.0 / (1.0 + sum(float(v)
                                            for v in densities.values()))
+
+        def check_diluters(self, nuclides, mts):
+            pass
 
         def scale(self, nuc, rxn, row):
             if rxn == '(n,gamma)':
@@ -295,10 +301,11 @@ def _run_gendf_wrapper(monkeypatch, domains, canned_flux, *,
                        urr_material_dilution=False, calendf_path=None,
                        mat_ssf_nuclides=None, gendf_library=None,
                        gendf_nuclides=('U235', 'U238'),
-                       chain_nuclides=('U235', 'U238')):
+                       chain_nuclides=('U235', 'U238'), model=None):
     """Drive get_gendfxs_and_flux with transport stubbed by canned per-domain
     flux (shape ``(n_domains, n_groups)``). Returns ``((fluxes, micros),
-    model)`` so callers can assert on ``model.run`` call state."""
+    model)`` so callers can assert on ``model.run`` call state; pass ``model``
+    (see :func:`_mock_model`) to inspect it after a raising call."""
     if gendf_library is None:
         gendf_library = MockGENDFLibrary(set(gendf_nuclides))
     reshaped = np.asarray(canned_flux, dtype=float)[:, :, np.newaxis, np.newaxis]
@@ -308,9 +315,8 @@ def _run_gendf_wrapper(monkeypatch, domains, canned_flux, *,
     statepoint.__enter__.return_value = statepoint
     statepoint.tallies.__getitem__.return_value = tally
 
-    model = Mock()
-    model.tallies = []
-    model.run.return_value = 'statepoint.dummy.h5'
+    if model is None:
+        model = _mock_model()
 
     with monkeypatch.context() as m:
         m.setattr(collapse_mod, '_get_chain',
@@ -325,6 +331,14 @@ def _run_gendf_wrapper(monkeypatch, domains, canned_flux, *,
             mat_ssf_nuclides=mat_ssf_nuclides,
         )
     return result, model
+
+
+def _mock_model(tallies=()):
+    """Model stand-in: ``model.run`` is a Mock returning a statepoint name."""
+    model = Mock()
+    model.tallies = list(tallies)
+    model.run.return_value = 'statepoint.dummy.h5'
+    return model
 
 
 def _direct_gendf(monkeypatch, flux, *, urr_material_dilution=False,
@@ -350,6 +364,8 @@ def _direct_gendf(monkeypatch, flux, *, urr_material_dilution=False,
 
 # Seeded four-nuclide library with fake CALENDF tables for the W isotopes.
 _W_NUCLIDES = ['W182', 'W184', 'Fe56', 'H1']
+# Library nuclides: _W_NUCLIDES plus Hf178, flagged but without a .tpe table.
+_URR_NUCLIDES = _W_NUCLIDES + ['Hf178']
 _URR_GROUP = 400          # band-carrying library group of the fake .tpe tables
 
 
@@ -358,19 +374,21 @@ def urr_library(monkeypatch):
     """Mock library (MT 1/102/18/16 rows) plus fake ``.tpe`` tables.
 
     ``find_tpe`` / ``read_tpe`` in calendf.py are patched: W182 and W184 carry
-    a ``_band_tpe()`` table, Fe56 and H1 carry none. Returns ``(library,
-    reads)``; ``reads`` counts the ``read_tpe`` calls per file name.
+    a ``_band_tpe()`` table (W184's with a fission partial, W182's without),
+    Fe56, H1 and the flagged Hf178 carry none. Returns ``(library, reads)``;
+    ``reads`` counts the ``read_tpe`` calls per file name.
     """
     n = CCFE709_NGROUPS
     rng = np.random.default_rng(20260924)
     shape = np.linspace(0.5, 2.0, n)
     xs = {nuc: {mt: shape * rng.uniform(0.1, 10.0, n)
                 for mt in (1, 102, 18, 16)}
-          for nuc in _W_NUCLIDES}
+          for nuc in _URR_NUCLIDES}
     tpe = {'W182': _band_tpe(5.0, 400.0, index=_URR_GROUP, capture_lo=0.5,
                              capture_hi=80.0),
            'W184': _band_tpe(8.0, 250.0, index=_URR_GROUP, capture_lo=0.3,
-                             capture_hi=40.0)}
+                             capture_hi=40.0, fission_lo=0.1,
+                             fission_hi=20.0)}
     reads = Counter()
 
     def fake_find_tpe(calendf_path, nuclide):
@@ -387,27 +405,27 @@ def urr_library(monkeypatch):
 
 # --- MicroXS.from_multigroup_flux_with_gendf toggle ---
 
-def test_urr_material_dilution_true_raises():
+def test_urr_material_dilution_true_raises(tmp_path):
     """Bare True is under-specified: no composition for the sigma0_mat background."""
     with pytest.raises(ValueError, match='under-specified'):
         MicroXS.from_multigroup_flux_with_gendf(
             multigroup_flux=np.ones(709),
             gendf_library=MockGENDFLibrary({'U235'}),
             chain_file='dummy_chain.xml',
-            urr_material_dilution=True, calendf_path='calendf')
+            urr_material_dilution=True, calendf_path=tmp_path)
 
 
-def test_urr_material_dilution_empty_mapping_raises():
+def test_urr_material_dilution_empty_mapping_raises(tmp_path):
     """An empty composition mapping must be loud, not silently degrade to f=1."""
     with pytest.raises(ValueError, match='empty'):
         MicroXS.from_multigroup_flux_with_gendf(
             multigroup_flux=np.ones(709),
             gendf_library=MockGENDFLibrary({'U235'}),
             chain_file='dummy_chain.xml',
-            urr_material_dilution={}, calendf_path='calendf')
+            urr_material_dilution={}, calendf_path=tmp_path)
 
 
-def test_urr_material_dilution_material_matches_dict(monkeypatch):
+def test_urr_material_dilution_material_matches_dict(monkeypatch, tmp_path):
     """An openmc.Material and its get_nuclide_atom_densities() dict feed the same
     densities to the CALENDF scaler and yield the same collapsed MicroXS."""
     mat = openmc.Material()
@@ -419,11 +437,11 @@ def test_urr_material_dilution_material_matches_dict(monkeypatch):
     built = _install_stub_scaler(monkeypatch)
 
     micro_mat = _direct_gendf(monkeypatch, np.ones(709),
-                              urr_material_dilution=mat, calendf_path='calendf')
+                              urr_material_dilution=mat, calendf_path=tmp_path)
     dens_from_mat = built.pop()['densities']
 
     micro_dict = _direct_gendf(monkeypatch, np.ones(709),
-                               urr_material_dilution=dens, calendf_path='calendf')
+                               urr_material_dilution=dens, calendf_path=tmp_path)
     dens_from_dict = built.pop()['densities']
 
     assert dens_from_mat == dens_from_dict == dict(dens)
@@ -433,7 +451,7 @@ def test_urr_material_dilution_material_matches_dict(monkeypatch):
 
 # --- get_gendfxs_and_flux: scaler contract ---
 
-def test_wrapper_ssf_called_once_per_domain(monkeypatch):
+def test_wrapper_scaler_built_once_per_material(monkeypatch, tmp_path):
     """One scaler per distinct Material.id, built with THAT material's
     densities and the supplied calendf_path; results come back in domain
     order."""
@@ -443,12 +461,12 @@ def test_wrapper_ssf_called_once_per_domain(monkeypatch):
 
     (_fluxes, micros), model = _run_gendf_wrapper(
         monkeypatch, [mat_a, mat_b, mat_a], np.ones((3, 709)),
-        urr_material_dilution=True, calendf_path=_CALENDF)
+        urr_material_dilution=True, calendf_path=tmp_path)
 
     assert len(built) == 2
     assert built[0]['densities'] == dict(mat_a.get_nuclide_atom_densities())
     assert built[1]['densities'] == dict(mat_b.get_nuclide_atom_densities())
-    assert built[0]['calendf_path'] == built[1]['calendf_path'] == _CALENDF
+    assert built[0]['calendf_path'] == built[1]['calendf_path'] == tmp_path
     # Domain order A, B, A: the stub's capture factor differs per material.
     assert len(micros) == 3
     assert np.array_equal(micros[0].data, micros[2].data)
@@ -478,7 +496,7 @@ def test_wrapper_off_matches_direct_collapse(monkeypatch):
     assert micros[0].nuclides == direct.nuclides
 
 
-def test_wrapper_geq_matches_direct_with_dilution(monkeypatch):
+def test_wrapper_geq_matches_direct_with_dilution(monkeypatch, tmp_path):
     """G-EQ: transport-coupled == flux-supplied. Each domain's diluted MicroXS
     equals the direct from_multigroup_flux_with_gendf call with that domain's
     composition and the same flux."""
@@ -489,19 +507,20 @@ def test_wrapper_geq_matches_direct_with_dilution(monkeypatch):
 
     (_fluxes, micros), _model = _run_gendf_wrapper(
         monkeypatch, [mat1, mat2], canned, urr_material_dilution=True,
-        calendf_path='cal')
+        calendf_path=tmp_path)
 
     d1 = _direct_gendf(monkeypatch, canned[0], urr_material_dilution=mat1,
-                       calendf_path='cal')
+                       calendf_path=tmp_path)
     d2 = _direct_gendf(monkeypatch, canned[1], urr_material_dilution=mat2,
-                       calendf_path='cal')
+                       calendf_path=tmp_path)
 
     assert len(built) == 4          # two in the wrapper, one per direct call
     np.testing.assert_allclose(micros[0].data, d1.data, rtol=1e-13, atol=0)
     np.testing.assert_allclose(micros[1].data, d2.data, rtol=1e-13, atol=0)
 
 
-def test_wrapper_domain_isolation_deepcopy_guard(monkeypatch, urr_library):
+def test_wrapper_domain_isolation_deepcopy_guard(monkeypatch, urr_library,
+                                                 tmp_path):
     """Two different-composition domains do not contaminate each other, and the
     library's rows are unchanged after the shielded collapse."""
     lib, _reads = urr_library
@@ -515,7 +534,7 @@ def test_wrapper_domain_isolation_deepcopy_guard(monkeypatch, urr_library):
 
     (_fluxes, micros), _model = _run_gendf_wrapper(
         monkeypatch, [mat_w, mat_no_w], canned, urr_material_dilution=True,
-        calendf_path=_CALENDF, gendf_library=lib, chain_nuclides=_W_NUCLIDES)
+        calendf_path=tmp_path, gendf_library=lib, chain_nuclides=_W_NUCLIDES)
 
     unshielded_w = _direct_gendf(monkeypatch, canned[0], gendf_library=lib,
                                  chain_nuclides=_W_NUCLIDES)
@@ -534,14 +553,15 @@ def test_wrapper_domain_isolation_deepcopy_guard(monkeypatch, urr_library):
             assert np.array_equal(lib.get_xs(nuc, mt), before[nuc][mt])
 
 
-def test_wrapper_dilution_cell_with_material_fill_resolves_composition(monkeypatch):
+def test_wrapper_dilution_cell_with_material_fill_resolves_composition(
+        monkeypatch, tmp_path):
     """A Cell filled with a single Material passes the dilution domain check and
     shields with that fill's composition (the tally domain stays the Cell)."""
     mat = _material(['U235', 'U238'], [1.0, 2.0], 3.0)
     cell = openmc.Cell(fill=mat)
 
     # The composition resolver returns the cell's fill Material; a bare Material
-    # resolves to itself (mixed Material/Cell sequences are allowed).
+    # resolves to itself.
     assert _gendf_dilution_material(cell) is mat
     assert _gendf_dilution_material(mat) is mat
 
@@ -551,7 +571,7 @@ def test_wrapper_dilution_cell_with_material_fill_resolves_composition(monkeypat
     built = _install_stub_scaler(monkeypatch)
     (_fluxes, micros), model = _run_gendf_wrapper(
         monkeypatch, [cell], np.ones((1, 709)), urr_material_dilution=True,
-        calendf_path='cal')
+        calendf_path=tmp_path)
 
     assert [b['densities'] for b in built] == [dict(mat.get_nuclide_atom_densities())]
     assert len(micros) == 1
@@ -559,7 +579,7 @@ def test_wrapper_dilution_cell_with_material_fill_resolves_composition(monkeypat
 
     (_fluxes, micros_mat), _model = _run_gendf_wrapper(
         monkeypatch, [mat], np.ones((1, 709)), urr_material_dilution=True,
-        calendf_path='cal')
+        calendf_path=tmp_path)
     assert np.array_equal(micros[0].data, micros_mat[0].data)
 
 
@@ -577,7 +597,7 @@ def test_wrapper_dilution_requires_calendf_path(monkeypatch):
     model.run.assert_not_called()
 
 
-def test_wrapper_dilution_requires_material_domains(monkeypatch):
+def test_wrapper_dilution_requires_material_domains(monkeypatch, tmp_path):
     """True with a non-Material domain raises before the transport solve."""
     cell = openmc.Cell()
     model = Mock()
@@ -585,11 +605,13 @@ def test_wrapper_dilution_requires_material_domains(monkeypatch):
     _register_mock_library(monkeypatch)
     with pytest.raises(ValueError, match='openmc.Material'):
         get_gendfxs_and_flux(model, [cell], MockGENDFLibrary({'U235'}),
-                             urr_material_dilution=True, calendf_path='cal')
+                             urr_material_dilution=True,
+                             calendf_path=tmp_path)
     model.run.assert_not_called()
 
 
-def test_wrapper_dilution_cell_with_nonmaterial_fill_raises(monkeypatch):
+def test_wrapper_dilution_cell_with_nonmaterial_fill_raises(monkeypatch,
+                                                            tmp_path):
     """A Cell whose fill is not a single Material (void or a Universe) has no
     single composition -> raise before the transport solve, with a clear message
     naming the offending cell's fill."""
@@ -603,11 +625,11 @@ def test_wrapper_dilution_cell_with_nonmaterial_fill_raises(monkeypatch):
                            match='filled with a single openmc.Material'):
             get_gendfxs_and_flux(
                 model, [bad], MockGENDFLibrary({'U235'}),
-                urr_material_dilution=True, calendf_path='cal')
+                urr_material_dilution=True, calendf_path=tmp_path)
         model.run.assert_not_called()
 
 
-def test_wrapper_non_bool_dilution_raises(monkeypatch):
+def test_wrapper_non_bool_dilution_raises(monkeypatch, tmp_path):
     """A non-bool urr_material_dilution raises with the redirect message,
     before the transport solve."""
     mat = _material(['U235'], [1.0], 1.0)
@@ -617,7 +639,8 @@ def test_wrapper_non_bool_dilution_raises(monkeypatch):
     with pytest.raises(ValueError,
                        match='must be a bool') as exc:
         get_gendfxs_and_flux(model, [mat], MockGENDFLibrary({'U235'}),
-                             urr_material_dilution=mat, calendf_path='cal')
+                             urr_material_dilution=mat,
+                             calendf_path=tmp_path)
     assert 'from_multigroup_flux_with_gendf' in str(exc.value)
     model.run.assert_not_called()
 
@@ -626,32 +649,61 @@ def test_wrapper_non_bool_dilution_raises(monkeypatch):
 
 def test_streaming_scaler_matches_table_applicator(urr_library):
     """The streaming collapse with a real scaler (several row blocks) equals the
-    table applicator followed by the table collapse, to 1e-13 relative."""
+    table applicator followed by the table collapse, to 1e-13 relative. Only
+    the selected rows change: capture of the flagged W isotopes, and fission
+    only where the table carries a fission partial. A flagged nuclide without
+    a table warns once and stays at infinite dilution."""
     lib, _reads = urr_library
     reactions = ['(n,gamma)', 'fission', '(n,2n)']
     mts = [REACTION_MT[r] for r in reactions]
-    densities = {'W182': 0.03, 'W184': 0.02, 'Fe56': 0.05, 'H1': 0.01}
+    densities = {'W182': 0.03, 'W184': 0.02, 'Fe56': 0.05, 'H1': 0.01,
+                 'Hf178': 0.005}
     n = lib.n_groups
     phi = _normalize_flux_batch(
         [np.random.default_rng(1).uniform(0.0, 1.0, n)], 0, n)
 
     scaler = _CalendfRowScaler(lib, _CALENDF, densities)
-    stream = _collapse_gendf_streaming(lib, _W_NUCLIDES, reactions, mts, phi,
-                                       block_rows=3, scaler=scaler)[0]
-    table = _build_sparse_xs_table(lib, _W_NUCLIDES, reactions, mts)
-    _apply_mat_ssf_gendf(table, lib, _CALENDF, densities)
+    with pytest.warns(UserWarning, match='Hf178') as record:
+        stream = _collapse_gendf_streaming(lib, _URR_NUCLIDES, reactions, mts,
+                                           phi, block_rows=3, scaler=scaler)[0]
+    # One warning, although Hf178 has both a capture and a fission row.
+    assert sum('Hf178' in str(w.message) for w in record) == 1
+    table = _build_sparse_xs_table(lib, _URR_NUCLIDES, reactions, mts)
+    with pytest.warns(UserWarning, match='Hf178'):
+        _apply_mat_ssf_gendf(table, lib, _CALENDF, densities)
     np.testing.assert_allclose(stream, table.collapse(phi[0]),
                                rtol=1e-13, atol=0)
 
     unshielded = _build_sparse_xs_table(
-        lib, _W_NUCLIDES, reactions, mts).collapse(phi[0])
-    ig = reactions.index('(n,gamma)')
-    iw, ife = _W_NUCLIDES.index('W182'), _W_NUCLIDES.index('Fe56')
-    assert stream[iw, ig] != pytest.approx(unshielded[iw, ig], rel=1e-12)
+        lib, _URR_NUCLIDES, reactions, mts).collapse(phi[0])
+    ig, i_fis = reactions.index('(n,gamma)'), reactions.index('fission')
+    iw2, iw4, ife, ihf = (_URR_NUCLIDES.index(k)
+                          for k in ('W182', 'W184', 'Fe56', 'Hf178'))
+    assert stream[iw2, ig] != pytest.approx(unshielded[iw2, ig], rel=1e-12)
     assert stream[ife, ig] == pytest.approx(unshielded[ife, ig], rel=1e-13)
+    assert stream[ihf, ig] == pytest.approx(unshielded[ihf, ig], rel=1e-13)
+    # Fission: W184's table carries a fission partial, W182's none (f = 1).
+    assert stream[iw4, i_fis] != pytest.approx(unshielded[iw4, i_fis],
+                                               rel=1e-12)
+    assert stream[iw2, i_fis] == pytest.approx(unshielded[iw2, i_fis],
+                                               rel=1e-13)
+
+    # mat_ssf_nuclides restricts the correction: W182 capture stays at
+    # infinite dilution, W184 capture is still shielded.
+    only_w184 = _CalendfRowScaler(lib, _CALENDF, densities,
+                                  mat_ssf_nuclides=['W184'])
+    restricted = _collapse_gendf_streaming(
+        lib, _URR_NUCLIDES, reactions, mts, phi, block_rows=3,
+        scaler=only_w184)[0]
+    assert restricted[iw2, ig] == pytest.approx(unshielded[iw2, ig], rel=1e-13)
+    assert restricted[iw4, ig] != pytest.approx(unshielded[iw4, ig], rel=1e-12)
+    # A bare nuclide name is not a list of nuclides.
+    with pytest.raises(TypeError, match='single string'):
+        _CalendfRowScaler(lib, _CALENDF, densities, mat_ssf_nuclides='W184')
 
 
-def test_wrapper_factor_sets_cached_per_material(monkeypatch, urr_library):
+def test_wrapper_factor_sets_cached_per_material(monkeypatch, urr_library,
+                                                 tmp_path):
     """Three domains over two materials read each .tpe file once per call."""
     lib, reads = urr_library
     n = lib.n_groups
@@ -660,8 +712,88 @@ def test_wrapper_factor_sets_cached_per_material(monkeypatch, urr_library):
 
     (_fluxes, micros), _model = _run_gendf_wrapper(
         monkeypatch, [mat_a, mat_b, mat_a], np.ones((3, n)),
-        urr_material_dilution=True, calendf_path=_CALENDF,
+        urr_material_dilution=True, calendf_path=tmp_path,
         gendf_library=lib, chain_nuclides=_W_NUCLIDES)
 
     assert len(micros) == 3
     assert reads == {'W182-294.tpe': 1, 'W184-294.tpe': 1}
+
+
+# --- Checks before the transport solve; tallies restored ---
+
+def test_wrapper_absent_diluter_raises_before_run(monkeypatch, urr_library,
+                                                  tmp_path):
+    """A diluter absent from the GENDF library raises before the transport
+    solve when the composition will be folded, and does not raise when
+    nothing is folded. The model's tallies are left as they were."""
+    lib, _reads = urr_library
+    n = lib.n_groups
+    user_tallies = ['user tally']
+
+    # W182 has a .tpe table, so its capture row is folded and the sigma0_mat
+    # background needs the O17 group total, which the library lacks.
+    folded = _material(['W182', 'Fe56', 'O17'], [0.3, 0.5, 0.2], 0.08)
+    model = _mock_model(user_tallies)
+    with pytest.raises(ValueError,
+                       match="'O17'.*absent from the GENDF library"):
+        _run_gendf_wrapper(
+            monkeypatch, [folded], np.ones((1, n)), urr_material_dilution=True,
+            calendf_path=tmp_path, gendf_library=lib,
+            chain_nuclides=_W_NUCLIDES, model=model)
+    model.run.assert_not_called()
+    assert model.tallies == user_tallies
+
+    # No flagged nuclide with a table: nothing is folded, O17 is not needed.
+    not_folded = _material(['Fe56', 'O17'], [0.8, 0.2], 0.08)
+    (_fluxes, micros), model = _run_gendf_wrapper(
+        monkeypatch, [not_folded], np.ones((1, n)), urr_material_dilution=True,
+        calendf_path=tmp_path, gendf_library=lib, chain_nuclides=_W_NUCLIDES)
+    model.run.assert_called_once()
+    unshielded = _direct_gendf(monkeypatch, np.ones(n), gendf_library=lib,
+                               chain_nuclides=_W_NUCLIDES)
+    assert np.array_equal(micros[0].data, unshielded.data)
+
+
+def test_wrapper_validation_before_run_paths_and_mixed_domains(monkeypatch,
+                                                               tmp_path):
+    """A calendf_path that is not a directory and a mixed Material/Cell domain
+    list raise before the transport solve; a failing transport solve still
+    restores the model's tallies."""
+    mat = _material(['U235'], [1.0], 1.0)
+    fill = _material(['U238'], [1.0], 1.0)
+    user_tallies = ['user tally']
+
+    a_file = tmp_path / 'W182-294.tpe'
+    a_file.write_text('')
+    for bad_path in (tmp_path / 'missing', a_file):
+        model = _mock_model(user_tallies)
+        with pytest.raises(ValueError, match='not a directory'):
+            _run_gendf_wrapper(
+                monkeypatch, [mat], np.ones((1, 709)),
+                urr_material_dilution=True, calendf_path=bad_path,
+                model=model)
+        model.run.assert_not_called()
+        assert model.tallies == user_tallies
+        with pytest.raises(ValueError, match='not a directory'):
+            _direct_gendf(monkeypatch, np.ones(709),
+                          urr_material_dilution=mat, calendf_path=bad_path)
+
+    # One flux tally filter serves one domain kind: no Material/Cell mix.
+    model = _mock_model(user_tallies)
+    with pytest.raises(ValueError, match='all domains to be openmc.Material'):
+        _run_gendf_wrapper(
+            monkeypatch, [mat, openmc.Cell(fill=fill)], np.ones((2, 709)),
+            urr_material_dilution=True, calendf_path=tmp_path, model=model)
+    model.run.assert_not_called()
+    assert model.tallies == user_tallies
+
+    # The transport solve fails after the flux tally was set on the model.
+    _install_stub_scaler(monkeypatch)
+    model = _mock_model(user_tallies)
+    model.run.side_effect = RuntimeError('transport failed')
+    with pytest.raises(RuntimeError, match='transport failed'):
+        _run_gendf_wrapper(monkeypatch, [mat], np.ones((1, 709)),
+                           urr_material_dilution=True, calendf_path=tmp_path,
+                           model=model)
+    model.run.assert_called_once()
+    assert model.tallies == user_tallies

@@ -892,7 +892,7 @@ class MicroXS:
         nuclides: Sequence[str] | None = None,
         reactions: Sequence[str] | None = None,
         *,
-        urr_material_dilution: openmc.Material | Mapping[str, float] | bool = False,
+        urr_material_dilution: openmc.Material | Mapping[str, float] | bool | None = False,
         calendf_path: PathLike | None = None,
         mat_ssf_nuclides: Sequence[str] | None = None,
     ) -> MicroXS:

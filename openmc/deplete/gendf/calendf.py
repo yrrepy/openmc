@@ -110,6 +110,7 @@ from typing import Optional, Iterable
 
 import numpy as np
 
+from openmc.checkvalue import check_iterable_type
 from openmc.data import REACTION_MT
 from openmc.mgxs import GROUP_STRUCTURES
 
@@ -859,7 +860,9 @@ class _CalendfRowScaler:
 
     The background is built lazily, on the first row that needs a factor: a
     composition with no foldable row reads no diluter total and no diluter
-    ``.tpe``, and raises no "absent from the GENDF library" error. The object
+    ``.tpe``, and raises no "absent from the GENDF library" error.
+    :meth:`check_diluters` applies the same rule ahead of the collapse, so a
+    caller can raise that error before an expensive transport solve. The object
     does not depend on the flux, so one scaler serves every collapse of the
     same composition.
 
@@ -874,24 +877,39 @@ class _CalendfRowScaler:
     densities : mapping of str to float
         Atom densities keyed by nuclide (only ratios matter). Non-positive or
         ``None`` entries are dropped.
-    mat_ssf_nuclides : sequence of str, optional
+    mat_ssf_nuclides : iterable of str, optional
         Restrict the correction to this subset of :data:`DEFAULT_FLAGGED`
         (restrict-only). ``None`` uses the full set.
     tpe_cache : dict, optional
         ``{path: TpeTable}`` shared between scalers so each ``.tpe`` file is
         parsed once, however many compositions use it. ``None`` gives the
         scaler a private cache.
+    totals_cache : dict, optional
+        ``{nuclide: sigma_t,g}`` diluter group totals (MT=1, barns) shared
+        between scalers like ``tpe_cache``, so each diluter total is read from
+        the library once, however many compositions contain it. The scaler
+        keeps references to these arrays and never modifies them. ``None``
+        gives the scaler a private cache.
 
     Raises
     ------
+    TypeError
+        If ``mat_ssf_nuclides`` is a single string or holds a non-string.
     ValueError
         If ``gendf_library`` has no ``energy_structure``.
     """
 
     def __init__(self, gendf_library, calendf_path, densities,
-                 mat_ssf_nuclides=None, tpe_cache=None):
+                 mat_ssf_nuclides=None, tpe_cache=None, totals_cache=None):
         flagged = set(DEFAULT_FLAGGED)
         if mat_ssf_nuclides is not None:
+            # A bare name would restrict to its letters, i.e. to nothing.
+            if isinstance(mat_ssf_nuclides, str):
+                raise TypeError(
+                    "mat_ssf_nuclides must be an iterable of nuclide names, "
+                    "not a single string")
+            mat_ssf_nuclides = list(mat_ssf_nuclides)
+            check_iterable_type('mat_ssf_nuclides', mat_ssf_nuclides, str)
             flagged &= set(mat_ssf_nuclides)
         self.flagged = flagged
 
@@ -910,6 +928,7 @@ class _CalendfRowScaler:
                               if v is not None and float(v) > 0.0}
 
         self._tpe_cache = {} if tpe_cache is None else tpe_cache
+        self._totals_cache = {} if totals_cache is None else totals_cache
         self._tables = {}         # nuc -> TpeTable or None (no .tpe file)
         self._f_cache = {}        # (nuc, reaction) -> f_g, or None (f = 1)
         self._warned = set()
@@ -930,17 +949,59 @@ class _CalendfRowScaler:
             self._tables[nuc] = tpe
         return self._tables[nuc]
 
+    def _raise_absent_diluters(self):
+        """Raise if a positive-density diluter has no GENDF data."""
+        available = self.gendf_library.available_nuclides_set()
+        missing = sorted(j for j in self.pos_densities if j not in available)
+        if missing:
+            names = ', '.join(repr(j) for j in missing)
+            raise ValueError(
+                f"diluter {names} has a density but is absent from the "
+                f"GENDF library; cannot build sigma0_mat")
+
+    def check_diluters(self, nuclides, mts):
+        """Raise the absent-diluter error now if the collapse would raise it.
+
+        The collapse builds the ``sigma0_mat`` background -- and so needs the
+        group total of every positive-density diluter -- only when it folds a
+        row: a capture (MT=102) or fission (MT=18) row of a flagged nuclide
+        with a positive density and a ``.tpe`` table. This check applies the
+        same rule before the collapse, so a caller can fail before an
+        expensive transport solve. The ``.tpe`` tables it reads stay cached
+        for the collapse.
+
+        Parameters
+        ----------
+        nuclides : iterable of str
+            Nuclides whose rows the collapse will stage.
+        mts : iterable of int
+            MT numbers of the reactions the collapse will stage.
+
+        Raises
+        ------
+        ValueError
+            If a fold will happen and one or more positive-density diluters
+            are absent from the GENDF library (all are named).
+        """
+        if not any(mt in _LIB_MT_REACTION for mt in mts):
+            return
+        folds = any(self.pos_densities.get(nuc, 0.0) > 0.0
+                    and self._table(nuc) is not None
+                    for nuc in sorted(self.flagged.intersection(nuclides)))
+        if folds:
+            self._raise_absent_diluters()
+
     def _build_background(self):
         """Diluter group totals and the mutual-shielding sigma0 iteration."""
-        available = self.gendf_library.available_nuclides_set()
+        self._raise_absent_diluters()
         group_totals = {}
         for j in self.pos_densities:
-            if j not in available:
-                raise ValueError(
-                    f"diluter {j!r} has a density but is absent from the "
-                    f"GENDF library; cannot build sigma0_mat")
-            group_totals[j] = np.asarray(
-                self.gendf_library.get_xs(j, _LIB_TOTAL_MT), dtype=float)
+            sigma_t = self._totals_cache.get(j)
+            if sigma_t is None:
+                sigma_t = np.asarray(
+                    self.gendf_library.get_xs(j, _LIB_TOTAL_MT), dtype=float)
+                self._totals_cache[j] = sigma_t
+            group_totals[j] = sigma_t
 
         # Coupling set: every positive-density nuclide with a .tpe table. Its
         # R_tot shields its own contribution to the background; the others
@@ -1012,18 +1073,22 @@ def _apply_mat_ssf_gendf(table, gendf_library, calendf_path, densities,
                          mat_ssf_nuclides=None):
     """Self-shield a sparse GENDF cross-section table in place (material dilution).
 
-    Apply seam for :meth:`openmc.deplete.MicroXS.from_multigroup_flux_with_gendf`.
-    It runs between the infinite-dilution table build and the flux collapse. For
-    every flagged, self-shielding nuclide that is present in ``table``, has a
-    positive density in ``densities`` and a ``.tpe`` file under ``calendf_path``,
-    it folds the nuclide's CALENDF probability tables against the material
-    background cross section ``sigma0_mat`` and multiplies that nuclide's capture
-    (MT=102) and, when fissile, fission (MT=18) group rows in ``table.xs_matrix``
-    by the per-group self-shielding factor ``f_g``. This is the exact analogue of
-    FISPACT-II ``PROBTABLE multxs=1``; the CALENDF tables span the resolved range
-    as well as the URR, so ``f_g`` deviates from 1 across both (in some
-    resolved-range groups capture anti-correlates with the total, giving
-    ``f_g`` > 1 -- legitimate ``multxs=1`` behaviour, not a bug).
+    The collapse entry points
+    (:meth:`openmc.deplete.MicroXS.from_multigroup_flux_with_gendf` and
+    :func:`openmc.deplete.gendf.collapse.get_gendfxs_and_flux`) apply the same
+    correction row by row through :class:`_CalendfRowScaler` during the
+    streaming collapse; this function is the table-level form, kept for the
+    gate scripts and tests. For every flagged, self-shielding nuclide that is
+    present in ``table``, has a positive density in ``densities`` and a
+    ``.tpe`` file under ``calendf_path``, it folds the nuclide's CALENDF
+    probability tables against the material background cross section
+    ``sigma0_mat`` and multiplies that nuclide's capture (MT=102) and, when
+    fissile, fission (MT=18) group rows in ``table.xs_matrix`` by the per-group
+    self-shielding factor ``f_g``. This is the exact analogue of FISPACT-II
+    ``PROBTABLE multxs=1``; the CALENDF tables span the resolved range as well
+    as the URR, so ``f_g`` deviates from 1 across both (in some resolved-range
+    groups capture anti-correlates with the total, giving ``f_g`` > 1 --
+    legitimate ``multxs=1`` behaviour, not a bug).
 
     ``sigma0_mat`` starts from the composition snapshot's first Bondarenko
     approximation (:func:`material_dilution_sigma0`) and is then refined to
@@ -1067,6 +1132,8 @@ def _apply_mat_ssf_gendf(table, gendf_library, calendf_path, densities,
 
     Raises
     ------
+    TypeError
+        If ``mat_ssf_nuclides`` is a single string or holds a non-string.
     ValueError
         If ``gendf_library`` has no ``energy_structure``, or if a nuclide named
         as a diluter in ``densities`` (positive density) is absent from the

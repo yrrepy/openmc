@@ -463,7 +463,9 @@ per-group self-shielding factors. The factors are folded from CALENDF
 probability tables against the background cross section of the material's own
 composition, the analogue of FISPACT-II ``PROBTABLE multxs=1``. The correction
 is off by default. The CALENDF tables span the resolved resonance range as well
-as the URR, so the correction acts across both.
+as the URR, so the correction acts across both. In some resolved-range groups
+capture varies against the total, which gives factors above 1; this is the same
+behaviour as FISPACT-II and not an error.
 
 For a single flux spectrum, pass the depleted material (or a
 ``{nuclide: density}`` mapping) and the directory of CALENDF ``.tpe`` files to
@@ -476,8 +478,8 @@ For a single flux spectrum, pass the depleted material (or a
 
 The transport wrapper :func:`~openmc.deplete.get_gendfxs_and_flux` takes
 ``urr_material_dilution=True`` and shields each domain with its own
-composition, so every domain must be a Material or a Cell filled with a single
-Material::
+composition, so the domains must be all Materials or all Cells each filled with
+a single Material::
 
     fluxes, micros = openmc.deplete.get_gendfxs_and_flux(
         model, materials, lib,
