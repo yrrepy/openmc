@@ -452,6 +452,43 @@ operator, which then looks up the multigroup cross sections on the fly::
     op = openmc.deplete.IndependentOperator(
         materials, fluxes, micros, chain_file, gendf_library=lib)
 
+URR self-shielding by material dilution
+---------------------------------------
+
+GENDF group cross sections are usually produced at infinite dilution, which
+overestimates reaction rates for strong resonance absorbers such as tungsten.
+The URR material-dilution correction scales the capture and fission group cross
+sections of a set of flagged nuclides (W, Ta, Re, Hf, Os isotopes and U/Pu) by
+per-group self-shielding factors. The factors are folded from CALENDF
+probability tables against the background cross section of the material's own
+composition, the analogue of FISPACT-II ``PROBTABLE multxs=1``. The correction
+is off by default. The CALENDF tables span the resolved resonance range as well
+as the URR, so the correction acts across both.
+
+For a single flux spectrum, pass the depleted material (or a
+``{nuclide: density}`` mapping) and the directory of CALENDF ``.tpe`` files to
+:meth:`~openmc.deplete.MicroXS.from_multigroup_flux_with_gendf`::
+
+    micro = openmc.deplete.MicroXS.from_multigroup_flux_with_gendf(
+        flux, lib,
+        urr_material_dilution=material,
+        calendf_path='/path/to/tp-709-294')
+
+The transport wrapper :func:`~openmc.deplete.get_gendfxs_and_flux` takes
+``urr_material_dilution=True`` and shields each domain with its own
+composition, so every domain must be a Material or a Cell filled with a single
+Material::
+
+    fluxes, micros = openmc.deplete.get_gendfxs_and_flux(
+        model, materials, lib,
+        urr_material_dilution=True,
+        calendf_path='/path/to/tp-709-294')
+
+The ``mat_ssf_nuclides`` argument restricts the correction to a subset of the
+flagged nuclides; it cannot add nuclides. The temperature is fixed by the chosen
+CALENDF directory (``tp-709-294`` is 294 K), and it is not checked against the
+material or transport temperature.
+
 Transport-coupled reaction rates with GENDF
 -------------------------------------------
 

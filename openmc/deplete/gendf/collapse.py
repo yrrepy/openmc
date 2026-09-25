@@ -34,6 +34,38 @@ from .library import GENDFLibrary
 from .calendf import _CalendfRowScaler
 
 
+def _gendf_dilution_material(domain) -> openmc.Material:
+    """Return the :class:`openmc.Material` shielding ``domain`` for URR dilution.
+
+    A :class:`~openmc.Material` shields with itself; a :class:`~openmc.Cell`
+    shields with its ``fill`` when that fill is a single Material (the tally
+    domain stays the Cell, so the flux is still per-cell). Any other domain -- a
+    Cell filled with void, a Universe, a Lattice or a distributed material, or a
+    non-Material/Cell object -- has no single composition and raises
+    ``ValueError``.
+    """
+    if isinstance(domain, openmc.Material):
+        return domain
+    if isinstance(domain, openmc.Cell):
+        fill = domain.fill
+        if isinstance(fill, openmc.Material):
+            return fill
+        kind = 'void' if fill is None else type(fill).__name__
+        raise ValueError(
+            'urr_material_dilution=True requires each openmc.Cell domain to be '
+            'filled with a single openmc.Material (its composition builds the '
+            f'URR self-shielding sigma_0 background); cell {domain.id} has a '
+            f'{kind} fill, which has no single composition. Pass a '
+            'material-filled cell or a Material, or set '
+            'urr_material_dilution=False.')
+    raise ValueError(
+        'urr_material_dilution=True requires every domain to be an '
+        'openmc.Material or an openmc.Cell filled with a single openmc.Material; '
+        f'got {type(domain).__name__}. Meshes, tally filters, universes and '
+        'lattices have no single composition -- pass materials or '
+        'material-filled cells, or set urr_material_dilution=False.')
+
+
 def get_gendfxs_and_flux(
     model: openmc.Model,
     domains: DomainTypes,
@@ -43,7 +75,11 @@ def get_gendfxs_and_flux(
     chain_file: PathLike | Chain | None = None,
     path_statepoint: PathLike | None = None,
     path_input: PathLike | None = None,
-    run_kwargs=None
+    run_kwargs=None,
+    *,
+    urr_material_dilution: bool = False,
+    calendf_path: PathLike | None = None,
+    mat_ssf_nuclides: Sequence[str] | None = None,
 ) -> tuple[list[Flux], list[MicroXS]]:
     """Generate microscopic cross sections and fluxes for multiple domains using GENDF library.
 
@@ -60,7 +96,11 @@ def get_gendfxs_and_flux(
     model : openmc.Model
         OpenMC model object. Must contain geometry, materials, and settings.
     domains : list of openmc.Material or openmc.Cell or openmc.Universe, or openmc.MeshBase, or openmc.Filter
-        Domains in which to tally reaction rates, or a spatial tally filter.
+        Domains in which to tally reaction rates, or a spatial tally filter. When
+        ``urr_material_dilution=True`` every domain must resolve to a single
+        composition -- an :class:`openmc.Material`, or an :class:`openmc.Cell`
+        filled with a single Material (mixed Material/Cell sequences allowed);
+        see that argument.
     gendf_library : path-like or GENDFLibrary
         Path to GENDF library directory or GENDFLibrary instance. If a path is
         provided, a GENDFLibrary object will be created.
@@ -84,6 +124,39 @@ def get_gendfxs_and_flux(
         not kept.
     run_kwargs : dict, optional
         Keyword arguments passed to :meth:`openmc.Model.run`
+    urr_material_dilution : bool, optional
+        Apply an unresolved-resonance-range (URR) self-shielding correction by
+        **material dilution** before the collapse, per domain. ``True`` uses
+        **each domain's own composition** automatically (via
+        :meth:`~openmc.Material.get_nuclide_atom_densities`) as the
+        ``sigma0_mat`` background, so every domain must resolve to a single
+        composition -- an :class:`openmc.Material` (shields with itself) or an
+        :class:`openmc.Cell` filled with a single Material (shields with its
+        fill; the tally domain stays the Cell, so the flux is per-cell). Mixed
+        Material/Cell sequences are allowed. Universes, lattices, meshes, tally
+        filters and cells with void/universe/lattice/distributed fills have no
+        single composition and raise ``ValueError``. This is the exact analogue
+        of FISPACT-II ``PROBTABLE multxs=1``; the CALENDF tables span the
+        resolved range as well as the URR, so the correction acts across both.
+        Requires ``calendf_path``. ``False`` (default) leaves the collapse
+        unchanged (infinite dilution, byte-identical to prior behaviour). This
+        wrapper takes a plain bool because it owns the domains; to supply an
+        explicit composition (:class:`openmc.Material` or ``{nuclide: density}``
+        mapping) call :meth:`MicroXS.from_multigroup_flux_with_gendf` directly.
+        Keyword-only. The Bondarenko fold uses the temperature baked into the
+        chosen CALENDF ``tp-...`` directory (``calendf_path``); no cross-check
+        against the material or transport temperature is performed, so ensure the
+        CALENDF temperature matches the conditions modelled.
+    calendf_path : path-like, optional
+        Directory of per-temperature CALENDF ``<Nuclide>-<T>.tpe`` probability
+        tables (e.g. ``.../tp-709-294``). Required when
+        ``urr_material_dilution`` is enabled (the GENDF path takes an explicit
+        CALENDF path). Keyword-only.
+    mat_ssf_nuclides : list of str, optional
+        Restrict the material-dilution correction to this subset of nuclides.
+        ``None`` (default) uses the built-in flagged set (bulk self-shielders:
+        W, Ta, Re, Hf, Os isotopes and U/Pu). When given it is intersected with
+        the built-in set (restrict-only). Keyword-only.
 
     Returns
     -------
@@ -108,6 +181,45 @@ def get_gendfxs_and_flux(
         raise TypeError(
             f"gendf_library must be a path or GENDFLibrary instance, "
             f"not {type(gendf_library)}")
+
+    # --- URR material-dilution validation (invariant 2: all before the
+    # expensive transport solve). This wrapper owns the domains, so the toggle
+    # is a plain bool -- True means "each domain's own composition". ---
+    if not isinstance(urr_material_dilution, bool):
+        raise ValueError(
+            "urr_material_dilution must be a bool for get_gendfxs_and_flux(); "
+            "True uses each domain's own composition automatically. To supply "
+            "an explicit composition (openmc.Material or {nuclide: density} "
+            "mapping), call MicroXS.from_multigroup_flux_with_gendf directly.")
+    # ``urr_material_dilution=True`` shields each domain with its own
+    # composition. Every domain must therefore resolve to a single Material: a
+    # Material shields with itself, an openmc.Cell with its single-Material fill
+    # (the tally domain stays the Cell, so the flux is per-cell). Mixed
+    # Material/Cell sequences are allowed; meshes, tally filters, universes and
+    # lattices (and cells with void/universe/lattice/distributed fills) have no
+    # single composition and raise. Resolve the per-domain shielding
+    # compositions up front so a bad domain fails before the expensive
+    # model.run.
+    dilution_materials = None
+    if urr_material_dilution:
+        # The correction needs the CALENDF probability tables; the GENDF path
+        # takes an explicit CALENDF path.
+        if calendf_path is None:
+            raise ValueError(
+                "urr_material_dilution requires `calendf_path` (the directory "
+                "of CALENDF .tpe probability tables); the GENDF path uses an "
+                "explicit CALENDF path")
+        if (isinstance(domains, (openmc.MeshBase, openmc.Filter))
+                or not isinstance(domains, Sequence) or len(domains) == 0
+                or isinstance(domains[0], openmc.Filter)):
+            raise ValueError(
+                'urr_material_dilution=True requires a sequence of '
+                'openmc.Material or material-filled openmc.Cell domains: the URR '
+                "self-shielding sigma_0 background is built from each domain's "
+                'own composition. Meshes and tally filters have no single '
+                'composition -- pass materials or material-filled cells, or set '
+                'urr_material_dilution=False.')
+        dilution_materials = [_gendf_dilution_material(d) for d in domains]
 
     # Use GENDF library's energy structure
     energies = gendf_library.energy_bounds
@@ -194,20 +306,45 @@ def get_gendfxs_and_flux(
     # Create list where each item corresponds to one domain
     fluxes = list(flux.squeeze((1, 2)))
 
-    # Collapse every domain flux against the GENDF rows in one streaming
-    # pass per chunk; the (nnz, n_groups) table is never built. A zero-sum
-    # flux stays all-zero through the normalizer and yields an all-zero
-    # MicroXS, as the per-domain zero check used to.
     mts = [REACTION_MT[name] for name in reactions]
     n_groups = len(energies) - 1
-    micros = []
-    for start in range(0, len(fluxes), _COLLAPSE_CHUNK_SIZE):
-        phi = _normalize_flux_batch(
-            fluxes[start:start + _COLLAPSE_CHUNK_SIZE], start, n_groups)
-        collapsed = _collapse_gendf_streaming(
-            gendf_library, nuclides, reactions, mts, phi)
-        micros.extend(MicroXS(c[:, :, np.newaxis], nuclides, reactions)
-                      for c in collapsed)
+    if urr_material_dilution:
+        # URR material dilution ON: one collapse per domain, because one set
+        # of self-shielding factors serves one composition only. Each domain
+        # is shielded by its own Material (a Cell by its fill, resolved into
+        # ``dilution_materials`` above). The factor sets and the parsed .tpe
+        # probability tables are cached per material for this call, so a
+        # material shared by several domains is folded once. The global flux
+        # index i appears in any normaliser error, and a zero flux stays
+        # all-zero through the normaliser and yields an all-zero MicroXS.
+        # Analogue of FISPACT-II PROBTABLE multxs=1.
+        tpe_cache, scalers, micros = {}, {}, []
+        for i, (mat, flux_i) in enumerate(zip(dilution_materials, fluxes)):
+            phi = _normalize_flux_batch([flux_i], i, n_groups)
+            scaler = scalers.get(mat.id)
+            if scaler is None:
+                scaler = scalers[mat.id] = _CalendfRowScaler(
+                    gendf_library, calendf_path,
+                    mat.get_nuclide_atom_densities(),
+                    mat_ssf_nuclides, tpe_cache=tpe_cache)
+            collapsed = _collapse_gendf_streaming(
+                gendf_library, nuclides, reactions, mts, phi,
+                scaler=scaler)[0]
+            micros.append(MicroXS(collapsed[:, :, np.newaxis],
+                                  nuclides, reactions))
+    else:
+        # Collapse every domain flux against the GENDF rows in one streaming
+        # pass per chunk; the (nnz, n_groups) table is never built. A zero-sum
+        # flux stays all-zero through the normalizer and yields an all-zero
+        # MicroXS, as the per-domain zero check used to.
+        micros = []
+        for start in range(0, len(fluxes), _COLLAPSE_CHUNK_SIZE):
+            phi = _normalize_flux_batch(
+                fluxes[start:start + _COLLAPSE_CHUNK_SIZE], start, n_groups)
+            collapsed = _collapse_gendf_streaming(
+                gendf_library, nuclides, reactions, mts, phi)
+            micros.extend(MicroXS(c[:, :, np.newaxis], nuclides, reactions)
+                          for c in collapsed)
 
     # Reset tallies
     model.tallies = original_tallies
