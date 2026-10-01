@@ -51,6 +51,26 @@ def test_roundtrip_all(tmp_path):
         assert loaded.reactions == orig.reactions
 
 
+def test_roundtrip_isomer_suffixed_reactions(tmp_path):
+    """Product-qualified reaction names ('_m1' suffix) survive write/read."""
+    reactions = ['fission', '(n,gamma)', '(n,gamma)_m1', '(n,2n)_m1']
+    rng = np.random.default_rng(7)
+    micros = [MicroXS(rng.random((N_NUC, len(reactions), 1)), NUCLIDES,
+                      reactions) for _ in range(3)]
+    mat_ids = _mat_ids(3)
+    fname = tmp_path / 'microxs.h5'
+
+    write_global_microxs_hdf5(micros, fname, mat_ids)
+    result, _ = read_local_microxs_hdf5(fname, ['3', '1'])
+
+    for local_id, loaded in zip(['3', '1'], result):
+        orig = micros[mat_ids.index(local_id)]
+        assert loaded.reactions == reactions
+        np.testing.assert_array_equal(loaded.data, orig.data)
+        np.testing.assert_array_equal(
+            loaded['U235', '(n,gamma)_m1'], orig['U235', '(n,gamma)_m1'])
+
+
 def test_subset_read(tmp_path):
     """Write 10, read only 3 local materials."""
     micros = _make_micros(10)

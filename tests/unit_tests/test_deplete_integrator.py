@@ -266,6 +266,38 @@ def test_integrator(run_in_tmpdir, scheme):
     assert integrator.solver is mock_good_solver_substeps
 
 
+@pytest.mark.parametrize("scheme", ["predictor", "si_celi"])
+def test_integrate_hdf5_dtype_compression(run_in_tmpdir, scheme):
+    """integrate() writes float32 and compressed datasets on request"""
+
+    bundle = dummy_operator.SCHEMES[scheme]
+
+    operator = dummy_operator.DummyOperator()
+    bundle.solver(operator, [0.75, 0.75], 1.0).integrate(
+        path='default.h5', write_rates=True)
+
+    operator = dummy_operator.DummyOperator()
+    bundle.solver(operator, [0.75, 0.75], 1.0).integrate(
+        path='compact.h5', write_rates=True, hdf5_dtype='float32',
+        hdf5_compression='lzf')
+
+    with h5py.File('default.h5', 'r') as handle:
+        for name in ('number', 'reaction rates'):
+            assert handle[name].dtype == np.float64
+            assert handle[name].compression is None
+
+    with h5py.File('compact.h5', 'r') as handle:
+        for name in ('number', 'reaction rates'):
+            assert handle[name].dtype == np.float32
+            assert handle[name].compression == 'lzf'
+
+    for nuc in ("1", "2"):
+        t_ref, y_ref = Results('default.h5').get_atoms("1", nuc)
+        t, y = Results('compact.h5').get_atoms("1", nuc)
+        np.testing.assert_array_equal(t, t_ref)
+        assert y == pytest.approx(y_ref, rel=1e-6)
+
+
 def test_custom_solver_with_default_substeps(monkeypatch):
     operator = dummy_operator.DummyOperator()
     n = operator.initial_condition()
