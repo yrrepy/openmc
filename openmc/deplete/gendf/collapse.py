@@ -28,8 +28,8 @@ import openmc.lib
 from openmc.mpi import comm
 from ..chain import Chain, _get_chain
 from .. import microxs as _microxs
-from ..microxs import (DomainTypes, Flux, MicroXS, _COLLAPSE_CHUNK_SIZE,
-                       _collapse_gendf_streaming, _normalize_flux_batch)
+from ..microxs import (DomainTypes, Flux, MicroXS, _collapse_gendf_streaming,
+                       _normalize_flux_batch)
 from .library import GENDFLibrary
 from .calendf import _CalendfRowScaler
 
@@ -246,6 +246,7 @@ def get_gendfxs_and_flux(
 
     # Get nuclides from chain, filtered to those with GENDF data
     available_nuclides = gendf_library.available_nuclides_set()
+    requested_nuclides = nuclides
     if not nuclides:
         nuclides = [nuc.name for nuc in chain.nuclides
                     if nuc.name in available_nuclides]
@@ -362,18 +363,15 @@ def get_gendfxs_and_flux(
                 micros.append(MicroXS(collapsed[:, :, np.newaxis],
                                       nuclides, reactions))
         else:
-            # Collapse every domain flux against the GENDF rows in one
-            # streaming pass per chunk; the (nnz, n_groups) table is never
-            # built. A zero-sum flux stays all-zero through the normalizer and
-            # yields an all-zero MicroXS, as the per-domain zero check used to.
-            micros = []
-            for start in range(0, len(fluxes), _COLLAPSE_CHUNK_SIZE):
-                phi = _normalize_flux_batch(
-                    fluxes[start:start + _COLLAPSE_CHUNK_SIZE], start, n_groups)
-                collapsed = _collapse_gendf_streaming(
-                    gendf_library, nuclides, reactions, mts, phi)
-                micros.extend(MicroXS(c[:, :, np.newaxis], nuclides, reactions)
-                              for c in collapsed)
+            # Collapse every domain flux in one batched call, one streaming
+            # pass per chunk of fluxes. A zero-sum flux yields an all-zero
+            # MicroXS. The method applies the same GENDF filter to the
+            # requested nuclides; an already filtered empty list would be
+            # read as "not given" and refilled from the chain.
+            micros = MicroXS.from_multigroup_flux_with_gendf(
+                fluxes, gendf_library, chain_file=chain,
+                nuclides=requested_nuclides, reactions=reactions)
+            micros = [micros] if isinstance(micros, MicroXS) else list(micros)
     finally:
         # Reset tallies, also when the solve or the collapse raises
         model.tallies = original_tallies
@@ -425,7 +423,7 @@ def _apply_gendf_mt4_fallback(micros, fluxes, gendf_library,
 
 def _from_multigroup_flux_with_gendf(
     cls,
-    multigroup_flux: Sequence[float],
+    multigroup_flux: Sequence[float] | Sequence[Sequence[float]] | np.ndarray,
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
     chain_file: PathLike | Chain | None = None,
     nuclides: Sequence[str] | None = None,
@@ -434,7 +432,7 @@ def _from_multigroup_flux_with_gendf(
     urr_material_dilution: openmc.Material | Mapping[str, float] | bool | None = False,
     calendf_path: PathLike | None = None,
     mat_ssf_nuclides: Sequence[str] | None = None,
-) -> MicroXS:
+) -> MicroXS | list[MicroXS]:
     """Implementation of :meth:`MicroXS.from_multigroup_flux_with_gendf`.
 
     URR material dilution is applied row by row in the streaming collapse
@@ -489,12 +487,27 @@ def _from_multigroup_flux_with_gendf(
             f"not {type(gendf_library)}")
 
     # Use GENDF library's energy structure
-    energies = gendf_library.energy_bounds
+    n_groups = len(gendf_library.energy_bounds) - 1
 
-    # Check dimension consistency
-    if len(multigroup_flux) != len(energies) - 1:
-        raise ValueError('Length of flux array should be len(energies)-1')
-
+    # One flux or a batch, told apart without copying the batch: an ndarray by
+    # its ndim, any other sequence by its first element. An input with no
+    # length (a bare scalar) is rejected like any other bad shape.
+    if isinstance(multigroup_flux, np.ndarray):
+        ndim = multigroup_flux.ndim
+    elif not hasattr(multigroup_flux, '__len__'):
+        ndim = 0
+    elif len(multigroup_flux) == 0:
+        ndim = 2
+    else:
+        ndim = np.ndim(multigroup_flux[0]) + 1
+    if ndim not in (1, 2):
+        raise ValueError('multigroup_flux must be 1-D or 2-D')
+    single = ndim == 1
+    fluxes = [multigroup_flux] if single else multigroup_flux
+    if len(fluxes) == 0:
+        return []
+    if isinstance(fluxes, np.ndarray) and fluxes.shape[1] != n_groups:
+        raise ValueError(f'Multigroup flux 0 must have length {n_groups}')
 
     chain = _get_chain(chain_file)
     # get available GENDF nuclides
@@ -522,10 +535,23 @@ def _from_multigroup_flux_with_gendf(
     scaler = None if densities is None else _CalendfRowScaler(
         gendf_library, calendf_path, densities, mat_ssf_nuclides)
 
-    # Normalize the flux (a zero flux stays all-zero, giving zero cross
-    # sections) and collapse the GENDF rows in one streaming pass
-    phi = _normalize_flux_batch([multigroup_flux], 0, len(energies) - 1)
-    collapsed = _collapse_gendf_streaming(
-        gendf_library, nuclides, reactions, mts, phi, scaler=scaler)[0]
+    # Normalize each chunk of fluxes (a zero flux stays all-zero, giving zero
+    # cross sections) and collapse the GENDF rows in one streaming pass per
+    # chunk. The chunk size is read from the module at call time.
+    chunk = _microxs._COLLAPSE_CHUNK_SIZE
+    micros = []
+    for start in range(0, len(fluxes), chunk):
+        rows = fluxes[start:start + chunk]
+        if not isinstance(rows, np.ndarray):
+            for i, f in enumerate(rows):
+                if np.ndim(f) != 1 or len(f) != n_groups:
+                    raise ValueError(
+                        f'Multigroup flux {start + i} must have length '
+                        f'{n_groups}')
+        phi = _normalize_flux_batch(rows, start, n_groups)
+        collapsed = _collapse_gendf_streaming(
+            gendf_library, nuclides, reactions, mts, phi, scaler=scaler)
+        micros.extend(cls(c[:, :, np.newaxis], nuclides, reactions)
+                      for c in collapsed)
 
-    return cls(collapsed[:, :, np.newaxis], nuclides, reactions)
+    return micros[0] if single else micros

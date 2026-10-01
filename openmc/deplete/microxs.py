@@ -886,7 +886,7 @@ class MicroXS:
     @classmethod
     def from_multigroup_flux_with_gendf(
         cls,
-        multigroup_flux: Sequence[float],
+        multigroup_flux: Sequence[float] | Sequence[Sequence[float]] | np.ndarray,
         gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary',
         chain_file: PathLike | Chain | None = None,
         nuclides: Sequence[str] | None = None,
@@ -895,7 +895,7 @@ class MicroXS:
         urr_material_dilution: openmc.Material | Mapping[str, float] | bool | None = False,
         calendf_path: PathLike | None = None,
         mat_ssf_nuclides: Sequence[str] | None = None,
-    ) -> MicroXS:
+    ) -> MicroXS | list[MicroXS]:
         """Generate one group microscopic cross sections by collapsing
         multigroup flux with multigroup cross-sections from a GENDF library.
 
@@ -903,12 +903,25 @@ class MicroXS:
         instead of calculating them from continuous-energy data, directly 
         retrieving cross-sections from a GENDF library.
 
+        A batch of flux spectra (a 2D array, or a sequence of 1D fluxes such as
+        a list of :class:`~openmc.deplete.Flux`) is collapsed in one call: the
+        GENDF rows are read once per chunk of spectra instead of once per flux,
+        and the batch is never copied as a whole. One :class:`MicroXS` is
+        returned per spectrum, in input order.
+
         .. versionadded:: 0.15.4
+
+        .. versionchanged:: 0.15.4
+            ``multigroup_flux`` also accepts a batch of spectra.
 
         Parameters
         ----------
-        multigroup_flux : iterable of float
-            Energy-dependent multigroup flux values for each energy group
+        multigroup_flux : iterable of float or 2D array-like
+            Energy-dependent multigroup flux values for each energy group, for
+            one spectrum (1D) or for a batch of spectra (2D array or sequence
+            of 1D fluxes). Each spectrum must have one value per GENDF group,
+            with no negative or non-finite values; an error names the
+            offending flux by its index in the batch.
         gendf_library : path-like or GENDFLibrary
             Path to GENDF library directory or GENDFLibrary instance. If a path is
             provided, the energy structure is auto-detected from the GENDF library.
@@ -942,7 +955,8 @@ class MicroXS:
             infinite-dilution (self-shielding factor 1). The composition must be
             given explicitly because this is the transport-free collapse path --
             no live session exists, and a model has many materials, so one
-            :class:`MicroXS` is built per material composition. ``False``
+            :class:`MicroXS` is built per material composition; with a batch of
+            spectra, this one composition shields every spectrum. ``False``
             (default) or ``None`` leaves the collapse unchanged (infinite
             dilution, byte-identical to prior behaviour); bare ``True`` and an
             empty mapping raise ``ValueError``. Keyword-only. The Bondarenko fold
@@ -963,8 +977,11 @@ class MicroXS:
 
         Returns
         -------
-        MicroXS
-            Microscopic cross-section data object
+        MicroXS or list of MicroXS
+            Microscopic cross-section data. A 1D ``multigroup_flux`` gives one
+            :class:`MicroXS`. A 2D array or a sequence of 1D fluxes gives a
+            list in input order: a one-row 2D input gives a one-element list,
+            and an empty batch gives ``[]``.
 
         Notes
         -----

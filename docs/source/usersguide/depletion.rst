@@ -452,6 +452,12 @@ operator, which then looks up the multigroup cross sections on the fly::
     op = openmc.deplete.IndependentOperator(
         materials, fluxes, micros, chain_file, gendf_library=lib)
 
+Flux spectra already in hand are collapsed in one call. A list of 1D fluxes or a
+2D array gives one ``MicroXS`` per spectrum, in input order::
+
+    micros = openmc.deplete.MicroXS.from_multigroup_flux_with_gendf(
+        fluxes, lib, chain_file=chain_file)
+
 URR self-shielding by material dilution
 ---------------------------------------
 

@@ -496,6 +496,30 @@ def test_wrapper_off_matches_direct_collapse(monkeypatch):
     assert micros[0].nuclides == direct.nuclides
 
 
+def test_wrapper_off_delegates_to_batched_classmethod(monkeypatch):
+    """Flag off: the wrapper hands all domain fluxes to the batched
+    from_multigroup_flux_with_gendf in one call; each result equals the direct
+    per-flux call."""
+    mats = [_material(['U235'], [1.0], 1.0),
+            _material(['U238'], [1.0], 2.0),
+            _material(['U235', 'U238'], [1.0, 2.0], 3.0)]
+    canned = np.vstack([np.ones(709), np.linspace(1.0, 2.0, 709),
+                        np.linspace(2.0, 1.0, 709)])
+    spy = Mock(wraps=MicroXS.from_multigroup_flux_with_gendf)
+    monkeypatch.setattr(MicroXS, 'from_multigroup_flux_with_gendf', spy)
+
+    (_fluxes, micros), _model = _run_gendf_wrapper(
+        monkeypatch, mats, canned, urr_material_dilution=False)
+
+    spy.assert_called_once()
+    assert len(spy.call_args.args[0]) == 3
+    assert len(micros) == 3
+    for flux, micro in zip(canned, micros):
+        direct = _direct_gendf(monkeypatch, flux, urr_material_dilution=False)
+        np.testing.assert_allclose(micro.data, direct.data, rtol=1e-12, atol=0)
+        assert micro.nuclides == direct.nuclides
+
+
 def test_wrapper_geq_matches_direct_with_dilution(monkeypatch, tmp_path):
     """G-EQ: transport-coupled == flux-supplied. Each domain's diluted MicroXS
     equals the direct from_multigroup_flux_with_gendf call with that domain's

@@ -8,6 +8,7 @@ Consolidates four legacy modules into one, organized by section:
 * Collapse helper - ``GENDFFluxCollapseHelper`` (gendf-flux reaction-rate mode).
 * Nuclide filtering - ``MicroXS.from_multigroup_flux_with_gendf`` filtering
   nuclides to those with GENDF data, matching the CE HDF5 workflow.
+* Batched collapse - the same method given a batch of spectra.
 * HDF5 round-trip - stacked HDF5 MicroXS write/read infrastructure.
 """
 
@@ -21,6 +22,7 @@ import numpy as np
 import pytest
 
 from openmc import Material
+import openmc.deplete.microxs as microxs_mod
 from openmc.deplete import Flux, IndependentOperator, MicroXS
 from openmc.deplete.helpers import GENDFFluxCollapseHelper
 from openmc.deplete.microxs import _build_sparse_xs_table
@@ -286,17 +288,13 @@ class MockChain:
         self.reactions = ['(n,gamma)', 'fission']
 
 
-def _create_microxs_with_mocks(chain_nuclides, gendf_nuclides, user_nuclides=None):
-    """Create MicroXS with mocked chain and GENDF type check."""
-    mock_gendf = MockGENDFLibrary(gendf_nuclides)
+def _collapse_with_mocks(flux, mock_gendf, chain_nuclides, user_nuclides=None):
+    """Collapse one flux or a batch with mocked chain and GENDF type check."""
     mock_chain = MockChain(chain_nuclides)
-
-    flux = np.ones(709)  # CCFE-709
 
     # Patch chain loading and add MockGENDFLibrary to valid GENDF types
     with patch('openmc.deplete.gendf.collapse._get_chain',
                return_value=mock_chain):
-        import openmc.deplete.microxs as microxs_mod
         original_types = microxs_mod._GENDF_TYPES
         try:
             microxs_mod._GENDF_TYPES = (MockGENDFLibrary,) + original_types
@@ -310,6 +308,13 @@ def _create_microxs_with_mocks(chain_nuclides, gendf_nuclides, user_nuclides=Non
             microxs_mod._GENDF_TYPES = original_types
 
     return micro_xs
+
+
+def _create_microxs_with_mocks(chain_nuclides, gendf_nuclides, user_nuclides=None):
+    """Create MicroXS with mocked chain and GENDF type check."""
+    flux = np.ones(709)  # CCFE-709
+    return _collapse_with_mocks(flux, MockGENDFLibrary(gendf_nuclides),
+                                chain_nuclides, user_nuclides)
 
 
 def test_microxs_only_contains_gendf_nuclides():
@@ -419,6 +424,88 @@ def test_no_zero_rows_from_missing_nuclides():
     for i, nuc in enumerate(micro_xs.nuclides):
         row_sum = micro_xs.data[i, :, :].sum()
         assert row_sum > 0, f"Row for {nuc} is all zeros"
+
+
+# ===========================================================================
+# Batched collapse (MicroXS.from_multigroup_flux_with_gendf)
+# ===========================================================================
+#
+# A 2-D array or a sequence of 1-D fluxes returns one MicroXS per spectrum;
+# the GENDF rows are staged once per chunk of spectra.
+
+def test_gendf_batch_matches_single():
+    """Each batch element equals the single-flux call, for a 2-D array and a
+    list of Flux."""
+    rng = np.random.default_rng(20260930)
+    gendf = MockGENDFLibrary({nuc: {102: rng.random(NG), 18: rng.random(NG)}
+                              for nuc in ('U235', 'U238', 'Pu239')})
+    chain_nuclides = ['U235', 'U238', 'Pu239']
+    spectra = rng.random((3, NG))
+    singles = [_collapse_with_mocks(s, gendf, chain_nuclides) for s in spectra]
+
+    for batch in (spectra, [Flux(s, energy_bounds=ENERGIES) for s in spectra]):
+        micros = _collapse_with_mocks(batch, gendf, chain_nuclides)
+        assert isinstance(micros, list)
+        assert len(micros) == len(singles)
+        for micro, single in zip(micros, singles):
+            assert isinstance(micro, MicroXS)
+            assert micro.nuclides == single.nuclides
+            assert micro.reactions == single.reactions
+            np.testing.assert_allclose(micro.data, single.data,
+                                       rtol=1e-12, atol=0)
+
+
+def test_gendf_batch_zero_and_empty():
+    """A zero flux gives zeros; an empty batch gives []; a one-row 2-D input
+    gives a one-element list."""
+    gendf = MockGENDFLibrary({'U235', 'U238'})
+    chain_nuclides = ['U235', 'U238']
+
+    micros = _collapse_with_mocks(np.vstack([np.ones(NG), np.zeros(NG)]),
+                                  gendf, chain_nuclides)
+    assert np.array_equal(micros[1].data, np.zeros((2, 2, 1)))
+
+    assert _collapse_with_mocks([], gendf, chain_nuclides) == []
+    assert _collapse_with_mocks(np.empty((0, NG)), gendf, chain_nuclides) == []
+
+    one = _collapse_with_mocks(np.ones((1, NG)), gendf, chain_nuclides)
+    assert isinstance(one, list) and len(one) == 1
+
+
+def test_gendf_batch_invalid():
+    """Bad fluxes raise, naming the offending flux by its batch index."""
+    gendf = MockGENDFLibrary({'U235'})
+    good = np.ones(NG)
+    nan = good.copy()
+    nan[5] = np.nan
+    negative = good.copy()
+    negative[5] = -1.0
+    cases = [
+        (np.vstack([good, nan]), 'Multigroup flux 1 contains non-finite'),
+        (np.vstack([good, negative]), 'Multigroup flux 1 contains negative'),
+        (np.ones((2, NG - 1)), 'Multigroup flux 0 must have length'),
+        (np.ones((2, 2, NG)), 'must be 1-D or 2-D'),
+        ([good, good, np.ones(3)], 'Multigroup flux 2 must have length'),
+    ]
+    for flux, message in cases:
+        with pytest.raises(ValueError, match=message):
+            _collapse_with_mocks(flux, gendf, ['U235'])
+
+
+def test_gendf_batch_stages_rows_once_per_chunk(monkeypatch):
+    """GENDF rows are read once per chunk of fluxes, not once per flux."""
+    gendf = MockGENDFLibrary({'U235', 'U238', 'Pu239'})
+    gendf.get_all_xs = Mock(wraps=gendf.get_all_xs)
+    chain_nuclides = ['U235', 'U238', 'Pu239', 'Am241']  # Am241 has no data
+    spectra = np.ones((5, NG))
+
+    _collapse_with_mocks(spectra, gendf, chain_nuclides)
+    assert gendf.get_all_xs.call_count == 3
+
+    gendf.get_all_xs.reset_mock()
+    monkeypatch.setattr(microxs_mod, '_COLLAPSE_CHUNK_SIZE', 2)
+    _collapse_with_mocks(spectra, gendf, chain_nuclides)
+    assert gendf.get_all_xs.call_count == 3 * 3
 
 
 # ===========================================================================
