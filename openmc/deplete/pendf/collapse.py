@@ -221,7 +221,8 @@ def get_pendf_microxs_and_flux(
         data.
     nuclides : list of str, optional
         Nuclides to get cross sections for. If not specified, all burnable
-        nuclides from the depletion chain file are used.
+        nuclides from the depletion chain file are used. The list is filtered
+        to nuclides present in ``pendf_library``.
     reactions : list of str, optional
         Reactions to get cross sections for. If not specified, all neutron
         reactions listed in the depletion chain file are used.
@@ -683,6 +684,20 @@ def _from_multigroup_flux(
             # it for the PENDF path (strip _mN, dedupe, drop unmappable).
             reactions = (_default_pendf_reactions(chain)
                          if pendf_library is not None else chain.reactions)
+
+    # Drop nuclides the PENDF library does not carry (chain-defaulted or
+    # caller-supplied): they stage no rows, so keeping them would only pad the
+    # dense MicroXS with all-zero rows. Order of the survivors is preserved.
+    # One summary warning names the dropped nuclides.
+    if pendf_library is not None:
+        available = set(pendf_library.nuclides)
+        missing = set(nuclides) - available
+        if missing:
+            names = ' '.join(sorted(missing)[:10])
+            more = ' ...' if len(missing) > 10 else ''
+            warn(f"{len(missing)} nuclides not in PENDF library are dropped "
+                 f"from the MicroXS: {names}{more}")
+        nuclides = [nuc for nuc in nuclides if nuc in available]
 
     # PENDF: contract the staged rows against the flux in blocks, in chunks of
     # at most _COLLAPSE_CHUNK_SIZE fluxes. The (nnz, n_groups) table is never

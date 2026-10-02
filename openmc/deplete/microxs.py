@@ -785,7 +785,8 @@ class MicroXS:
             Temperature for cross section evaluation in [K]. Default 293.6 K.
         nuclides : list of str, optional
             Nuclides to get cross sections for. If not specified, all burnable
-            nuclides from the depletion chain file are used.
+            nuclides from the depletion chain file are used. On the PENDF path
+            the list is filtered to nuclides present in ``pendf_library``.
         reactions : list of str, optional
             Reactions to get cross sections for. If not specified, all neutron
             reactions listed in the depletion chain file are used. Product

@@ -313,6 +313,43 @@ def test_pendf_block_collapse_independent_of_block_rows(block_rows):
         _assert_micros_equal(got, ref)
 
 
+def test_from_multigroup_flux_pendf_drops_library_absent_nuclides():
+    """Nuclides the PENDF library does not carry are dropped from the MicroXS
+    nuclide axis -- chain-defaulted and caller-supplied alike -- with the order
+    of the survivors kept and their values unchanged."""
+    fake = _fake_many()
+    flux = np.array([1.0, 2.0, 3.0, 4.0])
+    chain = Chain.from_xml(CHAIN_FILE)
+    kwargs = dict(
+        energies=_MANY_EDGES, multigroup_flux=flux, chain_file=chain,
+        reactions=_MANY_REACTIONS, pendf_library=fake)
+
+    # Chain default: Xe136, Cs135, Gd156 and U234 are not in the library.
+    # One summary warning names them.
+    with pytest.warns(UserWarning, match="4 nuclides not in PENDF library "
+                      "are dropped from the MicroXS: Cs135 Gd156 U234 Xe136"):
+        micro = MicroXS.from_multigroup_flux(**kwargs)
+    assert micro.nuclides == ["I135", "Xe135", "Gd157", "U235", "U238"]
+
+    # Caller-supplied absent nuclides are dropped too, the rest keep their order.
+    requested = ["U238", "Xe136", "Gd157", "Cs135", "I135"]
+    micro = MicroXS.from_multigroup_flux(nuclides=requested, **kwargs)
+    assert micro.nuclides == ["U238", "Gd157", "I135"]
+
+    # The surviving rows equal the unfiltered collapse (whose absent rows are
+    # all zero) and a call restricted to the present nuclides, bit for bit.
+    phi = _normalize_flux_batch([flux], 0, len(_MANY_EDGES) - 1)
+    [full] = _collapse_pendf_blocks(
+        requested, _MANY_REACTIONS, _MANY_EDGES, fake, chain, phi)
+    assert full.nuclides == requested
+    assert full.reactions == micro.reactions
+    assert not full.data[[1, 3]].any()
+    assert np.array_equal(micro.data, full.data[[0, 2, 4]])
+    restricted = MicroXS.from_multigroup_flux(
+        nuclides=["U238", "Gd157", "I135"], **kwargs)
+    _assert_micros_equal([micro], [restricted])
+
+
 def test_pendf_batch_equals_single_flux_calls():
     """An N-flux batch is exactly N single-flux calls, one MicroXS per flux."""
     fake = _fake_many()
