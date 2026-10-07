@@ -801,12 +801,12 @@ extern "C" int openmc_statepoint_load(const char* filename)
             moments.shape(2), moments.data());
 
           read_dataset(tally_group, "n_realizations", tally->n_realizations_);
-          close_group(tally_group);
 
           if (!owns_moments) {
             tally->moments() = tensor::Tensor<double>();
           }
         }
+        close_group(tally_group);
       }
       close_group(tallies_group);
     }
