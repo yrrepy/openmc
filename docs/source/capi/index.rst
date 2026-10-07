@@ -66,8 +66,9 @@ Functions
    Get the density of a cell
 
    :param int32_t index: Index in the cells array
-   :param int32_t* instance: Which instance of the cell. If a null pointer is passed, the density
-                             multiplier of the first instance is returned.
+   :param instance: Which instance of the cell. If a null pointer is passed, the density
+                    multiplier of the first instance is returned.
+   :type instance: const int32_t*
    :param double* density: Density of the cell in [g/cm3]
    :return: Return status (negative if an error occurred)
    :rtype: int
@@ -93,7 +94,7 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_cell_set_temperature(index index, double T, const int32_t* instance, bool set_contained)
+.. c:function:: int openmc_cell_set_temperature(int32_t index, double T, const int32_t* instance, bool set_contained)
 
    Set the temperature of a cell.
 
@@ -107,7 +108,7 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_cell_set_density(index index, double density, const int32_t* instance, bool set_contained)
+.. c:function:: int openmc_cell_set_density(int32_t index, double density, const int32_t* instance, bool set_contained)
 
    Set the density of a cell.
 
@@ -121,22 +122,23 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_energy_filter_get_bins(int32_t index, double** energies, int32_t* n)
+.. c:function:: int openmc_energy_filter_get_bins(int32_t index, const double** energies, size_t* n)
 
    Return the bounding energies for an energy filter
 
    :param int32_t index: Index in the filters array
-   :param double** energies: Bounding energies of the bins for the energy filter
-   :param int32_t* n: Number of energies specified
+   :param energies: Bounding energies of the bins for the energy filter
+   :type energies: const double**
+   :param size_t* n: Number of energies specified
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_energy_filter_set_bins(int32_t index, int32_t n, const double* energies)
+.. c:function:: int openmc_energy_filter_set_bins(int32_t index, size_t n, const double* energies)
 
    Set the bounding energies for an energy filter
 
    :param int32_t index: Index in the filters array
-   :param int32_t n: Number of energies specified
+   :param size_t n: Number of energies specified
    :param energies: Bounding energies of the bins for the energy filter
    :type energies: const double*
    :return: Return status (negative if an error occurred)
@@ -172,16 +174,6 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_extend_sources(int32_t n, int32_t* index_start, int32_t* index_end)
-
-   Extend the external sources array by n elements
-
-   :param int32_t n: Number of sources to create
-   :param int32_t* index_start: Index of first new source
-   :param int32_t* index_end: Index of last new source
-   :return: Return status (negative if an error occurred)
-   :rtype: int
-
 .. c:function:: int openmc_extend_tallies(int32_t n, int32_t* index_start, int32_t* index_end)
 
    Extend the tallies array by n elements
@@ -214,20 +206,6 @@ Functions
 
    Finalize a simulation
 
-   :return: Return status (negative if an error occurs)
-   :rtype: int
-
-.. c:function:: int openmc_find(double* xyz, int rtype, int32_t* id, int32_t* instance)
-
-   Determine the ID of the cell/material containing a given point
-
-   :param double[3] xyz: Cartesian coordinates
-   :param int rtype: Which ID to return (1=cell, 2=material)
-   :param int32_t* id: ID of the cell/material found. If a material is requested
-                       and the point is in a void, the ID is 0. If an error
-                       occurs, the ID is -1.
-   :param int32_t* instance: If a cell is repeated in the geometry, the instance
-                             of the cell that was found and zero otherwise.
    :return: Return status (negative if an error occurs)
    :rtype: int
 
@@ -343,13 +321,15 @@ Functions
    :return: Return status (negative if an error occurs)
    :rtype: int
 
-.. c:function:: int openmc_material_get_densities(int32_t index, int** nuclides, double** densities, int* n)
+.. c:function:: int openmc_material_get_densities(int32_t index, const int** nuclides, const double** densities, int* n)
 
    Get density for each nuclide in a material.
 
    :param int32_t index: Index in the materials array
-   :param int** nuclides: Pointer to array of nuclide indices
-   :param double** densities: Pointer to the array of densities
+   :param nuclides: Pointer to array of nuclide indices
+   :type nuclides: const int**
+   :param densities: Pointer to the array of densities
+   :type densities: const double**
    :param int* n: Length of the array
    :return: Return status (negative if an error occurs)
    :rtype: int
@@ -403,22 +383,23 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_material_filter_get_bins(int32_t index, int32_t** bins, int32_t* n)
+.. c:function:: int openmc_material_filter_get_bins(int32_t index, const int32_t** bins, size_t* n)
 
    Get the bins for a material filter
 
    :param int32_t index: Index in the filters array
-   :param int32_t** bins: Index in the materials array for each bin
-   :param int32_t* n: Number of bins
+   :param bins: Index in the materials array for each bin
+   :type bins: const int32_t**
+   :param size_t* n: Number of bins
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_material_filter_set_bins(int32_t index, int32_t n, const int32_t* bins)
+.. c:function:: int openmc_material_filter_set_bins(int32_t index, size_t n, const int32_t* bins)
 
    Set the bins for a material filter
 
    :param int32_t index: Index in the filters array
-   :param int32_t n: Number of bins
+   :param size_t n: Number of bins
    :param bins: Index in the materials array for each bin
    :type bins: const int32_t*
    :return: Return status (negative if an error occurred)
@@ -535,20 +516,22 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_next_batch()
+.. c:function:: int openmc_next_batch(int* status)
 
    Simulate next batch of particles. Must be called after openmc_simulation_init().
 
-   :return: Integer indicating whether simulation has finished (negative) or not
-            finished (zero).
+   :param int* status: Status after running the batch (0=normal, 1=reached
+                       maximum number of batches, 2=tally triggers reached)
+   :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_nuclide_name(int index, char** name)
+.. c:function:: int openmc_nuclide_name(int index, const char** name)
 
    Get name of a nuclide
 
    :param int index: Index in the nuclides array
-   :param char** name: Name of the nuclide
+   :param name: Name of the nuclide
+   :type name: const char**
    :return: Return status (negative if an error occurs)
    :rtype: int
 
@@ -839,10 +822,11 @@ Functions
    :return: Return status (negative if an error occurs)
    :rtype: int
 
-.. c:function:: int openmc_remove_tally(int32_t index);
+.. c:function:: int openmc_remove_tally(int32_t index)
 
    Given an index of a tally, remove it from the tallies array
-   :param int index: Index in tallies array
+
+   :param int32_t index: Index in tallies array
    :return: Return status (negative if an error occurs)
    :rtype: int
 
@@ -899,34 +883,24 @@ Functions
    :return: Return status (negative if an error occurs)
    :rtype: int
 
-.. c:function:: int openmc_source_bank(struct Bank** ptr, int64_t* n)
+.. c:function:: int openmc_source_bank(void** ptr, int64_t* n)
 
    Return a pointer to the source bank array.
 
    :param ptr: Pointer to the source bank array
-   :type ptr: struct Bank**
+   :type ptr: void**
    :param int64_t* n: Length of the source bank array
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_source_set_strength(int32_t index, double strength)
-
-   Set the strength of an external source
-
-   :param int32_t index: Index in the external source array
-   :param double strength: Source strength
-   :return: Return status (negative if an error occurred)
-   :rtype: int
-
-.. c:function:: int openmc_statepoint_write(const char filename[], const bool* write_source)
+.. c:function:: int openmc_statepoint_write(const char filename[], bool* write_source)
 
    Write a statepoint file
 
    :param filename: Name of file to create. If a null pointer is passed, a
                     filename is assigned automatically.
    :type filename: const char[]
-   :param write_source: Whether to include the source bank
-   :type write_source: const bool*
+   :param bool* write_source: Whether to include the source bank
    :return: Return status (negative if an error occurs)
    :rtype: int
 
@@ -939,13 +913,14 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_tally_get_filters(int32_t index, int32_t** indices, int* n)
+.. c:function:: int openmc_tally_get_filters(int32_t index, const int32_t** indices, size_t* n)
 
    Get filters specified in a tally
 
    :param int32_t index: Index in the tallies array
-   :param int32_t** indices: Array of filter indices
-   :param int* n: Number of filters
+   :param indices: Array of filter indices
+   :type indices: const int32_t**
+   :param size_t* n: Number of filters
    :return: Return status (negative if an error occurred)
    :rtype: int
 
@@ -986,12 +961,12 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_tally_set_filters(int32_t index, int n, const int32_t* indices)
+.. c:function:: int openmc_tally_set_filters(int32_t index, size_t n, const int32_t* indices)
 
    Set filters for a tally
 
    :param int32_t index: Index in the tallies array
-   :param int n: Number of filters
+   :param size_t n: Number of filters
    :param indices: Array of filter indices
    :type indices: const int32_t*
    :return: Return status (negative if an error occurred)
@@ -1017,13 +992,13 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_tally_set_scores(int32_t index, int n, const int* scores)
+.. c:function:: int openmc_tally_set_scores(int32_t index, int n, const char** scores)
 
    Set scores for a tally
 
    :param int32_t index: Index in the tallies array
    :param int n: Number of scores
    :param scores: Array of scores
-   :type scores: const int*
+   :type scores: const char**
    :return: Return status (negative if an error occurred)
    :rtype: int
