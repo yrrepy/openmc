@@ -976,13 +976,13 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_tally_results(int32_t index, double** ptr, int shape_[3])
+.. c:function:: int openmc_tally_results(int32_t index, double** ptr, size_t shape_[3])
 
    Get a pointer to tally results array.
 
    :param int32_t index: Index in the tallies array
    :param double** ptr: Pointer to the results array
-   :param int[3] shape_: Shape of the results array
+   :param size_t[3] shape_: Shape of the results array
    :return: Return status (negative if an error occurred)
    :rtype: int
 
