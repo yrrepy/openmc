@@ -59,6 +59,8 @@ import warnings
 
 import numpy as np
 
+from .nuclide import _ISOMER_SUFFIX
+
 # Nuclides that carry URR probability tables in the JEFF-3.3 PENDF library and
 # for which the material-dilution self-shielding correction is applied by
 # default. All 24 carry MF=2 MT=152/153; the collapse hook intersects this with
@@ -322,8 +324,8 @@ def mat_ssf_factors(ptab, sigma0_g, group_edges, reaction, flux_g=None,
     """
     # Imported lazily: microxs will import mat_ssf at the Wave-2 collapse hook,
     # and a top-level `from .microxs import ...` here would then form an import
-    # cycle. _group_average / _ISOMER_SUFFIX are module-internal helpers.
-    from .microxs import _group_average, _ISOMER_SUFFIX
+    # cycle. _group_average is a module-internal helper.
+    from .microxs import _group_average
 
     col_map = {'(n,gamma)': 4, 'fission': 3, 'total': 1}
     base = _ISOMER_SUFFIX.sub('', reaction)
@@ -619,7 +621,6 @@ class _MatSsfRowScaler:
 
     def __init__(self, pendf_library, energies, densities,
                  mat_ssf_nuclides=None):
-        from .microxs import _ISOMER_SUFFIX
         self._isomer_suffix = _ISOMER_SUFFIX
         self.pendf_library = pendf_library
         self.densities = densities

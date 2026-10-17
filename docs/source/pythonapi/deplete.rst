@@ -66,6 +66,7 @@ cross sections. The following function can be used to generate this information:
    :template: myfunction.rst
 
    get_microxs_and_flux
+   get_pendf_microxs_and_flux
 
 A depletion chain whose reactions follow the isomeric production pathways of a
 preprocessed PENDF library (rather than tabulated branching ratios) can be built

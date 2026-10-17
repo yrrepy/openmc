@@ -27,7 +27,7 @@ from openmc.checkvalue import PathLike
 from openmc.data import REACTION_MT
 import openmc
 from ..chain import Chain, _get_chain
-from ..microxs import _ISOMER_SUFFIX
+from ..nuclide import _ISOMER_SUFFIX
 
 
 def _liso_from_gnds(name: str) -> int:

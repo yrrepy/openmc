@@ -29,7 +29,7 @@ sys.path.insert(0, str(_HERE))
 import h5py
 import numpy as np
 
-from openmc.data.pendf_grouped import GroupedPendfLibrary
+from openmc.data.pendf import GroupedPendfLibrary
 from openmc.deplete.microxs import MicroXS
 from gate4_end_to_end import (parse_hfr, rebin_integral, one_group,
                               NAT_W, W_ISOTOPES, PRODUCTS, REACTIONS)
@@ -42,6 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description='Gate 5 - absent-ptable URR self-shielding path.')
     parser.add_argument('--grouped', type=Path, default=root / 'data/jeff33_urr_pendf_294K_ccfe709.h5', help='Grouped JEFF-3.3 URR library (CCFE-709)')
     parser.add_argument('--hfr',     type=Path, default=root / 'URR/616_HFR-low.txt',                   help='LLNL-616 HFR reference spectrum')
+    parser.add_argument('--chain',   type=Path, default=Path('/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/Chain_JEFF40-IsoFlag.lfs_order_mapped.xml'), help='Depletion chain (the PENDF collapse sources its row names from the chain)')
     args = parser.parse_args()
 
     # Copy the library and strip W186/urr from the copy.
@@ -63,7 +64,7 @@ def main():
 
     nucs = W_ISOTOPES + PRODUCTS
     kw = dict(energies=edges, multigroup_flux=flux_norm, nuclides=nucs,
-              reactions=REACTIONS, pendf_library=glib)
+              reactions=REACTIONS, pendf_library=glib, chain_file=args.chain)
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')

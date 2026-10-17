@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from openmc.data.pendf_grouped import GroupedPendfLibrary
+from openmc.data.pendf import GroupedPendfLibrary
 from openmc.deplete.microxs import MicroXS
 from openmc.deplete.mat_ssf import (
     material_dilution_sigma0, mat_ssf_factors, _smooth_at_nodes,
@@ -127,6 +127,7 @@ def main():
     parser = argparse.ArgumentParser(description='Gate 4 - end-to-end URR material-dilution self-shielding.')
     parser.add_argument('--grouped', type=Path, default=root / 'data/jeff33_urr_pendf_294K_ccfe709.h5', help='Grouped JEFF-3.3 URR library (CCFE-709)')
     parser.add_argument('--hfr',     type=Path, default=root / 'URR/616_HFR-low.txt',                   help='LLNL-616 HFR reference spectrum')
+    parser.add_argument('--chain',   type=Path, default=Path('/home/perry/NukeData/openmc_data/src/openmc_data/depletion/JEFF40/Chain_JEFF40-IsoFlag.lfs_order_mapped.xml'), help='Depletion chain (the PENDF collapse sources its row names from the chain)')
     parser.add_argument('--out',     type=Path, default=root / 'claude/urr_gate_results/gate4_end_to_end.md', help='Markdown result table')
     args = parser.parse_args()
 
@@ -145,7 +146,7 @@ def main():
     # --- collapse: flag off vs on ---
     nucs = W_ISOTOPES + PRODUCTS
     kw = dict(energies=edges, multigroup_flux=flux_norm, nuclides=nucs,
-              reactions=REACTIONS, pendf_library=glib)
+              reactions=REACTIONS, pendf_library=glib, chain_file=args.chain)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         off = MicroXS.from_multigroup_flux(**kw)

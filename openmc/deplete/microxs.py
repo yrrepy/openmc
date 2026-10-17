@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-import re
 import shutil
 from tempfile import TemporaryDirectory
 from typing import Union, TypeAlias, Self
@@ -23,6 +22,7 @@ from openmc.mgxs import GROUP_STRUCTURES
 from openmc.data import REACTION_MT
 import openmc
 from .chain import Chain, REACTIONS, _get_chain
+from .nuclide import _ISOMER_SUFFIX
 from .coupled_operator import _find_cross_sections, _get_nuclides_with_data
 from ..utility_funcs import h5py_file_or_group
 import openmc.lib
@@ -551,10 +551,6 @@ def _segment_group_area(
     edge_idx = np.searchsorted(union, edges)
     return np.add.reduceat(area, edge_idx[:-1])
 
-
-# Trailing metastable qualifier ('_m1') on nuclide names / qualified
-# reaction types.
-_ISOMER_SUFFIX = re.compile(r'_m\d+$')
 
 
 # Number of fluxes collapsed per GEMM; bounds working memory to the dense
