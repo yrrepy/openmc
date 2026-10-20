@@ -2,7 +2,8 @@ from pathlib import Path
 
 import numpy as np
 
-from openmc.mgxs.groups import EnergyGroups, convert_flux_groups
+from openmc.mgxs.groups import (
+    EnergyGroups, convert_flux_groups, build_fine_group_structure)
 from openmc.mgxs.library import Library
 from openmc.mgxs.mgxs import *
 from openmc.mgxs.mdgxs import *
@@ -26,9 +27,8 @@ GROUP_STRUCTURES = {}
   intermediate and thermal reactor applications ([SAR1990]_)
 - activation_ energy group structures "VITAMIN-J-42", "VITAMIN-J-175",
   "TRIPOLI-315", "LLNL-616", "CCFE-709_" and "UKAEA-1102_"
-- multi-group binning method energy structures, Fusion Optimized Multi-Group "FOMG-16k_",
-  LWR Optimized "VESTA-43k_"
-  ([MORGAN2013]_ and [HAECK2007]_)
+- Multigroup binning fine energy structures, Fusion Optimized Multi-Group "FOMG-16000_",
+  and LWR U238 Optimized "VESTA-43000_" ([MORGAN2013]_, [HAECK2007]_)
 
 .. _CASMO: http://large.stanford.edu/courses/2013/ph241/dalvi1/docs/c5.physor2006.pdf
 .. _SCALE44: https://www-nds.iaea.org/publications/indc/indc-czr-0001.pdf
@@ -44,8 +44,8 @@ GROUP_STRUCTURES = {}
 .. _CCFE-709: https://fispact.ukaea.uk/wiki/CCFE-709_group_structure
 .. _UKAEA-1102: https://fispact.ukaea.uk/wiki/UKAEA-1102_group_structure
 .. _ECCO-1968: https://serpent.vtt.fi/mediawiki/index.php/ECCO_1968-group_structure
-.. _FOMG-16k: https://fispact.ukaea.uk/wp-content/uploads/2016/07/snamc2013_05203.pdf
-.. _VESTA-43k: https://roma.sckcen.be/ws/portalfiles/portal/4558859/An_Optimum_Approach_to_Monte_Carlo_Burn_Up.pdf
+.. _FOMG-16000: https://doi.org/10.1016/j.anucene.2012.11.028
+.. _VESTA-43000: https://doi.org/10.13182/NSE07-A2695
 .. [SAR1990] Sartori, E., OECD/NEA Data Bank: Standard Energy Group Structures
    of Cross Section Libraries for Reactor Shielding, Reactor Cell and Fusion
    Neutronics Applications: VITAMIN-J, ECCO-33, ECCO-2000 and XMAS JEF/DOC-315
@@ -77,12 +77,13 @@ GROUP_STRUCTURES = {}
 .. [KIM2020] Kim, K.S., Ade, B., & Luciano, N.  (2020). Development
    of the MPACT 69-group Library for Magnox Reactor Analysis using VERA.
    Proceedings of International Conference on Physics of Reactors PHYSOR2020.
-.. [HAECK2007] Haeck, W., & Verboomen, B. (2007). An Optimum Approach to
-    Monte Carlo Burnup. Nuclear Science and Engineering, 156(2), 180–196.
+.. [HAECK2007] Haeck, W. (2007). An Optimum Approach to Monte Carlo Burnup.
+   PhD thesis, Ghent University (see also Haeck, W., & Verboomen, B.,
+   Nucl. Sci. Eng. 156, 180-196, 2007).
 .. [MORGAN2013] Morgan, L. W. G., Sublet, J. C., Haeck, W. (2013). Optimising
-    the nuclear data energy group structure used for fusion systems.
-    Joint International Conference on Supercomputing in Nuclear Applications
-    + Monte Carlo (SNA+MC 2013), Paris (France).
+   the nuclear data energy group structure used for fusion systems.
+   Joint International Conference on Supercomputing in Nuclear Applications +
+   Monte Carlo (SNA+MC 2013), Paris (France).
 """
 
 GROUP_STRUCTURES['CASMO-2'] = np.array([
@@ -1357,18 +1358,10 @@ GROUP_STRUCTURES['ECCO-1968'] = np.array([
     1.718869e7, 1.733253e7, 1.747757e7, 1.762383e7, 1.777131e7, 1.792002e7,
     1.806998e7, 1.822119e7, 1.837367e7, 1.852742e7, 1.868246e7, 1.883880e7,
     1.899644e7, 1.915541e7, 1.931570e7, 1.947734e7, 1.964033e7])
-# FOMG-16k and VESTA-43k (16k/43k edges) ship as compressed package data
-# rather than source literals.
-with np.load(Path(__file__).with_name('group_structures.npz')) as _f:
-    GROUP_STRUCTURES['FOMG-16k'] = _f['FOMG-16k']
-    GROUP_STRUCTURES['VESTA-43k'] = _f['VESTA-43k']
-
-
-def _canonical_group_structure_name(name):
-    """Resolve a group-structure name case-insensitively.
-
-    Returns the canonical key in :data:`GROUP_STRUCTURES` matching ``name``
-    up to case; raises :class:`KeyError` if no such group structure exists.
-    """
-    canonical = {k.upper(): k for k in GROUP_STRUCTURES}
-    return canonical[name.upper()]
+# formulaic fine group energy structures
+GROUP_STRUCTURES['FOMG-16000'] = build_fine_group_structure(
+    [1e-5, 1e-3, 1e0, 2e6, 1.96e7], [1, 999, 14000, 1000],
+    spacing=['linear', 'linear', 'log', 'linear'])
+GROUP_STRUCTURES['VESTA-43000'] = build_fine_group_structure(
+    [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0,  1e1, 1e2,  1e3, 1e4, 1e5, 1e6, 1e7, 2e7],
+    [1000, 1000, 1000, 1000, 1000, 4000, 4000, 10000, 10000, 4000, 4000, 1000, 1000])
