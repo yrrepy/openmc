@@ -224,20 +224,24 @@ def test_hybrid_tally_defaults_to_all_nuclides(run_in_tmpdir):
     assert default_micros[0].reactions == explicit_micros[0].reactions
 
 
-def test_flux_mode_returns_one_group_flux(run_in_tmpdir):
+def test_flux_mode_keeps_flux_spectrum(run_in_tmpdir):
+    """Flux mode returns the multigroup flux with one-group micros: isomeric
+    branching weights on the spectrum (upstream #3977 collapses it to one group)."""
+    energies = [0., 0.625, 2.0e7]
     model, mat = _simple_model()
     fluxes, micros = get_microxs_and_flux(
         model, [mat],
         nuclides=['H1'],
         reactions=['(n,2n)'],
-        energies=[0., 0.625, 2.0e7],
+        energies=energies,
         reaction_rate_mode='flux',
         chain_file=CHAIN_FILE,
     )
 
-    assert fluxes[0].shape == (1,)
+    assert fluxes[0].shape == (2,)
+    np.testing.assert_allclose(fluxes[0].energy_bounds, energies)
     assert micros[0].data.shape == (1, 1, 1)
-    assert fluxes[0][0] > 0.0
+    assert np.all(fluxes[0] > 0.0)
 
 
 @pytest.mark.parametrize('kwargs, n_rr_bins', [
