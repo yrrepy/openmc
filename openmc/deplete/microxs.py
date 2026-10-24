@@ -119,6 +119,7 @@ def get_microxs_and_flux(
     gendf_library: PathLike | 'openmc.deplete.gendf.GENDFLibrary' | None = None,
     reaction_rate_opts: dict | None = None,
     gendf_mt4_fallback: bool = False,
+    one_group_rr: bool = False,
 ) -> tuple[list[Flux], list[MicroXS]]:
     """Generate microscopic cross sections and fluxes for multiple domains.
 
@@ -154,7 +155,8 @@ def get_microxs_and_flux(
         filter is applied to the flux tally — unless ``gendf_library`` is
         provided (see below).
         When `reaction_rate_mode` is "direct", these boundaries define the output
-        flux and microscopic cross section energy group structure. When
+        flux and microscopic cross section energy group structure (one group
+        for the cross sections with `one_group_rr`). When
         `reaction_rate_mode` is "flux", these boundaries define the multigroup
         flux tally used to collapse continuous-energy cross sections; returned
         microscopic cross sections are one-group.
@@ -164,7 +166,8 @@ def get_microxs_and_flux(
         collapses reaction rates after a transport solve. When
         `reaction_rate_opts` is provided with `reaction_rate_mode='flux'`, the
         specified nuclide/reaction pairs are tallied directly and those values
-        override the flux-collapsed values.
+        override the flux-collapsed values. See `one_group_rr` to tally
+        direct reaction rates over one energy bin.
     chain_file : PathLike or Chain, optional
         Path to the depletion chain XML file or an instance of
         openmc.deplete.Chain. Used to determine cross sections for materials not
@@ -199,6 +202,15 @@ def get_microxs_and_flux(
         present in both the CE library and the GENDF library. Requires
         ``gendf_library``; the energy group structure must match the GENDF
         library's.
+
+        .. versionadded:: 0.15.4
+    one_group_rr : bool, optional
+        If True, direct reaction rates are tallied over one energy bin
+        spanning `energies` while the flux tally keeps the group structure,
+        so the returned fluxes carry the spectrum (isomeric branching, GENDF
+        MT=4 fallback) and the MicroXS are one-group. Only affects
+        `reaction_rate_mode='direct'`; flux mode always tallies one-group
+        reaction rates.
 
         .. versionadded:: 0.15.4
 
@@ -305,9 +317,12 @@ def get_microxs_and_flux(
         if rr_reactions:
             rr_reactions = [r for r in rr_reactions if r in set(reactions)]
 
-    # Use 1-group energy filter for RR in flux mode
+    # Use a 1-group energy filter for RR in flux mode, or in direct mode when
+    # one_group_rr is set; the flux tally keeps the group structure
     has_rr = bool(rr_nuclides and rr_reactions)
-    if has_rr and reaction_rate_mode == 'flux' and energy_filter is not None:
+    rr_one_group = (has_rr and energy_filter is not None and
+                    (reaction_rate_mode == 'flux' or one_group_rr))
+    if rr_one_group:
         rr_energy_filter = openmc.EnergyFilter(
             [energy_filter.values[0], energy_filter.values[-1]])
     else:
@@ -411,7 +426,7 @@ def get_microxs_and_flux(
                 reaction_rates = np.moveaxis(reaction_rates, 1, -1)
 
             # If RR is 1-group, sum flux over groups
-            if reaction_rate_mode == "flux":
+            if rr_one_group:
                 flux = flux.sum(axis=-1, keepdims=True)
 
             xs = np.zeros_like(reaction_rates)

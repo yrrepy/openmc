@@ -239,6 +239,80 @@ def test_flux_mode_returns_one_group_flux(run_in_tmpdir):
     assert micros[0].data.shape == (1, 1, 1)
     assert fluxes[0][0] > 0.0
 
+
+@pytest.mark.parametrize('kwargs, n_rr_bins', [
+    ({}, 2),
+    ({'one_group_rr': True}, 1),
+])
+def test_direct_one_group_rr_tally_setup(kwargs, n_rr_bins):
+    """In direct mode, one_group_rr gives the RR tally a 1-group energy filter
+    while the flux tally keeps the group structure."""
+    model, mat = _simple_model()
+    energies = [0., 0.625, 2.0e7]
+
+    captured = {}
+    def capture_run(**run_kwargs):
+        captured['tallies'] = list(model.tallies)
+        raise StopIteration
+
+    with patch.object(model, 'run', side_effect=capture_run):
+        with pytest.raises(StopIteration):
+            get_microxs_and_flux(
+                model, [mat],
+                nuclides=['H1', 'H2'],
+                reactions=['(n,2n)', '(n,gamma)'],
+                energies=energies,
+                reaction_rate_mode='direct',
+                chain_file=CHAIN_FILE,
+                **kwargs
+            )
+
+    tallies = {t.name: t for t in captured['tallies']}
+    flux_ef = tallies['MicroXS flux 0'].find_filter(openmc.EnergyFilter)
+    rr_ef = tallies['MicroXS RR 0'].find_filter(openmc.EnergyFilter)
+
+    # Flux tally keeps the group structure
+    assert flux_ef.num_bins == len(energies) - 1
+
+    # RR tally spans the full energy range in n_rr_bins bins
+    assert rr_ef.num_bins == n_rr_bins
+    assert rr_ef.values[0] == pytest.approx(energies[0])
+    assert rr_ef.values[-1] == pytest.approx(energies[-1])
+
+
+def test_direct_one_group_rr(run_in_tmpdir):
+    """With one_group_rr, direct micros are one-group and equal the
+    flux-weighted collapse of the multigroup direct micros, while the returned
+    fluxes keep the group structure."""
+    energies = [0., 0.625, 2.0e7]
+    kwargs = {
+        'nuclides': ['H1', 'H2'],
+        'reactions': ['(n,2n)', '(n,gamma)'],
+        'energies': energies,
+        'reaction_rate_mode': 'direct',
+        'chain_file': CHAIN_FILE,
+    }
+
+    model, mat = _simple_model()
+    mg_fluxes, mg_micros = get_microxs_and_flux(model, [mat], **kwargs)
+    assert mg_fluxes[0].shape == (2,)
+    assert mg_micros[0].data.shape == (2, 2, 2)
+
+    model, mat = _simple_model()
+    fluxes, micros = get_microxs_and_flux(
+        model, [mat], one_group_rr=True, **kwargs)
+    assert fluxes[0].shape == (2,)
+    np.testing.assert_allclose(fluxes[0].energy_bounds, energies)
+    assert micros[0].data.shape == (2, 2, 1)
+    assert micros[0]['H1', '(n,gamma)'][0] > 0.0
+
+    # Same random walk: identical fluxes, and the one-group reaction rate is
+    # the sum of the group reaction rates
+    np.testing.assert_allclose(fluxes[0], mg_fluxes[0])
+    collapsed = ((mg_micros[0].data * mg_fluxes[0]).sum(axis=-1)
+                 / mg_fluxes[0].sum())
+    np.testing.assert_allclose(micros[0].data[..., 0], collapsed, rtol=1e-12)
+
 # ---------------------------------------------------------------------------
 # Tests for MicroXS.merge()
 # ---------------------------------------------------------------------------
