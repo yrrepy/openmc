@@ -19,7 +19,8 @@ from openmc.mpi import comm
 from openmc.deplete import (
     ReactionRates, StepResult, Results, OperatorResult, PredictorIntegrator,
     CECMIntegrator, CF4Integrator, CELIIntegrator, EPCRK4Integrator,
-    LEQIIntegrator, SICELIIntegrator, SILEQIIntegrator, cram, pool)
+    LEQIIntegrator, SICELIIntegrator, SILEQIIntegrator, cram, pool,
+    stepresult)
 
 from tests import dummy_operator
 
@@ -147,6 +148,39 @@ def test_results_save_without_rates(run_in_tmpdir):
 
     res = Results('depletion_results.h5')
     assert res[0].rates.size == 0
+
+
+@pytest.mark.parametrize("write_rates", [False, True])
+def test_results_save_gather_payload(run_in_tmpdir, monkeypatch, write_rates):
+    """Reaction rates are sent to the root process only when written"""
+    # Fake comm of size 1: records the gather, forces the non-parallel branch
+    fake_comm = MagicMock(rank=0, size=1)
+    fake_comm.gather.side_effect = lambda obj, root=0: [obj]
+    fake_comm.bcast.side_effect = lambda obj, root=0: obj
+    monkeypatch.setattr(stepresult, "comm", fake_comm)
+
+    op = MagicMock()
+    op.get_results_info.return_value = (
+        {"0": 1.0}, ["na", "nb"], ["0"], ["0"], {"0": ""})
+    x = [np.array([1.0, 2.0])]
+    rates = ReactionRates(["0"], ["na", "nb"], ["ra"])
+    rates[:] = [[[3.0], [4.0]]]
+    op_result = OperatorResult(ufloat(1.0, 0.1), rates)
+
+    # A later step with the default still writes rates if the file has them
+    StepResult.save(op, x, op_result, [0.0, 1.0], 0.0, 0,
+                    write_rates=write_rates)
+    StepResult.save(op, x, op_result, [1.0, 2.0], 0.0, 1)
+
+    assert fake_comm.gather.call_count == 2
+    for call in fake_comm.gather.call_args_list:
+        assert (call.args[0].rates is rates) == write_rates
+    with h5py.File('depletion_results.h5', 'r') as handle:
+        np.testing.assert_array_equal(handle["number"], [x] * 2)
+        if write_rates:
+            np.testing.assert_array_equal(handle["reaction rates"][1], rates)
+        else:
+            assert "reaction rates" not in handle
 
 
 def test_bad_integrator_inputs():
