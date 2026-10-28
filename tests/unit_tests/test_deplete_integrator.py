@@ -149,6 +149,45 @@ def test_results_save_without_rates(run_in_tmpdir):
     assert res[0].rates.size == 0
 
 
+@pytest.mark.parametrize("write_rates", [False, True])
+def test_results_save_gather(run_in_tmpdir, monkeypatch, write_rates):
+    """StepResult.save gathers reaction rates only when they are written"""
+
+    class DummyComm:
+        rank = 0
+        size = 1
+
+        def __init__(self):
+            self.gathered = []
+
+        def bcast(self, obj):
+            return obj
+
+        def gather(self, obj):
+            self.gathered.append(obj)
+            return [obj]
+
+    dummy_comm = DummyComm()
+    monkeypatch.setattr("openmc.deplete.stepresult.comm", dummy_comm)
+
+    op = MagicMock()
+    op.get_results_info.return_value = ({"0": 1.0}, ["na"], ["0"], ["0"], {"0": ""})
+    x = [np.array([1.0])]
+    rates = ReactionRates(["0"], ["na"], ["ra"])
+    rates[:] = np.array([[[2.0]]])
+    op_result = OperatorResult(ufloat(1.0, 0.1), rates)
+
+    # Second step uses the default; rates stay if the file already has them
+    StepResult.save(op, x, op_result, [0.0, 1.0], 0.0, 0, write_rates=write_rates)
+    StepResult.save(op, x, op_result, [1.0, 2.0], 0.0, 1)
+
+    assert [res.rates is rates for res in dummy_comm.gathered] == [write_rates] * 2
+    with h5py.File('depletion_results.h5', 'r') as f:
+        assert ('reaction rates' in f) == write_rates
+        if write_rates:
+            np.testing.assert_array_equal(f['reaction rates'][1], rates)
+
+
 def test_bad_integrator_inputs():
     """Test failure modes for Integrator inputs"""
 
