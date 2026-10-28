@@ -162,7 +162,11 @@ original description of the algorithm presented by `Pusa
 
 The :math:`k`\ th order approximation for CRAM requires solving :math:`k/2`
 sparse linear systems. OpenMC relies on functionality from
-:mod:`scipy.sparse.linalg` for solving the linear systems.
+:mod:`scipy.sparse.linalg` for solving the linear systems. Each shifted matrix
+is LU-factorized with SuperLU in the natural nuclide order, and rows are only
+interchanged when a diagonal pivot is smaller than :math:`10^{-3}` of the
+largest magnitude in its column, so that small densities keep their relative
+precision.
 
 -------------------
 Data Considerations

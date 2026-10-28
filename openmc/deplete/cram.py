@@ -7,7 +7,7 @@ from functools import partial
 import numbers
 
 import numpy as np
-from scipy.sparse.linalg import spsolve, splu
+from scipy.sparse.linalg import splu
 
 from openmc.checkvalue import check_type, check_length, check_greater_than
 from .abc import DepSystemSolver
@@ -91,11 +91,15 @@ class IPFCramSolver(DepSystemSolver):
         A = step_dt * csc_array(A, dtype=np.float64)
         ident = eye_array(A.shape[0], format='csc')
 
+        # Natural order, no row swaps unless a pivot nearly vanishes: pivoting
+        # corrupts trace nuclide densities. spsolve cannot disable pivoting.
+        lu = partial(splu, permc_spec='NATURAL', diag_pivot_thresh=1e-3)
         if substeps == 1:
-            solvers = [partial(spsolve, A - theta * ident) for theta in self.theta]
+            # Factorize each pole only when it is used, one at a time.
+            solvers = (lu(A - theta * ident).solve for theta in self.theta)
         else:
             # Pre-compute LU factorizations and reuse them across substeps.
-            solvers = [splu(A - theta * ident).solve for theta in self.theta]
+            solvers = [lu(A - theta * ident).solve for theta in self.theta]
 
         y = n0.copy()
         for _ in range(substeps):
