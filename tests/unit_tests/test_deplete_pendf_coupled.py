@@ -37,7 +37,7 @@ from openmc.deplete.microxs import _group_average
 from openmc.deplete.nuclide import Nuclide
 from openmc.deplete.pendf.helpers import PendfFluxCollapseHelper
 from openmc.deplete.pendf.operators import _resolve_pendf_flux_options
-from openmc.mgxs import GROUP_STRUCTURES, _canonical_group_structure_name
+from openmc.mgxs import GROUP_STRUCTURES
 
 from tests.unit_tests.test_deplete_pendf_pathways import (
     _FakePendf, _chain_from_fake, _const)
@@ -451,7 +451,7 @@ def test_resolve_pendf_flux_options():
         pointwise, 'pendf-flux', {'energies': 'CASMO-40'})
     np.testing.assert_array_equal(
         energies,
-        np.asarray(GROUP_STRUCTURES[_canonical_group_structure_name('CASMO-40')],
+        np.asarray(GROUP_STRUCTURES['CASMO-40'],
                    dtype=float))
 
 

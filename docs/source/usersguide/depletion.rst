@@ -134,7 +134,7 @@ given as a group structure name or as an array of edges in eV::
         model, chain_file,
         reaction_rate_mode='pendf-flux',
         pendf_library='tendl2017_pendf_293K.h5',
-        reaction_rate_opts={'energies': 'FOMG-16k'})
+        reaction_rate_opts={'energies': 'FOMG-16000'})
 
 Selected reactions can still be tallied directly with continuous-energy data,
 for all nuclides or for a subset, with the same ``reactions`` and ``nuclides``

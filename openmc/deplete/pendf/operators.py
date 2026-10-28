@@ -19,7 +19,7 @@ import os
 
 import numpy as np
 
-from openmc.mgxs import GROUP_STRUCTURES, _canonical_group_structure_name
+from openmc.mgxs import GROUP_STRUCTURES
 
 
 # Keys ``reaction_rate_opts`` may carry in 'pendf-flux' mode. ``energies`` is
@@ -40,7 +40,7 @@ def _resolve_group_structure(energies):
     if isinstance(energies, str):
         name = energies
         edges = np.asarray(
-            GROUP_STRUCTURES[_canonical_group_structure_name(energies)],
+            GROUP_STRUCTURES[energies.upper()],
             dtype=float)
     else:
         name = None
