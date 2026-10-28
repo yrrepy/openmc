@@ -149,34 +149,22 @@ def deplete(func, chain, n, rates, dt, current_timestep=None, matrix_func=None,
                 )
                 isomeric_branching = None
 
-    if matrix_func is None:
-        if isomeric_branching is not None:
-            matrices = []
-            for rate, fy, iso in zip(rates, fission_yields, isomeric_branching):
-                matrix = chain.form_matrix(rate, fission_yields=fy,
-                                          isomeric_branching=iso)
-                matrices.append(matrix)
-        else:
-            matrices = []
-            for rate, fy in zip(rates, fission_yields):
-                matrix = chain.form_matrix(rate, fission_yields=fy)
-                matrices.append(matrix)
+    # Lazy: each matrix is formed just before its solve, then dropped. A
+    # matrix_func without an isomeric_branching parameter takes the plain path.
+    if isomeric_branching is not None and matrix_func is None:
+        matrices = (chain.form_matrix(rate, fission_yields=fy,
+                                      isomeric_branching=iso)
+                    for rate, fy, iso in zip(rates, fission_yields,
+                                             isomeric_branching))
+    elif (isomeric_branching is not None
+          and _accepts_isomeric_branching(matrix_func)):
+        matrices = map(matrix_func, repeat(chain), rates, fission_yields,
+                       isomeric_branching, *matrix_args)
+    elif matrix_func is None:
+        matrices = map(chain.form_matrix, rates, fission_yields)
     else:
-        if isomeric_branching is not None:
-            accepts_iso = _accepts_isomeric_branching(matrix_func)
-            matrices = []
-            for c, r, fy, iso in zip(repeat(chain), rates,
-                                    fission_yields, isomeric_branching):
-                if accepts_iso:
-                    m = matrix_func(c, r, fy, iso, *matrix_args)
-                else:
-                    m = matrix_func(c, r, fy, *matrix_args)
-                matrices.append(m)
-        else:
-            matrices = []
-            for c, r, fy in zip(repeat(chain), rates, fission_yields):
-                m = matrix_func(c, r, fy, *matrix_args)
-                matrices.append(m)
+        matrices = map(matrix_func, repeat(chain), rates, fission_yields,
+                       *matrix_args)
 
     # Determine if transfer rates or external source rates are active
     transfer_active = transfer_rates is not None and \
