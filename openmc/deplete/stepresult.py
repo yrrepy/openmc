@@ -256,6 +256,7 @@ class StepResult:
             What step is this?
         write_rates : bool, optional
             Whether to include reaction rate datasets in the results file.
+            Rates are also written when appending to a file that has them.
 
         """
         # Write new file if first time step, else add to existing file
@@ -269,8 +270,18 @@ class StepResult:
                 self._to_hdf5(handle, step, parallel=True,
                               write_rates=write_rates)
         else:
-            # Gather results at root process
-            all_results = comm.gather(self)
+            # Rank 0 writes rates if requested or if the file has them
+            need_rates = write_rates
+            if (comm.rank == 0 and not write_rates and step > 0
+                    and Path(filename).is_file()):
+                with h5py.File(filename, 'r') as handle:
+                    need_rates = 'reaction rates' in handle
+            payload = self
+            # Shallow copy without rates to keep the gather small
+            if not comm.bcast(need_rates):
+                payload = copy.copy(self)
+                payload.rates = None
+            all_results = comm.gather(payload)
 
             # Only root process writes results
             if comm.rank == 0:
