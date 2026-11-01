@@ -195,6 +195,15 @@ int openmc_simulation_finalize()
   // Increment total number of generations
   simulation::total_gen += simulation::current_batch * settings::gen_per_batch;
 
+  // A 'none' tally keeps no moments during the run: combine its run total and
+  // materialise its SUM plane for the end-of-run readout (tallies.out,
+  // openmc.lib). Collective on all ranks; skipped when a statepoint written at
+  // the last batch already did it.
+  for (auto& t : model::tallies) {
+    if (t->moments_mode() == MomentsMode::NONE)
+      t->collect_none();
+  }
+
 #ifdef OPENMC_MPI
   broadcast_results();
 #endif
@@ -938,9 +947,10 @@ void initialize_data()
 #ifdef OPENMC_MPI
 void broadcast_results()
 {
-  // Broadcast tally moments so that each process has access to results. The
-  // accumulator is all zeros at this point (end of run), so only the moments
-  // need broadcasting.
+  // Broadcast tally moments so that each process has access to results. Only
+  // the moments need broadcasting: the accumulator is all zeros at this point
+  // (end of run), except for a 'none' tally, whose moments are the SUM plane
+  // collect_none() materialised from it.
   for (auto& t : model::tallies) {
     // Distributed modes keep their results where they live (rank 0 for shared,
     // the owning rank for rma) and are read there by design, so they are not

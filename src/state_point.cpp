@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint> // for int64_t
+#include <limits>  // for numeric_limits
 #include <string>
 
 #include "openmc/tensor.h"
@@ -48,6 +49,23 @@ namespace openmc {
 //==============================================================================
 
 namespace {
+
+// A statepoint written with the 'none' moments mode holds only the scaled SUM
+// of a run total that the run kept in its accumulator, so it cannot seed a
+// restart. Stop on such a tally group (an absent attribute means 'full').
+void check_restart_moments(hid_t tally_group, int tally_id)
+{
+  if (!attribute_exists(tally_group, "moments"))
+    return;
+  std::string mode;
+  read_attribute(tally_group, "moments", mode);
+  if (mode == "none") {
+    fatal_error(fmt::format(
+      "Tally {} in the statepoint was written with the <exatally> moments "
+      "mode 'none', which does not support restarting from a statepoint.",
+      tally_id));
+  }
+}
 
 #ifdef OPENMC_MPI
 // Doubles per filter-bin row of a tally results dataset.
@@ -227,6 +245,8 @@ void read_distributed_rma_tally_results(hid_t file_id)
       continue;
     }
 
+    check_restart_moments(tally_group, tally->id_);
+
     // Every rank needs n_realizations for its owned-row fold. Read it on every
     // rank: this is a collective dataset read under Parallel HDF5 (each rank
     // otherwise has its own serial file handle), so it must not be master-only.
@@ -250,7 +270,10 @@ void read_distributed_rma_tally_results(hid_t file_id)
       fatal_error(fmt::format(
         "Tally {} results shape mismatch on rma restart: the current model "
         "expects [{}, {}, {}] but the statepoint \"results\" dataset is [{}]. "
-        "The restart model's tally layout must match the statepoint.",
+        "The restart model's tally layout must match the statepoint; the last "
+        "dimension is the number of moment planes (2 or 4 for the moments mode "
+        "'full' without or with higher moments, 1 for 'mean'), so the moments "
+        "mode and higher_moments must match too.",
         tally->id_, n_filter, n_score, n_moments, found));
     }
     read_owned_rows_hyperslab(dset, tally->rma_first_row(mpi::rank),
@@ -301,6 +324,20 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
 
   // Write message
   write_message("Creating state point " + filename_ + "...", 5);
+
+  // A 'none' tally keeps no moments during the run, so combine its run total
+  // and materialise its SUM plane now; the generic writer below (and the rma
+  // gather) then writes it as a one-plane results dataset. collect_none() is
+  // collective, so the guard mirrors the writer's tally-results guard, which
+  // is rank-identical.
+  const bool writes_tally_results =
+    settings::reduce_tallies && model::active_tallies.size() > 0;
+  if (writes_tally_results) {
+    for (auto& tally : model::tallies) {
+      if (tally->writable_ && tally->moments_mode() == MomentsMode::NONE)
+        tally->collect_none();
+    }
+  }
 
   hid_t file_id;
   if (mpi::master) {
@@ -445,6 +482,10 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
         } else {
           write_attribute(tally_group, "higher_moments", 0);
         }
+
+        // ExaTallies moments mode; readers treat an absent attribute as full.
+        write_attribute(
+          tally_group, "moments", moments_mode_name(tally->moments_mode()));
 
         if (tally->estimator_ == TallyEstimator::ANALOG) {
           write_dataset(tally_group, "estimator", "analog");
@@ -618,6 +659,20 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
   write_unstructured_mesh_results();
 #endif
 
+  // Free the SUM planes materialised above, so a 'none' tally holds no moments
+  // during the run -- unless the run ends with this batch (last batch, or
+  // triggers satisfied): the end-of-run readout keeps the plane and
+  // openmc_simulation_finalize() then skips a second collect. If the run does
+  // continue anyway, the next accumulate() releases the stale plane.
+  const bool run_ends = simulation::current_batch >= settings::n_max_batches ||
+                        simulation::satisfy_triggers;
+  if (writes_tally_results && !run_ends) {
+    for (auto& tally : model::tallies) {
+      if (tally->none_materialised())
+        tally->release_none_moments();
+    }
+  }
+
   simulation::time_statepoint.stop();
 
   return 0;
@@ -639,6 +694,18 @@ void restart_set_keff()
 
 void load_state_point()
 {
+  // A 'none' tally keeps its run total in the accumulator, and the statepoint
+  // holds only the scaled SUM, so it cannot be resumed. Every rank holds the
+  // same tallies, so every rank stops here.
+  for (const auto& tally : model::tallies) {
+    if (tally->writable_ && tally->moments_mode() == MomentsMode::NONE) {
+      fatal_error(fmt::format(
+        "Tally {} uses the <exatally> moments mode 'none', which does not "
+        "support restarting from a statepoint.",
+        tally->id_));
+    }
+  }
+
   write_message(
     fmt::format("Loading state point {}...", settings::path_statepoint), 5);
   openmc_statepoint_load(settings::path_statepoint.c_str());
@@ -790,6 +857,8 @@ extern "C" int openmc_statepoint_load(const char* filename)
         if (internal) {
           tally->writable_ = false;
         } else {
+          check_restart_moments(tally_group, tally->id_);
+
           // Under Parallel HDF5 every rank collectively opens, reads, and
           // closes the results dataset, so a rank that dropped its moments
           // (owner-only reduced mode) allocates a receiving buffer for the read
@@ -1160,7 +1229,12 @@ void write_unstructured_mesh_results()
                 moments(j, nuc_score_idx, TallyMoment::SUM) / n_realizations;
               mean_vec.at(j) = mean / volume;
 
-              // compute the standard deviation
+              // compute the standard deviation; the 'mean' and 'none'
+              // moments modes keep no sum of squares, so it is unknown (NaN)
+              if (tally->moments_mode() != MomentsMode::FULL) {
+                std_dev_vec[j] = std::numeric_limits<double>::quiet_NaN();
+                continue;
+              }
               double sum_sq = moments(j, nuc_score_idx, TallyMoment::SUM_SQ);
               double std_dev {0.0};
               if (n_realizations > 1) {

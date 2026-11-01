@@ -22,8 +22,10 @@ namespace openmc {
 enum class AccumulatorMode { REPLICATED, SHARED, RMA };
 
 // Which cross-batch moments a Tally keeps per bin (the moments mode):
-//   NONE - no moments (reserved, not implemented yet)
-//   MEAN - the running sum only (reserved, not implemented yet)
+//   NONE - no moments during the run: the accumulator is never zeroed and
+//          holds the run total, collected and scaled into one SUM plane only
+//          for a statepoint and at the end of the run (no standard deviation)
+//   MEAN - the sum only (one moment plane; no standard deviation)
 //   FULL - sum and sum of squares, plus the higher moments when requested
 enum class MomentsMode { NONE, MEAN, FULL };
 
@@ -36,16 +38,19 @@ struct ExaTally {
 
 //! \brief Parse the <exatally> block under `node` on top of `defaults`.
 //!
-//! A missing block or a missing child keeps the corresponding default. Only
-//! the 'full' moments mode is implemented; 'mean' and 'none' are rejected.
+//! A missing block or a missing child keeps the corresponding default.
 //! \param node      Element that may hold an <exatally> child
 //! \param defaults  Modes used for any setting the block does not give
 //! \param context   Where the block is, for error text ("settings.xml" or
 //!                  "tally N")
 //! \return The resolved modes
-//! \throw std::runtime_error on an invalid or unimplemented value
+//! \throw std::runtime_error on an invalid value
 ExaTally parse_exatally(
   pugi::xml_node node, const ExaTally& defaults, const std::string& context);
+
+//! The input word of a moments mode ("none", "mean" or "full"), as written to
+//! the statepoint and used in messages.
+const char* moments_mode_name(MomentsMode mode);
 
 } // namespace openmc
 

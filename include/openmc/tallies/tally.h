@@ -62,15 +62,18 @@ public:
   //! Accumulator mode: where accum_ (and, for rma, the moments) is homed.
   AccumulatorMode accumulator() const { return exatally_.accumulator; }
 
-  //! Moments mode: which cross-batch moments are kept (only FULL for now).
+  //! Moments mode: which cross-batch moments are kept (full, mean, or none).
   MomentsMode moments_mode() const { return exatally_.moments; }
 
   //! \brief Set the ExaTallies modes, validating the distributed accumulator
   //! modes' prerequisites (MPI + OpenMP build, tally reduction on, Monte Carlo
-  //! solver, MPI thread level, not event-based) and that the moments mode is
-  //! implemented. Must run before init_results(), which homes the storage.
-  //! Tallies created through the C API keep the replicated default; the
-  //! global settings::exatally default applies only to tallies read from XML.
+  //! solver, MPI thread level, not event-based) and the reduced moments modes'
+  //! restrictions (no triggers or higher moments; for 'none' also tally
+  //! reduction on and not the random ray solver). Must run after the triggers
+  //! and higher_moments are read and before init_results(), which homes the
+  //! storage. Tallies created through the C API keep the replicated/full
+  //! default; the global settings::exatally default applies only to tallies
+  //! read from XML.
   void set_exatally(const ExaTally& exatally);
 
   //! True when the moments are genuinely block-distributed across ranks (rma
@@ -95,8 +98,17 @@ public:
   tensor::Tensor<double>& moments() { return moments_; }
   const tensor::Tensor<double>& moments() const { return moments_; }
 
-  //! Number of moment columns stored per (filter, score) bin (2 or 4).
-  int n_moments() const { return higher_moments_ ? 4 : 2; }
+  //! Number of moment planes in the results array -- the moments_ array, the
+  //! statepoint "results" dataset, and the in-memory readout: 2 or 4 for the
+  //! full moments mode, 1 (SUM only) for mean and none. A 'none' tally holds
+  //! no planes during the run; its one SUM plane exists only once
+  //! collect_none() has materialised it.
+  int n_moments() const
+  {
+    if (exatally_.moments != MomentsMode::FULL)
+      return 1;
+    return higher_moments_ ? 4 : 2;
+  }
 
   //! Whether this tally currently holds an allocated moments array.
   bool has_moments() const { return moments_.size() != 0; }
@@ -210,6 +222,21 @@ public:
 
   void accumulate();
 
+  //! \brief Combine the run total of a 'none' tally and materialise its one
+  //! SUM plane (SUM = accumulator total x norm) into moments_: [F, S, 1] on the
+  //! master for the replicated and shared accumulator modes, the owned rows
+  //! under rma. Collective on all ranks; a no-op when the plane is already
+  //! current. The accumulator keeps the run total, so the run can continue.
+  //! Called before each statepoint write and at the end of the run.
+  void collect_none();
+
+  //! Free the materialised SUM plane of a 'none' tally (after a mid-run
+  //! statepoint write, or when the next batch makes it stale).
+  void release_none_moments();
+
+  //! True when a 'none' tally's SUM plane is materialised and current.
+  bool none_materialised() const { return none_materialised_; }
+
 #ifdef OPENMC_MPI
   //! \brief End-of-batch publish + internode combine for a shared tally.
   //! Publishes this node's atomic scores (win_sync + node barrier), then node
@@ -277,9 +304,10 @@ public:
   MPI_Win accum_win_ {MPI_WIN_NULL};
 #endif
 
-  //! Cross-batch moments, shape [n_filter_bins, n_score_bins, n_moments] with
-  //! n_moments = higher_moments_ ? 4 : 2. Written only by the once-per-batch
-  //! fold in accumulate(). This layout matches the on-disk statepoint dataset.
+  //! Cross-batch moments, shape [n_filter_bins, n_score_bins, n_moments()].
+  //! Written only by the once-per-batch fold in accumulate() (or, for a 'none'
+  //! tally, by collect_none()). This layout matches the on-disk statepoint
+  //! dataset.
   tensor::Tensor<double> moments_;
 
   //! Keep moments_ allocated on every rank, not just the master. In reduced
@@ -448,6 +476,14 @@ private:
   //! Per-batch normalization applied in the fold (source strength divided by
   //! contributing particles per generation; 1 for the random ray solver).
   double tally_normalization() const;
+
+  //! Master side of collect_none() for the replicated and shared accumulator
+  //! modes: allocate moments_ as [F, S, 1] and fill SUM = accum_ x norm.
+  void materialise_none_sum(double norm);
+
+  //! For a 'none' tally: moments_ holds the SUM plane materialised by
+  //! collect_none() and no batch has been accumulated since. Rank-identical.
+  bool none_materialised_ {false};
 
   //! Whether to multiply by atom density for reaction rates
   bool multiply_density_ {true};

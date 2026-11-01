@@ -988,6 +988,11 @@ Functions
       matches the on-disk statepoint layout. Callers using the ``openmc.lib``
       Python bindings are unaffected (they were updated in lockstep).
 
+   The number of moments is 2 (4 with higher moments) for the ExaTallies
+   moments mode ``full`` and 1 (``SUM`` only) for ``mean`` and ``none``. A
+   ``none`` tally holds no moments while the simulation runs, so its results
+   are available only once the simulation has been finalized.
+
    :param int32_t index: Index in the tallies array
    :param double** ptr: Pointer to the moments array
    :param size_t[3] shape_: Shape of the moments array

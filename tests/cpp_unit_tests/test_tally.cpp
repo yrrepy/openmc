@@ -9,6 +9,7 @@
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/filter_energy.h"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 
 using namespace openmc;
@@ -101,6 +102,11 @@ TEST_CASE("Tally filter-bin count does not overflow 32 bits")
 
 TEST_CASE("Test tally score_add, accumulate fold, and reset")
 {
+  // Run once per moments mode that folds every batch: 'full' keeps SUM and
+  // SUM_SQ (M = 2), 'mean' keeps SUM only (M = 1).
+  const auto moments_mode = GENERATE(MomentsMode::FULL, MomentsMode::MEAN);
+  const bool full = moments_mode == MomentsMode::FULL;
+
   // Save globals this case mutates; restore them at the end so the shared test
   // binary has no order dependence.
   const auto saved_run_mode = settings::run_mode;
@@ -119,12 +125,14 @@ TEST_CASE("Test tally score_add, accumulate fold, and reset")
   Tally* tally = Tally::create();
   tally->set_filters({&f, 1});
   tally->set_scores(std::vector<std::string> {"flux", "total"});
+  tally->set_exatally({AccumulatorMode::REPLICATED, moments_mode});
   tally->set_strides();
   tally->init_results();
 
   REQUIRE(tally->n_filter_bins() == 2);
   REQUIRE(tally->n_score_bins() == 2);
-  REQUIRE(tally->n_moments() == 2);
+  REQUIRE(tally->n_moments() == (full ? 2 : 1));
+  REQUIRE(tally->moments().shape(2) == tally->n_moments());
   REQUIRE(tally->has_moments());
 
   // Configure normalization so accumulate()'s norm factor is exactly 1
@@ -146,17 +154,28 @@ TEST_CASE("Test tally score_add, accumulate fold, and reset")
   tally->accumulate();
   const auto& m = tally->moments();
   REQUIRE(m(0, 0, TallyMoment::SUM) == 2.0);
-  REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 4.0);
   REQUIRE(m(1, 1, TallyMoment::SUM) == 3.0);
-  REQUIRE(m(1, 1, TallyMoment::SUM_SQ) == 9.0);
+  if (full) {
+    REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 4.0);
+    REQUIRE(m(1, 1, TallyMoment::SUM_SQ) == 9.0);
+  } else {
+    // With one plane the SUM entries are contiguous: bin (0, 1) follows (0, 0)
+    // directly, so a stray SUM_SQ write would land on a neighbour's SUM.
+    REQUIRE(m(0, 1, TallyMoment::SUM) == 0.0);
+    REQUIRE(m(1, 0, TallyMoment::SUM) == 0.0);
+  }
   REQUIRE(tally->accum(0, 0) == 0.0);
   REQUIRE(tally->accum(1, 1) == 0.0);
 
   // Second realization accumulates on top of the first.
   tally->score_add(0, 0, 5.0);
   tally->accumulate();
-  REQUIRE(m(0, 0, TallyMoment::SUM) == 7.0);     // 2 + 5
-  REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 29.0); // 4 + 25
+  REQUIRE(m(0, 0, TallyMoment::SUM) == 7.0); // 2 + 5
+  if (full) {
+    REQUIRE(m(0, 0, TallyMoment::SUM_SQ) == 29.0); // 4 + 25
+  } else {
+    REQUIRE(m(0, 1, TallyMoment::SUM) == 0.0);
+  }
   REQUIRE(tally->n_realizations_ == 2);
 
   // reset() clears both the accumulator and the moments.

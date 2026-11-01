@@ -180,7 +180,11 @@ def apply_time_correction(
     n_radionuclides = len(radionuclides)
     shape = (n_bins_before, n_radionuclides, n_bins_after, n_nuclides, n_scores)
     tally_sum = new_tally.sum.reshape(shape)
-    tally_sum_sq = new_tally.sum_sq.reshape(shape)
+    # sum_sq is None for a tally run with the ExaTally moments mode 'mean' or
+    # 'none' (sum only)
+    tally_sum_sq = new_tally.sum_sq
+    if tally_sum_sq is not None:
+        tally_sum_sq = tally_sum_sq.reshape(shape)
     tally_mean = new_tally.mean.reshape(shape)
     tally_std_dev = new_tally.std_dev.reshape(shape)
 
@@ -206,7 +210,8 @@ def apply_time_correction(
         # Apply TCF and change shape back to (filter combinations, nuclides,
         # scores)
         new_tally._sum = (tally_sum * tcf).reshape(shape)
-        new_tally._sum_sq = (tally_sum_sq * (tcf*tcf)).reshape(shape)
+        if tally_sum_sq is not None:
+            new_tally._sum_sq = (tally_sum_sq * (tcf*tcf)).reshape(shape)
         new_tally._mean = new_tally._mean.reshape(shape)
         new_tally._std_dev = new_tally._std_dev.reshape(shape)
 

@@ -680,6 +680,14 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
 
 void WeightWindows::check_tally_update_compatibility(const Tally* tally)
 {
+  // the update reads the sum of squares (relative error), which only the full
+  // moments mode keeps
+  if (tally->moments_mode() != MomentsMode::FULL) {
+    fatal_error(fmt::format("Tally {} uses the <exatally> moments mode '{}'; "
+                            "updating weight windows requires moments 'full'.",
+      tally->id(), moments_mode_name(tally->moments_mode())));
+  }
+
   // define the set of allowed filters for the tally
   const std::set<FilterType> allowed_filters = {
     FilterType::MESH, FilterType::ENERGY, FilterType::PARTICLE};
@@ -874,6 +882,15 @@ void WeightWindowsGenerator::create_tally()
       "Weight-window generation tally {} keeps the replicated accumulator "
       "mode (its moments are read on all ranks); the global <exatally> "
       "accumulator default does not apply to it.",
+      ww_tally->id()));
+  }
+  // Likewise it always keeps the full moments mode, since the weight-window
+  // update needs the relative error.
+  if (settings::exatally.moments != MomentsMode::FULL && mpi::master) {
+    warning(fmt::format(
+      "Weight-window generation tally {} keeps the moments mode 'full' (the "
+      "update needs its relative error); the global <exatally> moments "
+      "default does not apply to it.",
       ww_tally->id()));
   }
 

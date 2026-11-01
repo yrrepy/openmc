@@ -53,11 +53,10 @@ ExaTally parse_exatally(
     std::string mode = get_node_value(block, "moments", true, true);
     if (mode == "full") {
       result.moments = MomentsMode::FULL;
-    } else if (mode == "mean" || mode == "none") {
-      throw std::runtime_error {
-        fmt::format("The <exatally> moments mode '{}' in {} is not "
-                    "implemented yet; only 'full' is supported.",
-          mode, context)};
+    } else if (mode == "mean") {
+      result.moments = MomentsMode::MEAN;
+    } else if (mode == "none") {
+      result.moments = MomentsMode::NONE;
     } else {
       throw std::runtime_error {
         fmt::format("Invalid <exatally> moments mode '{}' in {}. Valid "
@@ -67,6 +66,18 @@ ExaTally parse_exatally(
   }
 
   return result;
+}
+
+const char* moments_mode_name(MomentsMode mode)
+{
+  switch (mode) {
+  case MomentsMode::NONE:
+    return "none";
+  case MomentsMode::MEAN:
+    return "mean";
+  default:
+    return "full";
+  }
 }
 
 //==============================================================================
@@ -564,7 +575,19 @@ void Tally::rma_fold()
   // reduce_tallies. n_realizations_ was incremented on all ranks in
   // accumulate().
   const double norm = tally_normalization();
-  if (higher_moments_) {
+  if (exatally_.moments == MomentsMode::MEAN) {
+    // The mean moments mode keeps the sum only.
+#pragma omp parallel for
+    for (int64_t i = 0; i < rma_n_rows_; ++i) {
+      for (int j = 0; j < n_score_bins_; ++j) {
+        const int64_t k = i * n_score_bins_ + j;
+        double val = (rma_win_base_[k] + accum_[k]) * norm;
+        rma_win_base_[k] = 0.0;
+        accum_[k] = 0.0;
+        moments_(i, j, TallyMoment::SUM) += val;
+      }
+    }
+  } else if (higher_moments_) {
 #pragma omp parallel for
     for (int64_t i = 0; i < rma_n_rows_; ++i) {
       for (int j = 0; j < n_score_bins_; ++j) {
@@ -613,6 +636,115 @@ void Tally::shared_batch_end()
   shared_resume();
 }
 #endif
+
+//==============================================================================
+// Tally member functions: the 'none' moments mode
+//==============================================================================
+
+void Tally::collect_none()
+{
+  // A 'none' tally keeps no moments during the run: its accumulator is never
+  // zeroed and holds the run total. This routine combines that total and
+  // materialises SUM = total x norm into a one-plane moments_ ([F, S, 1] on
+  // the master, or the owned rows under rma), so the generic statepoint writer
+  // (including the rma gather) and the end-of-run readout serve it exactly as
+  // they serve a 'mean' tally. One norm for the whole run is valid because
+  // tally_normalization() has no writer during a Monte Carlo run (random ray,
+  // whose scores are scaled per batch, rejects 'none'). Materialising first and
+  // writing generically costs one transient plane on the master but reuses all
+  // writer code, rather than scaling chunk by chunk inside the writer.
+  //
+  // Collective on every rank (each accumulator mode below communicates), and
+  // called for the same tallies in the same order on every rank: the moments
+  // mode is a rank-identical per-tally property and none_materialised_ is set
+  // and cleared identically on every rank.
+  if (none_materialised_)
+    return;
+  const double norm = tally_normalization();
+
+#ifdef OPENMC_MPI
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
+    // Complete every rank's accumulates (drain, flush_all, barrier, win_sync).
+    // The window is only read here, never zeroed or written by the CPU, so it
+    // keeps accumulating the run total (the E0 invariant: the CPU writes the
+    // window only inside the collective per-batch fold).
+    rma_publish();
+    moments_ = tensor::Tensor<double>({static_cast<size_t>(rma_n_rows_),
+      static_cast<size_t>(n_score_bins_), size_t {1}});
+#pragma omp parallel for
+    for (int64_t i = 0; i < rma_n_rows_; ++i) {
+      for (int j = 0; j < n_score_bins_; ++j) {
+        const int64_t k = i * n_score_bins_ + j;
+        moments_(i, j, TallyMoment::SUM) =
+          (rma_win_base_[k] + accum_[k]) * norm;
+      }
+    }
+    // Every rank must finish this snapshot before any rank issues the next
+    // batch's accumulates, or a slow rank would read next-batch mass into this
+    // statepoint. rma_resume() is exactly that barrier (win_sync + intracomm
+    // barrier + win_sync).
+    rma_resume();
+    none_materialised_ = true;
+    return;
+  }
+
+  if (exatally_.accumulator == AccumulatorMode::SHARED) {
+    // Node sync, then the node leaders reduce their planes onto the master's
+    // node plane, which then holds the run total so far.
+    shared_publish();
+    if (mpi::master) {
+      materialise_none_sum(norm);
+    }
+    // Non-master leaders zero their (now combined) node plane, so a later
+    // collect adds only new scores (a running total, never double-counted);
+    // the master keeps its plane. Then every node rank publishes the plane
+    // and barriers before scoring resumes, so no rank scores into the master's
+    // plane while the master reads it above.
+    shared_batch_end();
+    none_materialised_ = true;
+    return;
+  }
+
+  if (mpi::n_procs > 1) {
+    // Replicated: reduce the run totals in place onto the master. Non-master
+    // ranks then restart from zero, so a later collect adds only their new
+    // scores (the same running-total pattern as above).
+    if (mpi::master) {
+      mpi::reduce(
+        MPI_IN_PLACE, accum_, accum_size_, MPI_SUM, 0, mpi::intracomm);
+    } else {
+      mpi::reduce<double>(
+        accum_, nullptr, accum_size_, MPI_SUM, 0, mpi::intracomm);
+      std::fill(accum_, accum_ + accum_size_, 0.0);
+    }
+  }
+#endif
+
+  if (mpi::master) {
+    materialise_none_sum(norm);
+  }
+  none_materialised_ = true;
+}
+
+void Tally::materialise_none_sum(double norm)
+{
+  // Master side of collect_none() for the full-plane accumulator modes
+  // (replicated, shared): accum_ holds the global run total.
+  moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
+    static_cast<size_t>(n_score_bins_), size_t {1}});
+#pragma omp parallel for
+  for (int64_t i = 0; i < n_filter_bins_; ++i) {
+    for (int j = 0; j < n_score_bins_; ++j) {
+      moments_(i, j, TallyMoment::SUM) = accum_[i * n_score_bins_ + j] * norm;
+    }
+  }
+}
+
+void Tally::release_none_moments()
+{
+  moments_ = tensor::Tensor<double>();
+  none_materialised_ = false;
+}
 
 //==============================================================================
 // Trigger support

@@ -30,9 +30,17 @@ class ExaTally:
         rank, 'shared' keeps one plane per shared-memory node, and 'rma'
         block-distributes the accumulator and the moments across all ranks.
     moments : {'full', 'mean', 'none'}, optional
-        Which cross-batch moments are kept per bin. Only 'full' (the built-in
-        default) is implemented at present; OpenMC stops with an error for
-        'mean' and 'none', which are reserved for a future release.
+        Which cross-batch moments are kept per bin. 'full' (the built-in
+        default) keeps the sum and the sum of squares (plus the higher moments
+        when requested), so the mean and its standard deviation are available.
+        'mean' keeps the sum only: one moment plane, the mean but no standard
+        deviation (:attr:`openmc.Tally.std_dev` is NaN), and no triggers or
+        higher moments. 'none' keeps no moments during the run: the
+        accumulator holds the run total, which is combined and scaled only for
+        a statepoint and at the end of the run; it adds to the 'mean'
+        restrictions that a run cannot restart from its statepoint, and that
+        it requires tally reduction (no ``no_reduce``) and the Monte Carlo
+        solver. See :ref:`settings_exatally`.
 
     Attributes
     ----------

@@ -551,7 +551,10 @@ void read_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
     fatal_error(fmt::format(
       "Tally results shape mismatch reading statepoint group \"{}\": the "
       "current model expects [{}, {}, {}] but the stored \"results\" dataset "
-      "is [{}]. The restart model's tally layout must match the statepoint.",
+      "is [{}]. The restart model's tally layout must match the statepoint; "
+      "the last dimension is the number of moment planes (2 or 4 for the "
+      "moments mode 'full' without or with higher moments, 1 for 'mean'), so "
+      "the moments mode and higher_moments must match too.",
       object_name(group_id), n_filter, n_score, n_moments, found));
   }
 

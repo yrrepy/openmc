@@ -127,9 +127,10 @@ class Tally(IDManagerMixin):
         Whether or not a Summary has been linked
     sum : numpy.ndarray
         An array containing the sum of each independent realization for each bin
-    sum_sq : numpy.ndarray
+    sum_sq : numpy.ndarray or None
         An array containing the sum of each independent realization squared for
-        each bin
+        each bin. None for a tally run with the :class:`openmc.ExaTally`
+        moments mode 'mean' or 'none', which keep the sum only.
     sum_third : numpy.ndarray
         An array containing the sum of each independent realization to the third power for
         each bin
@@ -139,7 +140,11 @@ class Tally(IDManagerMixin):
     mean : numpy.ndarray
         An array containing the sample mean for each bin
     std_dev : numpy.ndarray
-        An array containing the sample standard deviation for each bin
+        An array containing the sample standard deviation for each bin. NaN in
+        every bin for a tally run with the :class:`openmc.ExaTally` moments
+        mode 'mean' or 'none' (no sum of squares is kept); the
+        variance-of-the-variance, central moments, skewness and kurtosis raise
+        a ValueError for such a tally.
     vov : numpy.ndarray
         An array containing the variance of the variance for each tally bin
     higher_moments : bool
@@ -470,14 +475,15 @@ class Tally(IDManagerMixin):
             else:
                 self._higher_moments = False
 
-            # Extract Tally data from the file
+            # Extract Tally data from the file. A tally run with the ExaTally
+            # moments mode 'mean' or 'none' stores the sum only (one plane), so
+            # it has no sum of squares.
             data = group['results']
-            sum_ = data[:, :, 0]
-            sum_sq = data[:, :, 1]
-
-            # Reshape the results arrays
-            sum_ = np.reshape(sum_, self.shape)
-            sum_sq = np.reshape(sum_sq, self.shape)
+            sum_ = np.reshape(data[:, :, 0], self.shape)
+            if data.shape[2] > 1:
+                sum_sq = np.reshape(data[:, :, 1], self.shape)
+            else:
+                sum_sq = None
 
             # Set the data for this Tally
             self._sum = sum_
@@ -499,7 +505,8 @@ class Tally(IDManagerMixin):
             # Convert NumPy arrays to SciPy sparse LIL matrices
             if self.sparse:
                 self._sum = lil_array(self._sum.reshape(1, -1))
-                self._sum_sq = lil_array(self._sum_sq.reshape(1, -1))
+                if self._sum_sq is not None:
+                    self._sum_sq = lil_array(self._sum_sq.reshape(1, -1))
                 if self._sum_third is not None:
                     self._sum_third = lil_array(self._sum_third.reshape(1, -1))
                 if self._sum_fourth is not None:
@@ -530,7 +537,7 @@ class Tally(IDManagerMixin):
     @property
     @ensure_results
     def sum_sq(self):
-        if not self._sp_filename or self.derived:
+        if not self._sp_filename or self.derived or self._sum_sq is None:
             return None
 
         if self.sparse:
@@ -615,7 +622,11 @@ class Tally(IDManagerMixin):
             n = self.num_realizations
             nonzero = np.abs(self.mean) > 0
             std_dev = np.zeros_like(self.mean)
-            if n > 1:
+            if self._sum_sq is None:
+                # The ExaTally moments modes 'mean' and 'none' keep no sum of
+                # squares, so the standard deviation is unknown
+                std_dev = np.full_like(self.mean, np.nan)
+            elif n > 1:
                 # Rounding can push the variance below zero when realizations
                 # are nearly identical, so clamp at zero
                 variance = (self.sum_sq[nonzero]/n - self.mean[nonzero]**2)/(n - 1)
@@ -638,9 +649,19 @@ class Tally(IDManagerMixin):
         else:
             return self._std_dev
 
+    def _check_sum_sq(self, quantity):
+        """Raise if the tally has no sum of squares to compute `quantity`."""
+        if self.sum_sq is None:
+            raise ValueError(
+                f"The {quantity} of tally {self.id} is not available: the tally "
+                "has no sum of squares (it was run with the ExaTally moments "
+                "mode 'mean' or 'none'). This requires the moments mode "
+                "'full'.")
+
     @property
     def vov(self):
         if self._vov is None:
+            self._check_sum_sq('variance of the variance')
             n = self.num_realizations
             sum1 = self.sum
             sum2 = self.sum_sq
@@ -669,11 +690,13 @@ class Tally(IDManagerMixin):
 
     @property
     def m2(self):
+        self._check_sum_sq('second central moment')
         n = self.num_realizations
         return self.sum_sq/n - self.mean**2
 
     @property
     def m3(self):
+        self._check_sum_sq('third central moment')
         n = self.num_realizations
         mean = self.mean
         sum2 = self.sum_sq/n
@@ -683,6 +706,7 @@ class Tally(IDManagerMixin):
 
     @property
     def m4(self):
+        self._check_sum_sq('fourth central moment')
         n = self.num_realizations
         mean = self.mean
         sum2 = self.sum_sq/n
@@ -1599,7 +1623,8 @@ class Tally(IDManagerMixin):
 
         # Scale the raw moments by the atom densities
         self._sum *= factors
-        self._sum_sq *= factors**2
+        if self._sum_sq is not None:
+            self._sum_sq *= factors**2
         if self._sum_third is not None:
             self._sum_third *= factors**3
         if self._sum_fourth is not None:

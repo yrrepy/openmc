@@ -789,6 +789,17 @@ void write_tallies()
         for (auto score : tally.scores_) {
           std::string score_name =
             score > 0 ? reaction_name(score) : score_names.at(score);
+          if (tally.n_moments() < 2) {
+            // The 'mean' and 'none' moments modes keep the sum only, so there
+            // is no uncertainty to print.
+            double mean =
+              tally.moments()(filter_index, score_index, TallyMoment::SUM) /
+              tally.n_realizations_;
+            fmt::print(tallies_out, "{0:{1}}{2:<36} {3:.6}\n", "", indent + 1,
+              score_name, mean);
+            score_index += 1;
+            continue;
+          }
           double mean, stdev;
           std::tie(mean, stdev) =
             mean_stdev(&tally.moments()(filter_index, score_index, 0),

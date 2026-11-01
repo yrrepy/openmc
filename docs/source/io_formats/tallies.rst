@@ -69,12 +69,16 @@ The ``<tally>`` element accepts the following sub-elements:
     the global ``<exatally>`` default in ``settings.xml`` sub-element by
     sub-element. It accepts the same two optional sub-elements:
     ``<accumulator>`` (``replicated``, ``shared``, or ``rma``: where the
-    per-batch accumulator is homed across MPI ranks) and ``<moments>`` (only
-    ``full`` is implemented at present). See the :ref:`\<exatally\> element
-    <settings_exatally>` for the meaning of each mode. A run may mix
-    accumulator modes across tallies (for example a large flux mesh tally with
-    the ``shared`` or ``rma`` accumulator alongside small ``replicated``
-    tallies).
+    per-batch accumulator is homed across MPI ranks) and ``<moments>``
+    (``full``, ``mean``, or ``none``: which cross-batch moments are kept; with
+    ``mean`` or ``none`` the tally has no standard deviation and cannot carry
+    triggers or higher moments, and ``none`` further rules out restart,
+    ``no_reduce`` and the random ray solver). See the :ref:`\<exatally\>
+    element <settings_exatally>` for the meaning of each mode. A run may mix
+    modes across tallies (for example a large flux mesh tally with the
+    ``shared`` or ``rma`` accumulator and moments ``none`` alongside a small
+    ``replicated`` tally with moments ``full`` on a coarse mesh that provides
+    the uncertainty).
 
     *Default*: the values of the ``<exatally>`` element in settings.xml
     (accumulator ``replicated`` and moments ``full`` if unset).

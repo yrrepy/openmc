@@ -660,6 +660,49 @@ for ``rma``, the moments) live:
   :math:`1/N`. Users sizing runs against this memory model should budget for the
   extra plane.
 
+The ``<moments>`` sub-element (the moments mode) selects which cross-batch
+moments are kept, independently of the accumulator mode. ``full`` keeps
+:math:`n_\text{moments} = 2` planes (:math:`\sum x` and :math:`\sum x^2`; 4
+with higher moments). ``mean`` keeps :math:`\sum x` only, giving up the
+standard deviation, triggers, and higher moments. ``none`` keeps no moment plane
+during the run: the accumulator is never zeroed, so it holds the run total, and
+it is combined across ranks only when a statepoint is written and at the end of
+the run -- one collection per statepoint instead of one reduction per batch.
+There the total is scaled once by the tally normalization into a one-plane sum,
+which is written and read exactly like the ``mean`` sum, so the mean is formed
+once at the end. Scaling the total once is equivalent to scaling every batch
+because the normalization (the source strength divided by the number of source
+particles per batch) has no writer during a Monte Carlo run, and batch
+statistics make the mean independent of how the histories are grouped into
+batches [Romano2012]_. The random ray solver scales its tally scores in place
+every batch and therefore cannot use ``none``. The table gives the tally memory
+in planes of :math:`F \times S` doubles (:math:`F` filter bins, :math:`S` score
+bins) on :math:`N` ranks; :math:`M` is 2, or 4 with higher moments.
+
+.. list-table:: Tally memory by accumulator and moments mode (planes)
+   :header-rows: 1
+   :widths: 16 28 28 28
+
+   * - Accumulator
+     - ``full``
+     - ``mean``
+     - ``none``
+   * - ``replicated``
+     - 1 per rank + :math:`M` on the master
+     - 1 per rank + 1 on the master
+     - 1 per rank; + 1 on the master at each statepoint and at the end of the
+       run
+   * - ``shared``
+     - 1 per node + :math:`M` on the master
+     - 1 per node + 1 on the master
+     - 1 per node; + 1 on the master at each statepoint and at the end of the
+       run
+   * - ``rma``
+     - :math:`(2 + M)/N` per rank
+     - :math:`3/N` per rank
+     - :math:`2/N` per rank; + :math:`1/N` at each statepoint and at the end of
+       the run
+
 All three modes preserve the statistical semantics of the ``replicated``
 default. Because scores accumulate locally within a batch and are reduced or
 folded exactly once per batch, the sample mean is statistically exact --

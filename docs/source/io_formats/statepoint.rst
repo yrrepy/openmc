@@ -155,6 +155,9 @@ The current version of the statepoint file format is 18.2.
                rates should be multiplied by atom density (1) or not (0).
              - **higher_moments** (*int*) -- Flag indicating whether
                higher-order tally moments are enabled (1) or not (0).
+             - **moments** (*char[]*) -- ExaTallies moments mode of the tally,
+               'full', 'mean', or 'none'. Files without this attribute were
+               written with 'full'.
 
 :Datasets: - **n_realizations** (*int*) -- Number of realizations.
            - **n_filters** (*int*) -- Number of filters used.
@@ -168,11 +171,16 @@ The current version of the statepoint file format is 18.2.
            - **n_score_bins** (*int*) -- Number of scoring bins for a single
              nuclide.
            - **score_bins** (*char[][]*) -- Values of specified scores.
-           - **results** (*double[][][2]*) -- Accumulated sum and sum-of-squares
-             for each bin of the i-th tally. The first dimension represents
-             combinations of filter bins, the second dimensions represents
-             scoring bins, and the third dimension has two entries for the sum
-             and the sum-of-squares.
+           - **results** (*double[][][]*) -- Accumulated moments for each bin
+             of the i-th tally. The first dimension represents combinations of
+             filter bins, the second dimension represents scoring bins, and
+             the third dimension holds the moments in the order sum,
+             sum-of-squares, sum of third powers, sum of fourth powers. It has
+             two entries (sum and sum-of-squares) for the moments mode 'full',
+             four for 'full' with higher moments, and one (the sum) for 'mean'
+             and 'none'. For 'none' the sum is the run total scaled once by
+             the tally normalization, so the mean is again the sum divided by
+             **n_realizations**.
 
 **/runtime/**
 

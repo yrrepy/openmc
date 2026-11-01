@@ -557,9 +557,42 @@ attributes/sub-elements:
     *Default*: replicated
 
   :moments:
-    Moments kept per bin. Only ``full`` (sum, sum of squares, and the higher
-    moments when requested) is implemented at present; ``mean`` and ``none``
-    are reserved for a future release.
+    The moments mode: which cross-batch moments are kept per bin. Accepted
+    values are:
+
+    :full:
+      The sum and the sum of squares of the batch results, plus the third and
+      fourth sums when higher moments are requested. The mean, its standard
+      deviation, the variance of the variance and tally triggers are
+      available.
+
+    :mean:
+      The sum only: one moment plane instead of two (or four), so the mean is
+      available but its standard deviation is not (the Python API reports it
+      as NaN, and ``tallies.out`` prints the mean without an uncertainty).
+      Tally triggers and higher moments cannot be used. The tally is folded
+      every batch as in ``full`` and supports restart and ``no_reduce``.
+
+    :none:
+      No moments during the run. The per-batch accumulator is never zeroed and
+      holds the run total; it is combined across ranks and scaled into one
+      sum plane only when a statepoint is written and at the end of the run,
+      so the tally needs no per-batch tally communication. The statepoint and
+      the end-of-run results (``tallies.out``, ``openmc.lib``) hold the same
+      one-plane sum as ``mean``. In addition to the ``mean`` restrictions, a
+      run cannot restart from a statepoint that holds such a tally, and the
+      mode requires tally reduction (it is not compatible with ``no_reduce``)
+      and the Monte Carlo solver (not random ray). A tally whose moments are
+      required on all ranks (the weight-window-generation tally) always keeps
+      ``full``; the global ``<exatally>`` moments default does not apply to it.
+
+    With ``mean`` or ``none`` the uncertainty must come from elsewhere: a
+    companion tally on a coarser mesh or energy grid with moments ``full``, or
+    *K* independent runs with different random number seeds, each treated as
+    one realization -- the mean of the *K* means is the estimate and the
+    standard deviation of the mean follows from their spread, exactly as in
+    batch statistics with one run per batch. OpenMC does not combine the runs
+    for you.
 
     *Default*: full
 

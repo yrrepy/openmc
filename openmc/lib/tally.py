@@ -343,7 +343,10 @@ class Tally(_FortranObjectWithID):
         The array has shape ``(n_filter_bins, n_score_bins, n_moments)`` where
         the innermost axis holds the cross-batch moments in order
         ``[SUM, SUM_SQ, ...]``. This matches the on-disk statepoint layout; there
-        is no leading ``VALUE`` column. Availability depends on the tally's
+        is no leading ``VALUE`` column. ``n_moments`` is 2 (4 with higher
+        moments) for the ExaTally moments mode ``full`` and 1 (``SUM`` only)
+        for ``mean`` and ``none``; a ``none`` tally serves results only once
+        the run has finished. Availability depends on the tally's
         accumulator mode: ``replicated`` tallies serve results on rank 0 during a
         run and on every rank once the run has finished; ``shared`` tallies
         serve them on rank 0 only; ``rma`` tallies on a multi-rank run keep no
@@ -383,6 +386,10 @@ class Tally(_FortranObjectWithID):
     @property
     def std_dev(self):
         results = self.results
+        if results.shape[2] < 2:
+            # The ExaTally moments modes 'mean' and 'none' keep the sum only,
+            # so the standard deviation is unknown
+            return np.full(results.shape[:2], np.nan)
         std_dev = np.empty(results.shape[:2])
         std_dev.fill(np.inf)
 
