@@ -109,10 +109,10 @@ public:
 
   //! Number of filter-bin rows owned by `rank` under rma block distribution.
   int64_t rma_rows_owned(int rank) const;
-#endif
 
   //! Duplicate rma staging rows merged so far (remote-coalescing diagnostic).
   int64_t rma_merged_rows() const { return rma_merged_rows_; }
+#endif
 
   //! \brief Add a contribution to the per-batch accumulator. This is the ONLY
   //! way transport writes a tally, and it is on the hot path.
