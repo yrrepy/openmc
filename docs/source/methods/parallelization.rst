@@ -628,6 +628,14 @@ for ``rma``, the moments) live:
   window, so per-node tally memory no longer scales with the number of ranks on
   the node.
 
+  Linux places each page of the node plane on the NUMA domain of the core that
+  first touches it. Every rank on the node therefore zeroes its own
+  page-aligned slice of the plane at initialization, so the plane is spread
+  over the node's NUMA domains instead of sitting on the domain of the node
+  leader. The same slices are used for the per-batch zeroing of the plane on
+  every node but the master's: after one node barrier, each rank zeroes its own
+  slice.
+
 * **rma** -- the accumulator *and* its moments are block-distributed by
   filter-bin row across all ranks, so total tally memory is divided by the
   number of ranks (per-node memory falls as roughly one plane per node divided

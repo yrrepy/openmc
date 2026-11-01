@@ -29,7 +29,9 @@ extern MPI_Comm intracomm;
 extern MPI_Comm node_comm;
 extern MPI_Comm internode_comm;
 extern int node_rank;    //!< rank within node_comm
+extern int node_size;    //!< number of ranks in node_comm
 extern bool node_leader; //!< node_rank == 0
+extern bool master_node; //!< this node holds the world master
 extern int n_nodes;      //!< number of shared-memory nodes
 
 //==============================================================================

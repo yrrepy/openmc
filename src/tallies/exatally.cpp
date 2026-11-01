@@ -350,13 +350,32 @@ void Tally::init_shared_accum()
   // win_sync memory barriers used at every batch boundary are legal MPI.
   MPI_Win_lock_all(MPI_MODE_NOCHECK, accum_win_);
 
-  // Zero the plane on the leader and publish it so every rank sees all-zeros
-  // before the first score.
-  if (mpi::node_leader)
-    std::fill(accum_, accum_ + accum_size_, 0.0);
+  // Every node rank zeroes its own page-aligned slice, then the plane is
+  // published so every rank sees all-zeros before the first score. The MPI
+  // library does not touch the pages at allocation, so this fill is their
+  // first touch: Linux places each page on the NUMA domain of the rank that
+  // zeroes it, which spreads the plane over the node instead of putting it all
+  // on the leader's domain.
+  int64_t begin, end;
+  shared_slice(begin, end);
+  std::fill(accum_ + begin, accum_ + end, 0.0);
   MPI_Win_sync(accum_win_);
   MPI_Barrier(mpi::node_comm);
   MPI_Win_sync(accum_win_);
+}
+
+void Tally::shared_slice(int64_t& begin, int64_t& end) const
+{
+  // Whole 4 KiB pages (512 doubles) per node rank, so no page is shared by two
+  // slices and page placement follows the slicing. The ceiling division makes
+  // the slices cover the plane; trailing ranks may get an empty slice.
+  constexpr int64_t PAGE_DOUBLES = 4096 / sizeof(double);
+  const int64_t n_pages = (accum_size_ + PAGE_DOUBLES - 1) / PAGE_DOUBLES;
+  const int64_t pages_per_rank =
+    (n_pages + mpi::node_size - 1) / mpi::node_size;
+  const int64_t slice = pages_per_rank * PAGE_DOUBLES;
+  begin = std::min<int64_t>(mpi::node_rank * slice, accum_size_);
+  end = std::min<int64_t>((mpi::node_rank + 1) * slice, accum_size_);
 }
 
 void Tally::shared_publish()
@@ -621,13 +640,20 @@ void Tally::rma_fold()
 
 void Tally::shared_batch_end()
 {
-  if (!mpi::master && mpi::node_leader) {
-    // A non-master node leader does not fold, but its node plane was the source
-    // of the internode reduce and still holds this node's batch sum. Zero it so
-    // it does not carry into the next batch. (The master zeroes its own plane
-    // in the fold in accumulate().)
+  if (!mpi::master_node) {
+    // A non-master node does not fold, but its node plane was the source of the
+    // internode reduce and still holds this node's batch sum. Zero it so it
+    // does not carry into the next batch. (The master zeroes its own plane in
+    // the fold in accumulate(); collect_none() reuses this routine, so there
+    // the master node keeps its run total.) After this barrier the leader has
+    // returned from the internode reduce and the plane is dead data;
+    // non-leaders must not write it before that. Each rank then zeroes its own
+    // slice, so it writes the pages that first touch placed on its NUMA domain.
+    MPI_Barrier(mpi::node_comm);
+    int64_t begin, end;
+    shared_slice(begin, end);
 #pragma omp parallel for
-    for (int64_t i = 0; i < accum_size_; ++i)
+    for (int64_t i = begin; i < end; ++i)
       accum_[i] = 0.0;
   }
 
@@ -695,9 +721,9 @@ void Tally::collect_none()
     if (mpi::master) {
       materialise_none_sum(norm);
     }
-    // Non-master leaders zero their (now combined) node plane, so a later
+    // Non-master nodes zero their (now combined) node plane, so a later
     // collect adds only new scores (a running total, never double-counted);
-    // the master keeps its plane. Then every node rank publishes the plane
+    // the master node keeps its plane. Then every node rank publishes the plane
     // and barriers before scoring resumes, so no rank scores into the master's
     // plane while the master reads it above.
     shared_batch_end();

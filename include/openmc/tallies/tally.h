@@ -242,8 +242,9 @@ public:
   //! Publishes this node's atomic scores (win_sync + node barrier), then node
   //! leaders reduce the node planes onto the world master (skipped for a
   //! single-node run). After this the master's plane holds the global sum; the
-  //! plane belongs to the node leader until shared_resume() -- non-leaders must
-  //! not touch accum_ in between. Called from reduce_tally_results().
+  //! plane belongs to the node leader until the node barrier in
+  //! shared_batch_end() -- non-leaders must not touch accum_ before it. Called
+  //! from reduce_tally_results().
   void shared_publish();
 
   //! \brief End-of-batch publish for an rma tally. Drains any thread-local
@@ -461,10 +462,17 @@ private:
   //! (win_sync + node barrier) so the next batch scores into all-zeros.
   void shared_resume();
 
-  //! \brief End-of-batch tail for a shared tally: a non-master node leader
-  //! zeroes its node plane, then every node rank calls shared_resume(). Called
-  //! by accumulate() after the master's fold.
+  //! \brief End-of-batch tail for a shared tally: on a non-master node every
+  //! node rank zeroes its shared_slice() of the node plane (after a node
+  //! barrier), then every node rank calls shared_resume(). Called by
+  //! accumulate() after the master's fold, and by collect_none().
   void shared_batch_end();
+
+  //! \brief This node rank's slice [begin, end) of the shared node plane:
+  //! equal counts of whole 4 KiB pages per node rank, clamped to accum_size_
+  //! (trailing ranks may get an empty slice). Each rank zeroes its own slice,
+  //! so first touch places those pages on its NUMA domain.
+  void shared_slice(int64_t& begin, int64_t& end) const;
 
   //! Close the passive-target epoch and free accum_win_ (idempotent).
   void free_accum_window();

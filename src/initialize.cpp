@@ -197,10 +197,30 @@ void initialize_mpi(MPI_Comm intracomm)
   // leader; world rank 0 is therefore always a node leader and is rank 0 of
   // internode_comm, so it holds the node count for the broadcast below.
   if (mpi::node_comm == MPI_COMM_NULL) {
-    MPI_Comm_split_type(intracomm, MPI_COMM_TYPE_SHARED, mpi::rank,
-      MPI_INFO_NULL, &mpi::node_comm);
+    // OPENMC_NODE_SIZE=<k> is a development seam that fakes k-rank nodes on
+    // one real node, so the multi-node shared path (internode reduce, zeroing
+    // on non-master nodes) can run on a workstation. All ranks still share
+    // memory, so the shared window over each fake node stays legal.
+    int fake_node_size = 0;
+    if (const char* env = std::getenv("OPENMC_NODE_SIZE")) {
+      fake_node_size = std::atoi(env);
+    }
+    if (fake_node_size > 0) {
+      MPI_Comm_split(
+        intracomm, mpi::rank / fake_node_size, mpi::rank, &mpi::node_comm);
+    } else {
+      MPI_Comm_split_type(intracomm, MPI_COMM_TYPE_SHARED, mpi::rank,
+        MPI_INFO_NULL, &mpi::node_comm);
+    }
     MPI_Comm_rank(mpi::node_comm, &mpi::node_rank);
+    MPI_Comm_size(mpi::node_comm, &mpi::node_size);
     mpi::node_leader = (mpi::node_rank == 0);
+    // World rank 0 is node rank 0 of its node, so it is the root of this
+    // broadcast and every rank of its node learns that it is on the master
+    // node.
+    int flag = mpi::master ? 1 : 0;
+    MPI_Bcast(&flag, 1, MPI_INT, 0, mpi::node_comm);
+    mpi::master_node = (flag != 0);
     MPI_Comm_split(intracomm, mpi::node_leader ? 0 : MPI_UNDEFINED, mpi::rank,
       &mpi::internode_comm);
     if (mpi::master)
