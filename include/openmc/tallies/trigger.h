@@ -57,5 +57,13 @@ void check_triggers();
 //! metadata, so it returns the same value on every rank.
 bool has_rma_triggers();
 
+//! \brief Reduce the limiting trigger across ranks for rma tallies (MPI
+//! builds only).
+//!
+//! MAXLOC-reduces {ratio, rank} over all ranks; the owning rank sends its
+//! tally id and score to the master. Collective: call on every rank, and only
+//! when has_rma_triggers() is true.
+void rma_reduce_trigger(double& ratio, int& tally_id, int& score);
+
 } // namespace openmc
 #endif // OPENMC_TALLIES_TRIGGER_H

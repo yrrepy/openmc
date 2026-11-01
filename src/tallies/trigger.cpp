@@ -57,21 +57,6 @@ std::pair<double, double> get_tally_uncertainty(
 //! param[out] tally_id The ID number of the most limiting tally
 //! param[out] score The most limiting tally score bin
 
-bool has_rma_triggers()
-{
-#ifdef OPENMC_MPI
-  for (const auto& t : model::tallies) {
-    if (t->storage() != TallyStorage::RMA)
-      continue;
-    for (const auto& trigger : t->triggers_) {
-      if (trigger.metric != TriggerMetric::not_active)
-        return true;
-    }
-  }
-#endif
-  return false;
-}
-
 void check_tally_triggers(double& ratio, int& tally_id, int& score)
 {
   ratio = 0.;
@@ -167,32 +152,8 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
   }
 
 #ifdef OPENMC_MPI
-  // For rma tallies each rank has only walked its owned rows, so the most
-  // limiting trigger lives on whichever rank owns it. Reduce {ratio, rank} with
-  // MAXLOC to find the global maximum and the (lowest) rank holding it; that
-  // rank ships its tally id / score to the master, which alone forms the
-  // diagnostic message and the satisfy/continue decision from the global ratio.
-  // The reduction runs iff has_rma_triggers() -- exactly when every rank calls
-  // this function (see finalize_batch) -- so it is never a half-collective.
-  if (has_rma_triggers()) {
-    struct {
-      double val;
-      int rank;
-    } in {ratio, mpi::rank}, out {};
-    MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, mpi::intracomm);
-    ratio = out.val;
-    if (out.rank != 0) {
-      int buf[2] {tally_id, score};
-      if (mpi::rank == out.rank) {
-        MPI_Send(buf, 2, MPI_INT, 0, TAG_RMA_TRIGGER, mpi::intracomm);
-      } else if (mpi::master) {
-        MPI_Recv(buf, 2, MPI_INT, out.rank, TAG_RMA_TRIGGER, mpi::intracomm,
-          MPI_STATUS_IGNORE);
-        tally_id = buf[0];
-        score = buf[1];
-      }
-    }
-  }
+  if (has_rma_triggers())
+    rma_reduce_trigger(ratio, tally_id, score);
 #endif
 }
 

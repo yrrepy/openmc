@@ -415,9 +415,19 @@ private:
   //! all-zeros.
   void rma_resume();
 
+  //! \brief End-of-batch fold for an rma tally: fold this rank's owned rows
+  //! (window block plus private plane) into the moments, zero both planes,
+  //! then rma_resume(). Called by accumulate().
+  void rma_fold();
+
   //! \brief End-of-batch resume for a shared tally: publish the zeroed plane
   //! (win_sync + node barrier) so the next batch scores into all-zeros.
   void shared_resume();
+
+  //! \brief End-of-batch tail for a shared tally: a non-master node leader
+  //! zeroes its node plane, then every node rank calls shared_resume(). Called
+  //! by accumulate() after the master's fold.
+  void shared_batch_end();
 
   //! Close the passive-target epoch and free accum_win_ (idempotent).
   void free_accum_window();
