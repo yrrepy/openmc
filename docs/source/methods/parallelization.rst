@@ -637,10 +637,17 @@ for ``rma``, the moments) live:
   slice.
 
 * **rma** -- the accumulator *and* its moments are block-distributed by
-  filter-bin row across all ranks, so total tally memory is divided by the
-  number of ranks (per-node memory falls as roughly one plane per node divided
-  by the number of nodes). Transport is replicated rather than
-  domain-decomposed, so most scores target bins owned by other ranks. A rank
+  filter-bin row across all ranks, so each rank holds only its share of a
+  fixed total of about four planes (two with moments ``none``), and per-node
+  tally memory falls as the number of nodes grows. Transport is replicated
+  rather than
+  domain-decomposed, so most scores target bins owned by other ranks. This is
+  the opposite choice from OpenMC's earlier domain-decomposed terabyte-tally
+  work [Horelik2014]_, which partitioned the geometry, moved particles between
+  domains, and let each rank tally only its own region: ExaTallies keeps every
+  history on the rank that started it and partitions only the tally data, so
+  the random walk, the source convergence and the load balance are those of
+  the replicated run. A rank
   writes bins it owns into a private plane and accumulates contributions to
   remote bins into other ranks' blocks with one-sided ``MPI_Accumulate``. To
   keep one-sided operations off the per-score critical path, scores are
@@ -651,8 +658,9 @@ for ``rma``, the moments) live:
   [Romano2011]_ and [Dun2015]_; both are implemented here independently on
   MPI-3. The tally-server alternative -- dedicating ranks to hold tally memory
   and forwarding scores to them -- is analyzed in [Romano2013]_. Results are
-  read from the statepoint file, to which each rank writes (and from which each
-  rank reads back) only its owned rows.
+  read from the statepoint file: for the write the master gathers the owned
+  rows of every rank in bounded chunks, and on restart each rank reads back
+  only its own rows.
 
   The private plane is a deliberate memory cost. The window block is touched
   only by ``MPI_Accumulate`` while scoring is in flight -- mixing CPU
@@ -666,7 +674,8 @@ for ``rma``, the moments) live:
   the default two moments about one third more than the theoretical
   :math:`(1 + n_\text{moments}) / N` minimum -- though it still falls as
   :math:`1/N`. Users sizing runs against this memory model should budget for the
-  extra plane.
+  extra plane, and for the staging buffers of the remote scoring path, which
+  take a fixed budget of 64 MiB per rank shared by all ``rma`` tallies.
 
 The ``<moments>`` sub-element (the moments mode) selects which cross-batch
 moments are kept, independently of the accumulator mode. ``full`` keeps
@@ -711,6 +720,12 @@ bins) on :math:`N` ranks; :math:`M` is 2, or 4 with higher moments.
      - :math:`2/N` per rank; + :math:`1/N` at each statepoint and at the end of
        the run
 
+Two cases add to the table. At the end of a run a ``replicated`` tally
+broadcasts its moments to every rank, so each rank then holds :math:`M` planes
+(1 for ``mean`` and ``none``); ``shared`` and ``rma`` tallies skip this
+broadcast and are read from the statepoint. Under ``no_reduce`` every rank
+folds its own moments and holds :math:`M` planes throughout the run.
+
 All three modes preserve the statistical semantics of the ``replicated``
 default. Because scores accumulate locally within a batch and are reduced or
 folded exactly once per batch, the sample mean is statistically exact --
@@ -736,28 +751,30 @@ distributed tally storage with on-node shared-memory parallelism (the
 .. _methods_parallel_thread_level:
 
 MPI thread level
-++++++++++++++++++
+----------------
 
 The ``rma`` mode is the first place OpenMC issues MPI calls from inside an
 OpenMP parallel region (the transport scoring loop). Those calls are serialized
-with a single named ``omp critical`` section, so OpenMC initializes MPI with
-``MPI_THREAD_SERIALIZED`` rather than the more permissive
+with a single named ``omp critical`` section, so an OpenMC built with OpenMP
+initializes MPI with ``MPI_THREAD_SERIALIZED`` rather than the more permissive
 ``MPI_THREAD_MULTIPLE``. This is deliberate: the MCNP 6.3 storage-backend
 experience documents a throughput collapse when many threads issue concurrent
 one-sided operations under ``MPI_THREAD_MULTIPLE`` on some fabrics
 [Josey2021]_. Dropping the critical section for genuinely concurrent
-``MPI_Accumulate`` is a possible optimization, but it is gated on a fabric
-micro-benchmark on the target machine and is not enabled by default.
+``MPI_Accumulate`` is a possible optimization, but it is not implemented: it
+is gated on a fabric micro-benchmark on the target machine.
 
 Parallel HDF5 caveats
-++++++++++++++++++++++
+---------------------
 
-The ``rma`` statepoint gather and restart use the same master-serial HDF5 path
-as the other modes by default, so they do not require a Parallel HDF5 build. If
-Parallel HDF5 is used, collective tally I/O can be very sensitive to the
-underlying filesystem -- it performs well on parallel filesystems such as Lustre
-but can stall on NFS -- which is why collective/chunked statepoint writing is an
-opt-in rather than the default [Rising2025]_.
+The ``rma`` statepoint write uses the same master-serial HDF5 path as the other
+modes. On restart every rank reads its own rows from the file, as one
+collective read under Parallel HDF5 and from its own file handle otherwise.
+Neither requires a Parallel HDF5 build. Collective tally I/O can be very
+sensitive to the underlying filesystem -- it performs well on parallel
+filesystems such as Lustre but can stall on NFS -- so a collective or chunked
+statepoint write, should one be added, would be an opt-in rather than the
+default [Rising2025]_.
 
 .. only:: html
 
@@ -787,6 +804,11 @@ opt-in rather than the default [Rising2025]_.
 .. [Romano2013b] P. K. Romano, "Parallel Algorithms for Monte Carlo Particle
    Transport Simulation on Exascale Computing Architectures," Ph.D. thesis,
    Massachusetts Institute of Technology (2013).
+
+.. [Horelik2014] N. Horelik, A. Siegel, B. Forget, and K. Smith, "Monte Carlo
+   domain decomposition for robust nuclear reactor analysis," *Parallel
+   Comput.*, **40**, 646--660 (2014). `doi:10.1016/j.parco.2014.10.001
+   <https://doi.org/10.1016/j.parco.2014.10.001>`_.
 
 .. [Dun2015] N. Dun, H. Fujita, J. R. Tramm, A. A. Chien, and A. R. Siegel,
    "Data Decomposition in Monte Carlo Neutron Transport Simulations using Global

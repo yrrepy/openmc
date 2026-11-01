@@ -538,15 +538,16 @@ attributes/sub-elements:
     :rma:
       Both the per-batch accumulator and its cross-batch moments are
       block-distributed across *all* MPI ranks (each rank owns a contiguous
-      block of filter-bin rows), so per-node tally memory falls as roughly one
-      plane per node divided by the number of nodes. During transport a rank
-      scores its own filter bins into a private plane and stages remote
-      contributions into batched one-sided ``MPI_Accumulate`` operations.
-      Results are written to (and restarted from) the statepoint file via an
-      owner-to-master gather; on multi-rank runs the ``tallies.out`` summary and
-      in-memory ``openmc.lib`` readout are not available for ``rma`` tallies (a
-      single-rank ``rma`` tally holds its full results and serves them
-      normally). Requires an MPI- and OpenMP-enabled build and the Monte Carlo
+      block of filter-bin rows), so the total tally memory is about four planes
+      (two with moments ``none``) spread over all ranks, and falls as the number
+      of nodes grows. During transport a rank scores its own filter bins into a
+      private plane and stages remote contributions into batched one-sided
+      ``MPI_Accumulate`` operations. For the statepoint write the master
+      gathers the owned rows of every rank; on restart each rank reads back its
+      own rows. On multi-rank runs the ``tallies.out`` summary, the
+      unstructured-mesh output and the in-memory ``openmc.lib`` readout are not
+      available for ``rma`` tallies (a single-rank ``rma`` tally holds its full
+      results and serves them normally). Requires an MPI- and OpenMP-enabled build and the Monte Carlo
       solver, and is not compatible with ``no_reduce``, CMFD, or event-based
       transport. A tally whose moments are required on all ranks (the
       weight-window-generation tally) always keeps the ``replicated``
@@ -570,8 +571,9 @@ attributes/sub-elements:
       The sum only: one moment plane instead of two (or four), so the mean is
       available but its standard deviation is not (the Python API reports it
       as NaN, and ``tallies.out`` prints the mean without an uncertainty).
-      Tally triggers and higher moments cannot be used. The tally is folded
-      every batch as in ``full`` and supports restart and ``no_reduce``.
+      Tally triggers and higher moments cannot be used, and the tally cannot
+      drive a weight-window update. The tally is folded every batch as in
+      ``full`` and supports restart and ``no_reduce``.
 
     :none:
       No moments during the run. The per-batch accumulator is never zeroed and
@@ -580,11 +582,15 @@ attributes/sub-elements:
       so the tally needs no per-batch tally communication. The statepoint and
       the end-of-run results (``tallies.out``, ``openmc.lib``) hold the same
       one-plane sum as ``mean``. In addition to the ``mean`` restrictions, a
-      run cannot restart from a statepoint that holds such a tally, and the
-      mode requires tally reduction (it is not compatible with ``no_reduce``)
-      and the Monte Carlo solver (not random ray). A tally whose moments are
-      required on all ranks (the weight-window-generation tally) always keeps
-      ``full``; the global ``<exatally>`` moments default does not apply to it.
+      run cannot restart from a statepoint that holds such a tally, the mode
+      requires tally reduction (it is not compatible with ``no_reduce``) and
+      the Monte Carlo solver (not random ray), and with the ``shared`` or
+      ``rma`` accumulator the tally cannot be reset through the C API while a
+      simulation is running.
+
+    A tally whose moments are required on all ranks (the tally that generates
+    weight windows) always keeps ``full``; the global ``<exatally>`` moments
+    default does not apply to it.
 
     With ``mean`` or ``none`` the uncertainty must come from elsewhere: a
     companion tally on a coarser mesh or energy grid with moments ``full``, or

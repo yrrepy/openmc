@@ -177,9 +177,10 @@ class Settings:
         Default ExaTallies accumulator/moments modes for all tallies. The
         accumulator mode controls how the per-batch accumulator is distributed
         across MPI ranks; 'replicated' (the built-in default) keeps a full
-        private copy on every rank. A mode left unset keeps the built-in
-        default. Individual tallies can override this via
-        :attr:`openmc.Tally.exatally`.
+        private copy on every rank. The moments mode controls which cross-batch
+        moments are kept per bin; 'full' (the built-in default) keeps the sum
+        and the sum of squares. A mode left unset keeps the built-in default.
+        Individual tallies can override this via :attr:`openmc.Tally.exatally`.
 
         .. versionadded:: 0.16.1
     output : dict

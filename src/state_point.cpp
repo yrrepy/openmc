@@ -37,15 +37,16 @@
 namespace openmc {
 
 //==============================================================================
-// rma tally statepoint gather / restart scatter
+// rma tally statepoint gather / per-owner restart read
 //
 // Under the rma accumulator mode a tally's moments are block-distributed by
 // filter-bin row across all ranks, so no rank holds the whole array. The
-// statepoint therefore gathers rows to the master on write and scatters them
-// back to their owners on restart, both in bounded chunks so an individual MPI
-// call never exceeds the int element-count limit. The reduce-path master-serial
-// file format is unchanged (a single [n_filter, n_score, n_moments] "results"
-// dataset), so Python readers are untouched and there is no version bump.
+// statepoint therefore gathers rows to the master on write, in bounded chunks
+// so an individual MPI call never exceeds the int element-count limit, and on
+// restart each rank reads back only its own rows (see below). The reduce-path
+// master-serial file format is unchanged (a single [n_filter, n_score,
+// n_moments] "results" dataset), so Python readers are untouched and there is
+// no version bump.
 //==============================================================================
 
 namespace {
