@@ -8,6 +8,7 @@
 #include "openmc/capi.h"
 #include "openmc/constants.h"
 #include "openmc/error.h"
+#include "openmc/message_passing.h"
 #include "openmc/reaction.h"
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
@@ -28,14 +29,8 @@ KTrigger keff_trigger;
 //==============================================================================
 
 std::pair<double, double> get_tally_uncertainty(
-  int i_tally, int score_index, int64_t filter_index)
+  double sum, double sum_sq, int n)
 {
-  const auto& tally {model::tallies[i_tally]};
-
-  auto sum = tally->results_(filter_index, score_index, TallyResult::SUM);
-  auto sum_sq = tally->results_(filter_index, score_index, TallyResult::SUM_SQ);
-
-  int n = tally->n_realizations_;
   auto mean = sum / n;
 
   // if the result has no contributions, return an invalid pair
@@ -58,8 +53,26 @@ std::pair<double, double> get_tally_uncertainty(
 void check_tally_triggers(double& ratio, int& tally_id, int& score)
 {
   ratio = 0.;
-  for (auto i_tally = 0; i_tally < model::tallies.size(); ++i_tally) {
+  tally_id = 0;
+  score = 0;
+  bool found_no_contribution = false;
+
+  for (auto i_tally = 0;
+       i_tally < model::tallies.size() && !found_no_contribution; ++i_tally) {
     const Tally& t {*model::tallies[i_tally]};
+
+#ifdef OPENMC_MPI
+    // Under rma each rank walks only the moment rows it owns; every other mode
+    // homes the moments on the master, so only the master walks those. A rank
+    // that owns nothing (or a non-master rank on a replicated tally) simply
+    // contributes ratio 0 to the reduction below.
+    const bool is_rma = (t.accumulator() == AccumulatorMode::RMA);
+    if (!is_rma && !mpi::master)
+      continue;
+    const int64_t n_rows = is_rma ? t.rma_n_rows() : t.n_filter_bins();
+#else
+    const int64_t n_rows = t.n_filter_bins();
+#endif
 
     // Ignore tallies with less than two realizations.
     if (t.n_realizations_ < 2)
@@ -70,23 +83,44 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
       if (trigger.metric == TriggerMetric::not_active)
         continue;
 
-      const auto& results = t.results_;
-      for (int64_t filter_index = 0; filter_index < results.shape(0);
-           ++filter_index) {
-        // Compute the tally uncertainty metrics.
-        auto uncert_pair =
-          get_tally_uncertainty(i_tally, trigger.score_index, filter_index);
+      // Walk the rows on all threads. Each thread keeps the largest ratio of
+      // its rows; the maximum is order-independent, so the result is the
+      // serial walk's. A non-ignored zero bin anywhere gives the same result
+      // as the first one the serial walk stops at, so once any thread finds
+      // one, every thread skips its remaining rows. The raw moments pointer
+      // and strides avoid indexing through the tensor per bin; the doubles
+      // read are the same.
+      const double* m = t.moments().data();
+      const int64_t n_mom = static_cast<int64_t>(t.moments().shape(2));
+      const int64_t row_stride = t.n_score_bins() * n_mom;
+      const int64_t col = trigger.score_index * n_mom;
+      const int n = t.n_realizations_;
+      double best = ratio;
+      bool zero_bin = false;
 
-        // If there is a score without contributions, skip it when zero
-        // scores are ignored for this trigger; otherwise set ratio to inf
-        // and exit early.
+#pragma omp parallel for schedule(static) reduction(max : best)
+      for (int64_t filter_index = 0; filter_index < n_rows; ++filter_index) {
+        bool stop;
+#pragma omp atomic read
+        stop = zero_bin;
+        if (stop)
+          continue;
+
+        // Compute the tally uncertainty metrics.
+        const double* cell = m + filter_index * row_stride + col;
+        auto uncert_pair =
+          get_tally_uncertainty(cell[static_cast<int>(TallyMoment::SUM)],
+            cell[static_cast<int>(TallyMoment::SUM_SQ)], n);
+
+        // A score without contributions is skipped when zero scores are
+        // ignored for this trigger; otherwise it forces the maximum ratio
+        // (handled after the loop).
         if (uncert_pair.first == -1) {
-          if (trigger.ignore_zeros)
-            continue;
-          ratio = INFINITY;
-          score = t.scores_[trigger.score_index];
-          tally_id = t.id_;
-          return;
+          if (!trigger.ignore_zeros) {
+#pragma omp atomic write
+            zero_bin = true;
+          }
+          continue;
         }
 
         double std_dev = uncert_pair.first;
@@ -118,15 +152,35 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
           this_ratio = std::sqrt(this_ratio);
         }
 
-        // If this is the most uncertain value, set the output variables.
-        if (this_ratio > ratio) {
-          ratio = this_ratio;
-          score = t.scores_[trigger.score_index];
-          tally_id = t.id_;
-        }
+        if (this_ratio > best)
+          best = this_ratio;
+      }
+
+      // A score without contributions forces the maximum ratio. Record it and
+      // stop scanning -- but fall through to the cross-rank reduction rather
+      // than returning, so a collective rma check is still reached on every
+      // rank.
+      if (zero_bin) {
+        ratio = INFINITY;
+        score = t.scores_[trigger.score_index];
+        tally_id = t.id_;
+        found_no_contribution = true;
+        break;
+      }
+
+      // If this is the most uncertain value, set the output variables.
+      if (best > ratio) {
+        ratio = best;
+        score = t.scores_[trigger.score_index];
+        tally_id = t.id_;
       }
     }
   }
+
+#ifdef OPENMC_MPI
+  if (has_rma_triggers())
+    rma_reduce_trigger(ratio, tally_id, score);
+#endif
 }
 
 //! Compute the uncertainty/threshold ratio for the eigenvalue trigger.
@@ -179,11 +233,21 @@ void check_triggers()
   if (((current_batch - n_batches) % interval) != 0)
     return;
 
-  // Check the eigenvalue and tally triggers.
-  double keff_ratio = check_keff_trigger();
+  // Check the eigenvalue and tally triggers. The eigenvalue metric and the
+  // satisfy/continue decision are master-only, but check_tally_triggers is
+  // collective when an rma tally carries a trigger (its owned-row walks are
+  // partial), so every rank must reach it -- finalize_batch invokes
+  // check_triggers on all ranks in exactly that case.
+  double keff_ratio = mpi::master ? check_keff_trigger() : 0.0;
   double tally_ratio;
   int tally_id, score;
   check_tally_triggers(tally_ratio, tally_id, score);
+
+  // The remaining work (messaging, batch prediction, and setting
+  // satisfy_triggers) belongs to the master; the flag is then broadcast from
+  // finalize_batch as the sole decision channel.
+  if (!mpi::master)
+    return;
 
   // If all the triggers are satisfied, alert the user and return.
   if (std::max(keff_ratio, tally_ratio) <= 1.) {

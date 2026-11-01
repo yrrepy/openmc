@@ -23,8 +23,45 @@
 
 #include <numeric>
 #include <string>
+#include <utility>
 
 namespace openmc {
+
+namespace {
+
+//! Per-thread list of the (filter index, weight) combinations of one event,
+//! reused across events so that collecting them allocates nothing.
+vector<std::pair<int64_t, double>>& event_filter_bins()
+{
+  thread_local vector<std::pair<int64_t, double>> bins;
+  return bins;
+}
+
+//! Collect the valid filter bin combinations of the current event, from
+//! filter_iter to end, into event_filter_bins() and prefetch their accumulator
+//! rows, so that the scoring loop which replays them finds the rows in cache.
+//
+//! Returns false and collects nothing for a tally with a delayed-group or
+//! energyout filter: score_fission_delayed_dg() and score_fission_eout()
+//! rebuild the filter index from the live bin cursors of the filter matches,
+//! which must stand at the combination being scored, so such a tally walks the
+//! iterator lazily while it scores.
+bool collect_filter_bins(
+  const Tally& tally, FilterBinIter& filter_iter, const FilterBinIter& end)
+{
+  if (tally.delayedgroup_filter_ != C_NONE || tally.energyout_filter_ != C_NONE)
+    return false;
+
+  auto& bins = event_filter_bins();
+  bins.clear();
+  for (; filter_iter != end; ++filter_iter) {
+    bins.emplace_back(filter_iter.index_, filter_iter.weight_);
+    tally.prefetch_row(filter_iter.index_);
+  }
+  return true;
+}
+
+} // namespace
 
 //==============================================================================
 // FilterBinIter implementation
@@ -168,10 +205,8 @@ void score_fission_delayed_dg(int i_tally, int d_bin, double score,
     filter_weight *= match.weights_[i_bin];
   }
 
-// Update the tally result
-#pragma omp atomic
-  tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-    score * filter_weight;
+  // Update the tally result
+  tally.score_add(filter_index, score_index, score * filter_weight);
 
   // Reset the original delayed group bin
   dg_match.bins_[i_bin] = original_bin;
@@ -459,10 +494,8 @@ void score_fission_eout(Particle& p, int i_tally, int i_score, int score_bin)
         filter_weight *= match.weights_[i_bin];
       }
 
-// Update tally results
-#pragma omp atomic
-      tally.results_(filter_index, i_score, TallyResult::VALUE) +=
-        score * filter_weight;
+      // Update tally results
+      tally.score_add(filter_index, i_score, score * filter_weight);
 
     } else if (score_bin == SCORE_DELAYED_NU_FISSION && g != 0) {
 
@@ -507,10 +540,8 @@ void score_fission_eout(Particle& p, int i_tally, int i_score, int score_bin)
           filter_weight *= match.weights_[i_bin];
         }
 
-// Update tally results
-#pragma omp atomic
-        tally.results_(filter_index, i_score, TallyResult::VALUE) +=
-          score * filter_weight;
+        // Update tally results
+        tally.score_add(filter_index, i_score, score * filter_weight);
       }
     }
   }
@@ -1099,10 +1130,8 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
       apply_derivative_to_score(
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
-// Update tally results
-#pragma omp atomic
-    tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-      score * filter_weight;
+    // Update tally results
+    tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -1603,10 +1632,8 @@ void score_general_ce_analog(Particle& p, int i_tally, int start_index,
       apply_derivative_to_score(
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
-// Update tally results
-#pragma omp atomic
-    tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-      score * filter_weight;
+    // Update tally results
+    tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -2299,10 +2326,8 @@ void score_general_mg(Particle& p, int i_tally, int start_index,
       continue;
     }
 
-// Update tally results
-#pragma omp atomic
-    tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-      score * filter_weight;
+    // Update tally results
+    tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
 
@@ -2324,10 +2349,14 @@ void score_analog_tally_ce(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
-    for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2368,10 +2397,14 @@ void score_analog_tally_mg(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
-    for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2422,10 +2455,14 @@ void score_tracklength_tally_general(
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
-    for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2552,10 +2589,14 @@ void score_collision_tally(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
-    for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2635,8 +2676,7 @@ void score_meshsurface_tally(Particle& p, const vector<int>& tallies)
       double score = current * filter_weight;
       for (auto score_index = 0; score_index < tally.scores_.size();
            ++score_index) {
-#pragma omp atomic
-        tally.results_(filter_index, score_index, TallyResult::VALUE) += score;
+        tally.score_add(filter_index, score_index, score);
       }
     }
 
@@ -2698,9 +2738,7 @@ void score_surface_tally(
           // SCORE_FLUX: surface-crossing estimator phi_S = sum(w / |mu|).
           score = wgt / abs_mu;
         }
-#pragma omp atomic
-        tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-          score * filter_weight;
+        tally.score_add(filter_index, score_index, score * filter_weight);
       }
     }
     // If the user has specified that we can assume all tallies are spatially
@@ -2769,9 +2807,7 @@ void score_pulse_height_tally(Particle& p, const vector<int>& tallies)
           // Loop over scores.
           for (auto score_index = 0; score_index < tally.scores_.size();
                ++score_index) {
-#pragma omp atomic
-            tally.results_(filter_index, score_index, TallyResult::VALUE) +=
-              filter_weight;
+            tally.score_add(filter_index, score_index, filter_weight);
           }
         }
       }

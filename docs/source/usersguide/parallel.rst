@@ -72,6 +72,186 @@ argument to :func:`openmc.run`::
 Distributed memory calculations with the random ray solver for DAGMC geometries 
 require MOAB version 5.2.0 or later.
 
+.. _usersguide_exatallies:
+
+----------------------------------------
+Large Tallies on Many Ranks (ExaTallies)
+----------------------------------------
+
+A tally with a fine mesh filter and a fine energy filter can need tens of
+gigabytes per copy. By default every MPI rank keeps its own copy, so on a node
+with many ranks the tallies, not the particles, decide whether a run fits in
+memory. ExaTallies adds two per-tally settings that change where a tally is
+stored and how much of it is kept. They do not change how particles are
+tracked or how scores are made, and the tally means are those of a default run
+to within floating-point round-off.
+
+* The **accumulator mode** selects where the per-batch accumulator is stored:
+  ``replicated`` (one copy per rank, the default), ``shared`` (one copy per
+  node, in MPI-3 shared memory) or ``rma`` (one copy in total, distributed
+  across all ranks by filter-bin row, together with the moments).
+* The **moments mode** selects which cross-batch moments are kept: ``full``
+  (sum and sum of squares, the default), ``mean`` (sum only) or ``none`` (no
+  moments during the run; the run total is collected only when a statepoint is
+  written and at the end of the run).
+
+Set the global default on :class:`openmc.Settings` and override it per tally
+with :class:`openmc.ExaTally`::
+
+   settings.exatally = openmc.ExaTally(accumulator='shared')
+
+   flux = openmc.Tally(name='fine flux')
+   flux.filters = [mesh_filter, energy_filter]
+   flux.scores = ['flux']
+   flux.exatally = openmc.ExaTally(moments='none')
+
+   coarse = openmc.Tally(name='coarse flux')
+   coarse.filters = [coarse_mesh_filter]
+   coarse.scores = ['flux']
+   coarse.exatally = openmc.ExaTally(moments='full')
+
+In XML the same settings are the ``<exatally>`` element of :ref:`settings.xml
+<settings_exatally>` and of each tally in :ref:`tallies.xml <io_tallies>`.
+Modes can be mixed across the tallies of one run, as above: the large tally
+carries no moments, and the small tally on the coarse mesh provides the
+uncertainty.
+
+**How much memory a tally needs.** One *plane* is one double per tally bin:
+the number of filter bins times the number of score bins times 8 bytes. The
+table gives the tally memory of a flux tally on a mesh of 200,000 voxels with
+16,000 energy groups, for which one plane is 25.6 GB, on nodes that run 48 MPI
+ranks each. The full memory model is in :ref:`methods_parallel_exatallies`.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 40 36
+
+   * - Accumulator / moments
+     - Tally memory
+     - What is held
+   * - ``replicated`` / ``full``
+     - 1.28 TB on the node of rank 0, 1.23 TB on every other node
+     - one accumulator plane per rank, plus two moment planes on rank 0
+   * - ``shared`` / ``full``
+     - 77 GB on the node of rank 0, 26 GB on every other node
+     - one accumulator plane per node, plus two moment planes on rank 0
+   * - ``shared`` / ``mean``
+     - 51 GB on the node of rank 0, 26 GB on every other node
+     - one accumulator plane per node, plus one moment plane on rank 0
+   * - ``shared`` / ``mean`` + a 175-group projection
+     - 52 GB on the node of rank 0, 26 GB on every other node
+     - as ``mean``, plus 0.84 GB on rank 0 for the projection's sum, sum of
+       squares and current realization
+   * - ``shared`` / ``none``
+     - 26 GB per node, plus 26 GB on the node of rank 0 while a statepoint is
+       written and at the end of the run
+     - one accumulator plane per node, no moment plane during the run
+   * - ``rma`` / ``full``
+     - 102 GB in total, divided evenly over all ranks
+     - two accumulator planes and two moment planes, each distributed
+   * - ``rma`` / ``none``
+     - 51 GB in total, divided evenly over all ranks, plus 26 GB in total
+       while a statepoint is written and at the end of the run
+     - two accumulator planes, each distributed, no moment plane during the
+       run
+
+The table shows the memory held between batches. Short transients come on top
+of it: + up to 1 GB per rank during each reduction (the per-batch reduction of
+``replicated``, the reduction between nodes of ``shared``, and the collection
+of a ``none`` tally), + two 64 MiB receive buffers on rank 0 during an ``rma``
+statepoint write, and, for ``rma``, the staging of remote scores, sized from
+a 64 MiB per-rank budget; a warning is printed when the budget holds fewer
+than eight rows per buffer, or not even the minimum of one.
+Restart from a statepoint adds nothing on a rank that holds no moments.
+
+**Choosing the accumulator mode.**
+
+- Use ``shared`` whenever several MPI ranks run on each node and one plane
+  fits in the memory of a node. It is the mode to try first: tally memory
+  stops growing with the number of ranks per node, and the scoring rate does
+  not drop, because the per-batch reduction shrinks to one plane per node. It
+  needs a build with both MPI and OpenMP and the Monte Carlo solver, 
+  and it cannot be combined with ``no_reduce`` or CMFD.
+- Use ``rma`` when one plane does not fit on a node, or when the run spans
+  many nodes. ``rma`` holds about four planes (two with moments ``none``) in
+  total over all ranks, against one per node for ``shared``, so it saves
+  memory over ``shared`` only beyond about four nodes (two with ``none``), and
+  it pays for the saving with scoring rate: nearly every score goes to a bin
+  owned by another rank and crosses the network. It has the requirements of
+  ``shared`` and is not available in event-based mode. On runs with more than
+  one rank, the results of an ``rma`` tally are available only in the
+  statepoint file, not in ``tallies.out`` or through :mod:`openmc.lib`.
+- Global tallies, including :math:`k_\text{eff}`, always stay replicated, and
+  the tally that generates weight windows always keeps ``replicated`` and
+  ``full``, whatever the global default. Under MPI the weight-window update
+  runs on rank 0, which broadcasts the new bounds to all ranks. A tally passed
+  to :meth:`openmc.lib.WeightWindows.update_magic` needs moments ``full`` and,
+  on more than one rank, the ``replicated`` or ``shared`` accumulator mode;
+  every rank must make the call.
+
+**Choosing the moments mode.**
+
+- Keep ``full`` when you need the standard deviation of the tally, tally
+  triggers or higher moments.
+- Use ``mean`` when the mean is enough. It drops one moment plane on rank 0
+  and otherwise behaves like ``full``, including restart from a statepoint.
+- Use ``none`` for the largest tallies whose result is consumed as a mean,
+  such as a fine flux spectrum that is later collapsed for an activation
+  calculation. The tally then causes no communication at all between batches.
+  A run cannot restart from a statepoint that contains such a tally, and the
+  mode needs tally reduction (no ``no_reduce``) and the Monte Carlo solver.
+- With ``mean``, declare projections for the collapsed quantities you need
+  uncertainties for, for example the flux of each voxel in 175 groups or in
+  total, or the spectrum of the whole mesh. Each projection keeps the sum and
+  the sum of squares of its own batch realizations, so its standard deviation
+  is exact, including the covariance of the fine groups it sums, for a small
+  fraction of the memory of one plane. Put the filter you collapse last in
+  the tally's filter list::
+
+     coarse = openmc.EnergyFilter.from_group_structure('VITAMIN-J-175')
+     flux.exatally = openmc.ExaTally(
+         moments='mean',
+         projections={'coarse': [mesh_filter, coarse],
+                      'total': [mesh_filter],
+                      'spectrum': [coarse]})
+
+  The coarse energy filter must be nested in the tally's energy filter: each
+  of its boundaries must be one of the tally's boundaries.
+- With ``mean`` or ``none`` the uncertainty can otherwise come from a
+  companion tally with ``full`` on a coarser mesh or energy grid, or from
+  independent runs with different random number seeds (see the ``moments``
+  entry of :ref:`settings_exatally`).
+
+**Running and reading the results.** ``shared`` lets you run many MPI ranks
+per node, for example one per NUMA domain or one per core, without
+multiplying tally memory; the shared plane is spread over the NUMA domains of
+the node. ``rma`` needs MPI initialized with at least
+``MPI_THREAD_SERIALIZED`` when more than one OpenMP thread is used; OpenMC
+requests this itself, and a program that initializes MPI before OpenMC (for
+example through ``mpi4py``) must do the same. Results are read as always with
+:class:`openmc.StatePoint`. On more than one rank the in-memory results of a
+``shared`` tally live on rank 0 only, so a consumer that reads tally results
+on every rank, such as the coupled operator of :mod:`openmc.deplete` under MPI
+or any :mod:`openmc.lib` reader on another rank, needs ``replicated`` or a
+statepoint readout. For a tally with moments ``mean`` or ``none``,
+:attr:`openmc.Tally.std_dev` is NaN, :attr:`openmc.Tally.sum_sq` is None, and
+``tallies.out`` prints the mean without an uncertainty. The statepoint records
+the moments mode of each tally, and :class:`openmc.StatePoint` sets
+:attr:`openmc.Tally.exatally` on the tallies whose mode is ``mean`` or
+``none``. The projections of a tally are read as
+:attr:`openmc.Tally.projections`, a dictionary of derived tallies by
+projection name, each with the projected filters, the mean and the standard
+deviation, which support the usual analysis methods such as
+:meth:`openmc.Tally.get_pandas_dataframe` and :meth:`openmc.Tally.get_slice`::
+
+   with openmc.StatePoint('statepoint.100.h5') as sp:
+       flux = sp.get_tally(name='fine flux')
+       coarse = flux.projections['coarse']
+       print(coarse.mean, coarse.std_dev)
+
+Projections are not printed in ``tallies.out`` and are not available through
+:mod:`openmc.lib`.
+
 ----------------------
 Maximizing Performance
 ----------------------
@@ -96,6 +276,11 @@ performance on a machine when running in parallel:
 - **Use process binding**. When running with MPI, you should ensure that
   processes are bound_ to a specific hardware region. This can be set using the
   ``-bind-to`` (MPICH) or ``--bind-to`` (OpenMPI) option to ``mpiexec``.
+- **Use the ExaTallies modes for large tallies**. A tally with millions of
+  bins should use the ``shared`` or ``rma`` accumulator mode, and the ``mean``
+  or ``none`` moments mode when its standard deviation is not needed, so that
+  tally memory does not grow with the number of ranks per node. See
+  :ref:`usersguide_exatallies`.
 - **Turn off generation of tallies.out**. For large simulations with millions of
   tally bins or more, generating this ASCII file might consume considerable
   time. You can turn off generation of ``tallies.out`` via the

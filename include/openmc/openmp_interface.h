@@ -1,11 +1,61 @@
 #ifndef OPENMC_OPENMP_INTERFACE_H
 #define OPENMC_OPENMP_INTERFACE_H
 
+#include <algorithm> // for fill
+#include <atomic>
+#include <cstdint> // for int64_t
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 namespace openmc {
+
+#ifdef OPENMC_MPI
+//! Lock-free 8-byte atomics are a prerequisite for the shared accumulator
+//! mode, where several processes atomically update one shared-memory plane.
+static_assert(std::atomic<double>::is_always_lock_free,
+  "the shared accumulator mode requires lock-free 8-byte atomics");
+#endif
+
+//! \brief Atomically add a contribution to a tally accumulator element.
+//!
+//! On the tally hot path this is one OpenMP atomic RMW. For the shared
+//! accumulator mode accum_ points into an MPI-3 shared-memory window mapped by
+//! several processes: #pragma omp atomic on an 8-byte double lowers to a
+//! hardware atomic RMW (lock-prefixed on x86, LL/SC on ARM) whose atomicity is
+//! enforced by the cache-coherence protocol at the physical address. It is
+//! therefore address-free -- valid across processes sharing the memory, the
+//! same guarantee lock-free std::atomic relies on. The static_assert above is a
+//! necessary (not sufficient) platform check; the cross-rank hammer test is the
+//! empirical proof. Without _OPENMP the pragma vanishes and this is not atomic,
+//! so the shared accumulator mode is rejected at input validation.
+inline void atomic_score_add(double* ptr, double val)
+{
+#pragma omp atomic
+  *ptr += val;
+}
+
+//! \brief Fill n doubles starting at p with v, splitting the range evenly over
+//! the OpenMP threads.
+//!
+//! schedule(static) gives thread t the t-th contiguous slice, the same
+//! partition the tally fold uses. A plane zeroed here for the first time is
+//! therefore first-touched slice by slice on the NUMA domains of the threads
+//! that later fold it, and every later fill writes the pages its thread owns.
+//! Ranges below 1 MiB are filled serially, so small tallies do not pay for a
+//! parallel region. Must be called outside a parallel region to use the
+//! threads.
+inline void parallel_fill(double* p, int64_t n, double v)
+{
+  if (n < (int64_t {1} << 17)) {
+    std::fill(p, p + n, v);
+    return;
+  }
+#pragma omp parallel for schedule(static)
+  for (int64_t i = 0; i < n; ++i)
+    p[i] = v;
+}
 
 //==============================================================================
 //! Accessor functions related to number of threads and thread number

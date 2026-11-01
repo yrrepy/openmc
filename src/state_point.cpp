@@ -1,7 +1,9 @@
 #include "openmc/state_point.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint> // for int64_t
+#include <limits>  // for numeric_limits
 #include <string>
 
 #include "openmc/tensor.h"
@@ -33,6 +35,408 @@
 #include "openmc/vector.h"
 
 namespace openmc {
+
+//==============================================================================
+// rma tally statepoint gather / per-owner restart read
+//
+// Under the rma accumulator mode a tally's moments are block-distributed by
+// filter-bin row across all ranks, so no rank holds the whole array. The
+// statepoint therefore gathers rows to the master on write, in bounded chunks
+// so an individual MPI call never exceeds the int element-count limit, and on
+// restart each rank reads back only its own rows (see below). The reduce-path
+// master-serial file format is unchanged (a single [n_filter, n_score,
+// n_moments] "results" dataset), so Python readers are untouched and there is
+// no version bump.
+//==============================================================================
+
+namespace {
+
+// A statepoint written with the 'none' moments mode holds only the scaled SUM
+// of a run total that the run kept in its accumulator, so it cannot seed a
+// restart. Stop on such a tally group (an absent attribute means 'full').
+void check_restart_moments(hid_t tally_group, int tally_id)
+{
+  if (!attribute_exists(tally_group, "moments"))
+    return;
+  std::string mode;
+  read_attribute(tally_group, "moments", mode);
+  if (mode == "none") {
+    fatal_error(fmt::format(
+      "Tally {} in the statepoint was written with the <exatally> moments "
+      "mode 'none', which does not support restarting from a statepoint.",
+      tally_id));
+  }
+}
+
+#ifdef OPENMC_MPI
+// Doubles per filter-bin row of a tally results dataset.
+inline int64_t results_row_len(const Tally& tally)
+{
+  return static_cast<int64_t>(tally.n_score_bins()) * tally.n_moments();
+}
+
+// Filter-bin rows moved per chunk of the rma statepoint gather: the 64 MiB cap
+// applied at row granularity (at least one row). Sender and receiver both size
+// their chunks here, so they stay in lock-step.
+inline int64_t results_rows_per_chunk(int64_t row_len)
+{
+  return std::max<int64_t>(
+    1, MAX_RMA_GATHER_DOUBLES / std::max<int64_t>(1, row_len));
+}
+
+// Write a contiguous block of n_rows filter-bin rows, starting at global row
+// first_row, into a tally "results" dataset. The reduce-path statepoint is
+// written by the master alone on a serial file handle, so plain writes suffice.
+void write_results_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
+  hsize_t n_score, hsize_t n_moments, const double* buffer)
+{
+  hsize_t start[3] {static_cast<hsize_t>(first_row), 0, 0};
+  hsize_t count[3] {static_cast<hsize_t>(n_rows), n_score, n_moments};
+  hid_t filespace = H5Dget_space(dset);
+  H5Sselect_hyperslab(
+    filespace, H5S_SELECT_SET, start, nullptr, count, nullptr);
+  hid_t memspace = H5Screate_simple(3, count, nullptr);
+  H5Dwrite(dset, H5T_NATIVE_DOUBLE, memspace, filespace, H5P_DEFAULT, buffer);
+  H5Sclose(memspace);
+  H5Sclose(filespace);
+}
+
+#endif // OPENMC_MPI
+
+// Read this rank's owned block of n_rows filter-bin rows (starting at global
+// row first_row) from a tally "results" dataset straight into buffer. Every
+// rank reads a disjoint hyperslab, so under Parallel HDF5 the reads run
+// collectively -- the read_source_bank idiom (state_point.cpp) -- rather than
+// master-scatter: a lone rank's independent read on a collectively-opened MPIO
+// file does not complete on all fabrics. With a serial build each rank reads
+// independently from its own file handle. A rank owning zero rows issues an
+// empty collective read; the reduce-path restart uses the same empty read for
+// a rank that holds no moments.
+void read_owned_rows_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
+  hsize_t n_score, hsize_t n_moments, double* buffer)
+{
+  hsize_t start[3] {static_cast<hsize_t>(first_row), 0, 0};
+  hsize_t count[3] {static_cast<hsize_t>(n_rows), n_score, n_moments};
+  hid_t filespace = H5Dget_space(dset);
+  if (n_rows > 0) {
+    H5Sselect_hyperslab(
+      filespace, H5S_SELECT_SET, start, nullptr, count, nullptr);
+  } else {
+    H5Sselect_none(filespace);
+  }
+  hid_t memspace = H5Screate_simple(3, count, nullptr);
+  // A rank that owns no rows still participates (empty selection) but has an
+  // empty moments tensor, whose data() is null; hand HDF5 a dummy buffer since
+  // some versions reject a null pointer even when nothing will be transferred.
+  double dummy;
+  if (n_rows == 0) {
+    H5Sselect_none(memspace);
+    buffer = &dummy;
+  }
+#ifdef PHDF5
+  if (using_mpio_device(dset)) {
+    hid_t plist = H5Pcreate(H5P_DATASET_XFER);
+    H5Pset_dxpl_mpio(plist, H5FD_MPIO_COLLECTIVE);
+    H5Dread(dset, H5T_NATIVE_DOUBLE, memspace, filespace, plist, buffer);
+    H5Pclose(plist);
+  } else
+#endif
+    H5Dread(dset, H5T_NATIVE_DOUBLE, memspace, filespace, H5P_DEFAULT, buffer);
+  H5Sclose(memspace);
+  H5Sclose(filespace);
+}
+
+// Projected moments of a tally (written by the master; master-homed in every
+// accumulator mode): group "projections" with attribute n_projections, and per
+// projection a group <name> with attributes filters (filter ids, projected
+// order) and n_filter_bins, and the dataset results [F_p, n_score_bins, 2]
+// (SUM, SUM_SQ). Nothing is written for a tally without projections, so its
+// statepoint is unchanged. data[p] points at projection p's moments (its own,
+// or a reduced copy).
+void write_tally_projections(
+  hid_t tally_group, const Tally& tally, const vector<const double*>& data)
+{
+  const auto& projections = tally.projections();
+  if (projections.empty())
+    return;
+  hid_t group = create_group(tally_group, "projections");
+  write_attribute(group, "n_projections", static_cast<int>(projections.size()));
+  for (size_t p = 0; p < projections.size(); ++p) {
+    const auto& proj = projections[p];
+    hid_t proj_group = create_group(group, proj.name);
+    vector<int32_t> ids;
+    for (auto i_filt : proj.filters)
+      ids.push_back(model::tally_filters[i_filt]->id());
+    // A projection summing over every filter has an empty list; HDF5 refuses
+    // a null buffer even for a zero-size attribute.
+    int32_t none = 0;
+    hsize_t dims[] {ids.size()};
+    write_attr(proj_group, 1, dims, "filters", H5T_NATIVE_INT,
+      ids.empty() ? &none : ids.data());
+    write_attribute(proj_group, "n_filter_bins", proj.n_bins);
+    write_tally_results(
+      proj_group, proj.n_bins, tally.n_score_bins(), 2, data[p]);
+    close_group(proj_group);
+  }
+  close_group(group);
+}
+
+// Restart read of a tally's projections, on every rank that reads the tally
+// group (all ranks under Parallel HDF5, the master alone otherwise; all ranks
+// for a distributed rma tally). The model must declare the same projections
+// as the file -- by count, name, filters and shape -- or the restart stops; a
+// statepoint without a projections group matches a tally without projections.
+// The master reads the moments; a rank holding none joins each collective
+// read with an empty selection, as for the tally results.
+void read_tally_projections(hid_t tally_group, Tally& tally)
+{
+  auto& projections = tally.projections();
+  const bool present = object_exists(tally_group, "projections");
+  hid_t group = -1;
+  int n_file = 0;
+  if (present) {
+    group = open_group(tally_group, "projections");
+    read_attribute(group, "n_projections", n_file);
+  }
+  if (n_file != static_cast<int>(projections.size())) {
+    fatal_error(fmt::format(
+      "Tally {} declares {} projection(s), but the statepoint holds {}; a "
+      "restart model must declare the same projections as the run that "
+      "wrote the statepoint.",
+      tally.id_, projections.size(), n_file));
+  }
+  if (!present)
+    return;
+
+  const auto n_score = static_cast<hsize_t>(tally.n_score_bins());
+  for (auto& proj : projections) {
+    if (!object_exists(group, proj.name.c_str())) {
+      fatal_error(fmt::format(
+        "Tally {} projection '{}' is not in the statepoint; a restart model "
+        "must declare the same projections as the run that wrote it.",
+        tally.id_, proj.name));
+    }
+    hid_t proj_group = open_group(group, proj.name.c_str());
+    vector<int32_t> ids;
+    if (attribute_shape(proj_group, "filters")[0] > 0)
+      read_attribute(proj_group, "filters", ids);
+    vector<int32_t> want;
+    for (auto i_filt : proj.filters)
+      want.push_back(model::tally_filters[i_filt]->id());
+    int64_t n_bins = 0;
+    read_attribute(proj_group, "n_filter_bins", n_bins);
+    if (ids != want || n_bins != proj.n_bins) {
+      auto list = [](const vector<int32_t>& v) {
+        std::string text;
+        for (auto id : v)
+          text += (text.empty() ? "" : ", ") + std::to_string(id);
+        return text;
+      };
+      fatal_error(fmt::format(
+        "Tally {} projection '{}' in the statepoint has filters [{}] ({} "
+        "bins), but the model's projection has filters [{}] ({} bins).",
+        tally.id_, proj.name, list(ids), n_bins, list(want), proj.n_bins));
+    }
+    const auto n_proj = static_cast<hsize_t>(proj.n_bins);
+    check_tally_results_shape(proj_group, n_proj, n_score, 2);
+    if (proj.moments.size() != 0) {
+      read_tally_results(proj_group, n_proj, n_score, 2, proj.moments.data());
+    } else {
+      hid_t dset = open_dataset(proj_group, "results");
+      read_owned_rows_hyperslab(dset, 0, 0, n_score, 2, nullptr);
+      close_dataset(dset);
+    }
+    close_group(proj_group);
+  }
+  close_group(group);
+}
+
+// The data pointers of a tally's own projection moments, for
+// write_tally_projections().
+vector<const double*> projection_moments(const Tally& tally)
+{
+  vector<const double*> data;
+  for (const auto& proj : tally.projections())
+    data.push_back(proj.moments.data());
+  return data;
+}
+
+#ifdef OPENMC_MPI
+// One chunk of the rma statepoint gather: crows filter-bin rows of rank `rank`,
+// starting at global row first_row.
+struct GatherChunk {
+  int rank;
+  int64_t first_row;
+  int64_t crows;
+};
+
+// Master side of the statepoint write: create the full results dataset, write
+// the master's own owned rows, then receive each other rank's owned rows in
+// chunks and write them into their hyperslab. The receives are pipelined over
+// two buffers: the receive of the next chunk is posted before the current
+// chunk is written, so the network and the disk work at the same time. Only
+// one receive is outstanding at a time, and chunks are received in the order
+// each sender sends them, so MPI's non-overtaking order for messages from one
+// source with one tag matches every chunk to its buffer.
+void gather_rma_tally_results(hid_t tally_group, const Tally& tally)
+{
+  const hsize_t n_filter = static_cast<hsize_t>(tally.n_filter_bins());
+  const hsize_t n_score = static_cast<hsize_t>(tally.n_score_bins());
+  const hsize_t n_moments = static_cast<hsize_t>(tally.n_moments());
+  hsize_t dims[3] {n_filter, n_score, n_moments};
+  hid_t dspace = H5Screate_simple(3, dims, nullptr);
+  hid_t dset = H5Dcreate(tally_group, "results", H5T_NATIVE_DOUBLE, dspace,
+    H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+  const int64_t row_len = results_row_len(tally);
+  const int64_t rows_per_chunk = results_rows_per_chunk(row_len);
+
+  // Master owns rows [0, nrows); its moments are locally indexed from 0 and
+  // are written directly.
+  const int64_t n_master = tally.rma_rows_owned(0);
+  for (int64_t off = 0; off < n_master; off += rows_per_chunk) {
+    const int64_t crows = std::min(rows_per_chunk, n_master - off);
+    write_results_hyperslab(dset, tally.rma_first_row(0) + off, crows, n_score,
+      n_moments, tally.moments().data() + off * row_len);
+  }
+
+  // The other ranks' chunks, rank ascending and offset ascending: the order
+  // each sender issues them in.
+  vector<GatherChunk> chunks;
+  int64_t max_crows = 0;
+  for (int r = 1; r < mpi::n_procs; ++r) {
+    const int64_t first = tally.rma_first_row(r);
+    const int64_t nrows = tally.rma_rows_owned(r);
+    for (int64_t off = 0; off < nrows; off += rows_per_chunk) {
+      const int64_t crows = std::min(rows_per_chunk, nrows - off);
+      chunks.push_back({r, first + off, crows});
+      max_crows = std::max(max_crows, crows);
+    }
+  }
+
+  if (!chunks.empty()) {
+    // Two receive buffers of at most one chunk each (64 MiB, or one row if a
+    // row is longer). Chunk k lands in buf[k % 2].
+    const int64_t buf_len = max_crows * row_len;
+    vector<double> buf[2];
+    buf[0].resize(buf_len);
+    if (chunks.size() > 1)
+      buf[1].resize(buf_len);
+
+    auto post = [&](size_t k) {
+      MPI_Request req;
+      MPI_Irecv(buf[k % 2].data(), static_cast<int>(chunks[k].crows * row_len),
+        MPI_DOUBLE, chunks[k].rank, TAG_RMA_GATHER, mpi::intracomm, &req);
+      return req;
+    };
+
+    MPI_Request req = post(0);
+    for (size_t k = 0; k < chunks.size(); ++k) {
+      MPI_Wait(&req, MPI_STATUS_IGNORE);
+      // Receive chunk k+1 into the other buffer while chunk k is written.
+      if (k + 1 < chunks.size())
+        req = post(k + 1);
+      write_results_hyperslab(dset, chunks[k].first_row, chunks[k].crows,
+        n_score, n_moments, buf[k % 2].data());
+    }
+  }
+  H5Dclose(dset);
+  H5Sclose(dspace);
+}
+
+// Non-master side of the statepoint write: ship this rank's owned moment rows
+// to the master in the same bounded chunks the master receives.
+void send_rma_tally_results(const Tally& tally)
+{
+  const int64_t row_len = results_row_len(tally);
+  const int64_t rows_per_chunk = results_rows_per_chunk(row_len);
+  const int64_t nrows = tally.rma_n_rows();
+  const double* data = tally.moments().data();
+  for (int64_t off = 0; off < nrows; off += rows_per_chunk) {
+    const int64_t crows = std::min(rows_per_chunk, nrows - off);
+    const int64_t count = crows * row_len;
+    MPI_Send(data + off * row_len, static_cast<int>(count), MPI_DOUBLE, 0,
+      TAG_RMA_GATHER, mpi::intracomm);
+  }
+}
+
+// Restart read for the distributed rma moments (all ranks). Every rank has the
+// statepoint open, so the group/dataset opens are collective under Parallel
+// HDF5; each rank then reads only the moment rows it owns straight into its
+// (owned-rows) moments. No rank allocates the full moments, so the replicated
+// path's temporary full allocation is avoided; and because every rank reads a
+// disjoint owned
+// hyperslab the reads compose into a single collective transfer rather than a
+// master-scatter (a lone rank's independent read on a collectively-opened MPIO
+// file does not complete on all fabrics).
+void read_distributed_rma_tally_results(hid_t file_id)
+{
+  // Nothing to do without a genuinely distributed rma tally.
+  bool any = false;
+  for (const auto& t : model::tallies) {
+    if (t->rma_distributed()) {
+      any = true;
+      break;
+    }
+  }
+  if (!any)
+    return;
+
+  // Results are only present if the writing run had active, reduced tallies.
+  // Read on every rank (each has its own file handle in a serial build).
+  bool present = false;
+  if (attribute_exists(file_id, "tallies_present"))
+    read_attribute(file_id, "tallies_present", present);
+  if (!present)
+    return;
+
+  hid_t tallies_group = open_group(file_id, "tallies");
+  for (auto& tally : model::tallies) {
+    if (!tally->rma_distributed())
+      continue;
+
+    std::string name = "tally " + std::to_string(tally->id_);
+    hid_t tally_group = open_group(tallies_group, name.c_str());
+
+    int internal = 0;
+    if (attribute_exists(tally_group, "internal"))
+      read_attribute(tally_group, "internal", internal);
+    if (internal) {
+      tally->writable_ = false;
+      close_group(tally_group);
+      continue;
+    }
+
+    check_restart_moments(tally_group, tally->id_);
+
+    // Every rank needs n_realizations for its owned-row fold. Read it on every
+    // rank: this is a collective dataset read under Parallel HDF5 (each rank
+    // otherwise has its own serial file handle), so it must not be master-only.
+    read_dataset(tally_group, "n_realizations", tally->n_realizations_);
+
+    const hsize_t n_filter = static_cast<hsize_t>(tally->n_filter_bins());
+    const hsize_t n_score = static_cast<hsize_t>(tally->n_score_bins());
+    const hsize_t n_moments = static_cast<hsize_t>(tally->n_moments());
+    // Every rank reads the same on-disk extent and holds the same model shape,
+    // so this check is reached identically on all ranks -- a mismatch fatals on
+    // every rank with no collective divergence. Validate the full extent before
+    // selecting each rank's owned-row hyperslab; the read otherwise assumes the
+    // statepoint layout matches the current model.
+    check_tally_results_shape(tally_group, n_filter, n_score, n_moments);
+    hid_t dset = open_dataset(tally_group, "results");
+    read_owned_rows_hyperslab(dset, tally->rma_first_row(mpi::rank),
+      tally->rma_n_rows(), n_score, n_moments, tally->moments().data());
+    close_dataset(dset);
+
+    // Projections are master-homed; the other ranks join with empty reads.
+    read_tally_projections(tally_group, *tally);
+    close_group(tally_group);
+  }
+  close_group(tallies_group);
+}
+#endif // OPENMC_MPI
+
+} // namespace
 
 extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
 {
@@ -70,6 +474,20 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
 
   // Write message
   write_message("Creating state point " + filename_ + "...", 5);
+
+  // A 'none' tally keeps no moments during the run, so combine its run total
+  // and materialise its SUM plane now; the generic writer below (and the rma
+  // gather) then writes it as a one-plane results dataset. collect_none() is
+  // collective, so the guard mirrors the writer's tally-results guard, which
+  // is rank-identical.
+  const bool writes_tally_results =
+    settings::reduce_tallies && model::active_tallies.size() > 0;
+  if (writes_tally_results) {
+    for (auto& tally : model::tallies) {
+      if (tally->writable_ && tally->moments_mode() == MomentsMode::NONE)
+        tally->collect_none();
+    }
+  }
 
   hid_t file_id;
   if (mpi::master) {
@@ -215,6 +633,10 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
           write_attribute(tally_group, "higher_moments", 0);
         }
 
+        // ExaTallies moments mode; readers treat an absent attribute as full.
+        write_attribute(
+          tally_group, "moments", moments_mode_name(tally->moments_mode()));
+
         if (tally->estimator_ == TallyEstimator::ANALOG) {
           write_dataset(tally_group, "estimator", "analog");
         } else if (tally->estimator_ == TallyEstimator::TRACKLENGTH) {
@@ -282,9 +704,24 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
           // Write results for each bin
           std::string name = "tally " + std::to_string(tally->id_);
           hid_t tally_group = open_group(tallies_group, name.c_str());
-          auto& results = tally->results_;
-          write_tally_results(tally_group, results.shape(0), results.shape(1),
-            results.shape(2), results.data());
+
+          // Projected moments live on the master in every accumulator mode.
+          write_tally_projections(
+            tally_group, *tally, projection_moments(*tally));
+#ifdef OPENMC_MPI
+          // Under multi-rank rma the master holds only its own owned rows, so
+          // gather every rank's rows into the full dataset. The matching sends
+          // are issued by the non-master ranks just after this master-only
+          // block.
+          if (tally->rma_distributed()) {
+            gather_rma_tally_results(tally_group, *tally);
+            close_group(tally_group);
+            continue;
+          }
+#endif
+          auto& moments = tally->moments();
+          write_tally_results(tally_group, moments.shape(0), moments.shape(1),
+            moments.shape(2), moments.data());
           close_group(tally_group);
         }
       } else {
@@ -295,6 +732,22 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
 
     close_group(tallies_group);
   }
+
+#ifdef OPENMC_MPI
+  // Non-master ranks ship their owned rma moment rows to the master, which
+  // receives and writes them inside its writer loop above. Guard exactly as the
+  // master's writer does (reduced tallies, at least one active tally) so the
+  // sends and receives pair up over model::tallies in the same order.
+  if (!mpi::master && settings::reduce_tallies &&
+      model::active_tallies.size() > 0) {
+    for (const auto& tally : model::tallies) {
+      if (!tally->writable_)
+        continue;
+      if (tally->rma_distributed())
+        send_rma_tally_results(*tally);
+    }
+  }
+#endif
 
   // Check for the no-tally-reduction method
   if (!settings::reduce_tallies) {
@@ -360,6 +813,20 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
   write_unstructured_mesh_results();
 #endif
 
+  // Free the SUM planes materialised above, so a 'none' tally holds no moments
+  // during the run -- unless the run ends with this batch (last batch, or
+  // triggers satisfied): the end-of-run readout keeps the plane and
+  // openmc_simulation_finalize() then skips a second collect. If the run does
+  // continue anyway, the next accumulate() releases the stale plane.
+  const bool run_ends = simulation::current_batch >= settings::n_max_batches ||
+                        simulation::satisfy_triggers;
+  if (writes_tally_results && !run_ends) {
+    for (auto& tally : model::tallies) {
+      if (tally->none_materialised())
+        tally->release_none_moments();
+    }
+  }
+
   simulation::time_statepoint.stop();
 
   return 0;
@@ -381,6 +848,18 @@ void restart_set_keff()
 
 void load_state_point()
 {
+  // A 'none' tally keeps its run total in the accumulator, and the statepoint
+  // holds only the scaled SUM, so it cannot be resumed. Every rank holds the
+  // same tallies, so every rank stops here.
+  for (const auto& tally : model::tallies) {
+    if (tally->writable_ && tally->moments_mode() == MomentsMode::NONE) {
+      fatal_error(fmt::format(
+        "Tally {} uses the <exatally> moments mode 'none', which does not "
+        "support restarting from a statepoint.",
+        tally->id_));
+    }
+  }
+
   write_message(
     fmt::format("Loading state point {}...", settings::path_statepoint), 5);
   openmc_statepoint_load(settings::path_statepoint.c_str());
@@ -511,6 +990,16 @@ extern "C" int openmc_statepoint_load(const char* filename)
       hid_t tallies_group = open_group(file_id, "tallies");
 
       for (auto& tally : model::tallies) {
+        // rma tally moments are block-distributed; each rank reads its owned
+        // rows in a separate all-ranks pass
+        // (read_distributed_rma_tally_results, called below) so no rank
+        // temp-allocates the full moments. Skip them here -- consistently on
+        // every rank, keeping the Parallel HDF5 collective group/dataset calls
+        // below in lock-step.
+        if (tally->rma_distributed()) {
+          continue;
+        }
+
         // Read sum, sum_sq, and N for each bin
         std::string name = "tally " + std::to_string(tally->id_);
         hid_t tally_group = open_group(tallies_group, name.c_str());
@@ -522,17 +1011,43 @@ extern "C" int openmc_statepoint_load(const char* filename)
         if (internal) {
           tally->writable_ = false;
         } else {
-          auto& results = tally->results_;
-          read_tally_results(tally_group, results.shape(0), results.shape(1),
-            results.shape(2), results.data());
+          check_restart_moments(tally_group, tally->id_);
+
+          // Every rank checks the stored shape, so a mismatch stops the run
+          // the same way on every rank. Under Parallel HDF5 every rank joins
+          // the collective read of the results dataset; a rank that dropped
+          // its moments (owner-only reduced mode) joins with an empty
+          // selection and allocates nothing. Only the master's copy survives
+          // the restart; the other ranks are refilled by the end-of-run
+          // broadcast.
+          const auto n_filter = static_cast<hsize_t>(tally->n_filter_bins());
+          const auto n_score = static_cast<hsize_t>(tally->n_score_bins());
+          const auto n_moments = static_cast<hsize_t>(tally->n_moments());
+          check_tally_results_shape(tally_group, n_filter, n_score, n_moments);
+          if (tally->has_moments()) {
+            read_tally_results(tally_group, n_filter, n_score, n_moments,
+              tally->moments().data());
+          } else {
+            hid_t dset = open_dataset(tally_group, "results");
+            read_owned_rows_hyperslab(dset, 0, 0, n_score, n_moments, nullptr);
+            close_dataset(dset);
+          }
 
           read_dataset(tally_group, "n_realizations", tally->n_realizations_);
+          read_tally_projections(tally_group, *tally);
         }
         close_group(tally_group);
       }
       close_group(tallies_group);
     }
   }
+
+#ifdef OPENMC_MPI
+  // Read the block-distributed moments of any multi-rank rma tally: each rank
+  // reads its owned rows (all ranks participate; the statepoint file is still
+  // open on every rank here).
+  read_distributed_rma_tally_results(file_id);
+#endif
 
   // Read source if in eigenvalue mode
   if (settings::run_mode == RunMode::EIGENVALUE) {
@@ -795,6 +1310,20 @@ void write_unstructured_mesh_results()
       if (!umesh->output_)
         continue;
 
+      // A multi-rank rma tally holds only owned moment rows on each rank; the
+      // gather this per-rank mesh output would need is not yet implemented, so
+      // point the user at the statepoint. A single-rank rma tally holds the
+      // full array and writes normally.
+      if (tally->rma_distributed()) {
+        if (mpi::master)
+          warning(fmt::format(
+            "Unstructured mesh output for tally {} is skipped because it uses "
+            "the 'rma' accumulator mode. Read the results from the statepoint "
+            "file.",
+            tally->id_));
+        continue;
+      }
+
       if (umesh->library() == "moab") {
         if (mpi::master)
           warning(fmt::format(
@@ -841,23 +1370,33 @@ void write_unstructured_mesh_results()
           // construct result vectors
           vector<double> mean_vec(umesh->n_bins()),
             std_dev_vec(umesh->n_bins());
-          for (int j = 0; j < tally->results_.shape(0); j++) {
-            // get the volume for this bin
-            double volume = umesh->volume(j);
-            // compute the mean
-            double mean = tally->results_(j, nuc_score_idx, TallyResult::SUM) /
-                          n_realizations;
-            mean_vec.at(j) = mean / volume;
+          // Only ranks that own moments fill these from the tally; the values
+          // are then broadcast from the master below, so non-owner ranks leave
+          // them zero here and receive the master's copy.
+          if (tally->has_moments()) {
+            const auto& moments = tally->moments();
+            for (int j = 0; j < moments.shape(0); j++) {
+              // get the volume for this bin
+              double volume = umesh->volume(j);
+              // compute the mean
+              double mean =
+                moments(j, nuc_score_idx, TallyMoment::SUM) / n_realizations;
+              mean_vec.at(j) = mean / volume;
 
-            // compute the standard deviation
-            double sum_sq =
-              tally->results_(j, nuc_score_idx, TallyResult::SUM_SQ);
-            double std_dev {0.0};
-            if (n_realizations > 1) {
-              std_dev = sum_sq / n_realizations - mean * mean;
-              std_dev = std::sqrt(std_dev / (n_realizations - 1));
+              // compute the standard deviation; the 'mean' and 'none'
+              // moments modes keep no sum of squares, so it is unknown (NaN)
+              if (tally->moments_mode() != MomentsMode::FULL) {
+                std_dev_vec[j] = std::numeric_limits<double>::quiet_NaN();
+                continue;
+              }
+              double sum_sq = moments(j, nuc_score_idx, TallyMoment::SUM_SQ);
+              double std_dev {0.0};
+              if (n_realizations > 1) {
+                std_dev = sum_sq / n_realizations - mean * mean;
+                std_dev = std::sqrt(std_dev / (n_realizations - 1));
+              }
+              std_dev_vec[j] = std_dev / volume;
             }
-            std_dev_vec[j] = std_dev / volume;
           }
 #ifdef OPENMC_MPI
           MPI_Bcast(
@@ -928,56 +1467,42 @@ void write_tally_results_nr(hid_t file_id)
     if (!t->writable_)
       continue;
 
+    // rma requires reduce_tallies at input validation, so an rma tally can
+    // never reach the no-reduction writer.
+    assert(t->accumulator() != AccumulatorMode::RMA);
+
     if (mpi::master && !attribute_exists(file_id, "tallies_present")) {
       write_attribute(file_id, "tallies_present", 1);
     }
 
-    // Copy the SUM and SUM_SQ columns from the tally results into a
-    // contiguous array for MPI reduction
-    const int r_start = static_cast<int>(TallyResult::SUM);
-    const int r_end = static_cast<int>(TallyResult::SUM_SQ) + 1;
-    const size_t r_count = r_end - r_start;
-    const size_t ni = t->results_.shape(0);
-    const size_t nj = t->results_.shape(1);
-    tensor::Tensor<double> values({ni, nj, r_count});
-    for (size_t i = 0; i < ni; i++)
-      for (size_t j = 0; j < nj; j++)
-        for (size_t r = 0; r < r_count; r++)
-          values(i, j, r) = t->results_(i, j, r_start + r);
+    // Reduce a copy of the moments onto the master. moments_ is already the
+    // on-disk layout, so the copy reduces contiguously (chunked to respect the
+    // int MPI count limit). The copy keeps each rank's own moments intact for
+    // the next batch's accumulation. All n_moments columns are reduced and
+    // written, including SUM_THIRD/SUM_FOURTH for higher-moments tallies.
+    tensor::Tensor<double> values = t->moments();
 
     if (mpi::master) {
       // Open group for tally
       std::string groupname {"tally " + std::to_string(t->id_)};
       hid_t tally_group = open_group(tallies_group, groupname.c_str());
 
-      // The MPI_IN_PLACE specifier allows the master to copy values into
-      // a receive buffer without having a temporary variable
 #ifdef OPENMC_MPI
       mpi::reduce(
         MPI_IN_PLACE, values.data(), values.size(), MPI_SUM, 0, mpi::intracomm);
 #endif
 
-      // At the end of the simulation, store the reduced results back
-      // into the tally results array
+      // At the end of the simulation, store the reduced moments back into the
+      // tally so post-run consumers (openmc.lib, output) see combined results.
       if (simulation::current_batch == settings::n_max_batches ||
           simulation::satisfy_triggers) {
-        for (size_t i = 0; i < ni; i++)
-          for (size_t j = 0; j < nj; j++)
-            for (size_t r = 0; r < r_count; r++)
-              t->results_(i, j, r_start + r) = values(i, j, r);
+        t->moments() = values;
       }
 
-      // Put reduced values into a full-sized copy for writing to HDF5
-      tensor::Tensor<double> results_copy = tensor::zeros_like(t->results_);
-      for (size_t i = 0; i < ni; i++)
-        for (size_t j = 0; j < nj; j++)
-          for (size_t r = 0; r < r_count; r++)
-            results_copy(i, j, r_start + r) = values(i, j, r);
-
-      // Write reduced tally results to file
-      auto shape = results_copy.shape();
+      // Write reduced tally moments to file
+      auto shape = values.shape();
       write_tally_results(
-        tally_group, shape[0], shape[1], shape[2], results_copy.data());
+        tally_group, shape[0], shape[1], shape[2], values.data());
 
       close_group(tally_group);
     } else {
@@ -986,6 +1511,34 @@ void write_tally_results_nr(hid_t file_id)
       mpi::reduce<double>(
         values.data(), nullptr, values.size(), MPI_SUM, 0, mpi::intracomm);
 #endif
+    }
+
+    // Without tally reduction every rank folds its own projected moments;
+    // reduce copies onto the master exactly as the tally's moments above.
+    if (!t->projections().empty()) {
+      vector<tensor::Tensor<double>> reduced;
+      for (const auto& proj : t->projections()) {
+        reduced.push_back(proj.moments);
+#ifdef OPENMC_MPI
+        auto& v = reduced.back();
+        if (mpi::master) {
+          mpi::reduce(
+            MPI_IN_PLACE, v.data(), v.size(), MPI_SUM, 0, mpi::intracomm);
+        } else {
+          mpi::reduce<double>(
+            v.data(), nullptr, v.size(), MPI_SUM, 0, mpi::intracomm);
+        }
+#endif
+      }
+      if (mpi::master) {
+        vector<const double*> data;
+        for (const auto& v : reduced)
+          data.push_back(v.data());
+        std::string groupname {"tally " + std::to_string(t->id_)};
+        hid_t tally_group = open_group(tallies_group, groupname.c_str());
+        write_tally_projections(tally_group, *t, data);
+        close_group(tally_group);
+      }
     }
   }
 

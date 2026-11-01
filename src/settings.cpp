@@ -1,9 +1,10 @@
 #include "openmc/settings.h"
 #include "openmc/random_ray/flat_source_domain.h"
 
-#include <cmath>   // for ceil, pow
-#include <cstring> // for strcmp
-#include <limits>  // for numeric_limits
+#include <cmath>     // for ceil, pow
+#include <cstring>   // for strcmp
+#include <limits>    // for numeric_limits
+#include <stdexcept> // for runtime_error
 #include <string>
 
 #include <fmt/core.h>
@@ -32,6 +33,7 @@
 #include "openmc/simulation.h"
 #include "openmc/source.h"
 #include "openmc/string_utils.h"
+#include "openmc/tallies/exatally.h"
 #include "openmc/tallies/trigger.h"
 #include "openmc/volume_calc.h"
 #include "openmc/weight_windows.h"
@@ -128,6 +130,7 @@ double res_scat_energy_max {1000.0};
 vector<std::string> res_scat_nuclides;
 RunMode run_mode {RunMode::UNSET};
 SolverType solver_type {SolverType::MONTE_CARLO};
+ExaTally exatally;
 std::unordered_set<int> sourcepoint_batch;
 std::unordered_set<int> statepoint_batch;
 double source_rejection_fraction {0.05};
@@ -1086,6 +1089,19 @@ void read_settings_xml(pugi::xml_node root)
   // batch
   if (check_for_node(root, "no_reduce")) {
     reduce_tallies = !get_node_value_bool(root, "no_reduce");
+  }
+
+  // Default ExaTallies accumulator and moments modes (a per-tally <exatally>
+  // block overrides them). The parser throws on an invalid value.
+  try {
+    exatally = parse_exatally(root, ExaTally {}, "settings.xml");
+  } catch (const std::runtime_error& e) {
+    fatal_error(e.what());
+  }
+  if (root.child("exatally").child("projection")) {
+    fatal_error("A <projection> appears in the settings.xml <exatally> block; "
+                "projections are declared per tally, in the tally's "
+                "<exatally> block in tallies.xml.");
   }
 
   // Check if the user has specified to use confidence intervals for

@@ -557,12 +557,16 @@ void print_runtime()
 
 //==============================================================================
 
+// x points at the SUM element, with SUM_SQ immediately after it. This holds for
+// both a tally's moments_ row (SUM=0, SUM_SQ=1) and a global_tallies row (SUM
+// and SUM_SQ are the two columns following VALUE), so callers pass a pointer to
+// the SUM column in either layout.
 std::pair<double, double> mean_stdev(const double* x, int n)
 {
-  double mean = x[static_cast<int>(TallyResult::SUM)] / n;
+  double mean = x[static_cast<int>(TallyMoment::SUM)] / n;
   double stdev =
     n > 1 ? std::sqrt(std::max(0.0,
-              (x[static_cast<int>(TallyResult::SUM_SQ)] / n - mean * mean) /
+              (x[static_cast<int>(TallyMoment::SUM_SQ)] / n - mean * mean) /
                 (n - 1)))
           : 0.0;
   return {mean, stdev};
@@ -594,13 +598,16 @@ void print_results()
   double mean, stdev;
   if (n > 1) {
     if (settings::run_mode == RunMode::EIGENVALUE) {
-      std::tie(mean, stdev) = mean_stdev(&gt(GlobalTally::K_COLLISION, 0), n);
+      std::tie(mean, stdev) =
+        mean_stdev(&gt(GlobalTally::K_COLLISION, TallyResult::SUM), n);
       fmt::print(" k-effective (Collision)     = {:.5f} +/- {:.5f}\n", mean,
         t_n1 * stdev);
-      std::tie(mean, stdev) = mean_stdev(&gt(GlobalTally::K_TRACKLENGTH, 0), n);
+      std::tie(mean, stdev) =
+        mean_stdev(&gt(GlobalTally::K_TRACKLENGTH, TallyResult::SUM), n);
       fmt::print(" k-effective (Track-length)  = {:.5f} +/- {:.5f}\n", mean,
         t_n1 * stdev);
-      std::tie(mean, stdev) = mean_stdev(&gt(GlobalTally::K_ABSORPTION, 0), n);
+      std::tie(mean, stdev) =
+        mean_stdev(&gt(GlobalTally::K_ABSORPTION, TallyResult::SUM), n);
       fmt::print(" k-effective (Absorption)    = {:.5f} +/- {:.5f}\n", mean,
         t_n1 * stdev);
       if (n > 3) {
@@ -610,7 +617,8 @@ void print_results()
           k_combined[0], k_combined[1]);
       }
     }
-    std::tie(mean, stdev) = mean_stdev(&gt(GlobalTally::LEAKAGE, 0), n);
+    std::tie(mean, stdev) =
+      mean_stdev(&gt(GlobalTally::LEAKAGE, TallyResult::SUM), n);
     fmt::print(
       " Leakage Fraction            = {:.5f} +/- {:.5f}\n", mean, t_n1 * stdev);
   } else {
@@ -694,6 +702,16 @@ void write_tallies()
       continue;
     }
 
+    // Multi-rank rma tallies keep only owned moment rows on each rank; the
+    // full results are gathered only into the statepoint, so tallies.out
+    // points the user there. A single-rank rma tally prints normally.
+    if (tally.rma_distributed()) {
+      fmt::print(tallies_out,
+        " Results for this tally use the 'rma' accumulator mode and are "
+        "written to the statepoint file only.\n\n");
+      continue;
+    }
+
     // Calculate t-value for confidence intervals
     double t_value = 1;
     if (settings::confidence_intervals) {
@@ -771,9 +789,20 @@ void write_tallies()
         for (auto score : tally.scores_) {
           std::string score_name =
             score > 0 ? reaction_name(score) : score_names.at(score);
+          if (tally.n_moments() < 2) {
+            // The 'mean' and 'none' moments modes keep the sum only, so there
+            // is no uncertainty to print.
+            double mean =
+              tally.moments()(filter_index, score_index, TallyMoment::SUM) /
+              tally.n_realizations_;
+            fmt::print(tallies_out, "{0:{1}}{2:<36} {3:.6}\n", "", indent + 1,
+              score_name, mean);
+            score_index += 1;
+            continue;
+          }
           double mean, stdev;
           std::tie(mean, stdev) =
-            mean_stdev(&tally.results_(filter_index, score_index, 0),
+            mean_stdev(&tally.moments()(filter_index, score_index, 0),
               tally.n_realizations_);
           fmt::print(tallies_out, "{0:{1}}{2:<36} {3:.6} +/- {4:.6}\n", "",
             indent + 1, score_name, mean, t_value * stdev);

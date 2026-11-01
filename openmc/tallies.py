@@ -58,6 +58,53 @@ _FILTER_CLASSES = (Filter, CrossFilter, AggregateFilter)
 ESTIMATOR_TYPES = {'tracklength', 'collision', 'analog'}
 
 
+def _std_dev_from_moments(mean, sum_sq, n):
+    """Sample standard deviation of the mean of n batch realizations.
+
+    Parameters
+    ----------
+    mean : numpy.ndarray
+        Mean per bin (the sum over n)
+    sum_sq : numpy.ndarray
+        Sum of the squared realizations per bin
+    n : int
+        Number of realizations
+
+    Returns
+    -------
+    numpy.ndarray
+        Zero where the mean is zero; NaN where it is not when n == 1 (with a
+        warning)
+
+    """
+    nonzero = np.abs(mean) > 0
+    std_dev = np.zeros_like(mean)
+    if n > 1:
+        # Rounding can push the variance below zero when realizations
+        # are nearly identical, so clamp at zero
+        variance = (sum_sq[nonzero]/n - mean[nonzero]**2)/(n - 1)
+        std_dev[nonzero] = np.sqrt(np.maximum(variance, 0.0))
+    elif nonzero.any():
+        warnings.warn(
+            'Standard deviation is undefined for a tally with a single '
+            'realization; reporting it as NaN.')
+        std_dev[nonzero] = np.nan
+    return std_dev
+
+
+def _filters_with_projections(tally):
+    """The tally's filters, then those only its ExaTally projections use."""
+    yield from tally.filters
+    exatally = tally.exatally
+    if exatally is not None and exatally.projections:
+        seen = list(tally.filters)
+        for filters in exatally.projections.values():
+            for f in filters:
+                if not any(f is g for g in seen):
+                    seen.append(f)
+                    yield f
+
+
 class Tally(IDManagerMixin):
     """A tally defined by a set of scores that are accumulated for a list of
     nuclides given a set of filters.
@@ -102,6 +149,24 @@ class Tally(IDManagerMixin):
         Type of estimator for the tally. If unset (None), OpenMC will automatically
         select an appropriate estimator based on the tally filters and scores
         with a preference for 'tracklength'.
+    exatally : openmc.ExaTally or None
+        ExaTallies accumulator/moments modes for this tally; None inherits
+        :attr:`openmc.Settings.exatally`. A mode left unset in the
+        :class:`openmc.ExaTally` also inherits the global default.
+
+        .. versionadded:: 0.16.1
+    projections : dict of str to openmc.Tally
+        Projected tallies read from a statepoint, by projection name (see
+        the ``projections`` of :class:`openmc.ExaTally`); empty for a tally
+        without projections or not read from a statepoint. Each is a derived
+        tally with the projected filters and this tally's scores, nuclides,
+        estimator and number of realizations, whose mean and standard
+        deviation come from the sum and sum of squares of the projected batch
+        realizations, so the standard deviation includes the covariance of
+        the fine bins summed into each projected bin. Read from the
+        statepoint on first access.
+
+        .. versionadded:: 0.16.1
     triggers : list of openmc.Trigger
         List of tally triggers
     num_scores : int
@@ -121,9 +186,10 @@ class Tally(IDManagerMixin):
         Whether or not a Summary has been linked
     sum : numpy.ndarray
         An array containing the sum of each independent realization for each bin
-    sum_sq : numpy.ndarray
+    sum_sq : numpy.ndarray or None
         An array containing the sum of each independent realization squared for
-        each bin
+        each bin. None for a tally run with the :class:`openmc.ExaTally`
+        moments mode 'mean' or 'none', which keep the sum only.
     sum_third : numpy.ndarray
         An array containing the sum of each independent realization to the third power for
         each bin
@@ -133,7 +199,11 @@ class Tally(IDManagerMixin):
     mean : numpy.ndarray
         An array containing the sample mean for each bin
     std_dev : numpy.ndarray
-        An array containing the sample standard deviation for each bin
+        An array containing the sample standard deviation for each bin. NaN in
+        every bin for a tally run with the :class:`openmc.ExaTally` moments
+        mode 'mean' or 'none' (no sum of squares is kept), as a read-only view
+        that holds no per-bin memory; the variance-of-the-variance, central
+        moments, skewness and kurtosis raise a ValueError for such a tally.
     vov : numpy.ndarray
         An array containing the variance of the variance for each tally bin
     higher_moments : bool
@@ -165,6 +235,8 @@ class Tally(IDManagerMixin):
         self._nuclides = cv.CheckedList(_NUCLIDE_CLASSES, 'tally nuclides')
         self._scores = cv.CheckedList(_SCORE_CLASSES, 'tally scores')
         self._estimator = None
+        self._exatally = None
+        self._projections = None
         self._triggers = cv.CheckedList(openmc.Trigger, 'tally triggers')
         self._derivative = None
         self._multiply_density = True
@@ -400,6 +472,64 @@ class Tally(IDManagerMixin):
         self._estimator = estimator
 
     @property
+    def exatally(self):
+        return self._exatally
+
+    @exatally.setter
+    def exatally(self, exatally):
+        # None defers to the global Settings.exatally default
+        cv.check_type('exatally', exatally, openmc.ExaTally, none_ok=True)
+        self._exatally = exatally
+
+    @property
+    def projections(self):
+        if self._projections is None:
+            self._projections = {}
+            if self._sp_filename is not None and not self.derived:
+                self._read_projections()
+        return self._projections
+
+    def _read_projections(self):
+        """Build the projected tallies from the statepoint (see projections)."""
+        with h5py.File(self._sp_filename, 'r') as f:
+            group = f[f'tallies/tally {self.id}']
+            if 'projections' not in group:
+                return
+            # Read directly so that the fine results stay unread
+            n = int(group['n_realizations'][()])
+            nuclides = [name.decode().strip()
+                        for name in group['nuclides'][()]]
+            own = {filt.id: filt for filt in self.filters}
+            meshes = {filt.mesh.id: filt.mesh for filt in self.filters
+                      if isinstance(filt, MeshFilter)}
+            for name, proj_group in group['projections'].items():
+                filters = []
+                for filter_id in np.atleast_1d(proj_group.attrs['filters']):
+                    filter_id = int(filter_id)
+                    if filter_id in own:
+                        filters.append(own[filter_id])
+                    else:
+                        filters.append(Filter.from_hdf5(
+                            f[f'tallies/filters/filter {filter_id}'],
+                            meshes=meshes))
+                proj = Tally(name=f'{self.name} projection {name}'.strip())
+                proj._derived = True
+                proj._estimator = self.estimator
+                proj._num_realizations = n
+                proj._sp_filename = self._sp_filename
+                proj._results_read = True
+                proj._with_batch_statistics = True
+                proj.filters = filters
+                proj.nuclides = list(nuclides)
+                proj.scores = list(self.scores)
+                data = proj_group['results'][()]
+                sum_ = np.reshape(data[:, :, 0], proj.shape)
+                sum_sq = np.reshape(data[:, :, 1], proj.shape)
+                proj._mean = sum_ / n
+                proj._std_dev = _std_dev_from_moments(proj._mean, sum_sq, n)
+                self._projections[name] = proj
+
+    @property
     def triggers(self):
         return self._triggers
 
@@ -453,14 +583,15 @@ class Tally(IDManagerMixin):
             else:
                 self._higher_moments = False
 
-            # Extract Tally data from the file
+            # Extract Tally data from the file. A tally run with the ExaTally
+            # moments mode 'mean' or 'none' stores the sum only (one plane), so
+            # it has no sum of squares.
             data = group['results']
-            sum_ = data[:, :, 0]
-            sum_sq = data[:, :, 1]
-
-            # Reshape the results arrays
-            sum_ = np.reshape(sum_, self.shape)
-            sum_sq = np.reshape(sum_sq, self.shape)
+            sum_ = np.reshape(data[:, :, 0], self.shape)
+            if data.shape[2] > 1:
+                sum_sq = np.reshape(data[:, :, 1], self.shape)
+            else:
+                sum_sq = None
 
             # Set the data for this Tally
             self._sum = sum_
@@ -482,7 +613,8 @@ class Tally(IDManagerMixin):
             # Convert NumPy arrays to SciPy sparse LIL matrices
             if self.sparse:
                 self._sum = lil_array(self._sum.reshape(1, -1))
-                self._sum_sq = lil_array(self._sum_sq.reshape(1, -1))
+                if self._sum_sq is not None:
+                    self._sum_sq = lil_array(self._sum_sq.reshape(1, -1))
                 if self._sum_third is not None:
                     self._sum_third = lil_array(self._sum_third.reshape(1, -1))
                 if self._sum_fourth is not None:
@@ -513,7 +645,7 @@ class Tally(IDManagerMixin):
     @property
     @ensure_results
     def sum_sq(self):
-        if not self._sp_filename or self.derived:
+        if not self._sp_filename or self.derived or self._sum_sq is None:
             return None
 
         if self.sparse:
@@ -595,19 +727,14 @@ class Tally(IDManagerMixin):
             if not self._sp_filename:
                 return None
 
-            n = self.num_realizations
-            nonzero = np.abs(self.mean) > 0
-            std_dev = np.zeros_like(self.mean)
-            if n > 1:
-                # Rounding can push the variance below zero when realizations
-                # are nearly identical, so clamp at zero
-                variance = (self.sum_sq[nonzero]/n - self.mean[nonzero]**2)/(n - 1)
-                std_dev[nonzero] = np.sqrt(np.maximum(variance, 0.0))
-            elif nonzero.any():
-                warnings.warn(
-                    'Standard deviation is undefined for a tally with a single '
-                    'realization; reporting it as NaN.')
-                std_dev[nonzero] = np.nan
+            if self._sum_sq is None:
+                # The ExaTally moments modes 'mean' and 'none' keep no sum of
+                # squares, so the standard deviation is unknown (a read-only
+                # NaN view: no per-bin memory)
+                std_dev = np.broadcast_to(np.nan, self.mean.shape)
+            else:
+                std_dev = _std_dev_from_moments(
+                    self.mean, self.sum_sq, self.num_realizations)
 
             # Convert NumPy array to SciPy sparse LIL matrix
             if self.sparse:
@@ -621,9 +748,19 @@ class Tally(IDManagerMixin):
         else:
             return self._std_dev
 
+    def _check_sum_sq(self, quantity):
+        """Raise if the tally has no sum of squares to compute `quantity`."""
+        if self.sum_sq is None:
+            raise ValueError(
+                f"The {quantity} of tally {self.id} is not available: the tally "
+                "has no sum of squares (it was run with the ExaTally moments "
+                "mode 'mean' or 'none'). This requires the moments mode "
+                "'full'.")
+
     @property
     def vov(self):
         if self._vov is None:
+            self._check_sum_sq('variance of the variance')
             n = self.num_realizations
             sum1 = self.sum
             sum2 = self.sum_sq
@@ -652,11 +789,13 @@ class Tally(IDManagerMixin):
 
     @property
     def m2(self):
+        self._check_sum_sq('second central moment')
         n = self.num_realizations
         return self.sum_sq/n - self.mean**2
 
     @property
     def m3(self):
+        self._check_sum_sq('third central moment')
         n = self.num_realizations
         mean = self.mean
         sum2 = self.sum_sq/n
@@ -666,6 +805,7 @@ class Tally(IDManagerMixin):
 
     @property
     def m4(self):
+        self._check_sum_sq('fourth central moment')
         n = self.num_realizations
         mean = self.mean
         sum2 = self.sum_sq/n
@@ -1480,6 +1620,12 @@ class Tally(IDManagerMixin):
             subelement = ET.SubElement(element, "estimator")
             subelement.text = self.estimator
 
+        # ExaTallies accumulator/moments modes (written only when any is set)
+        if self.exatally is not None:
+            subelement = self.exatally.to_xml_element()
+            if subelement is not None:
+                element.append(subelement)
+
         # Optional Triggers
         for trigger in self.triggers:
             element.append(trigger.to_xml_element())
@@ -1576,7 +1722,8 @@ class Tally(IDManagerMixin):
 
         # Scale the raw moments by the atom densities
         self._sum *= factors
-        self._sum_sq *= factors**2
+        if self._sum_sq is not None:
+            self._sum_sq *= factors**2
         if self._sum_third is not None:
             self._sum_third *= factors**3
         if self._sum_fourth is not None:
@@ -1631,6 +1778,12 @@ class Tally(IDManagerMixin):
         estimator = get_text(elem, "estimator")
         if estimator is not None:
             tally.estimator = estimator
+
+        # Set ExaTallies accumulator/moments modes and projections
+        exatally_elem = elem.find("exatally")
+        if exatally_elem is not None:
+            tally.exatally = openmc.ExaTally.from_xml_element(
+                exatally_elem, filters=kwargs.get('filters'))
 
         # Read triggers
         tally.triggers = [
@@ -3877,7 +4030,7 @@ class Tallies(cv.CheckedList):
     def _create_mesh_subelements(self, root_element, memo=None):
         already_written = memo if memo else set()
         for tally in self:
-            for f in tally.filters:
+            for f in _filters_with_projections(tally):
                 if isinstance(f, MeshFilter):
                     if f.mesh.id in already_written:
                         continue
@@ -3889,7 +4042,7 @@ class Tallies(cv.CheckedList):
     def _create_filter_subelements(self, root_element):
         already_written = dict()
         for tally in self:
-            for f in tally.filters:
+            for f in _filters_with_projections(tally):
                 if f not in already_written:
                     root_element.append(f.to_xml_element())
                     already_written[f] = f.id

@@ -378,6 +378,35 @@ Tally::Tally(pugi::xml_node node)
     }
   }
 
+  // Read the projections of the <exatally> block and resolve their filter ids
+  // as for <filters>; init_projections() validates them against the tally's
+  // filters. Read before set_exatally(), which rejects them with 'none'.
+  try {
+    for (auto& [name, ids] :
+      parse_projections(node, fmt::format("tally {}", id_))) {
+      TallyProjection proj;
+      proj.name = name;
+      for (int32_t filter_id : ids) {
+        auto it = model::filter_map.find(filter_id);
+        if (it == model::filter_map.end()) {
+          fatal_error(
+            fmt::format("Tally {} projection '{}': could not find filter {}.",
+              id_, name, filter_id));
+        }
+        proj.filters.push_back(it->second);
+      }
+      projections_.push_back(std::move(proj));
+    }
+  } catch (const std::runtime_error& e) {
+    fatal_error(e.what());
+  }
+
+  // Resolve the ExaTallies modes: a per-tally <exatally> block overrides the
+  // global settings::exatally default child by child (the parser throws on an
+  // invalid value); set_exatally validates the modes' prerequisites.
+  this->set_exatally(
+    parse_exatally(node, settings::exatally, fmt::format("tally {}", id_)));
+
 #ifdef OPENMC_LIBMESH_ENABLED
   // ensure a tracklength tally isn't used with a libMesh filter
   for (auto i : this->filters_) {
@@ -396,6 +425,9 @@ Tally::Tally(pugi::xml_node node)
 Tally::~Tally()
 {
   model::tally_map.erase(id_);
+#ifdef OPENMC_MPI
+  free_accum_window();
+#endif
 }
 
 Tally* Tally::create(int32_t id)
@@ -753,6 +785,109 @@ void Tally::set_nuclides(const vector<std::string>& nuclides)
   }
 }
 
+void Tally::set_exatally(const ExaTally& exatally)
+{
+  // Validate the moments mode. 'mean' and 'none' keep no sum of squares, so
+  // nothing that needs the batch variance (triggers, higher moments) can use
+  // them. This runs after the XML constructor has read the triggers and
+  // higher_moments; the C API offers no way to add either later.
+  if (exatally.moments != MomentsMode::FULL) {
+    const char* mode = moments_mode_name(exatally.moments);
+    if (!triggers_.empty()) {
+      fatal_error(fmt::format("Tally {} uses the <exatally> moments mode '{}', "
+                              "but triggers require moments 'full'.",
+        id_, mode));
+    }
+    if (higher_moments_) {
+      fatal_error(fmt::format("Tally {} uses the <exatally> moments mode '{}', "
+                              "but higher moments require moments 'full'.",
+        id_, mode));
+    }
+  }
+  if (exatally.moments == MomentsMode::NONE) {
+    // A projection folds each batch realization; 'none' keeps none.
+    if (!projections_.empty()) {
+      fatal_error(fmt::format(
+        "Tally {} declares projections, but the <exatally> moments mode "
+        "'none' keeps no batch realizations to project; use 'mean' or 'full'.",
+        id_));
+    }
+    // 'none' forms the mean once from the reduced run total; the no-reduction
+    // writer would need per-rank totals instead.
+    if (!settings::reduce_tallies) {
+      fatal_error(fmt::format(
+        "Tally {} cannot combine the <exatally> moments mode 'none' with the "
+        "no-reduction (no_reduce) option.",
+        id_));
+    }
+    // Random ray scales the accumulator in place every batch (volume
+    // normalization), so a run total kept across batches would be wrong.
+    if (settings::solver_type == SolverType::RANDOM_RAY) {
+      fatal_error(fmt::format(
+        "Tally {} uses the <exatally> moments mode 'none', which is not "
+        "supported by the random ray solver.",
+        id_));
+    }
+  }
+
+  // Validate the accumulator mode. The distributed modes carry hard
+  // prerequisites.
+  if (exatally.accumulator != AccumulatorMode::REPLICATED) {
+#ifndef OPENMC_MPI
+    fatal_error(
+      fmt::format("Tally {} requests a non-replicated accumulator mode, "
+                  "which requires an MPI-enabled build.",
+        id_));
+#endif
+#ifndef _OPENMP
+    // Shared scoring updates one plane from several ranks through omp atomic;
+    // with OpenMP disabled that pragma is a no-op and the updates would race.
+    fatal_error(
+      fmt::format("Tally {} requests a non-replicated accumulator mode, "
+                  "which requires an OpenMP-enabled build.",
+        id_));
+#endif
+    if (!settings::reduce_tallies) {
+      fatal_error(
+        fmt::format("Tally {} cannot combine a non-replicated accumulator mode "
+                    "with the no-reduction (no_reduce) option.",
+          id_));
+    }
+    if (settings::solver_type != SolverType::MONTE_CARLO) {
+      fatal_error(fmt::format(
+        "Tally {} requests a non-replicated accumulator mode, which is "
+        "only supported by the Monte Carlo solver.",
+        id_));
+    }
+    if (exatally.accumulator == AccumulatorMode::RMA) {
+#if defined(OPENMC_MPI) && defined(_OPENMP)
+      // The remote-scoring arm issues MPI from inside the OpenMP scoring
+      // region. Until MPI is initialized with MPI_THREAD_SERIALIZED, reject a
+      // threaded rma run whose MPI cannot serialize those calls; a
+      // single-thread run is safe regardless of the provided level.
+      int provided;
+      MPI_Query_thread(&provided);
+      if (provided < MPI_THREAD_SERIALIZED && num_threads() > 1) {
+        fatal_error(fmt::format(
+          "Tally {} requests accumulator mode 'rma' with more than one OpenMP "
+          "thread, but MPI does not provide MPI_THREAD_SERIALIZED. Run with a "
+          "single thread or an MPI build providing thread serialization.",
+          id_));
+      }
+#endif
+      // Event-based transport reorders scoring; the rma coalescer assumes the
+      // history-based order.
+      if (settings::event_based) {
+        fatal_error(
+          fmt::format("Tally {} requests accumulator mode 'rma', which is "
+                      "not supported in event-based mode.",
+            id_));
+      }
+    }
+  }
+  exatally_ = exatally;
+}
+
 void Tally::init_triggers(pugi::xml_node node)
 {
   for (auto trigger_node : node.children("trigger")) {
@@ -828,22 +963,154 @@ void Tally::init_triggers(pugi::xml_node node)
 
 void Tally::init_results()
 {
-  int n_scores = scores_.size() * nuclides_.size();
-  if (higher_moments_) {
-    results_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
-      static_cast<size_t>(n_scores), size_t {5}});
+  n_score_bins_ = scores_.size() * nuclides_.size();
+  accum_size_ = n_filter_bins_ * n_score_bins_;
+
+  // With one OpenMP thread nothing else writes a rank-private plane, so the
+  // hot path can skip the atomic. Re-evaluated at every simulation init, so a
+  // changed thread count between runs is honoured. The shared node plane is
+  // written by other processes and always needs the atomic.
+  plain_add_ =
+    (num_threads() == 1) && exatally_.accumulator != AccumulatorMode::SHARED;
+
+#ifdef OPENMC_MPI
+  if (exatally_.accumulator == AccumulatorMode::SHARED) {
+    // The per-batch accumulator is one shared plane per node rather than a
+    // per-rank buffer.
+    init_shared_accum();
+  } else if (exatally_.accumulator == AccumulatorMode::RMA) {
+    // The accumulator and moments are block-distributed across ranks; each rank
+    // allocates only its owned window block plus a private owned-rows plane.
+    init_rma_accum();
+  } else
+#endif
+  {
+    // Per-batch accumulator plane. In replicated mode every rank owns a private
+    // contiguous buffer. Any previous plane is released first; the new one is
+    // allocated uninitialised and zeroed by all threads (its first touch).
+    accum_buffer_.reset();
+    accum_buffer_.reset(new double[accum_size_]);
+    parallel_fill(accum_buffer_.get(), accum_size_, 0.0);
+    accum_ = accum_buffer_.get();
+  }
+
+  // Projected moments and realizations (after the rma block map is known).
+  init_projections();
+
+  // Cross-batch moments, shaped [n_filter_bins, n_score_bins, n_moments]. The
+  // moment count is 2 (SUM, SUM_SQ) or 4 (adding SUM_THIRD, SUM_FOURTH). This
+  // is exactly the on-disk statepoint layout, so no VALUE column is stored.
+  //
+  // In reduced mode only the master folds and holds the moments during the run;
+  // the other ranks receive a copy at the final broadcast. They therefore skip
+  // the allocation here, cutting their per-tally footprint to just the
+  // accumulator plane. The moments live on every rank when tallies are not
+  // reduced (each rank is its own owner).
+  //
+  // A 'none' tally keeps no moments during the run on any rank;
+  // collect_none() materialises its one SUM plane for a statepoint and at the
+  // end of the run.
+  //
+  // A full-plane moments array is constructed under the interleave memory
+  // policy, so the constructor's zero pass spreads its pages over the NUMA
+  // domains. The rma owned-rows array is rank-private and small; it stays on
+  // the constructing thread's domain, where this rank's threads fold it.
+  none_materialised_ = false;
+  if (exatally_.moments == MomentsMode::NONE) {
+    moments_ = tensor::Tensor<double>();
+    return;
+  }
+#ifdef OPENMC_MPI
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
+    // Under rma every rank folds and holds the moment rows for the filter bins
+    // it owns; a rank owning zero rows gets an empty (size-0) array.
+    moments_ = tensor::Tensor<double>({static_cast<size_t>(rma_n_rows_),
+      static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
+  } else
+#endif
+    if (mpi::master || !settings::reduce_tallies) {
+    InterleaveDuringAlloc policy(true);
+    moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
+      static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
   } else {
-    results_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
-      static_cast<size_t>(n_scores), size_t {3}});
+    moments_ = tensor::Tensor<double>();
   }
 }
 
 void Tally::reset()
 {
-  n_realizations_ = 0;
-  if (results_.size() != 0) {
-    results_.fill(0.0);
+#ifdef OPENMC_MPI
+  // A 'none' tally with the shared or rma accumulator keeps its run total in
+  // the node plane or the window, which reset() must never write (see below).
+  // Once batches have been accumulated in a running simulation that total
+  // cannot be cleared here, so refuse rather than silently keep it. Resetting
+  // at simulation init, or after the run has finished, is fine: init_results()
+  // gives every run a freshly zeroed window.
+  if (exatally_.moments == MomentsMode::NONE &&
+      exatally_.accumulator != AccumulatorMode::REPLICATED &&
+      simulation::initialized && n_realizations_ > 0) {
+    fatal_error(fmt::format(
+      "Tally {} cannot be reset during a simulation: it uses the <exatally> "
+      "moments mode 'none' with the '{}' accumulator mode, whose run total "
+      "can only be cleared by a new simulation.",
+      id_,
+      exatally_.accumulator == AccumulatorMode::SHARED ? "shared" : "rma"));
   }
+#endif
+  n_realizations_ = 0;
+  // Projection moments and realizations are CPU-local on every rank.
+  reset_projections();
+#ifdef OPENMC_MPI
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
+    // This rank's window block is written from the CPU only inside the
+    // collective fold in rma_fold(), never here. Between batches it is zero,
+    // and at init or between runs it may already hold remote accumulates for
+    // the coming batch from ranks that are ahead; zeroing it here, with no
+    // collective after, would discard them. Only the private plane, written
+    // solely by this rank's threads, is this rank's to reset.
+    if (rma_plane_size_ > 0) {
+      parallel_fill(accum_, rma_plane_size_, 0.0);
+    }
+    if (moments_.size() != 0) {
+      parallel_fill(moments_.data(), moments_.size(), 0.0);
+    }
+    return;
+  }
+#endif
+  if (accum_ != nullptr && accum_size_ != 0) {
+#ifdef OPENMC_MPI
+    // The shared node plane is never written here: it is zero at init (the
+    // window is born zeroed) and between batches (each batch ends with a
+    // fold/zero + publish). A leader zeroing it here could race other node
+    // ranks that are already scoring the next batch into it.
+    if (exatally_.accumulator != AccumulatorMode::SHARED)
+#endif
+    {
+      parallel_fill(accum_, accum_size_, 0.0);
+    }
+  }
+  if (moments_.size() != 0) {
+    parallel_fill(moments_.data(), moments_.size(), 0.0);
+  }
+}
+
+double Tally::tally_normalization() const
+{
+  // Total source strength (fixed source) or unity (eigenvalue) per generation,
+  // divided by the number of contributing particles.
+  double total_source = 1.0;
+  if (settings::run_mode == RunMode::FIXED_SOURCE) {
+    total_source = model::external_sources_probability.integral();
+  }
+  double contributing_particles = settings::reduce_tallies
+                                    ? settings::n_particles
+                                    : simulation::work_per_rank;
+  double norm =
+    total_source / (contributing_particles * settings::gen_per_batch);
+  if (settings::solver_type == SolverType::RANDOM_RAY) {
+    norm = 1.0;
+  }
+  return norm;
 }
 
 void Tally::accumulate()
@@ -851,58 +1118,37 @@ void Tally::accumulate()
   // Increment number of realizations
   n_realizations_ += settings::reduce_tallies ? 1 : mpi::n_procs;
 
-  if (mpi::master || !settings::reduce_tallies) {
-    // Calculate total source strength for normalization
-    double total_source = 0.0;
-    if (settings::run_mode == RunMode::FIXED_SOURCE) {
-      total_source = model::external_sources_probability.integral();
-    } else {
-      total_source = 1.0;
-    }
-
-    // Determine number of particles contributing to tally
-    double contributing_particles = settings::reduce_tallies
-                                      ? settings::n_particles
-                                      : simulation::work_per_rank;
-
-    // Account for number of source particles in normalization
-    double norm =
-      total_source / (contributing_particles * settings::gen_per_batch);
-
-    if (settings::solver_type == SolverType::RANDOM_RAY) {
-      norm = 1.0;
-    }
-
-    // Accumulate each result
-    if (higher_moments_) {
-#pragma omp parallel for
-      // filter bins (specific cell, energy bins)
-      for (int64_t i = 0; i < results_.shape(0); ++i) {
-        // score bins (flux, total reaction rate, fission reaction rate, etc.)
-        for (int j = 0; j < results_.shape(1); ++j) {
-          double val = results_(i, j, TallyResult::VALUE) * norm;
-          double val2 = val * val;
-          results_(i, j, TallyResult::VALUE) = 0.0;
-          results_(i, j, TallyResult::SUM) += val;
-          results_(i, j, TallyResult::SUM_SQ) += val2;
-          results_(i, j, TallyResult::SUM_THIRD) += val2 * val;
-          results_(i, j, TallyResult::SUM_FOURTH) += val2 * val2;
-        }
-      }
-    } else {
-#pragma omp parallel for
-      // filter bins (specific cell, energy bins)
-      for (int64_t i = 0; i < results_.shape(0); ++i) {
-        // score bins (flux, total reaction rate, fission reaction rate, etc.)
-        for (int j = 0; j < results_.shape(1); ++j) {
-          double val = results_(i, j, TallyResult::VALUE) * norm;
-          results_(i, j, TallyResult::VALUE) = 0.0;
-          results_(i, j, TallyResult::SUM) += val;
-          results_(i, j, TallyResult::SUM_SQ) += val * val;
-        }
-      }
-    }
+  if (exatally_.moments == MomentsMode::NONE) {
+    // No fold and no collective: the accumulator keeps the run total, and
+    // collect_none() combines it only for a statepoint and at the end of the
+    // run. A SUM plane materialised before this batch is now stale.
+    //
+    // Under rma the remote-scoring staging is therefore not drained per batch.
+    // That is safe: buffers keep filling across batch boundaries and are issued
+    // when full, and rma_coalescer_flush() retires a buffer still in flight
+    // (flush_local to its target) before reusing it, so buffer liveness never
+    // depended on the per-batch drain. collect_none() drains everything.
+    if (none_materialised_)
+      release_none_moments();
+    return;
   }
+
+#ifdef OPENMC_MPI
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
+    rma_fold();
+    return;
+  }
+#endif
+
+  // Fold the per-batch accumulator into the moments and zero it (only the
+  // master holds the reduced sum unless reduction is off).
+  if (mpi::master || !settings::reduce_tallies)
+    fold_moments();
+
+#ifdef OPENMC_MPI
+  if (exatally_.accumulator == AccumulatorMode::SHARED)
+    shared_batch_end();
+#endif
 }
 
 int Tally::score_index(const std::string& score) const
@@ -922,10 +1168,10 @@ tensor::Tensor<double> Tally::get_reshaped_data() const
   }
 
   // add number of scores and nuclides to tally
-  shape.push_back(results_.shape(1));
-  shape.push_back(results_.shape(2));
+  shape.push_back(moments_.shape(1));
+  shape.push_back(moments_.shape(2));
 
-  tensor::Tensor<double> reshaped_results = results_;
+  tensor::Tensor<double> reshaped_results = moments_;
   reshaped_results.reshape(shape);
   return reshaped_results;
 }
@@ -1023,30 +1269,43 @@ void read_tallies_xml(pugi::xml_node root)
 #ifdef OPENMC_MPI
 void reduce_tally_results()
 {
-  // Don't reduce tally is no_reduce option is on
+  // Don't reduce tallies if the no_reduce option is on
   if (settings::reduce_tallies) {
     for (int i_tally : model::active_tallies) {
       // Skip any tallies that are not active
       auto& tally {model::tallies[i_tally]};
 
-      // Extract 2D view of the VALUE column from the 3D results tensor,
-      // then copy into a contiguous array for MPI reduction
-      const int val_idx = static_cast<int>(TallyResult::VALUE);
-      tensor::View<double> val_view =
-        tally->results_.slice(tensor::all, tensor::all, val_idx);
-      tensor::Tensor<double> values(val_view);
+      // A 'none' tally keeps its run total in the accumulator and is combined
+      // only by collect_none() (statepoint batches and the end of the run).
+      // The mode is rank-identical, so every rank skips the same tallies.
+      if (tally->moments_mode() == MomentsMode::NONE)
+        continue;
 
-      tensor::Tensor<double> values_reduced(values.shape());
+      if (tally->accumulator() == AccumulatorMode::SHARED) {
+        // Publish this node's scores and combine the node planes onto the
+        // master, replacing the intracomm reduce. The plane then belongs to the
+        // node leader until accumulate() folds/zeroes it and resumes.
+        tally->shared_publish();
+        continue;
+      }
 
-      // Reduce contiguous set of tally results
-      mpi::reduce(values.data(), values_reduced.data(), values.size(), MPI_SUM,
-        0, mpi::intracomm);
+      if (tally->accumulator() == AccumulatorMode::RMA) {
+        // Complete every rank's accumulates into the distributed window and
+        // barrier so nothing is in flight; accumulate() then folds each rank's
+        // owned rows. No intracomm reduce -- the data is already at its owner.
+        tally->rma_publish();
+        continue;
+      }
 
-      // Transfer values on master and reset on other ranks
-      if (mpi::master) {
-        val_view = values_reduced;
-      } else {
-        val_view = 0.0;
+      // The accumulator is contiguous, so it reduces in place onto the master
+      // with no scratch buffer, in 1 GiB chunks (reduce_accum_to_master).
+      reduce_accum_to_master(tally->accum_, tally->accum_size_, mpi::intracomm);
+
+      // The fold that zeroes accum_ only runs on the master, so non-master
+      // ranks must clear their (now already-summed) accumulator here to avoid
+      // double-counting into the next batch.
+      if (!mpi::master) {
+        parallel_fill(tally->accum_, tally->accum_size_, 0.0);
       }
     }
   }
@@ -1587,14 +1846,37 @@ extern "C" int openmc_tally_results(
   }
 
   const auto& t {model::tallies[index]};
-  if (t->results_.size() == 0) {
-    set_errmsg("Tally results have not been allocated yet.");
+  if (t->rma_distributed()) {
+    // Under multi-rank rma each rank holds only its owned moment rows, so
+    // there is no global in-memory array to return; consume those results
+    // from the statepoint. A single-rank rma tally holds the full array and
+    // is served below.
+    set_errmsg(
+      "In-memory results are not available for a tally using the 'rma' "
+      "accumulator mode on a multi-rank run; read them from the statepoint "
+      "file instead.");
+    return OPENMC_E_ALLOCATE;
+  }
+  if (!t->has_moments()) {
+    if (t->moments_mode() == MomentsMode::NONE) {
+      set_errmsg("In-memory results of a tally using the <exatally> moments "
+                 "mode 'none' are available only at the end of the run.");
+    } else if (t->accumulator() == AccumulatorMode::SHARED &&
+               mpi::n_procs > 1) {
+      set_errmsg("In-memory results of a tally using the 'shared' "
+                 "accumulator mode live on rank 0 of each run; read them "
+                 "there or from the statepoint file.");
+    } else {
+      set_errmsg("Tally results have not been allocated yet.");
+    }
     return OPENMC_E_ALLOCATE;
   }
 
-  // Set pointer to results and copy shape
-  *results = t->results_.data();
-  auto s = t->results_.shape();
+  // Set pointer to the moments array and copy its shape. The innermost
+  // dimension is now n_moments (SUM=0, SUM_SQ=1, ...), matching the on-disk
+  // statepoint layout -- there is no leading VALUE column.
+  *results = t->moments().data();
+  auto s = t->moments().shape();
   shape[0] = s[0];
   shape[1] = s[1];
   shape[2] = s[2];
@@ -1617,7 +1899,10 @@ extern "C" size_t tallies_size()
   return model::tallies.size();
 }
 
-// given a tally ID, remove it from the tallies vector
+// given a tally ID, remove it from the tallies vector. For a tally in the
+// shared or rma accumulator mode this frees an MPI window and is therefore
+// collective on all ranks (node_comm for shared, intracomm for rma) -- every
+// rank must remove the same tally.
 extern "C" int openmc_remove_tally(int32_t index)
 {
   // check that id is in the map

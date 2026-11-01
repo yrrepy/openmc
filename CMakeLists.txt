@@ -405,6 +405,7 @@ list(APPEND libopenmc_SOURCES
   src/surface.cpp
   src/xdg.cpp
   src/tallies/derivative.cpp
+  src/tallies/exatally.cpp
   src/tallies/filter.cpp
   src/tallies/filter_azimuthal.cpp
   src/tallies/filter_cell.cpp

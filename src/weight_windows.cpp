@@ -427,6 +427,27 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
     }
   }
 
+  // Under a reduced multi-rank run only rank 0 holds the tally's folded
+  // moments: it computes the bounds and broadcasts them. Without reduction each
+  // rank owns an independent realization and updates its own bounds.
+  if (mpi::master || !settings::reduce_tallies)
+    this->compute_bounds(tally, value, threshold, ratio, method);
+
+#ifdef OPENMC_MPI
+  if (settings::reduce_tallies && mpi::n_procs > 1) {
+    mpi::broadcast(lower_ww_.data(), lower_ww_.size(), 0, mpi::intracomm);
+    mpi::broadcast(upper_ww_.data(), upper_ww_.size(), 0, mpi::intracomm);
+  }
+#endif
+}
+
+void WeightWindows::compute_bounds(const Tally* tally, const std::string& value,
+  double threshold, double ratio, WeightWindowUpdateMethod method)
+{
+  // Dimensions of weight window arrays
+  int e_bins = lower_ww_.shape(0);
+  int64_t mesh_bins = lower_ww_.shape(1);
+
   // determine which value to use
   const std::set<std::string> allowed_values = {"mean", "rel_err"};
   if (allowed_values.count(value) == 0) {
@@ -455,7 +476,7 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
   // build a shape for the tally results, this will always be
   // dimension 5 (3 filter dimensions, 1 score dimension, 1 results dimension)
   // Look for the size of the last dimension of the results tensor
-  const auto& results = tally->results();
+  const auto& results = tally->moments();
   const int results_dim = static_cast<int>(results.shape(2));
   std::array<int, 5> shape = {1, 1, 1, tally->n_scores(), results_dim};
 
@@ -530,8 +551,8 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
   tensor::Tensor<double> sum_sq(
     {static_cast<size_t>(e_bins), static_cast<size_t>(mesh_bins)});
 
-  const int i_sum = static_cast<int>(TallyResult::SUM);
-  const int i_sum_sq = static_cast<int>(TallyResult::SUM_SQ);
+  const int i_sum = static_cast<int>(TallyMoment::SUM);
+  const int i_sum_sq = static_cast<int>(TallyMoment::SUM_SQ);
 
   for (int e = 0; e < e_bins; e++) {
     for (int64_t m = 0; m < mesh_bins; m++) {
@@ -680,6 +701,24 @@ void WeightWindows::update_weights(const Tally* tally, const std::string& value,
 
 void WeightWindows::check_tally_update_compatibility(const Tally* tally)
 {
+  // the update runs on rank 0, which needs the tally's full moments; under a
+  // distributed rma accumulator each rank holds only the rows it owns
+  if (tally->rma_distributed()) {
+    fatal_error(fmt::format("Tally {} uses the <exatally> accumulator mode "
+                            "'rma'; updating weight windows needs the tally's "
+                            "full moments on rank 0, so use the replicated or "
+                            "shared accumulator mode.",
+      tally->id()));
+  }
+
+  // the update reads the sum of squares (relative error), which only the full
+  // moments mode keeps
+  if (tally->moments_mode() != MomentsMode::FULL) {
+    fatal_error(fmt::format("Tally {} uses the <exatally> moments mode '{}'; "
+                            "updating weight windows requires moments 'full'.",
+      tally->id(), moments_mode_name(tally->moments_mode())));
+  }
+
   // define the set of allowed filters for the tally
   const std::set<FilterType> allowed_filters = {
     FilterType::MESH, FilterType::ENERGY, FilterType::PARTICLE};
@@ -858,6 +897,28 @@ void WeightWindowsGenerator::create_tally()
   Tally* ww_tally = Tally::create();
   tally_idx_ = model::tally_map[ww_tally->id()];
   ww_tally->set_scores({"flux"});
+
+  // The weight-window-generation tally always keeps the replicated accumulator
+  // mode: the global <exatally> accumulator default does not apply to it. Warn
+  // once (on the master) if a distributed default was requested, so the
+  // retained per-rank memory is not a surprise.
+  if (settings::exatally.accumulator != AccumulatorMode::REPLICATED &&
+      mpi::master) {
+    warning(fmt::format(
+      "Weight-window generation tally {} keeps the replicated accumulator "
+      "mode (its moments are folded on rank 0, which broadcasts the bounds); "
+      "the global <exatally> accumulator default does not apply to it.",
+      ww_tally->id()));
+  }
+  // Likewise it always keeps the full moments mode, since the weight-window
+  // update needs the relative error.
+  if (settings::exatally.moments != MomentsMode::FULL && mpi::master) {
+    warning(fmt::format(
+      "Weight-window generation tally {} keeps the moments mode 'full' (the "
+      "update needs its relative error); the global <exatally> moments "
+      "default does not apply to it.",
+      ww_tally->id()));
+  }
 
   int32_t mesh_id = wws->mesh()->id();
   int32_t mesh_idx = model::mesh_map.at(mesh_id);

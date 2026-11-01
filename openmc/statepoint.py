@@ -438,6 +438,15 @@ class StatePoint:
                     if 'higher_moments' in group.attrs:
                         tally.higher_moments = bool(group.attrs['higher_moments'][()])
 
+                    # ExaTally moments mode (an absent attribute means 'full');
+                    # recorded on the tally only when it is not the default
+                    if 'moments' in group.attrs:
+                        moments = group.attrs['moments']
+                        if isinstance(moments, bytes):
+                            moments = moments.decode()
+                        if moments != 'full':
+                            tally.exatally = openmc.ExaTally(moments=moments)
+
                     # Read the number of realizations
                     n_realizations = group['n_realizations'][()]
 

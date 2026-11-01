@@ -976,13 +976,32 @@ Functions
    :return: Return status (negative if an error occurred)
    :rtype: int
 
-.. c:function:: int openmc_tally_results(int32_t index, double** ptr, int shape_[3])
+.. c:function:: int openmc_tally_results(int32_t index, double** ptr, size_t shape_[3])
 
-   Get a pointer to tally results array.
+   Get a pointer to a tally's moments array.
+
+   .. versionchanged:: 0.16.1
+      The returned array is now the cross-batch moments with shape
+      ``(n_filter_bins, n_score_bins, n_moments)``. The innermost axis holds
+      ``[SUM, SUM_SQ, ...]`` -- there is no longer a leading ``VALUE`` column,
+      so ``SUM`` moved from index 1 to index 0 and ``SUM_SQ`` from 2 to 1. This
+      matches the on-disk statepoint layout. The ``mean`` and ``std_dev``
+      properties of ``openmc.lib.Tally`` follow the new layout; code that
+      indexes the raw ``results`` array must use the new column numbers.
+
+   The number of moments is 2 (4 with higher moments) for the ExaTallies
+   moments mode ``full`` and 1 (``SUM`` only) for ``mean`` and ``none``. A
+   ``none`` tally holds no moments while the simulation runs, so its results
+   are available only once the simulation has been finalized. On a multi-rank
+   run the results of a tally with the ``rma`` accumulator mode are not held in
+   memory and the call returns an error; read them from the statepoint file.
+   With the ``replicated`` accumulator the results are held on the master
+   rank only until the end-of-run broadcast; with ``shared`` they stay on the
+   master rank.
 
    :param int32_t index: Index in the tallies array
-   :param double** ptr: Pointer to the results array
-   :param int[3] shape_: Shape of the results array
+   :param double** ptr: Pointer to the moments array
+   :param size_t[3] shape_: Shape of the moments array
    :return: Return status (negative if an error occurred)
    :rtype: int
 

@@ -195,7 +195,19 @@ int openmc_simulation_finalize()
   // Increment total number of generations
   simulation::total_gen += simulation::current_batch * settings::gen_per_batch;
 
+  // A 'none' tally keeps no moments during the run: combine its run total and
+  // materialise its SUM plane for the end-of-run readout (tallies.out,
+  // openmc.lib). Collective on all ranks; skipped when a statepoint written at
+  // the last batch already did it.
+  for (auto& t : model::tallies) {
+    if (t->moments_mode() == MomentsMode::NONE)
+      t->collect_none();
+  }
+
 #ifdef OPENMC_MPI
+  // Collective on all ranks; prints the rma traffic counters at verbosity 8.
+  report_rma_statistics();
+
   broadcast_results();
 #endif
 
@@ -479,6 +491,21 @@ void initialize_batch()
 {
   // Increment current batch
   ++simulation::current_batch;
+
+  // Shared/rma accumulator modes are incompatible with CMFD, which reads tally
+  // results on all ranks mid-run. cmfd_run is only set once the run has started
+  // (and openmc_reset clears it during simulation init), so this is checked
+  // here rather than at input validation. The scan runs only in CMFD runs.
+  if (settings::cmfd_run) {
+    for (const auto& t : model::tallies) {
+      if (t->accumulator() != AccumulatorMode::REPLICATED) {
+        fatal_error(
+          fmt::format("Tally {} uses a non-replicated accumulator mode, "
+                      "which is not compatible with CMFD.",
+            t->id_));
+      }
+    }
+  }
   if (settings::run_mode == RunMode::FIXED_SOURCE) {
     if (settings::solver_type == SolverType::RANDOM_RAY &&
         simulation::current_batch < settings::n_inactive + 1) {
@@ -536,11 +563,17 @@ void finalize_batch()
     simulation::n_realizations = 0;
   }
 
-  // Check_triggers
-  if (mpi::master)
-    check_triggers();
+  // Check triggers. This is normally a master-only computation, but when an
+  // rma-accumulator tally carries a trigger the tally-uncertainty walk is
+  // distributed (each rank owns only part of the moments), so every rank must
+  // participate. The satisfy/continue decision still flows solely from the
+  // master via the broadcast below.
 #ifdef OPENMC_MPI
+  if (mpi::master || has_rma_triggers())
+    check_triggers();
   MPI_Bcast(&simulation::satisfy_triggers, 1, MPI_C_BOOL, 0, mpi::intracomm);
+#else
+  check_triggers();
 #endif
   if (simulation::satisfy_triggers ||
       (settings::trigger_on &&
@@ -917,10 +950,33 @@ void initialize_data()
 #ifdef OPENMC_MPI
 void broadcast_results()
 {
-  // Broadcast tally results so that each process has access to results
+  // Broadcast tally moments so that each process has access to results. Only
+  // the moments need broadcasting: the accumulator is all zeros at this point
+  // (end of run), except for a 'none' tally, whose moments are the SUM plane
+  // collect_none() materialised from it.
   for (auto& t : model::tallies) {
-    auto& results = t->results_;
-    mpi::broadcast(results.data(), results.size(), 0, mpi::intracomm);
+    // Distributed modes keep their results where they live (rank 0 for shared,
+    // the owning rank for rma) and are read there by design, so they are not
+    // broadcast. Only replicated tallies serve full results on every rank.
+    if (t->accumulator() != AccumulatorMode::REPLICATED)
+      continue;
+
+    // Non-master ranks drop their moments during a reduced run, so allocate a
+    // receiving buffer before the broadcast. This restores the end-of-run
+    // contract that every rank can serve results (openmc.lib .mean on any rank,
+    // coupled depletion). The shape comes from the tally's own dimensions so it
+    // matches the master's array exactly. It is constructed under the
+    // interleave memory policy, like the master's moments.
+    if (!t->has_moments()) {
+      InterleaveDuringAlloc policy(true);
+      t->moments() =
+        tensor::Tensor<double>({static_cast<size_t>(t->n_filter_bins()),
+          static_cast<size_t>(t->n_score_bins()),
+          static_cast<size_t>(t->n_moments())});
+    }
+
+    auto& moments = t->moments();
+    mpi::broadcast(moments.data(), moments.size(), 0, mpi::intracomm);
   }
 
   // Also broadcast global tally results

@@ -156,6 +156,7 @@ Constructing Tallies
    openmc.MeshMaterialVolumes
    openmc.Trigger
    openmc.TallyDerivative
+   openmc.ExaTally
    openmc.Tally
    openmc.Tallies
 

@@ -49,5 +49,21 @@ extern KTrigger keff_trigger;
 
 void check_triggers();
 
+//! \brief Whether any rma-accumulator tally carries an active trigger.
+//!
+//! When true, the tally-uncertainty walk must run collectively across ranks
+//! (each rank owns only part of the moments), so the trigger check is invoked
+//! on every rank rather than the master alone. The scan is over global tally
+//! metadata, so it returns the same value on every rank.
+bool has_rma_triggers();
+
+//! \brief Reduce the limiting trigger across ranks for rma tallies (MPI
+//! builds only).
+//!
+//! MAXLOC-reduces {ratio, rank} over all ranks; the owning rank sends its
+//! tally id and score to the master. Collective: call on every rank, and only
+//! when has_rma_triggers() is true.
+void rma_reduce_trigger(double& ratio, int& tally_id, int& score);
+
 } // namespace openmc
 #endif // OPENMC_TALLIES_TRIGGER_H

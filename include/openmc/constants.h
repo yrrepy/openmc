@@ -313,7 +313,31 @@ enum class MgxsType {
 // ============================================================================
 // TALLY-RELATED CONSTANTS
 
+// Interleaved per-result layout used only by simulation::global_tallies (k-eff
+// etc.). Per-tally results use a separate accumulator plane plus a moments
+// array indexed by TallyMoment (see tally.h).
 enum class TallyResult { VALUE, SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
+
+// Column indices into a Tally's moments_ array. n_moments is 2 by default and 4
+// when higher_moments_ is enabled. This layout matches the on-disk statepoint
+// "results" dataset exactly.
+enum class TallyMoment { SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
+
+// Maximum doubles moved per MPI/HDF5 call by the chunked tally paths (1 GiB);
+// keeps element counts below the int limit of the MPI C interface and bounds
+// the MPI library's internal reduction temporaries, which scale with the count
+// of one call.
+constexpr int64_t MAX_MPI_CHUNK_DOUBLES {int64_t {1} << 27};
+
+// Maximum doubles per chunk of the rma statepoint gather (64 MiB). The master
+// receives the next chunk into a second buffer while it writes the current one,
+// so the gather holds two such buffers.
+constexpr int64_t MAX_RMA_GATHER_DOUBLES {int64_t {1} << 23};
+
+// MPI point-to-point tags used by the distributed (rma) tally paths.
+constexpr int TAG_RMA_TRIGGER {42};    // limiting-trigger info to the master
+constexpr int TAG_RMA_GATHER {43};     // statepoint owned-rows gather
+constexpr int TAG_RMA_PROJECTION {44}; // per-batch projection partials
 
 enum class TallyType { VOLUME, MESH_SURFACE, SURFACE, PULSE_HEIGHT };
 

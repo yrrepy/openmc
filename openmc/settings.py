@@ -16,6 +16,7 @@ from ._xml import clean_indentation, get_elem_list, get_text
 from .mesh import _read_meshes, RegularMesh, MeshBase
 from .source import SourceBase, MeshSource, IndependentSource
 from .utility_funcs import input_path, set_xml_input_path
+from .exatally import ExaTally
 from .volume import VolumeCalculation
 from .weight_windows import WeightWindows, WeightWindowGenerator, WeightWindowsList
 
@@ -172,6 +173,18 @@ class Settings:
     no_reduce : bool
         Indicate that all user-defined and global tallies should not be reduced
         across processes in a parallel calculation.
+    exatally : openmc.ExaTally or None
+        Default ExaTallies accumulator/moments modes for all tallies. The
+        accumulator mode controls how the per-batch accumulator is distributed
+        across MPI ranks; 'replicated' (the built-in default) keeps a full
+        private copy on every rank. The moments mode controls which cross-batch
+        moments are kept per bin; 'full' (the built-in default) keeps the sum
+        and the sum of squares. A mode left unset keeps the built-in default.
+        Individual tallies can override this via :attr:`openmc.Tally.exatally`.
+        Projections are per tally: an :class:`openmc.ExaTally` with
+        projections raises a ValueError here.
+
+        .. versionadded:: 0.16.1
     output : dict
         Dictionary indicating what files to output. Acceptable keys are:
 
@@ -469,6 +482,7 @@ class Settings:
         self._surf_source_write = {}
 
         self._no_reduce = None
+        self._exatally = None
 
         self._verbosity = None
 
@@ -1035,6 +1049,18 @@ class Settings:
     def no_reduce(self, no_reduce: bool):
         cv.check_type('no reduction option', no_reduce, bool)
         self._no_reduce = no_reduce
+
+    @property
+    def exatally(self) -> ExaTally | None:
+        return self._exatally
+
+    @exatally.setter
+    def exatally(self, exatally: ExaTally | None):
+        cv.check_type('exatally', exatally, ExaTally, none_ok=True)
+        if exatally is not None and exatally.projections:
+            raise ValueError('ExaTally projections are declared per tally '
+                             '(openmc.Tally.exatally), not in the settings.')
+        self._exatally = exatally
 
     @property
     def verbosity(self) -> int:
@@ -1815,6 +1841,12 @@ class Settings:
             element = ET.SubElement(root, "no_reduce")
             element.text = str(self._no_reduce).lower()
 
+    def _create_exatally_subelement(self, root):
+        if self._exatally is not None:
+            element = self._exatally.to_xml_element()
+            if element is not None:
+                root.append(element)
+
     def _create_ifp_n_generation_subelement(self, root):
         if self._ifp_n_generation is not None:
             element = ET.SubElement(root, "ifp_n_generation")
@@ -2340,6 +2372,11 @@ class Settings:
         if text is not None:
             self.no_reduce = text in ('true', '1')
 
+    def _exatally_from_xml_element(self, root):
+        elem = root.find('exatally')
+        if elem is not None:
+            self.exatally = ExaTally.from_xml_element(elem)
+
     def _verbosity_from_xml_element(self, root):
         text = get_text(root, 'verbosity')
         if text is not None:
@@ -2631,6 +2668,7 @@ class Settings:
         self._create_entropy_mesh_subelement(element, mesh_memo)
         self._create_trigger_subelement(element)
         self._create_no_reduce_subelement(element)
+        self._create_exatally_subelement(element)
         self._create_verbosity_subelement(element)
         self._create_ifp_n_generation_subelement(element)
         self._create_tabular_legendre_subelements(element)
@@ -2750,6 +2788,7 @@ class Settings:
         settings._entropy_mesh_from_xml_element(elem, meshes)
         settings._trigger_from_xml_element(elem)
         settings._no_reduce_from_xml_element(elem)
+        settings._exatally_from_xml_element(elem)
         settings._verbosity_from_xml_element(elem)
         settings._ifp_n_generation_from_xml_element(elem)
         settings._tabular_legendre_from_xml_element(elem)

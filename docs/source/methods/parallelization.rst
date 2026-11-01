@@ -599,6 +599,249 @@ is actually independent of the number of nodes:
     E \left [ \Lambda_{j_{\text{max}}} \right ] = \sqrt{ \frac{N\sigma^2}{2\pi
     k^2}}.
 
+.. _methods_parallel_exatallies:
+
+----------------------------------------------
+ExaTallies: Tally Memory and Accumulator Modes
+----------------------------------------------
+
+By default every MPI rank keeps a private copy of each tally. For a fine mesh
+crossed with a fine energy grid a single tally can reach tens of gigabytes, so a
+per-rank copy on every core of a node makes the tally, not the transport, the
+memory bottleneck. OpenMC therefore separates a tally's storage into two
+objects: a per-batch *accumulator* plane, the only thing transport writes, and a
+smaller set of cross-batch *moments* (:math:`\sum x` and :math:`\sum x^2`, plus
+higher moments when requested) that a once-per-batch fold updates from the
+accumulator. This is the batch-means decomposition used by the shared-memory
+mesh tally in MCNP [Mosher2018]_; keeping the accumulator separate from the
+moments is what lets the accumulator be re-homed without touching the scoring
+hot path. The ``<accumulator>`` sub-element of the :ref:`\<exatally\> element
+<settings_exatally>` (the accumulator mode) selects where the accumulator (and,
+for ``rma``, the moments) live:
+
+* **replicated** -- one private accumulator per rank (the default). The
+  end-of-batch reduction sums the accumulators onto the master, which folds the
+  moments; a final broadcast restores full results on every rank.
+
+* **shared** -- one accumulator plane per shared-memory node, held in an MPI-3
+  shared-memory window. Cross-process scores use hardware atomics on the shared
+  window, so per-node tally memory no longer scales with the number of ranks on
+  the node. A rank-private plane (the ``replicated`` accumulator and the
+  ``rma`` private plane) is updated with plain adds instead of atomics when the
+  rank runs one OpenMP thread; the ``shared`` plane keeps the atomic at any
+  thread count, because other processes update it too.
+
+  Linux places each page of the node plane on the NUMA domain of the core that
+  first touches it. Every rank on the node therefore zeroes its own
+  page-aligned slice of the plane at initialization, so the plane is spread
+  over the node's NUMA domains instead of sitting on the domain of the node
+  leader. The same slices are used for the per-batch zeroing of the plane on
+  every node but the master's: after one node barrier, each rank zeroes its own
+  slice.
+
+* **rma** -- the accumulator *and* its moments are block-distributed by
+  filter-bin row across all ranks, so each rank holds only its share of a
+  fixed total of about four planes (two with moments ``none``), and per-node
+  tally memory falls as the number of nodes grows. Transport is replicated
+  rather than
+  domain-decomposed, so most scores target bins owned by other ranks. This is
+  the opposite choice from OpenMC's earlier domain-decomposed terabyte-tally
+  work [Horelik2014]_, which partitioned the geometry, moved particles between
+  domains, and let each rank tally only its own region: ExaTallies keeps every
+  history on the rank that started it and partitions only the tally data, so
+  the random walk, the source convergence and the load balance are those of
+  the replicated run. A rank
+  writes bins it owns into a private plane and accumulates contributions to
+  remote bins into other ranks' blocks with one-sided ``MPI_Accumulate``. To
+  keep one-sided operations off the per-score critical path, scores are
+  coalesced per filter-bin row and staged into per-target buffers that are
+  flushed as batched, indexed accumulates -- the origin-side buffering that
+  makes remote accumulation viable [Romano2011]_ [Dun2015]_. One-sided tally
+  accumulation on a distributed, globally addressable tally block follows
+  [Romano2011]_ and [Dun2015]_; both are implemented here independently on
+  MPI-3. The tally-server alternative -- dedicating ranks to hold tally memory
+  and forwarding scores to them -- is analyzed in [Romano2013]_. Results are
+  read from the statepoint file: for the write the master gathers the owned
+  rows of every rank in bounded chunks, and on restart each rank reads back
+  only its own rows.
+
+  The private plane is a deliberate memory cost. The window block is touched
+  only by ``MPI_Accumulate`` while scoring is in flight -- mixing CPU
+  read-modify-writes with NIC-side atomics on the same locations is undefined in
+  MPI and corrupts on fabrics with device atomics -- so a rank keeps the scores
+  it makes to its own bins in a separate private plane rather than writing them
+  into the window, which holds those scores at memory speed. Each rank therefore
+  holds, for its owned block of filter-bin rows, the window block, its owned
+  moment rows, *and* this extra private accumulator plane. Per-rank tally memory
+  is thus :math:`(2 + n_\text{moments}) / N` planes on :math:`N` ranks -- with
+  the default two moments about one third more than the theoretical
+  :math:`(1 + n_\text{moments}) / N` minimum -- though it still falls as
+  :math:`1/N`. Users sizing runs against this memory model should budget for the
+  extra plane, and for the staging buffers of the remote scoring path, which
+  are sized from a 64 MiB per-rank budget shared by all ``rma`` tallies; the
+  budget covers the staged rows, their displacements and the per-thread
+  compaction scratch. A warning is printed when the minimum staging (one row
+  per buffer) does not fit the budget, and when the budget allows fewer than
+  eight rows per buffer.
+
+The ``<moments>`` sub-element (the moments mode) selects which cross-batch
+moments are kept, independently of the accumulator mode. ``full`` keeps
+:math:`n_\text{moments} = 2` planes (:math:`\sum x` and :math:`\sum x^2`; 4
+with higher moments). ``mean`` keeps :math:`\sum x` only, giving up the
+standard deviation, triggers, and higher moments. ``none`` keeps no moment plane
+during the run: the accumulator is never zeroed, so it holds the run total, and
+it is combined across ranks only when a statepoint is written and at the end of
+the run -- one collection per statepoint instead of one reduction per batch.
+There the total is scaled once by the tally normalization into a one-plane sum,
+which is written and read exactly like the ``mean`` sum, so the mean is formed
+once at the end. Scaling the total once is equivalent to scaling every batch
+because the normalization (the source strength divided by the number of source
+particles per batch) has no writer during a Monte Carlo run, and batch
+statistics make the mean independent of how the histories are grouped into
+batches [Romano2012]_. The random ray solver scales its tally scores in place
+every batch and therefore cannot use ``none``. The table gives the tally memory
+in planes of :math:`F \times S` doubles (:math:`F` filter bins, :math:`S` score
+bins) on :math:`N` ranks; :math:`M` is 2, or 4 with higher moments. The same
+per-mode accounting is given for MCNP's ``batch`` and ``rma_batch`` tally modes
+in [Rising2025]_ (slide 03-19).
+
+.. list-table:: Tally memory by accumulator and moments mode (planes)
+   :header-rows: 1
+   :widths: 16 28 28 28
+
+   * - Accumulator
+     - ``full``
+     - ``mean``
+     - ``none``
+   * - ``replicated``
+     - 1 per rank + :math:`M` on the master
+     - 1 per rank + 1 on the master
+     - 1 per rank; + 1 on the master at each statepoint and at the end of the
+       run
+   * - ``shared``
+     - 1 per node + :math:`M` on the master
+     - 1 per node + 1 on the master
+     - 1 per node; + 1 on the master at each statepoint and at the end of the
+       run
+   * - ``rma``
+     - :math:`(2 + M)/N` per rank
+     - :math:`3/N` per rank
+     - :math:`2/N` per rank; + :math:`1/N` at each statepoint and at the end of
+       the run
+
+Two cases add to the table. At the end of a run a ``replicated`` tally
+broadcasts its moments to every rank, so each rank then holds :math:`M` planes
+(1 for ``mean`` and ``none``); ``shared`` and ``rma`` tallies skip this
+broadcast and are read from the statepoint. Under ``no_reduce`` every rank
+folds its own moments and holds :math:`M` planes throughout the run.
+
+The table is the steady state between batches; transients add a bounded amount.
+Every per-batch reduction (``replicated``, the internode step of ``shared``,
+and the ``none`` collection) runs in 1 GiB chunks, so the MPI library's
+reduction scratch stays within about 1 GiB per participating rank however many
+planes the tally holds. The ``rma`` statepoint write holds two 64 MiB receive
+buffers on the master: it receives the next chunk of owned rows while it writes
+the current one. Restart adds nothing on a rank that holds no
+moments, and the ``rma`` remote-scoring staging stays within the 64 MiB
+per-rank budget described above unless a warning says otherwise.
+
+A tally may also declare *projections*: coarser views of its filter bins in
+which an energy filter is collapsed onto a nested coarser grid or a filter is
+summed over (see the ``exatally`` entry of :ref:`io_tallies`). For each
+projection the fold forms the projected batch realization
+:math:`y_b = P x_b`, where :math:`x_b` is the normalized accumulator plane of
+batch :math:`b` (the values the fold adds to :math:`\sum x`) and :math:`P`
+sums the fine bins of each projected bin, and keeps :math:`\sum_b y_b` and
+:math:`\sum_b y_b^2`. The mean and standard deviation of a projected bin then
+follow from batch statistics exactly as for a tally bin, and the variance
+includes the covariance between the fine bins it sums:
+
+.. math::
+
+    \operatorname{Var}\Big(\sum_{i} x_i\Big) = \sum_{i} \operatorname{Var}(x_i)
+    + 2 \sum_{i<j} \operatorname{Cov}(x_i, x_j).
+
+Fine bins of one batch are correlated -- a history that scatters through
+several energy groups of a voxel scores in each of them -- so the per-bin
+standard deviations alone cannot give the uncertainty of their sum.
+:meth:`openmc.Tally.summation` combines per-bin standard deviations in
+quadrature, and tally arithmetic propagates uncertainties under the assumption
+that the tally data is independently distributed, as its docstrings state;
+both drop the covariance term. A projection keeps two moments whatever the
+moments mode, so with ``mean`` the fine tally holds one moment plane and its
+projections supply the standard deviations of the collapsed quantities.
+
+A projection with :math:`F_p` projected filter bins holds
+:math:`3 F_p \times S` doubles on the master (the sum, the sum of squares, and
+the realization of the current batch), whatever the accumulator mode; for
+:math:`2 \times 10^5` voxels and 175 groups that is 0.84 GB, 3.3 % of the
+25.6 GB plane of the 16,000-group tally. The projection is formed where the
+fold runs: on the master under tally reduction, on every rank under
+``no_reduce`` (each rank projects its own realization, consistent with its own
+moments), and over the owned rows of each rank under ``rma``, where the
+master sums the partial realizations of all ranks every batch before it
+squares them (a projected bin whose fine bins straddle two owners arrives
+twice and sums correctly). A projection that keeps every filter of the tally
+but the last, collapsing or summing the last, maps whole rows of the last
+filter to disjoint projected rows, so the threads of the fold add into the
+realization in place; under ``rma`` each rank then sends about
+:math:`F_p S / N` doubles per batch. Any other projection adds into one
+private realization per OpenMP thread (:math:`n_\text{threads} F_p S` doubles
+on each folding rank, printed at verbosity 8), summed after the fold, and
+each rank sends all :math:`F_p S` doubles per batch under ``rma``; ordering
+the tally's filters so that the collapsed one is last avoids both.
+
+All three modes preserve the statistical semantics of the ``replicated``
+default. Because scores accumulate locally within a batch and are reduced or
+folded exactly once per batch, the sample mean is statistically exact --
+identical to a serial run to within floating-point round-off -- and the
+variance is unbiased regardless of how histories are batched across ranks
+[Romano2012]_; the resulting run-to-run non-reproducibility of the parallel
+variance estimate is an accepted property of batch statistics, not an artifact
+of the accumulator modes. Independent of the accumulator mode, global tallies
+-- including :math:`k`-effective -- remain replicated and are reduced every
+batch, a precondition for serial-equivalent tally means when the tally
+reduction is deferred or distributed [Romano2013b]_. Using too few generations
+per batch in a problem with a high dominance ratio underpredicts the tally
+variance, again independent of the accumulator mode, because of
+inter-generation correlation of the fission source [Romano2012]_
+[Gelbard1990]_.
+
+The distributed modes realize future work identified for OpenMC in
+[Romano2013b]_ (section 6.5): one-sided fetch-and-add tally accumulation
+without dedicated tally-server ranks (the ``rma`` mode), and the combination of
+distributed tally storage with on-node shared-memory parallelism (the
+``shared`` mode, and ``rma`` under the serialized threading model below).
+
+.. _methods_parallel_thread_level:
+
+MPI thread level
+----------------
+
+The ``rma`` mode is the first place OpenMC issues MPI calls from inside an
+OpenMP parallel region (the transport scoring loop). Those calls are serialized
+with a single named ``omp critical`` section, so an OpenMC built with OpenMP
+initializes MPI with ``MPI_THREAD_SERIALIZED`` rather than the more permissive
+``MPI_THREAD_MULTIPLE``. This is deliberate: the MCNP 6.3 storage-backend
+experience documents a throughput collapse when many threads issue concurrent
+one-sided operations under ``MPI_THREAD_MULTIPLE`` on some fabrics
+[Josey2021]_. Dropping the critical section for genuinely concurrent
+``MPI_Accumulate`` is a possible optimization, but it is not implemented: it
+is gated on a fabric micro-benchmark on the target machine.
+
+Parallel HDF5 caveats
+---------------------
+
+The ``rma`` statepoint write uses the same master-serial HDF5 path as the other
+modes. On restart every rank reads its own rows from the file, as one
+collective read under Parallel HDF5 and from its own file handle otherwise.
+Neither requires a Parallel HDF5 build. Collective tally I/O can be very
+sensitive to the underlying filesystem -- it performs well on parallel
+filesystems such as Lustre but can stall on NFS -- so a collective or chunked
+statepoint write, should one be added, would be an opt-in rather than the
+default [Rising2025]_. The collective read of an ``rma`` restart under Parallel
+HDF5 is subject to the same filesystem sensitivity [Rising2025]_.
+
 .. only:: html
 
    .. rubric:: References
@@ -606,6 +849,48 @@ is actually independent of the number of nodes:
 .. [Troubetzkoy] E. Troubetzkoy, H. Steinberg, and M. Kalos, "Monte Carlo
    Radiation Penetration Calculations on a Parallel Computer,"
    *Trans. Am. Nucl. Soc.*, **17**, 260 (1973).
+
+.. [Gelbard1990] E. M. Gelbard and R. Prael, "Computation of Standard
+   Deviations in Eigenvalue Calculations," *Prog. Nucl. Energy*, **24**, 237
+   (1990).
+
+.. [Romano2011] P. K. Romano, B. Forget, and F. B. Brown, "Towards Scalable
+   Parallelism in Monte Carlo Particle Transport Codes Using Remote Memory
+   Access," *Prog. Nucl. Sci. Technol.*, **2**, 670--675 (2011).
+
+.. [Romano2012] P. K. Romano and B. Forget, "Reducing Parallel Communication
+   in Monte Carlo Simulations via Batch Statistics," *Trans. Am. Nucl. Soc.*,
+   **107**, 519 (2012).
+
+.. [Romano2013] P. K. Romano, A. R. Siegel, B. Forget, and K. Smith, "Data
+   decomposition of Monte Carlo particle transport simulations via tally
+   servers," *J. Comput. Phys.*, **252**, 20--36 (2013).
+   `doi:10.1016/j.jcp.2013.06.011 <https://doi.org/10.1016/j.jcp.2013.06.011>`_.
+
+.. [Romano2013b] P. K. Romano, "Parallel Algorithms for Monte Carlo Particle
+   Transport Simulation on Exascale Computing Architectures," Ph.D. thesis,
+   Massachusetts Institute of Technology (2013).
+
+.. [Horelik2014] N. Horelik, A. Siegel, B. Forget, and K. Smith, "Monte Carlo
+   domain decomposition for robust nuclear reactor analysis," *Parallel
+   Comput.*, **40**, 646--660 (2014). `doi:10.1016/j.parco.2014.10.001
+   <https://doi.org/10.1016/j.parco.2014.10.001>`_.
+
+.. [Dun2015] N. Dun, H. Fujita, J. R. Tramm, A. A. Chien, and A. R. Siegel,
+   "Data Decomposition in Monte Carlo Neutron Transport Simulations using Global
+   View Arrays," *Int. J. High Perform. Comput. Appl.*, **29** (2015).
+
+.. [Mosher2018] S. W. Mosher and S. C. Wilson, "Algorithmic Improvements to
+   MCNP5 for High-Resolution Fusion Neutronics Analyses," *Fusion Sci.
+   Technol.* (2018). `doi:10.1080/15361055.2018.1496691
+   <https://doi.org/10.1080/15361055.2018.1496691>`_.
+
+.. [Josey2021] C. J. Josey and J. A. Kulesza, "Improved FMESH Capabilities in
+   the MCNP 6.3 Code," LA-UR-21-26363, 2021 MCNP User Symposium (2021).
+
+.. [Rising2025] M. E. Rising, A. Sood, et al., MCNP6 workshop materials,
+   LA-UR-25-23947 Rev. 1, Los Alamos National Laboratory (2025); per-mode
+   tally memory on slide 03-19.
 
 .. _first paper: https://doi.org/10.2307/2280232
 

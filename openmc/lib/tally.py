@@ -310,7 +310,7 @@ class Tally(_FortranObjectWithID):
     @property
     def mean(self):
         n = self.num_realizations
-        sum_ = self.results[:, :, 1]
+        sum_ = self.results[:, :, 0]
         if n > 0:
             return sum_ / n
         else:
@@ -338,6 +338,21 @@ class Tally(_FortranObjectWithID):
 
     @property
     def results(self):
+        """Return the in-memory tally moments as a NumPy array.
+
+        The array has shape ``(n_filter_bins, n_score_bins, n_moments)`` where
+        the innermost axis holds the cross-batch moments in order
+        ``[SUM, SUM_SQ, ...]``. This matches the on-disk statepoint layout; there
+        is no leading ``VALUE`` column. ``n_moments`` is 2 (4 with higher
+        moments) for the ExaTally moments mode ``full`` and 1 (``SUM`` only)
+        for ``mean`` and ``none``; a ``none`` tally serves results only once
+        the run has finished. Availability depends on the tally's
+        accumulator mode: ``replicated`` tallies serve results on rank 0 during a
+        run and on every rank once the run has finished; ``shared`` tallies
+        serve them on rank 0 only; ``rma`` tallies on a multi-rank run keep no
+        full in-memory array (read those from the statepoint file), while a
+        single-rank rma tally serves them like replicated.
+        """
         data = POINTER(c_double)()
         shape = (c_size_t*3)()
         _dll.openmc_tally_results(self._index, data, shape)
@@ -371,14 +386,18 @@ class Tally(_FortranObjectWithID):
     @property
     def std_dev(self):
         results = self.results
+        if results.shape[2] < 2:
+            # The ExaTally moments modes 'mean' and 'none' keep the sum only,
+            # so the standard deviation is unknown
+            return np.full(results.shape[:2], np.nan)
         std_dev = np.empty(results.shape[:2])
         std_dev.fill(np.inf)
 
         n = self.num_realizations
         if n > 1:
             # Get sum and sum-of-squares from results
-            sum_ = results[:, :, 1]
-            sum_sq = results[:, :, 2]
+            sum_ = results[:, :, 0]
+            sum_sq = results[:, :, 1]
 
             # Determine non-zero entries
             mean = sum_ / n
@@ -456,7 +475,13 @@ class _TallyMapping(Mapping):
         return repr(dict(self))
 
     def __delitem__(self, key):
-        """Delete a tally from tally vector and remove the ID,index pair from tally"""
+        """Delete a tally from tally vector and remove the ID,index pair from tally
+
+        .. note:: Deleting a tally that uses the ``shared`` or ``rma``
+                  accumulator mode frees an MPI window and is collective on
+                  all ranks (the node communicator for ``shared``, all ranks
+                  for ``rma``): every MPI rank must delete the same tally.
+        """
         _dll.openmc_remove_tally(self[key]._index)
 
 tallies = _TallyMapping()

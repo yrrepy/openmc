@@ -285,6 +285,13 @@ class WeightWindows(_FortranObjectWithID):
         ratio : float
             Ratio of the lower to upper weight window bounds
 
+        Notes
+        -----
+        When tallies are reduced over more than one MPI rank, this call is
+        collective: every rank must call it. Rank 0, which holds the tally's
+        results, computes the bounds and broadcasts them. A tally using the
+        'rma' accumulator mode on more than one rank cannot be used.
+
         """
         _dll.openmc_weight_windows_update_magic(self._index,
                                                 tally._index,
