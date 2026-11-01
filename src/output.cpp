@@ -707,8 +707,8 @@ void write_tallies()
     // points the user there. A single-rank rma tally prints normally.
     if (tally.rma_distributed()) {
       fmt::print(tallies_out,
-        " Results for this tally use 'rma' storage and are written to the "
-        "statepoint file only.\n\n");
+        " Results for this tally use the 'rma' accumulator mode and are "
+        "written to the statepoint file only.\n\n");
       continue;
     }
 

@@ -1,4 +1,4 @@
-// Remote-scoring hammer test for the rma tally storage mode.
+// Remote-scoring hammer test for the rma tally accumulator mode.
 //
 // Drives a real Tally in rma mode through the actual score_add seam: every rank
 // (and, where the MPI provides thread serialization, every OpenMP thread)
@@ -78,7 +78,7 @@ static bool run_rma_cycle(int64_t n_bins, int n_scores)
   Tally* tally = Tally::create();
   tally->set_filters({&f, 1});
   tally->set_scores(scores);
-  tally->set_storage(TallyStorage::RMA);
+  tally->set_exatally({AccumulatorMode::RMA, MomentsMode::FULL});
   tally->set_strides();
   tally->init_results();
 
@@ -161,7 +161,7 @@ static bool run_rma_revisit(int64_t n_bins, int n_scores, int revisits)
   Tally* tally = Tally::create();
   tally->set_filters({&f, 1});
   tally->set_scores(scores);
-  tally->set_storage(TallyStorage::RMA);
+  tally->set_exatally({AccumulatorMode::RMA, MomentsMode::FULL});
   tally->set_strides();
   tally->init_results();
 

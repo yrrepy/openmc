@@ -73,7 +73,7 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
     // homes the moments on the master, so only the master walks those. A rank
     // that owns nothing (or a non-master rank on a replicated tally) simply
     // contributes ratio 0 to the reduction below.
-    const bool is_rma = (t.storage() == TallyStorage::RMA);
+    const bool is_rma = (t.accumulator() == AccumulatorMode::RMA);
     if (!is_rma && !mpi::master)
       continue;
     const int64_t n_rows = is_rma ? t.rma_n_rows() : t.n_filter_bins();

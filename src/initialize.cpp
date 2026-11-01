@@ -165,14 +165,14 @@ void initialize_mpi(MPI_Comm intracomm)
   MPI_Initialized(&flag);
   if (!flag) {
 #ifdef _OPENMP
-    // The rma tally storage mode issues MPI calls from inside the OpenMP
+    // The rma accumulator mode issues MPI calls from inside the OpenMP
     // scoring region, serialized by a named critical section. Request thread
-    // serialization so those calls are legal under threads; the other storage
-    // modes never issue MPI while threaded, so this is strictly more correct
-    // than the plain MPI_Init it replaces. SERIALIZED-first (rather than
-    // THREAD_MULTIPLE) per the MCNP 6.3 experience, Josey & Kulesza (2021),
-    // LA-UR-21-26363. The external-init path (mpi4py) does not run this; the
-    // rma validation checks the provided level there.
+    // serialization so those calls are legal under threads; the other
+    // accumulator modes never issue MPI while threaded, so this is strictly
+    // more correct than the plain MPI_Init it replaces. SERIALIZED-first
+    // (rather than THREAD_MULTIPLE) per the MCNP 6.3 experience, Josey &
+    // Kulesza (2021), LA-UR-21-26363. The external-init path (mpi4py) does not
+    // run this; the rma validation checks the provided level there.
     int provided;
     MPI_Init_thread(nullptr, nullptr, MPI_THREAD_SERIALIZED, &provided);
     // The rma tally validation (tally.cpp) re-checks the granted level via
@@ -189,7 +189,7 @@ void initialize_mpi(MPI_Comm intracomm)
   mpi::master = (mpi::rank == 0);
 
   // Build the shared-memory (node) and node-leader (internode) communicators
-  // used by shared-storage tallies. Guard against re-entry so a repeated
+  // used by shared-accumulator tallies. Guard against re-entry so a repeated
   // openmc_init (e.g. openmc.lib re-runs) does not leak communicators; this
   // assumes intracomm does not change across re-inits without an intervening
   // openmc_finalize (which frees these comms). Keying

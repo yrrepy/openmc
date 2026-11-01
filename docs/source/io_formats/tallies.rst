@@ -64,17 +64,20 @@ The ``<tally>`` element accepts the following sub-elements:
 
     *Default*: ``tracklength`` but will revert to ``analog`` if necessary.
 
-  :storage:
-    The storage element sets the accumulator storage mode for this tally,
-    overriding the global ``<tally_storage>`` default in ``settings.xml``.
-    Accepted values are ``replicated``, ``shared``, and ``rma``; see the
-    :ref:`\<tally_storage\> element <settings_tally_storage>` for the meaning of
-    each mode. A run may mix modes across tallies (for example a large flux mesh
-    tally with ``shared`` or ``rma`` storage alongside small ``replicated``
+  :exatally:
+    The exatally element sets the ExaTallies modes for this tally, overriding
+    the global ``<exatally>`` default in ``settings.xml`` sub-element by
+    sub-element. It accepts the same two optional sub-elements:
+    ``<accumulator>`` (``replicated``, ``shared``, or ``rma``: where the
+    per-batch accumulator is homed across MPI ranks) and ``<moments>`` (only
+    ``full`` is implemented at present). See the :ref:`\<exatally\> element
+    <settings_exatally>` for the meaning of each mode. A run may mix
+    accumulator modes across tallies (for example a large flux mesh tally with
+    the ``shared`` or ``rma`` accumulator alongside small ``replicated``
     tallies).
 
-    *Default*: the value of the ``<tally_storage>`` element in settings.xml
-    (``replicated`` if unset).
+    *Default*: the values of the ``<exatally>`` element in settings.xml
+    (accumulator ``replicated`` and moments ``full`` if unset).
 
   :scores:
     A space-separated list of the desired responses to be accumulated. A full

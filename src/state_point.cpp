@@ -38,7 +38,7 @@ namespace openmc {
 //==============================================================================
 // rma tally statepoint gather / restart scatter
 //
-// Under the rma storage mode a tally's moments are block-distributed by
+// Under the rma accumulator mode a tally's moments are block-distributed by
 // filter-bin row across all ranks, so no rank holds the whole array. The
 // statepoint therefore gathers rows to the master on write and scatters them
 // back to their owners on restart, both in bounded chunks so an individual MPI
@@ -1095,7 +1095,8 @@ void write_unstructured_mesh_results()
         if (mpi::master)
           warning(fmt::format(
             "Unstructured mesh output for tally {} is skipped because it uses "
-            "'rma' storage. Read the results from the statepoint file.",
+            "the 'rma' accumulator mode. Read the results from the statepoint "
+            "file.",
             tally->id_));
         continue;
       }
@@ -1240,7 +1241,7 @@ void write_tally_results_nr(hid_t file_id)
 
     // rma requires reduce_tallies at input validation, so an rma tally can
     // never reach the no-reduction writer.
-    assert(t->storage() != TallyStorage::RMA);
+    assert(t->accumulator() != AccumulatorMode::RMA);
 
     if (mpi::master && !attribute_exists(file_id, "tallies_present")) {
       write_attribute(file_id, "tallies_present", 1);

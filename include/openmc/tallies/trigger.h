@@ -49,7 +49,7 @@ extern KTrigger keff_trigger;
 
 void check_triggers();
 
-//! \brief Whether any rma-storage tally carries an active trigger.
+//! \brief Whether any rma-accumulator tally carries an active trigger.
 //!
 //! When true, the tally-uncertainty walk must run collectively across ranks
 //! (each rank owns only part of the moments), so the trigger check is invoked

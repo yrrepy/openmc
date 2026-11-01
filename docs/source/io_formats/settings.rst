@@ -505,51 +505,66 @@ tally data, this option can significantly improve the parallel efficiency.
 
   *Default*: false
 
-.. _settings_tally_storage:
+.. _settings_exatally:
 
----------------------------
-``<tally_storage>`` Element
----------------------------
+----------------------
+``<exatally>`` Element
+----------------------
 
-The ``<tally_storage>`` element sets the default storage mode for tally
-accumulators, controlling how the per-batch accumulator is distributed across
-MPI ranks. Accepted values are:
+The ``<exatally>`` element sets the global default ExaTallies modes for all
+tallies: the accumulator mode, which controls how each tally's per-batch
+accumulator is distributed across MPI ranks, and the moments mode, which
+controls the cross-batch moments kept per bin. Both sub-elements are optional;
+a missing sub-element keeps its default. This element has the following
+attributes/sub-elements:
 
-  :replicated:
-    Every rank owns a full private copy of each tally's accumulator (the legacy
-    behavior).
+  :accumulator:
+    The accumulator mode. Accepted values are:
 
-  :shared:
-    One accumulator plane is shared per shared-memory node, cutting per-node
-    tally memory from one plane per rank to one plane per node. Results are read
-    on rank 0. Requires an MPI- and OpenMP-enabled build and the Monte Carlo
-    solver, and is not compatible with ``no_reduce`` or CMFD. A tally whose
-    moments are required on all ranks (the weight-window-generation tally)
-    always keeps ``replicated`` storage; the global ``tally_storage`` setting
-    does not apply to it, and the run proceeds.
+    :replicated:
+      Every rank owns a full private copy of each tally's accumulator (the
+      legacy behavior).
 
-  :rma:
-    Both the per-batch accumulator and its cross-batch moments are
-    block-distributed across *all* MPI ranks (each rank owns a contiguous block
-    of filter-bin rows), so per-node tally memory falls as roughly one plane per
-    node divided by the number of nodes. During transport a rank scores its own
-    filter bins into a private plane and stages remote contributions into
-    batched one-sided ``MPI_Accumulate`` operations. Results are written to (and
-    restarted from) the statepoint file via an owner-to-master gather; on
-    multi-rank runs the ``tallies.out`` summary and in-memory ``openmc.lib``
-    readout are not available for ``rma`` tallies (a single-rank ``rma`` tally
-    holds its full results and serves them normally). Requires an MPI- and
-    OpenMP-enabled build and the Monte Carlo solver, and is not compatible with
-    ``no_reduce``, CMFD, or event-based transport. A tally whose moments are
-    required on all ranks (the weight-window-generation tally) always keeps
-    ``replicated`` storage; the global ``tally_storage`` setting does not apply
-    to it, and the run proceeds. See :ref:`methods_parallel_tally_storage` for
-    the memory model and performance notes.
+    :shared:
+      One accumulator plane is shared per shared-memory node, cutting per-node
+      tally memory from one plane per rank to one plane per node. Results are
+      read on rank 0. Requires an MPI- and OpenMP-enabled build and the Monte
+      Carlo solver, and is not compatible with ``no_reduce`` or CMFD. A tally
+      whose moments are required on all ranks (the weight-window-generation
+      tally) always keeps the ``replicated`` accumulator mode; the global
+      ``<exatally>`` accumulator default does not apply to it, and the run
+      proceeds.
 
-Individual tallies can override this default with the per-tally ``<storage>``
-element (see :ref:`io_tallies`).
+    :rma:
+      Both the per-batch accumulator and its cross-batch moments are
+      block-distributed across *all* MPI ranks (each rank owns a contiguous
+      block of filter-bin rows), so per-node tally memory falls as roughly one
+      plane per node divided by the number of nodes. During transport a rank
+      scores its own filter bins into a private plane and stages remote
+      contributions into batched one-sided ``MPI_Accumulate`` operations.
+      Results are written to (and restarted from) the statepoint file via an
+      owner-to-master gather; on multi-rank runs the ``tallies.out`` summary and
+      in-memory ``openmc.lib`` readout are not available for ``rma`` tallies (a
+      single-rank ``rma`` tally holds its full results and serves them
+      normally). Requires an MPI- and OpenMP-enabled build and the Monte Carlo
+      solver, and is not compatible with ``no_reduce``, CMFD, or event-based
+      transport. A tally whose moments are required on all ranks (the
+      weight-window-generation tally) always keeps the ``replicated``
+      accumulator mode; the global ``<exatally>`` accumulator default does not
+      apply to it, and the run proceeds. See :ref:`methods_parallel_exatallies`
+      for the memory model and performance notes.
 
-  *Default*: replicated
+    *Default*: replicated
+
+  :moments:
+    Moments kept per bin. Only ``full`` (sum, sum of squares, and the higher
+    moments when requested) is implemented at present; ``mean`` and ``none``
+    are reserved for a future release.
+
+    *Default*: full
+
+Individual tallies can override these defaults with a per-tally ``<exatally>``
+element (see the ``exatally`` entry of :ref:`io_tallies`).
 
 --------------------
 ``<output>`` Element

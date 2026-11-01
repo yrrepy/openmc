@@ -1,4 +1,4 @@
-// Cross-process atomic hammer test for the shared tally storage mode.
+// Cross-process atomic hammer test for the shared tally accumulator mode.
 //
 // Proves that openmc::atomic_score_add performs an address-free atomic RMW on
 // an MPI-3 shared-memory window: every rank and thread hammers the same window

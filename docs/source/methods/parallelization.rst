@@ -599,11 +599,11 @@ is actually independent of the number of nodes:
     E \left [ \Lambda_{j_{\text{max}}} \right ] = \sqrt{ \frac{N\sigma^2}{2\pi
     k^2}}.
 
-.. _methods_parallel_tally_storage:
+.. _methods_parallel_exatallies:
 
-------------------------------
-Tally Memory and Storage Modes
-------------------------------
+----------------------------------------------
+ExaTallies: Tally Memory and Accumulator Modes
+----------------------------------------------
 
 By default every MPI rank keeps a private copy of each tally. For a fine mesh
 crossed with a fine energy grid a single tally can reach tens of gigabytes, so a
@@ -615,8 +615,9 @@ higher moments when requested) that a once-per-batch fold updates from the
 accumulator. This is the batch-means decomposition used by the shared-memory
 mesh tally in MCNP [Mosher2018]_; keeping the accumulator separate from the
 moments is what lets the accumulator be re-homed without touching the scoring
-hot path. The :ref:`\<tally_storage\> element <settings_tally_storage>` selects
-where the accumulator (and, for ``rma``, the moments) live:
+hot path. The ``<accumulator>`` sub-element of the :ref:`\<exatally\> element
+<settings_exatally>` (the accumulator mode) selects where the accumulator (and,
+for ``rma``, the moments) live:
 
 * **replicated** -- one private accumulator per rank (the default). The
   end-of-batch reduction sums the accumulators onto the master, which folds the
@@ -666,13 +667,14 @@ identical to a serial run to within floating-point round-off -- and the
 variance is unbiased regardless of how histories are batched across ranks
 [Romano2012]_; the resulting run-to-run non-reproducibility of the parallel
 variance estimate is an accepted property of batch statistics, not an artifact
-of the storage modes. Independent of the storage mode, global tallies --
-including :math:`k`-effective -- remain replicated and are reduced every
+of the accumulator modes. Independent of the accumulator mode, global tallies
+-- including :math:`k`-effective -- remain replicated and are reduced every
 batch, a precondition for serial-equivalent tally means when the tally
 reduction is deferred or distributed [Romano2013b]_. Using too few generations
 per batch in a problem with a high dominance ratio underpredicts the tally
-variance, again independent of storage mode, because of inter-generation
-correlation of the fission source [Romano2012]_ [Gelbard1990]_.
+variance, again independent of the accumulator mode, because of
+inter-generation correlation of the fission source [Romano2012]_
+[Gelbard1990]_.
 
 The distributed modes realize future work identified for OpenMC in
 [Romano2013b]_ (section 6.5): one-sided fetch-and-add tally accumulation

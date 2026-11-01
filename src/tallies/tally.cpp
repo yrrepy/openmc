@@ -378,26 +378,11 @@ Tally::Tally(pugi::xml_node node)
     }
   }
 
-  // Resolve the storage mode: a per-tally <storage> element overrides the
-  // global settings::tally_storage default (the same idiom as <estimator>);
-  // set_storage validates the mode's prerequisites either way.
-  TallyStorage storage = settings::tally_storage;
-  if (check_for_node(node, "storage")) {
-    std::string mode = get_node_value(node, "storage", true, true);
-    if (mode == "replicated") {
-      storage = TallyStorage::REPLICATED;
-    } else if (mode == "shared") {
-      storage = TallyStorage::SHARED;
-    } else if (mode == "rma") {
-      storage = TallyStorage::RMA;
-    } else {
-      throw std::runtime_error {
-        fmt::format("Invalid storage mode '{}' on tally {}. Valid options are "
-                    "'replicated', 'shared', and 'rma'.",
-          mode, id_)};
-    }
-  }
-  this->set_storage(storage);
+  // Resolve the ExaTallies modes: a per-tally <exatally> block overrides the
+  // global settings::exatally default child by child (the parser throws on an
+  // invalid value); set_exatally validates the modes' prerequisites.
+  this->set_exatally(
+    parse_exatally(node, settings::exatally, fmt::format("tally {}", id_)));
 
 #ifdef OPENMC_LIBMESH_ENABLED
   // ensure a tracklength tally isn't used with a libMesh filter
@@ -777,35 +762,46 @@ void Tally::set_nuclides(const vector<std::string>& nuclides)
   }
 }
 
-void Tally::set_storage(TallyStorage storage)
+void Tally::set_exatally(const ExaTally& exatally)
 {
-  // Validate the storage mode. The distributed modes carry hard prerequisites.
-  if (storage != TallyStorage::REPLICATED) {
-#ifndef OPENMC_MPI
-    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
-                            "which requires an MPI-enabled build.",
+  // Only the full moments mode is implemented so far.
+  if (exatally.moments != MomentsMode::FULL) {
+    fatal_error(fmt::format("Tally {} requests an <exatally> moments mode "
+                            "other than 'full', which is not implemented yet; "
+                            "only 'full' is supported.",
       id_));
+  }
+
+  // Validate the accumulator mode. The distributed modes carry hard
+  // prerequisites.
+  if (exatally.accumulator != AccumulatorMode::REPLICATED) {
+#ifndef OPENMC_MPI
+    fatal_error(
+      fmt::format("Tally {} requests a non-replicated accumulator mode, "
+                  "which requires an MPI-enabled build.",
+        id_));
 #endif
 #ifndef _OPENMP
     // Shared scoring updates one plane from several ranks through omp atomic;
     // with OpenMP disabled that pragma is a no-op and the updates would race.
-    fatal_error(fmt::format("Tally {} requests a non-replicated storage mode, "
-                            "which requires an OpenMP-enabled build.",
-      id_));
+    fatal_error(
+      fmt::format("Tally {} requests a non-replicated accumulator mode, "
+                  "which requires an OpenMP-enabled build.",
+        id_));
 #endif
     if (!settings::reduce_tallies) {
       fatal_error(
-        fmt::format("Tally {} cannot combine a non-replicated storage mode "
+        fmt::format("Tally {} cannot combine a non-replicated accumulator mode "
                     "with the no-reduction (no_reduce) option.",
           id_));
     }
     if (settings::solver_type != SolverType::MONTE_CARLO) {
-      fatal_error(
-        fmt::format("Tally {} requests a non-replicated storage mode, which is "
-                    "only supported by the Monte Carlo solver.",
-          id_));
+      fatal_error(fmt::format(
+        "Tally {} requests a non-replicated accumulator mode, which is "
+        "only supported by the Monte Carlo solver.",
+        id_));
     }
-    if (storage == TallyStorage::RMA) {
+    if (exatally.accumulator == AccumulatorMode::RMA) {
 #if defined(OPENMC_MPI) && defined(_OPENMP)
       // The remote-scoring arm issues MPI from inside the OpenMP scoring
       // region. Until MPI is initialized with MPI_THREAD_SERIALIZED, reject a
@@ -815,7 +811,7 @@ void Tally::set_storage(TallyStorage storage)
       MPI_Query_thread(&provided);
       if (provided < MPI_THREAD_SERIALIZED && num_threads() > 1) {
         fatal_error(fmt::format(
-          "Tally {} requests storage mode 'rma' with more than one OpenMP "
+          "Tally {} requests accumulator mode 'rma' with more than one OpenMP "
           "thread, but MPI does not provide MPI_THREAD_SERIALIZED. Run with a "
           "single thread or an MPI build providing thread serialization.",
           id_));
@@ -825,13 +821,13 @@ void Tally::set_storage(TallyStorage storage)
       // history-based order.
       if (settings::event_based) {
         fatal_error(
-          fmt::format("Tally {} requests storage mode 'rma', which is "
+          fmt::format("Tally {} requests accumulator mode 'rma', which is "
                       "not supported in event-based mode.",
             id_));
       }
     }
   }
-  storage_ = storage;
+  exatally_ = exatally;
 }
 
 void Tally::init_triggers(pugi::xml_node node)
@@ -917,17 +913,19 @@ void Tally::init_results()
   // distributed mode, which homes moments on the master alone (shared) or on
   // the owning rank (rma). This flag is set after construction, so the check
   // lives here rather than in the XML ctor.
-  if (storage_ != TallyStorage::REPLICATED && moments_all_ranks_) {
-    fatal_error(fmt::format("Tally {} cannot use a distributed storage mode "
-                            "because its moments are required on all ranks.",
-      id_));
+  if (exatally_.accumulator != AccumulatorMode::REPLICATED &&
+      moments_all_ranks_) {
+    fatal_error(
+      fmt::format("Tally {} cannot use a distributed accumulator mode "
+                  "because its moments are required on all ranks.",
+        id_));
   }
 
-  if (storage_ == TallyStorage::SHARED) {
+  if (exatally_.accumulator == AccumulatorMode::SHARED) {
     // The per-batch accumulator is one shared plane per node rather than a
     // per-rank buffer.
     init_shared_accum();
-  } else if (storage_ == TallyStorage::RMA) {
+  } else if (exatally_.accumulator == AccumulatorMode::RMA) {
     // The accumulator and moments are block-distributed across ranks; each rank
     // allocates only its owned window block plus a private owned-rows plane.
     init_rma_accum();
@@ -951,7 +949,7 @@ void Tally::init_results()
   // reduced (each rank is its own owner) or when a consumer reads them off the
   // master mid-run (moments_all_ranks_).
 #ifdef OPENMC_MPI
-  if (storage_ == TallyStorage::RMA) {
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
     // Under rma every rank folds and holds the moment rows for the filter bins
     // it owns; a rank owning zero rows gets an empty (size-0) array.
     moments_ = tensor::Tensor<double>({static_cast<size_t>(rma_n_rows_),
@@ -970,7 +968,7 @@ void Tally::reset()
 {
   n_realizations_ = 0;
 #ifdef OPENMC_MPI
-  if (storage_ == TallyStorage::RMA) {
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
     // This rank's window block is written from the CPU only inside the
     // collective fold in rma_fold(), never here. Between batches it is zero,
     // and at init or between runs it may already hold remote accumulates for
@@ -992,7 +990,7 @@ void Tally::reset()
     // window is born zeroed) and between batches (each batch ends with a
     // fold/zero + publish). A leader zeroing it here could race other node
     // ranks that are already scoring the next batch into it.
-    if (storage_ != TallyStorage::SHARED)
+    if (exatally_.accumulator != AccumulatorMode::SHARED)
 #endif
     {
       std::fill(accum_, accum_ + accum_size_, 0.0);
@@ -1028,7 +1026,7 @@ void Tally::accumulate()
   n_realizations_ += settings::reduce_tallies ? 1 : mpi::n_procs;
 
 #ifdef OPENMC_MPI
-  if (storage_ == TallyStorage::RMA) {
+  if (exatally_.accumulator == AccumulatorMode::RMA) {
     rma_fold();
     return;
   }
@@ -1072,7 +1070,7 @@ void Tally::accumulate()
   }
 
 #ifdef OPENMC_MPI
-  if (storage_ == TallyStorage::SHARED)
+  if (exatally_.accumulator == AccumulatorMode::SHARED)
     shared_batch_end();
 #endif
 }
@@ -1201,7 +1199,7 @@ void reduce_tally_results()
       // Skip any tallies that are not active
       auto& tally {model::tallies[i_tally]};
 
-      if (tally->storage() == TallyStorage::SHARED) {
+      if (tally->accumulator() == AccumulatorMode::SHARED) {
         // Publish this node's scores and combine the node planes onto the
         // master, replacing the intracomm reduce. The plane then belongs to the
         // node leader until accumulate() folds/zeroes it and resumes.
@@ -1209,7 +1207,7 @@ void reduce_tally_results()
         continue;
       }
 
-      if (tally->storage() == TallyStorage::RMA) {
+      if (tally->accumulator() == AccumulatorMode::RMA) {
         // Complete every rank's accumulates into the distributed window and
         // barrier so nothing is in flight; accumulate() then folds each rank's
         // owned rows. No intracomm reduce -- the data is already at its owner.
@@ -1777,9 +1775,10 @@ extern "C" int openmc_tally_results(
     // there is no global in-memory array to return; consume those results
     // from the statepoint. A single-rank rma tally holds the full array and
     // is served below.
-    set_errmsg("In-memory results are not available for a tally using 'rma' "
-               "storage on a multi-rank run; read them from the statepoint "
-               "file instead.");
+    set_errmsg(
+      "In-memory results are not available for a tally using the 'rma' "
+      "accumulator mode on a multi-rank run; read them from the statepoint "
+      "file instead.");
     return OPENMC_E_ALLOCATE;
   }
   if (!t->has_moments()) {
@@ -1814,9 +1813,9 @@ extern "C" size_t tallies_size()
   return model::tallies.size();
 }
 
-// given a tally ID, remove it from the tallies vector. For a shared-storage
-// tally this destroys an MPI window and is therefore collective on node_comm --
-// every rank must call it for the same index.
+// given a tally ID, remove it from the tallies vector. For a tally in the
+// shared accumulator mode this destroys an MPI window and is therefore
+// collective on node_comm -- every rank must call it for the same index.
 extern "C" int openmc_remove_tally(int32_t index)
 {
   // check that id is in the map

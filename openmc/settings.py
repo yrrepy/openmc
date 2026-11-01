@@ -16,6 +16,7 @@ from ._xml import clean_indentation, get_elem_list, get_text
 from .mesh import _read_meshes, RegularMesh, MeshBase
 from .source import SourceBase, MeshSource, IndependentSource
 from .utility_funcs import input_path, set_xml_input_path
+from .exatally import ExaTally
 from .volume import VolumeCalculation
 from .weight_windows import WeightWindows, WeightWindowGenerator, WeightWindowsList
 
@@ -172,11 +173,13 @@ class Settings:
     no_reduce : bool
         Indicate that all user-defined and global tallies should not be reduced
         across processes in a parallel calculation.
-    tally_storage : {'replicated', 'shared', 'rma'}
-        Default storage mode for tally accumulators, controlling how the
-        per-batch accumulator is distributed across MPI ranks. 'replicated'
-        (the default) keeps a full private copy on every rank. Individual
-        tallies can override this via :attr:`openmc.Tally.storage`.
+    exatally : openmc.ExaTally or None
+        Default ExaTallies accumulator/moments modes for all tallies. The
+        accumulator mode controls how the per-batch accumulator is distributed
+        across MPI ranks; 'replicated' (the built-in default) keeps a full
+        private copy on every rank. A mode left unset keeps the built-in
+        default. Individual tallies can override this via
+        :attr:`openmc.Tally.exatally`.
 
         .. versionadded:: 0.16.1
     output : dict
@@ -476,7 +479,7 @@ class Settings:
         self._surf_source_write = {}
 
         self._no_reduce = None
-        self._tally_storage = None
+        self._exatally = None
 
         self._verbosity = None
 
@@ -1045,14 +1048,13 @@ class Settings:
         self._no_reduce = no_reduce
 
     @property
-    def tally_storage(self) -> str:
-        return self._tally_storage
+    def exatally(self) -> ExaTally | None:
+        return self._exatally
 
-    @tally_storage.setter
-    def tally_storage(self, tally_storage: str):
-        cv.check_value(
-            'tally storage', tally_storage, ('replicated', 'shared', 'rma'))
-        self._tally_storage = tally_storage
+    @exatally.setter
+    def exatally(self, exatally: ExaTally | None):
+        cv.check_type('exatally', exatally, ExaTally, none_ok=True)
+        self._exatally = exatally
 
     @property
     def verbosity(self) -> int:
@@ -1833,10 +1835,11 @@ class Settings:
             element = ET.SubElement(root, "no_reduce")
             element.text = str(self._no_reduce).lower()
 
-    def _create_tally_storage_subelement(self, root):
-        if self._tally_storage is not None:
-            element = ET.SubElement(root, "tally_storage")
-            element.text = self._tally_storage
+    def _create_exatally_subelement(self, root):
+        if self._exatally is not None:
+            element = self._exatally.to_xml_element()
+            if element is not None:
+                root.append(element)
 
     def _create_ifp_n_generation_subelement(self, root):
         if self._ifp_n_generation is not None:
@@ -2363,10 +2366,10 @@ class Settings:
         if text is not None:
             self.no_reduce = text in ('true', '1')
 
-    def _tally_storage_from_xml_element(self, root):
-        text = get_text(root, 'tally_storage')
-        if text is not None:
-            self.tally_storage = text
+    def _exatally_from_xml_element(self, root):
+        elem = root.find('exatally')
+        if elem is not None:
+            self.exatally = ExaTally.from_xml_element(elem)
 
     def _verbosity_from_xml_element(self, root):
         text = get_text(root, 'verbosity')
@@ -2659,7 +2662,7 @@ class Settings:
         self._create_entropy_mesh_subelement(element, mesh_memo)
         self._create_trigger_subelement(element)
         self._create_no_reduce_subelement(element)
-        self._create_tally_storage_subelement(element)
+        self._create_exatally_subelement(element)
         self._create_verbosity_subelement(element)
         self._create_ifp_n_generation_subelement(element)
         self._create_tabular_legendre_subelements(element)
@@ -2779,7 +2782,7 @@ class Settings:
         settings._entropy_mesh_from_xml_element(elem, meshes)
         settings._trigger_from_xml_element(elem)
         settings._no_reduce_from_xml_element(elem)
-        settings._tally_storage_from_xml_element(elem)
+        settings._exatally_from_xml_element(elem)
         settings._verbosity_from_xml_element(elem)
         settings._ifp_n_generation_from_xml_element(elem)
         settings._tabular_legendre_from_xml_element(elem)

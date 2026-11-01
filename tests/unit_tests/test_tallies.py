@@ -24,7 +24,7 @@ def test_xml_roundtrip(run_in_tmpdir):
     )
     tally.triggers = [openmc.Trigger('rel_err', 0.025)]
     tally.triggers[0].scores = ['total', 'fission']
-    tally.storage = 'shared'
+    tally.exatally = openmc.ExaTally(accumulator='shared', moments='full')
     tallies = openmc.Tallies([tally])
 
     # Roundtrip through XML and make sure we get what we started with
@@ -48,18 +48,24 @@ def test_xml_roundtrip(run_in_tmpdir):
     assert new_tally.triggers[0].threshold == tally.triggers[0].threshold
     assert new_tally.triggers[0].scores == tally.triggers[0].scores
     assert new_tally.multiply_density == tally.multiply_density
-    assert new_tally.storage == tally.storage
+    assert new_tally.exatally.accumulator == tally.exatally.accumulator
+    assert new_tally.exatally.moments == tally.exatally.moments
 
 
-def test_tally_storage():
+def test_tally_exatally():
     tally = openmc.Tally()
-    # Defaults to None (defer to the global Settings.tally_storage default)
-    assert tally.storage is None
+    # Defaults to None (defer to the global Settings.exatally default)
+    assert tally.exatally is None
     for mode in ('replicated', 'shared', 'rma'):
-        tally.storage = mode
-        assert tally.storage == mode
+        tally.exatally = openmc.ExaTally(accumulator=mode)
+        assert tally.exatally.accumulator == mode
+        assert tally.exatally.moments is None
     with pytest.raises(ValueError):
-        tally.storage = 'bogus'
+        openmc.ExaTally(accumulator='bogus')
+    with pytest.raises(ValueError):
+        openmc.ExaTally(moments='bogus')
+    with pytest.raises(TypeError):
+        tally.exatally = 'rma'
 
 
 @pytest.mark.parametrize('storage', ['shared', 'rma'])
@@ -92,7 +98,7 @@ def test_distributed_storage_equivalence(storage, run_in_tmpdir):
         settings.run_mode = 'fixed source'
         settings.seed = 987
         settings.source = openmc.IndependentSource(space=openmc.stats.Point())
-        settings.tally_storage = mode
+        settings.exatally = openmc.ExaTally(accumulator=mode)
         model = openmc.model.Model(
             geometry, openmc.Materials([m]), settings, openmc.Tallies([tally]))
         kwargs = {}

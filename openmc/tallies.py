@@ -57,9 +57,6 @@ _FILTER_CLASSES = (Filter, CrossFilter, AggregateFilter)
 # Valid types of estimators
 ESTIMATOR_TYPES = {'tracklength', 'collision', 'analog'}
 
-# Valid tally accumulator storage modes
-STORAGE_TYPES = {'replicated', 'shared', 'rma'}
-
 
 class Tally(IDManagerMixin):
     """A tally defined by a set of scores that are accumulated for a list of
@@ -105,9 +102,10 @@ class Tally(IDManagerMixin):
         Type of estimator for the tally. If unset (None), OpenMC will automatically
         select an appropriate estimator based on the tally filters and scores
         with a preference for 'tracklength'.
-    storage : {'replicated', 'shared', 'rma'}
-        Storage mode for this tally's accumulator across MPI ranks. If unset
-        (None), the global :attr:`openmc.Settings.tally_storage` default is used.
+    exatally : openmc.ExaTally or None
+        ExaTallies accumulator/moments modes for this tally; None inherits
+        :attr:`openmc.Settings.exatally`. A mode left unset in the
+        :class:`openmc.ExaTally` also inherits the global default.
 
         .. versionadded:: 0.16.1
     triggers : list of openmc.Trigger
@@ -173,7 +171,7 @@ class Tally(IDManagerMixin):
         self._nuclides = cv.CheckedList(_NUCLIDE_CLASSES, 'tally nuclides')
         self._scores = cv.CheckedList(_SCORE_CLASSES, 'tally scores')
         self._estimator = None
-        self._storage = None
+        self._exatally = None
         self._triggers = cv.CheckedList(openmc.Trigger, 'tally triggers')
         self._derivative = None
         self._multiply_density = True
@@ -409,14 +407,14 @@ class Tally(IDManagerMixin):
         self._estimator = estimator
 
     @property
-    def storage(self):
-        return self._storage
+    def exatally(self):
+        return self._exatally
 
-    @storage.setter
-    def storage(self, storage):
-        # None defers to the global Settings.tally_storage default
-        cv.check_value('storage', storage, STORAGE_TYPES | {None})
-        self._storage = storage
+    @exatally.setter
+    def exatally(self, exatally):
+        # None defers to the global Settings.exatally default
+        cv.check_type('exatally', exatally, openmc.ExaTally, none_ok=True)
+        self._exatally = exatally
 
     @property
     def triggers(self):
@@ -1499,10 +1497,11 @@ class Tally(IDManagerMixin):
             subelement = ET.SubElement(element, "estimator")
             subelement.text = self.estimator
 
-        # Tally accumulator storage mode
-        if self.storage is not None:
-            subelement = ET.SubElement(element, "storage")
-            subelement.text = self.storage
+        # ExaTallies accumulator/moments modes (written only when any is set)
+        if self.exatally is not None:
+            subelement = self.exatally.to_xml_element()
+            if subelement is not None:
+                element.append(subelement)
 
         # Optional Triggers
         for trigger in self.triggers:
@@ -1656,10 +1655,10 @@ class Tally(IDManagerMixin):
         if estimator is not None:
             tally.estimator = estimator
 
-        # Set storage mode
-        storage = get_text(elem, "storage")
-        if storage is not None:
-            tally.storage = storage
+        # Set ExaTallies accumulator/moments modes
+        exatally_elem = elem.find("exatally")
+        if exatally_elem is not None:
+            tally.exatally = openmc.ExaTally.from_xml_element(exatally_elem)
 
         # Read triggers
         tally.triggers = [

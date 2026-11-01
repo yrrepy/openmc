@@ -10,24 +10,24 @@
 namespace openmc {
 
 #ifdef OPENMC_MPI
-//! Lock-free 8-byte atomics are a prerequisite for the shared tally storage
+//! Lock-free 8-byte atomics are a prerequisite for the shared accumulator
 //! mode, where several processes atomically update one shared-memory plane.
 static_assert(std::atomic<double>::is_always_lock_free,
-  "shared tally storage requires lock-free 8-byte atomics");
+  "the shared accumulator mode requires lock-free 8-byte atomics");
 #endif
 
 //! \brief Atomically add a contribution to a tally accumulator element.
 //!
-//! On the tally hot path this is one OpenMP atomic RMW. For the shared storage
-//! mode accum_ points into an MPI-3 shared-memory window mapped by several
-//! processes: #pragma omp atomic on an 8-byte double lowers to a hardware
-//! atomic RMW (lock-prefixed on x86, LL/SC on ARM) whose atomicity is enforced
-//! by the cache-coherence protocol at the physical address. It is therefore
-//! address-free -- valid across processes sharing the memory, the same
-//! guarantee lock-free std::atomic relies on. The static_assert above is a
+//! On the tally hot path this is one OpenMP atomic RMW. For the shared
+//! accumulator mode accum_ points into an MPI-3 shared-memory window mapped by
+//! several processes: #pragma omp atomic on an 8-byte double lowers to a
+//! hardware atomic RMW (lock-prefixed on x86, LL/SC on ARM) whose atomicity is
+//! enforced by the cache-coherence protocol at the physical address. It is
+//! therefore address-free -- valid across processes sharing the memory, the
+//! same guarantee lock-free std::atomic relies on. The static_assert above is a
 //! necessary (not sufficient) platform check; the cross-rank hammer test is the
 //! empirical proof. Without _OPENMP the pragma vanishes and this is not atomic,
-//! so shared storage is rejected at input validation.
+//! so the shared accumulator mode is rejected at input validation.
 inline void atomic_score_add(double* ptr, double val)
 {
 #pragma omp atomic

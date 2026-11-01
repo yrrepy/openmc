@@ -864,14 +864,16 @@ void WeightWindowsGenerator::create_tally()
   ww_tally->moments_all_ranks_ = true;
 
   // Because its moments are read on all ranks, the weight-window-generation
-  // tally always keeps replicated storage: the global tally_storage setting
-  // does not apply to it. Warn once (on the master) if a distributed default
-  // was requested, so the retained per-rank memory is not a surprise.
-  if (settings::tally_storage != TallyStorage::REPLICATED && mpi::master) {
+  // tally always keeps the replicated accumulator mode: the global <exatally>
+  // accumulator default does not apply to it. Warn once (on the master) if a
+  // distributed default was requested, so the retained per-rank memory is not a
+  // surprise.
+  if (settings::exatally.accumulator != AccumulatorMode::REPLICATED &&
+      mpi::master) {
     warning(fmt::format(
-      "Weight-window generation tally {} keeps replicated storage (its moments "
-      "are read on all ranks); the global tally_storage setting does not apply "
-      "to it.",
+      "Weight-window generation tally {} keeps the replicated accumulator "
+      "mode (its moments are read on all ranks); the global <exatally> "
+      "accumulator default does not apply to it.",
       ww_tally->id()));
   }
 

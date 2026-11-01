@@ -480,16 +480,17 @@ void initialize_batch()
   // Increment current batch
   ++simulation::current_batch;
 
-  // Shared/rma tally storage is incompatible with CMFD, which reads tally
+  // Shared/rma accumulator modes are incompatible with CMFD, which reads tally
   // results on all ranks mid-run. cmfd_run is only set once the run has started
   // (and openmc_reset clears it during simulation init), so this is checked
   // here rather than at input validation. The scan runs only in CMFD runs.
   if (settings::cmfd_run) {
     for (const auto& t : model::tallies) {
-      if (t->storage() != TallyStorage::REPLICATED) {
-        fatal_error(fmt::format("Tally {} uses a non-replicated storage mode, "
-                                "which is not compatible with CMFD.",
-          t->id_));
+      if (t->accumulator() != AccumulatorMode::REPLICATED) {
+        fatal_error(
+          fmt::format("Tally {} uses a non-replicated accumulator mode, "
+                      "which is not compatible with CMFD.",
+            t->id_));
       }
     }
   }
@@ -551,7 +552,7 @@ void finalize_batch()
   }
 
   // Check triggers. This is normally a master-only computation, but when an
-  // rma-storage tally carries a trigger the tally-uncertainty walk is
+  // rma-accumulator tally carries a trigger the tally-uncertainty walk is
   // distributed (each rank owns only part of the moments), so every rank must
   // participate. The satisfy/continue decision still flows solely from the
   // master via the broadcast below.
@@ -944,7 +945,7 @@ void broadcast_results()
     // Distributed modes keep their results where they live (rank 0 for shared,
     // the owning rank for rma) and are read there by design, so they are not
     // broadcast. Only replicated tallies serve full results on every rank.
-    if (t->storage() != TallyStorage::REPLICATED)
+    if (t->accumulator() != AccumulatorMode::REPLICATED)
       continue;
 
     // Non-master ranks drop their moments during a reduced run, so allocate a

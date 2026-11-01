@@ -5,6 +5,7 @@
 #include "openmc/memory.h" // for unique_ptr
 #include "openmc/openmp_interface.h"
 #include "openmc/span.h"
+#include "openmc/tallies/exatally.h"
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/trigger.h"
 #include "openmc/vector.h"
@@ -55,20 +56,27 @@ public:
 
   void set_writable(bool writable) { writable_ = writable; }
 
-  //! Where accum_ (and, for rma, the moments) is homed.
-  TallyStorage storage() const { return storage_; }
+  //! The ExaTallies modes of this tally (accumulator and moments).
+  const ExaTally& exatally() const { return exatally_; }
 
-  //! \brief Set the storage mode, validating the distributed modes'
-  //! prerequisites (MPI + OpenMP build, tally reduction on, Monte Carlo
-  //! solver, MPI thread level, not event-based). Must run before
-  //! init_results(), which homes the storage. Tallies created through the C
-  //! API keep the replicated default; the settings::tally_storage global
-  //! applies only to tallies read from XML.
-  void set_storage(TallyStorage storage);
+  //! Accumulator mode: where accum_ (and, for rma, the moments) is homed.
+  AccumulatorMode accumulator() const { return exatally_.accumulator; }
+
+  //! Moments mode: which cross-batch moments are kept (only FULL for now).
+  MomentsMode moments_mode() const { return exatally_.moments; }
+
+  //! \brief Set the ExaTallies modes, validating the distributed accumulator
+  //! modes' prerequisites (MPI + OpenMP build, tally reduction on, Monte Carlo
+  //! solver, MPI thread level, not event-based) and that the moments mode is
+  //! implemented. Must run before init_results(), which homes the storage.
+  //! Tallies created through the C API keep the replicated default; the
+  //! global settings::exatally default applies only to tallies read from XML.
+  void set_exatally(const ExaTally& exatally);
 
   //! True when the moments are genuinely block-distributed across ranks (rma
-  //! storage on a multi-rank run). A single-rank rma tally holds the complete,
-  //! globally-indexed moments and serves every replicated readout path.
+  //! accumulator mode on a multi-rank run). A single-rank rma tally holds the
+  //! complete, globally-indexed moments and serves every replicated readout
+  //! path.
   bool rma_distributed() const;
 
   void set_scores(pugi::xml_node node);
@@ -98,8 +106,8 @@ public:
 
 #ifdef OPENMC_MPI
   //! Number of filter-bin rows this rank owns under rma block distribution
-  //! (0 in every other storage mode). Under rma the moments array is homed on
-  //! the owning rank and locally indexed, so this is its outer dimension.
+  //! (0 in every other accumulator mode). Under rma the moments array is homed
+  //! on the owning rank and locally indexed, so this is its outer dimension.
   int64_t rma_n_rows() const { return rma_n_rows_; }
 
   //! First global filter-bin row owned by `rank` under rma block distribution.
@@ -117,13 +125,13 @@ public:
   //! \brief Add a contribution to the per-batch accumulator. This is the ONLY
   //! way transport writes a tally, and it is on the hot path.
   //!
-  //! For the local storage modes (replicated/shared) accum_ points at an
+  //! For the local accumulator modes (replicated/shared) accum_ points at an
   //! owned or shared plane and the add is a single atomic RMW. The rma branch
   //! (predicted-not-taken) routes remote bins through an out-of-line handler.
   void score_add(int64_t filter_index, int score_index, double val)
   {
 #ifdef OPENMC_MPI
-    if (storage_ == TallyStorage::RMA) {
+    if (exatally_.accumulator == AccumulatorMode::RMA) {
       rma_score_add(filter_index, score_index, val);
       return;
     }
@@ -264,8 +272,8 @@ public:
   vector<double> accum_buffer_; //!< backing storage for accum_ (replicated)
 
 #ifdef OPENMC_MPI
-  //! Shared-memory window backing accum_ in the shared storage mode (one plane
-  //! per node). MPI_WIN_NULL in every other mode.
+  //! Shared-memory window backing accum_ in the shared accumulator mode (one
+  //! plane per node). MPI_WIN_NULL in every other mode.
   MPI_Win accum_win_ {MPI_WIN_NULL};
 #endif
 
@@ -311,16 +319,17 @@ private:
   //! Innermost dimension of the results: number of score x nuclide combinations
   int n_score_bins_ {0};
 
-  //! Where accum_ (and, for rma, moments_) is homed. Set through
-  //! set_storage(), which validates the distributed modes' prerequisites.
-  TallyStorage storage_ {TallyStorage::REPLICATED};
+  //! ExaTallies modes: where accum_ (and, for rma, moments_) is homed, and
+  //! which moments are kept. Set through set_exatally(), which validates the
+  //! distributed modes' prerequisites.
+  ExaTally exatally_;
 
 #ifdef OPENMC_MPI
-  //! Distributed-window state for the rma storage mode. accum_win_ (reused from
-  //! the shared mode) holds this rank's contiguous block of owned filter-bin
-  //! rows and receives only MPI_Accumulate; accum_/accum_buffer_ is a private
-  //! same-size plane for this rank's own scores to bins it owns. Both planes
-  //! are locally indexed (row 0 == rma_first_row_). The fold sums them.
+  //! Distributed-window state for the rma accumulator mode. accum_win_ (reused
+  //! from the shared mode) holds this rank's contiguous block of owned
+  //! filter-bin rows and receives only MPI_Accumulate; accum_/accum_buffer_ is
+  //! a private same-size plane for this rank's own scores to bins it owns. Both
+  //! planes are locally indexed (row 0 == rma_first_row_). The fold sums them.
   double* rma_win_base_ {nullptr}; //!< base of this rank's owned window block
   int64_t rma_bins_per_rank_ {0};  //!< block size of the ownership map
   int64_t rma_first_row_ {0};      //!< first global filter-bin row owned
@@ -382,9 +391,9 @@ private:
   //! metric, also asserted by the unit tests.
   int64_t rma_merged_rows_ {0};
 
-  //! Out-of-line handler for the rma storage mode; only reached when
-  //! storage_ == RMA. Local bins score into the private plane; remote bins are
-  //! coalesced and staged for a batched MPI_Accumulate.
+  //! Out-of-line handler for the rma accumulator mode; only reached when
+  //! exatally_.accumulator == RMA. Local bins score into the private plane;
+  //! remote bins are coalesced and staged for a batched MPI_Accumulate.
   void rma_score_add(int64_t filter_index, int score_index, double val);
 
   //! Owner rank of a global filter-bin row under rma block distribution.

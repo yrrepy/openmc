@@ -1,29 +1,82 @@
 //! \file exatally.cpp
-//! \brief ExaTallies shared/rma tally-storage machinery: node-shared
+//! \brief ExaTallies machinery: the <exatally> mode parser, node-shared
 //! accumulator windows and one-sided RMA distribution. The hot-path seam stays
 //! in tally.h/tally.cpp.
 
-#include "openmc/tallies/tally.h"
+#include "openmc/tallies/exatally.h"
 
 #include "openmc/error.h"
 #include "openmc/message_passing.h"
+#include "openmc/tallies/tally.h"
 #include "openmc/tallies/trigger.h"
+#include "openmc/xml_interface.h"
+
+#include <fmt/core.h>
 
 #include <algorithm> // for min, max, clamp, copy, fill, sort
 #include <cassert>
-#include <cstdint> // for uintptr_t
-#include <cstdlib> // for getenv, atoll
+#include <cstdint>   // for uintptr_t
+#include <cstdlib>   // for getenv, atoll
+#include <stdexcept> // for runtime_error
 
 namespace openmc {
 
 //==============================================================================
-// Tally member functions: storage modes
+// ExaTallies mode switch
+//==============================================================================
+
+ExaTally parse_exatally(
+  pugi::xml_node node, const ExaTally& defaults, const std::string& context)
+{
+  ExaTally result = defaults;
+  pugi::xml_node block = node.child("exatally");
+  if (!block)
+    return result;
+
+  if (check_for_node(block, "accumulator")) {
+    std::string mode = get_node_value(block, "accumulator", true, true);
+    if (mode == "replicated") {
+      result.accumulator = AccumulatorMode::REPLICATED;
+    } else if (mode == "shared") {
+      result.accumulator = AccumulatorMode::SHARED;
+    } else if (mode == "rma") {
+      result.accumulator = AccumulatorMode::RMA;
+    } else {
+      throw std::runtime_error {fmt::format(
+        "Invalid <exatally> accumulator mode '{}' in {}. Valid options are "
+        "'replicated', 'shared', and 'rma'.",
+        mode, context)};
+    }
+  }
+
+  if (check_for_node(block, "moments")) {
+    std::string mode = get_node_value(block, "moments", true, true);
+    if (mode == "full") {
+      result.moments = MomentsMode::FULL;
+    } else if (mode == "mean" || mode == "none") {
+      throw std::runtime_error {
+        fmt::format("The <exatally> moments mode '{}' in {} is not "
+                    "implemented yet; only 'full' is supported.",
+          mode, context)};
+    } else {
+      throw std::runtime_error {
+        fmt::format("Invalid <exatally> moments mode '{}' in {}. Valid "
+                    "options are 'full', 'mean', and 'none'.",
+          mode, context)};
+    }
+  }
+
+  return result;
+}
+
+//==============================================================================
+// Tally member functions: accumulator modes
 //==============================================================================
 
 bool Tally::rma_distributed() const
 {
 #ifdef OPENMC_MPI
-  return storage_ == TallyStorage::RMA && mpi::n_procs > 1;
+  return exatally_.accumulator == AccumulatorMode::RMA && mpi::n_procs > 1;
 #else
   return false;
 #endif
@@ -278,8 +331,8 @@ void Tally::init_shared_accum()
   MPI_Win_get_attr(accum_win_, MPI_WIN_MODEL, &model, &flag);
   if (!flag || *model != MPI_WIN_UNIFIED) {
     fatal_error(
-      "Shared tally storage requires an MPI_WIN_UNIFIED shared-memory "
-      "window (non-cache-coherent hardware is not supported).");
+      "The shared accumulator mode requires an MPI_WIN_UNIFIED "
+      "shared-memory window (non-cache-coherent hardware is not supported).");
   }
 
   // Open a persistent passive-target epoch for the window's whole life so the
@@ -379,7 +432,7 @@ void Tally::init_rma_accum()
   int flag;
   MPI_Win_get_attr(accum_win_, MPI_WIN_MODEL, &model, &flag);
   if (!flag || *model != MPI_WIN_UNIFIED) {
-    fatal_error("rma tally storage requires an MPI_WIN_UNIFIED window "
+    fatal_error("The rma accumulator mode requires an MPI_WIN_UNIFIED window "
                 "(non-cache-coherent hardware is not supported).");
   }
 
@@ -431,7 +484,7 @@ void Tally::init_rma_staging()
     constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank, total
     int64_t n_rma = 0;
     for (const auto& t : model::tallies) {
-      if (t->storage_ == TallyStorage::RMA)
+      if (t->accumulator() == AccumulatorMode::RMA)
         ++n_rma;
     }
     const int64_t row_bytes =
@@ -569,7 +622,7 @@ bool has_rma_triggers()
 {
 #ifdef OPENMC_MPI
   for (const auto& t : model::tallies) {
-    if (t->storage() != TallyStorage::RMA)
+    if (t->accumulator() != AccumulatorMode::RMA)
       continue;
     for (const auto& trigger : t->triggers_) {
       if (trigger.metric != TriggerMetric::not_active)

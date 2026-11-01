@@ -344,7 +344,7 @@ class Tally(_FortranObjectWithID):
         the innermost axis holds the cross-batch moments in order
         ``[SUM, SUM_SQ, ...]``. This matches the on-disk statepoint layout; there
         is no leading ``VALUE`` column. Availability depends on the tally's
-        storage mode: ``replicated`` tallies serve results on rank 0 during a
+        accumulator mode: ``replicated`` tallies serve results on rank 0 during a
         run and on every rank once the run has finished; ``shared`` tallies
         serve them on rank 0 only; ``rma`` tallies on a multi-rank run keep no
         full in-memory array (read those from the statepoint file), while a
@@ -470,8 +470,8 @@ class _TallyMapping(Mapping):
     def __delitem__(self, key):
         """Delete a tally from tally vector and remove the ID,index pair from tally
 
-        .. note:: Deleting a tally that uses the ``shared`` storage mode frees an
-                  MPI shared-memory window and is collective: every MPI rank must
+        .. note:: Deleting a tally that uses the ``shared`` accumulator mode
+                  frees an MPI shared-memory window and is collective: every MPI rank must
                   delete the same tally.
         """
         _dll.openmc_remove_tally(self[key]._index)

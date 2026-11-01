@@ -323,12 +323,6 @@ enum class TallyResult { VALUE, SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
 // "results" dataset exactly.
 enum class TallyMoment { SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
 
-// Where a Tally's per-batch accumulator (and, for rma, its moments) is homed:
-//   REPLICATED - every rank owns a full private copy (default)
-//   SHARED     - one accumulator plane per shared-memory node (MPI-3 window)
-//   RMA        - accumulator and moments block-distributed across all ranks
-enum class TallyStorage { REPLICATED, SHARED, RMA };
-
 // Maximum doubles moved per MPI/HDF5 call by the chunked tally paths (1 GiB);
 // keeps element counts below the int limit of the MPI C interface.
 constexpr int64_t MAX_MPI_CHUNK_DOUBLES {int64_t {1} << 27};
