@@ -971,14 +971,14 @@ void Tally::reset()
   n_realizations_ = 0;
 #ifdef OPENMC_MPI
   if (storage_ == TallyStorage::RMA) {
-    // Both owned-rows planes are invariantly zero between batches (the fold
-    // zeroes them and the window is born zeroed), so this is defensive. Zero
-    // the private plane and this rank's window block; MPI_Win_sync is a local
-    // memory barrier (not collective), so a single-tally reset stays valid.
+    // This rank's window block is written from the CPU only inside the
+    // collective fold in rma_fold(), never here. Between batches it is zero,
+    // and at init or between runs it may already hold remote accumulates for
+    // the coming batch from ranks that are ahead; zeroing it here, with no
+    // collective after, would discard them. Only the private plane, written
+    // solely by this rank's threads, is this rank's to reset.
     if (rma_plane_size_ > 0) {
       std::fill(accum_, accum_ + rma_plane_size_, 0.0);
-      std::fill(rma_win_base_, rma_win_base_ + rma_plane_size_, 0.0);
-      MPI_Win_sync(accum_win_);
     }
     if (moments_.size() != 0) {
       moments_.fill(0.0);
@@ -988,14 +988,11 @@ void Tally::reset()
 #endif
   if (accum_ != nullptr && accum_size_ != 0) {
 #ifdef OPENMC_MPI
-    // The shared plane is invariantly all-zeros between batches (each batch
-    // ends with a fold/zero + publish, and the window is born zeroed), so this
-    // fill is a no-op in every reachable state. Only the node leader writes it,
-    // to avoid a cross-process data race on the shared window.
-    if (storage_ == TallyStorage::SHARED) {
-      if (mpi::node_leader)
-        std::fill(accum_, accum_ + accum_size_, 0.0);
-    } else
+    // The shared node plane is never written here: it is zero at init (the
+    // window is born zeroed) and between batches (each batch ends with a
+    // fold/zero + publish). A leader zeroing it here could race other node
+    // ranks that are already scoring the next batch into it.
+    if (storage_ != TallyStorage::SHARED)
 #endif
     {
       std::fill(accum_, accum_ + accum_size_, 0.0);
