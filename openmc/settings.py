@@ -181,6 +181,8 @@ class Settings:
         moments are kept per bin; 'full' (the built-in default) keeps the sum
         and the sum of squares. A mode left unset keeps the built-in default.
         Individual tallies can override this via :attr:`openmc.Tally.exatally`.
+        Projections are per tally: an :class:`openmc.ExaTally` with
+        projections raises a ValueError here.
 
         .. versionadded:: 0.16.1
     output : dict
@@ -1055,6 +1057,9 @@ class Settings:
     @exatally.setter
     def exatally(self, exatally: ExaTally | None):
         cv.check_type('exatally', exatally, ExaTally, none_ok=True)
+        if exatally is not None and exatally.projections:
+            raise ValueError('ExaTally projections are declared per tally '
+                             '(openmc.Tally.exatally), not in the settings.')
         self._exatally = exatally
 
     @property

@@ -138,6 +138,10 @@ ranks each. The full memory model is in :ref:`methods_parallel_exatallies`.
    * - ``shared`` / ``mean``
      - 51 GB on the node of rank 0, 26 GB on every other node
      - one accumulator plane per node, plus one moment plane on rank 0
+   * - ``shared`` / ``mean`` + a 175-group projection
+     - 52 GB on the node of rank 0, 26 GB on every other node
+     - as ``mean``, plus 0.84 GB on rank 0 for the projection's sum, sum of
+       squares and current realization
    * - ``shared`` / ``none``
      - 26 GB per node, plus 26 GB on the node of rank 0 while a statepoint is
        written and at the end of the run
@@ -190,10 +194,27 @@ Restart from a statepoint adds nothing on a rank that holds no moments.
   calculation. The tally then causes no communication at all between batches.
   A run cannot restart from a statepoint that contains such a tally, and the
   mode needs tally reduction (no ``no_reduce``) and the Monte Carlo solver.
-- With ``mean`` or ``none`` the uncertainty must come from a companion tally
-  with ``full`` on a coarser mesh or energy grid, or from independent runs with
-  different random number seeds (see the ``moments`` entry of
-  :ref:`settings_exatally`).
+- With ``mean``, declare projections for the collapsed quantities you need
+  uncertainties for, for example the flux of each voxel in 175 groups or in
+  total, or the spectrum of the whole mesh. Each projection keeps the sum and
+  the sum of squares of its own batch realizations, so its standard deviation
+  is exact, including the covariance of the fine groups it sums, for a small
+  fraction of the memory of one plane. Put the filter you collapse last in
+  the tally's filter list::
+
+     coarse = openmc.EnergyFilter.from_group_structure('VITAMIN-J-175')
+     flux.exatally = openmc.ExaTally(
+         moments='mean',
+         projections={'coarse': [mesh_filter, coarse],
+                      'total': [mesh_filter],
+                      'spectrum': [coarse]})
+
+  The coarse energy filter must be nested in the tally's energy filter: each
+  of its boundaries must be one of the tally's boundaries.
+- With ``mean`` or ``none`` the uncertainty can otherwise come from a
+  companion tally with ``full`` on a coarser mesh or energy grid, or from
+  independent runs with different random number seeds (see the ``moments``
+  entry of :ref:`settings_exatally`).
 
 **Running and reading the results.** ``shared`` lets you run many MPI ranks
 per node, for example one per NUMA domain or one per core, without
@@ -207,7 +228,19 @@ example through ``mpi4py``) must do the same. Results are read as always with
 ``tallies.out`` prints the mean without an uncertainty. The statepoint records
 the moments mode of each tally, and :class:`openmc.StatePoint` sets
 :attr:`openmc.Tally.exatally` on the tallies whose mode is ``mean`` or
-``none``.
+``none``. The projections of a tally are read as
+:attr:`openmc.Tally.projections`, a dictionary of derived tallies by
+projection name, each with the projected filters, the mean and the standard
+deviation, which support the usual analysis methods such as
+:meth:`openmc.Tally.get_pandas_dataframe` and :meth:`openmc.Tally.get_slice`::
+
+   with openmc.StatePoint('statepoint.100.h5') as sp:
+       flux = sp.get_tally(name='fine flux')
+       coarse = flux.projections['coarse']
+       print(coarse.mean, coarse.std_dev)
+
+Projections are not printed in ``tallies.out`` and are not available through
+:mod:`openmc.lib`.
 
 ----------------------
 Maximizing Performance

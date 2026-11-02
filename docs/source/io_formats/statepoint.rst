@@ -182,6 +182,28 @@ The current version of the statepoint file format is 18.2.
              the tally normalization, so the mean is again the sum divided by
              **n_realizations**.
 
+**/tallies/tally <uid>/projections/**
+
+Present only for a tally that declares projections.
+
+:Attributes: - **n_projections** (*int*) -- Number of projections.
+
+**/tallies/tally <uid>/projections/<name>/**
+
+:Attributes: - **filters** (*int[]*) -- User-defined unique IDs of the
+               projected filters, in the tally's filter order (empty when
+               every filter is summed over). Filters used only by projections
+               are written with the other filters under **/tallies/filters/**.
+             - **n_filter_bins** (*int*) -- Number of projected filter bins
+               (the product of the projected filters' bin counts; 1 when every
+               filter is summed over).
+
+:Datasets:
+    - **results** (*double[][][]*) -- Sum and sum of squares of the projected
+      batch realizations for each projected filter bin and scoring bin, laid
+      out as the tally's **results** with two moments. The number of
+      realizations is the tally's **n_realizations**.
+
 **/runtime/**
 
 All values are given in seconds and are measured on the master process.

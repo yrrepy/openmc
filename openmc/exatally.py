@@ -1,5 +1,8 @@
+from collections.abc import Iterable, Mapping
+
 import lxml.etree as ET
 
+import openmc
 import openmc.checkvalue as cv
 from ._xml import get_text
 
@@ -12,7 +15,7 @@ MOMENTS_MODES = {'full', 'mean', 'none'}
 
 
 class ExaTally:
-    """ExaTallies accumulator and moments modes of a tally.
+    """ExaTallies accumulator and moments modes of a tally, and its projections.
 
     An instance assigned to :attr:`openmc.Settings.exatally` sets the global
     default; one assigned to :attr:`openmc.Tally.exatally` overrides that
@@ -41,6 +44,22 @@ class ExaTally:
         restrictions that a run cannot restart from its statepoint, and that
         it requires tally reduction (no ``no_reduce``) and the Monte Carlo
         solver. See :ref:`settings_exatally`.
+    projections : dict of str to list of openmc.Filter, optional
+        Projections of the tally (per tally only; not allowed in
+        :attr:`openmc.Settings.exatally`). Each maps a name (unique within
+        the tally; no '/') to a filter list in the tally's filter order, in
+        which each of the tally's filters is either kept (the tally's own
+        filter object), collapsed (a coarser :class:`openmc.EnergyFilter`
+        whose boundaries are boundaries of the tally's energy filter), or
+        left out (summed over). An empty list sums over every filter. For
+        each projection the run keeps the sum and the sum of squares of the
+        projected batch realization, so the projected quantity gets an exact
+        standard deviation that includes the covariance of the fine bins it
+        sums. Not allowed with moments 'none'. The results are read as
+        :attr:`openmc.Tally.projections`. See the ``exatally`` entry of
+        :ref:`io_tallies`.
+
+        .. versionadded:: 0.16.1
 
     Attributes
     ----------
@@ -48,23 +67,38 @@ class ExaTally:
         Where the per-batch accumulator is homed across MPI ranks
     moments : {'full', 'mean', 'none'} or None
         Which cross-batch moments are kept per bin
+    projections : dict of str to list of openmc.Filter or None
+        Projections of the tally, by name
 
     """
 
-    def __init__(self, accumulator=None, moments=None):
+    def __init__(self, accumulator=None, moments=None, projections=None):
         self.accumulator = accumulator
         self.moments = moments
+        self.projections = projections
+
+    def _projection_key(self):
+        """Comparable form of the projections: name -> [(id, filter), ...]."""
+        if not self.projections:
+            return {}
+        return {name: [(f.id, f) for f in filters]
+                for name, filters in self.projections.items()}
 
     def __eq__(self, other):
         if not isinstance(other, ExaTally):
             return NotImplemented
         return (self.accumulator == other.accumulator
-                and self.moments == other.moments)
+                and self.moments == other.moments
+                and self._projection_key() == other._projection_key())
 
     def __repr__(self):
         string = 'ExaTally\n'
         string += '{: <16}=\t{}\n'.format('\tAccumulator', self._accumulator)
         string += '{: <16}=\t{}\n'.format('\tMoments', self._moments)
+        if self._projections:
+            proj = {name: [f.id for f in filters]
+                    for name, filters in self._projections.items()}
+            string += '{: <16}=\t{}\n'.format('\tProjections', proj)
         return string
 
     @property
@@ -88,17 +122,40 @@ class ExaTally:
             cv.check_value('exatally moments', moments, MOMENTS_MODES)
         self._moments = moments
 
+    @property
+    def projections(self):
+        return self._projections
+
+    @projections.setter
+    def projections(self, projections):
+        if projections is None:
+            self._projections = None
+            return
+        cv.check_type('exatally projections', projections, Mapping)
+        checked = {}
+        for name, filters in projections.items():
+            cv.check_type('exatally projection name', name, str)
+            if not name or name == '.' or '/' in name:
+                raise ValueError(
+                    f'Invalid ExaTally projection name {name!r}: a name '
+                    "must be non-empty, not '.', and contain no '/'.")
+            cv.check_type(f'filters of projection {name!r}', filters,
+                          Iterable, openmc.Filter)
+            checked[name] = list(filters)
+        self._projections = checked
+
     def to_xml_element(self):
         """Return XML representation of the ExaTallies modes
 
         Returns
         -------
         element : lxml.etree._Element or None
-            XML element containing the modes that are set, or None if no mode
-            is set (nothing needs to be written)
+            XML element containing the modes and projections that are set,
+            or None if nothing is set (nothing needs to be written)
 
         """
-        if self.accumulator is None and self.moments is None:
+        if (self.accumulator is None and self.moments is None
+                and not self.projections):
             return None
         element = ET.Element("exatally")
         if self.accumulator is not None:
@@ -107,16 +164,23 @@ class ExaTally:
         if self.moments is not None:
             subelement = ET.SubElement(element, "moments")
             subelement.text = self.moments
+        for name, filters in (self.projections or {}).items():
+            subelement = ET.SubElement(element, "projection")
+            subelement.set("name", name)
+            subelement.set("filters", ' '.join(str(f.id) for f in filters))
         return element
 
     @classmethod
-    def from_xml_element(cls, elem):
+    def from_xml_element(cls, elem, filters=None):
         """Generate ExaTallies modes from an XML element
 
         Parameters
         ----------
         elem : lxml.etree._Element
             ``<exatally>`` XML element
+        filters : dict of int to openmc.Filter, optional
+            Filters by ID, to resolve the filters of ``<projection>``
+            elements (required when the element has any)
 
         Returns
         -------
@@ -126,6 +190,16 @@ class ExaTally:
         """
         accumulator = get_text(elem, "accumulator")
         moments = get_text(elem, "moments")
+        projections = None
+        for proj in elem.findall("projection"):
+            if filters is None:
+                raise ValueError('<projection> elements need the filters by '
+                                 'ID to be resolved.')
+            if projections is None:
+                projections = {}
+            ids = proj.get("filters", "").split()
+            projections[proj.get("name")] = [filters[int(i)] for i in ids]
         return cls(
             accumulator=accumulator.strip() if accumulator is not None else None,
-            moments=moments.strip() if moments is not None else None)
+            moments=moments.strip() if moments is not None else None,
+            projections=projections)

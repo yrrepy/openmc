@@ -80,8 +80,61 @@ The ``<tally>`` element accepts the following sub-elements:
     ``replicated`` tally with moments ``full`` on a coarse mesh that provides
     the uncertainty).
 
+    The per-tally block may also declare projections, as ``<projection>``
+    sub-elements with two attributes:
+
+    :name:
+      The name of the projection, unique within the tally; it names the
+      projection's group in the statepoint, so it must be non-empty, must not
+      be ``.``, and must not contain ``/``.
+
+    :filters:
+      A space-separated list of filter IDs, in the tally's filter order. Each
+      of the tally's filters is either listed (kept), replaced by an energy
+      filter nested in it (collapsed), or left out (summed over); an empty
+      list sums over every filter. A nested energy filter is an
+      ``energy`` (or ``energyout``) filter of the same type as one of the
+      tally's filters whose boundaries are all boundaries of that filter and
+      whose range lies within its range; fine bins outside the coarse range
+      are not projected. The projection-only filters are declared with
+      ``<filter>`` elements like any other filter.
+
+    For each projection the run keeps the sum and the sum of squares of the
+    projected batch realization, so the projected quantity has a mean and an
+    exact standard deviation that includes the covariance of the fine bins it
+    sums (see :ref:`methods_parallel_exatallies`). Projections are allowed
+    with the moments modes ``full`` and ``mean`` (with ``mean`` they are the
+    only source of a standard deviation) and with every accumulator mode;
+    they always keep two moments. Their results are written to the statepoint
+    and read through :attr:`openmc.Tally.projections`; they are not printed in
+    ``tallies.out``, served through the C API, or used by triggers. The run
+    stops with an error for a projection with moments ``none``, a
+    ``<projection>`` in settings.xml, an unknown filter ID, a duplicate or
+    missing name, a filter that is neither the tally's own nor a nested
+    energy filter (a coarser mesh is not supported yet), coarse boundaries
+    that are not fine boundaries or lie outside the fine range, filters out
+    of the tally's order, a projection that keeps every filter, and a
+    collapse on a tally with more than one energy filter of that type. A
+    projection that keeps every filter but the last, collapsing or summing
+    the last, is folded without per-thread buffers, so put the filter to be
+    collapsed last. For example:
+
+    .. code-block:: xml
+
+        <tally id="1">
+          <filters>10 20</filters>  <!-- 10: mesh, 20: fine energy grid -->
+          <scores>flux</scores>
+          <exatally>
+            <moments>mean</moments>
+            <projection name="coarse" filters="10 21"/>  <!-- 21 nested in 20 -->
+            <projection name="total" filters="10"/>
+            <projection name="spectrum" filters="21"/>
+          </exatally>
+        </tally>
+
     *Default*: the values of the ``<exatally>`` element in settings.xml
-    (accumulator ``replicated`` and moments ``full`` if unset).
+    (accumulator ``replicated`` and moments ``full`` if unset); no
+    projections.
 
   :scores:
     A space-separated list of the desired responses to be accumulated. A full

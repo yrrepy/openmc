@@ -69,12 +69,16 @@ public:
   //! modes' prerequisites (MPI + OpenMP build, tally reduction on, Monte Carlo
   //! solver, MPI thread level, not event-based) and the reduced moments modes'
   //! restrictions (no triggers or higher moments; for 'none' also tally
-  //! reduction on and not the random ray solver). Must run after the triggers
-  //! and higher_moments are read and before init_results(), which homes the
-  //! storage. Tallies created through the C API keep the replicated/full
-  //! default; the global settings::exatally default applies only to tallies
-  //! read from XML.
+  //! reduction on, not the random ray solver, and no projections). Must run
+  //! after the triggers, higher_moments and projections are read and before
+  //! init_results(), which homes the storage. Tallies created through the C API
+  //! keep the replicated/full default; the global settings::exatally default
+  //! applies only to tallies read from XML.
   void set_exatally(const ExaTally& exatally);
+
+  //! Projections of this tally (see TallyProjection), in input order.
+  const vector<TallyProjection>& projections() const { return projections_; }
+  vector<TallyProjection>& projections() { return projections_; }
 
   //! True when the moments are genuinely block-distributed across ranks (rma
   //! accumulator mode on a multi-rank run). A single-rank rma tally holds the
@@ -519,6 +523,30 @@ private:
 
   //! Allocate the per-node shared accumulator plane and open its epoch.
   void init_shared_accum();
+#endif
+
+  //! Projections declared in the tally's <exatally> block; derived data and
+  //! storage are set up by init_projections().
+  vector<TallyProjection> projections_;
+
+  //! \brief Validate the projections against the tally's filters, build their
+  //! bin maps and strides, and allocate their moments and realizations.
+  //! Called from init_results() after set_strides().
+  void init_projections();
+
+  //! Zero the projection moments, realizations and thread buffers (reset()).
+  void reset_projections();
+
+  //! \brief Fold each projection's realization y into its moments (SUM += y,
+  //! SUM_SQ += y * y) and zero y, on the rank that holds the moments.
+  void fold_projection_moments();
+
+#ifdef OPENMC_MPI
+  //! \brief rma: sum every rank's partial projected realizations onto the
+  //! master, then fold them (fold_projection_moments()). Collective over all
+  //! ranks in tally order: each non-master sends one header (its row range)
+  //! plus its slice per projection; the master receives rank by rank.
+  void combine_rma_projections();
 #endif
 
   //! Per-batch normalization applied in the fold (source strength divided by

@@ -739,6 +739,52 @@ receive scratch on the master. Restart adds nothing on a rank that holds no
 moments, and the ``rma`` remote-scoring staging is the fixed 64 MiB per rank
 described above.
 
+A tally may also declare *projections*: coarser views of its filter bins in
+which an energy filter is collapsed onto a nested coarser grid or a filter is
+summed over (see the ``exatally`` entry of :ref:`io_tallies`). For each
+projection the fold forms the projected batch realization
+:math:`y_b = P x_b`, where :math:`x_b` is the normalized accumulator plane of
+batch :math:`b` (the values the fold adds to :math:`\sum x`) and :math:`P`
+sums the fine bins of each projected bin, and keeps :math:`\sum_b y_b` and
+:math:`\sum_b y_b^2`. The mean and standard deviation of a projected bin then
+follow from batch statistics exactly as for a tally bin, and the variance
+includes the covariance between the fine bins it sums:
+
+.. math::
+
+    \operatorname{Var}\Big(\sum_{i} x_i\Big) = \sum_{i} \operatorname{Var}(x_i)
+    + 2 \sum_{i<j} \operatorname{Cov}(x_i, x_j).
+
+Fine bins of one batch are correlated -- a history that scatters through
+several energy groups of a voxel scores in each of them -- so the per-bin
+standard deviations alone cannot give the uncertainty of their sum.
+:meth:`openmc.Tally.summation` combines per-bin standard deviations in
+quadrature, and tally arithmetic propagates uncertainties under the assumption
+that the tally data is independently distributed, as its docstrings state;
+both drop the covariance term. A projection keeps two moments whatever the
+moments mode, so with ``mean`` the fine tally holds one moment plane and its
+projections supply the standard deviations of the collapsed quantities.
+
+A projection with :math:`F_p` projected filter bins holds
+:math:`3 F_p \times S` doubles on the master (the sum, the sum of squares, and
+the realization of the current batch), whatever the accumulator mode; for
+:math:`2 \times 10^5` voxels and 175 groups that is 0.84 GB, 3.3 % of the
+25.6 GB plane of the 16,000-group tally. The projection is formed where the
+fold runs: on the master under tally reduction, on every rank under
+``no_reduce`` (each rank projects its own realization, consistent with its own
+moments), and over the owned rows of each rank under ``rma``, where the
+master sums the partial realizations of all ranks every batch before it
+squares them (a projected bin whose fine bins straddle two owners arrives
+twice and sums correctly). A projection that keeps every filter of the tally
+but the last, collapsing or summing the last, maps whole rows of the last
+filter to disjoint projected rows, so the threads of the fold add into the
+realization in place; under ``rma`` each rank then sends about
+:math:`F_p S / N` doubles per batch. Any other projection adds into one
+private realization per OpenMP thread (:math:`n_\text{threads} F_p S` doubles
+on each folding rank, printed at verbosity 8), summed after the fold, and
+each rank sends all :math:`F_p S` doubles per batch under ``rma``; ordering
+the tally's filters so that the collapsed one is last avoids both.
+
 All three modes preserve the statistical semantics of the ``replicated``
 default. Because scores accumulate locally within a batch and are reduced or
 folded exactly once per batch, the sample mean is statistically exact --

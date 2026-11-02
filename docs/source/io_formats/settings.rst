@@ -592,8 +592,11 @@ attributes/sub-elements:
     weight windows) always keeps ``full``; the global ``<exatally>`` moments
     default does not apply to it.
 
-    With ``mean`` or ``none`` the uncertainty must come from elsewhere: a
-    companion tally on a coarser mesh or energy grid with moments ``full``, or
+    With ``mean`` the projections of the tally (see the ``exatally`` entry of
+    :ref:`io_tallies`) can provide the standard deviations of the collapsed
+    quantities. With ``mean`` or ``none`` the uncertainty can otherwise come
+    from a companion tally on a coarser mesh or energy grid with moments
+    ``full``, or
     *K* independent runs with different random number seeds, each treated as
     one realization -- the mean of the *K* means is the estimate and the
     standard deviation of the mean follows from their spread, exactly as in
@@ -603,7 +606,10 @@ attributes/sub-elements:
     *Default*: full
 
 Individual tallies can override these defaults with a per-tally ``<exatally>``
-element (see the ``exatally`` entry of :ref:`io_tallies`).
+element (see the ``exatally`` entry of :ref:`io_tallies`). Projections, which
+give a tally with moments ``full`` or ``mean`` exact standard deviations of
+collapsed quantities, are declared only there: a ``<projection>`` sub-element
+here stops the run with an error.
 
 --------------------
 ``<output>`` Element

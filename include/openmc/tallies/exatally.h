@@ -6,11 +6,14 @@
 
 #include <cstdint>
 #include <string>
+#include <utility> // for pair
 
 #ifdef OPENMC_MPI
 #include <mpi.h>
 #endif
 
+#include "openmc/tensor.h"
+#include "openmc/vector.h"
 #include "pugixml.hpp"
 
 namespace openmc {
@@ -56,6 +59,66 @@ ExaTally parse_exatally(
 //! The input word of a moments mode ("none", "mean" or "full"), as written to
 //! the statepoint and used in messages.
 const char* moments_mode_name(MomentsMode mode);
+
+//==============================================================================
+// Projected moments
+//==============================================================================
+
+//! \brief One projection of a tally: a coarser view of the tally's filter
+//! bins whose batch realizations get their own sum and sum of squares.
+//!
+//! The projected filter list follows the tally's filter order. Each tally
+//! filter is kept (listed itself), collapsed (an energy filter nested in it is
+//! listed instead), or summed over (not listed). Each batch, the fold adds
+//! every bin's batch value into the projected bin of its row (the realization
+//! y = P x), and then SUM += y and SUM_SQ += y * y, so the variance of the
+//! projected quantity includes the covariance of the fine bins it sums.
+struct TallyProjection {
+  std::string name;        //!< Statepoint group name, unique within the tally
+  vector<int32_t> filters; //!< Projected filters (model::tally_filters indices)
+
+  // Derived by Tally::init_projections():
+
+  //! Per tally filter: fine bin -> bin on its projected axis, -1 dropping the
+  //! bin (outside the coarse energy range). Empty for a kept filter (the
+  //! identity) and for a summed-over filter.
+  vector<vector<int32_t>> maps;
+
+  //! Per tally filter: stride of its projected axis in the projected
+  //! filter-bin index (last projected filter fastest); 0 when summed over.
+  vector<int64_t> strides;
+
+  int64_t n_bins {0};     //!< Projected filter bins F_p (1 when all summed)
+  bool fast_path {false}; //!< Every filter but the tally's last kept (case A)
+
+  //! [F_p, n_score_bins, 2] SUM and SUM_SQ on the rank that folds them (the
+  //! master, or every rank without tally reduction); empty elsewhere. Two
+  //! moments in every moments mode that allows projections.
+  tensor::Tensor<double> moments;
+
+  //! This batch's projected realization y (under rma: this rank's partial,
+  //! summed onto the master before the moments fold), holding projected
+  //! filter-bin rows [first_row, last_row] x n_score_bins. Zero between
+  //! batches.
+  vector<double> realization;
+  int64_t first_row {0};
+  int64_t last_row {-1};
+
+  //! Case B: one private realization per OpenMP thread, summed into
+  //! realization after the fold (so no two threads write one value).
+  vector<vector<double>> thread_partials;
+};
+
+//! \brief Parse the <projection> children of the <exatally> block under
+//! `node`.
+//!
+//! \param node     Tally element that may hold an <exatally> child
+//! \param context  Where the block is, for error text ("tally N")
+//! \return One {name, filter ids} pair per projection, in input order
+//! \throw std::runtime_error on a projection without a name or a filters
+//!        attribute
+vector<std::pair<std::string, vector<int32_t>>> parse_projections(
+  pugi::xml_node node, const std::string& context);
 
 #ifdef OPENMC_MPI
 //! \brief Sum a contiguous accumulator onto the master (rank 0 of `comm`) in

@@ -378,6 +378,29 @@ Tally::Tally(pugi::xml_node node)
     }
   }
 
+  // Read the projections of the <exatally> block and resolve their filter ids
+  // as for <filters>; init_projections() validates them against the tally's
+  // filters. Read before set_exatally(), which rejects them with 'none'.
+  try {
+    for (auto& [name, ids] :
+      parse_projections(node, fmt::format("tally {}", id_))) {
+      TallyProjection proj;
+      proj.name = name;
+      for (int32_t filter_id : ids) {
+        auto it = model::filter_map.find(filter_id);
+        if (it == model::filter_map.end()) {
+          fatal_error(
+            fmt::format("Tally {} projection '{}': could not find filter {}.",
+              id_, name, filter_id));
+        }
+        proj.filters.push_back(it->second);
+      }
+      projections_.push_back(std::move(proj));
+    }
+  } catch (const std::runtime_error& e) {
+    fatal_error(e.what());
+  }
+
   // Resolve the ExaTallies modes: a per-tally <exatally> block overrides the
   // global settings::exatally default child by child (the parser throws on an
   // invalid value); set_exatally validates the modes' prerequisites.
@@ -782,6 +805,13 @@ void Tally::set_exatally(const ExaTally& exatally)
     }
   }
   if (exatally.moments == MomentsMode::NONE) {
+    // A projection folds each batch realization; 'none' keeps none.
+    if (!projections_.empty()) {
+      fatal_error(fmt::format(
+        "Tally {} declares projections, but the <exatally> moments mode "
+        "'none' keeps no batch realizations to project; use 'mean' or 'full'.",
+        id_));
+    }
     // 'none' forms the mean once from the reduced run total; the no-reduction
     // writer would need per-rank totals instead.
     if (!settings::reduce_tallies) {
@@ -966,6 +996,9 @@ void Tally::init_results()
     accum_ = accum_buffer_.data();
   }
 
+  // Projected moments and realizations (after the rma block map is known).
+  init_projections();
+
   // Cross-batch moments, shaped [n_filter_bins, n_score_bins, n_moments]. The
   // moment count is 2 (SUM, SUM_SQ) or 4 (adding SUM_THIRD, SUM_FOURTH). This
   // is exactly the on-disk statepoint layout, so no VALUE column is stored.
@@ -1022,6 +1055,8 @@ void Tally::reset()
   }
 #endif
   n_realizations_ = 0;
+  // Projection moments and realizations are CPU-local on every rank.
+  reset_projections();
 #ifdef OPENMC_MPI
   if (exatally_.accumulator == AccumulatorMode::RMA) {
     // This rank's window block is written from the CPU only inside the

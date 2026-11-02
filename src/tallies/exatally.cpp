@@ -9,14 +9,17 @@
 #include "openmc/message_passing.h"
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
+#include "openmc/tallies/filter_energy.h"
+#include "openmc/tallies/filter_mesh.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/tallies/trigger.h"
 #include "openmc/xml_interface.h"
 
 #include <fmt/core.h>
 
-#include <algorithm> // for min, max, clamp, copy, fill, sort
+#include <algorithm> // for min, max, clamp, copy, count, fill, find, sort
 #include <cassert>
+#include <cmath>     // for abs
 #include <cstdint>   // for uintptr_t
 #include <cstdlib>   // for getenv, atoll
 #include <stdexcept> // for runtime_error
@@ -149,8 +152,10 @@ inline bool fold_bin_nonzero(const double* acc, const double* win, int q)
 //! zero its accumulator. One plane: the batch value is acc * norm. Two planes
 //! (rma): it is (win + acc) * norm, the window block plus the private plane,
 //! and both are zeroed.
+//! \return The batch value folded
 template<bool TWO_PLANES, FoldKind KIND>
-inline void fold_bin(double* acc, double* win, double* mom, int q, double norm)
+inline double fold_bin(
+  double* acc, double* win, double* mom, int q, double norm)
 {
   double val;
   if constexpr (TWO_PLANES) {
@@ -173,62 +178,405 @@ inline void fold_bin(double* acc, double* win, double* mom, int q, double norm)
     m[static_cast<int>(TallyMoment::SUM)] += val;
     m[static_cast<int>(TallyMoment::SUM_SQ)] += val * val;
   }
+  return val;
 }
+
+//! \brief Fold one chunk of len <= FOLD_CHUNK_BINS bins, dense or sparse.
+//!
+//! A dense chunk folds every bin, exactly as a plain loop, and counts its
+//! nonzero bins on the way; a sparse chunk first lists its nonzero bins, then
+//! folds only those, so the moments of an empty bin are neither read nor
+//! written. `sparse` holds this thread's choice for the chunk on entry and its
+//! choice for the next chunk on return: sparse when at most 1/16 of this
+//! chunk's bins were nonzero. on_dense(val) receives the value of every bin of
+//! a dense chunk in order; on_sparse(q, val) receives each folded bin of a
+//! sparse chunk with its offset q (the projection arm; empty otherwise).
+template<bool TWO_PLANES, FoldKind KIND, class DENSE, class SPARSE>
+inline void fold_chunk(double* a, double* w, double* m, int len, double norm,
+  int* nonzero, bool& sparse, DENSE&& on_dense, SPARSE&& on_sparse)
+{
+  int n_nonzero = 0;
+  if (sparse) {
+    for (int q = 0; q < len; ++q) {
+      nonzero[n_nonzero] = q;
+      n_nonzero += fold_bin_nonzero<TWO_PLANES>(a, w, q);
+    }
+    for (int i = 0; i < n_nonzero; ++i) {
+      const int q = nonzero[i];
+      on_sparse(q, fold_bin<TWO_PLANES, KIND>(a, w, m, q, norm));
+    }
+  } else {
+    for (int q = 0; q < len; ++q) {
+      n_nonzero += fold_bin_nonzero<TWO_PLANES>(a, w, q);
+      on_dense(fold_bin<TWO_PLANES, KIND>(a, w, m, q, norm));
+    }
+  }
+  sparse = n_nonzero * FOLD_SPARSE_DIVISOR <= len;
+}
+
+//! The projection arm of a tally without projections: nothing to add.
+struct NoProjection {
+  static constexpr bool ENABLED = false;
+};
+
+//! \brief The projection arm of the batch fold: adds the batch value of every
+//! folded bin into the realization y of each projection of the tally.
+//!
+//! The plane being folded holds bins [first_bin, first_bin + n) of the tally
+//! (all bins, or an rma rank's owned rows), bin g = row * S + score bin, and a
+//! row's projected row is sum_i map_i(b_i) * stride_i over the tally filters
+//! (b_i its fine bin of filter i, map_i the identity for a kept or summed
+//! filter, the coarse map for a collapsed one). A dense chunk walks the bins
+//! with an odometer over (b_0, ..., b_{nf-1}, score bin); a row step looks up
+//! the last filter only, and the other filters' part is recomputed on a carry
+//! out of the last filter. A sparse chunk's bins are decomposed by division,
+//! once per bin for all projections. Zero-skipped bins add nothing to y,
+//! which is exact.
+//!
+//! Threads: a case-A projection (every filter but the last kept) maps whole
+//! outer rows (row / n_last) to disjoint projected rows, so its threads add
+//! straight into y if each thread folds whole outer rows. The parallel unit is
+//! therefore a block of whole outer rows (block_bins()), aligned to the
+//! GLOBAL outer-row boundaries: under rma a rank's owned rows may start or end
+//! inside an outer row, which then forms a lead block of its own, and the
+//! other owner projects the rest of that row (the master sums both partials
+//! before squaring). A case-B projection adds into one private y per thread
+//! (thread_partials), summed into y by reduce_thread_partials().
+class ProjectionFold {
+public:
+  static constexpr bool ENABLED = true;
+
+  ProjectionFold(vector<TallyProjection>& projections,
+    const vector<int32_t>& filters, int n_score_bins, int64_t first_bin)
+    : nf_(static_cast<int>(filters.size())), np_(projections.size()),
+      s_(n_score_bins), first_bin_(first_bin), n_bins_(nf_)
+  {
+    assert(nf_ > 0); // a projection of a filterless tally is the tally itself
+    for (int i = 0; i < nf_; ++i)
+      n_bins_[i] = model::tally_filters[filters[i]]->n_bins();
+
+    const int nt = num_threads();
+    bool any_case_a = false;
+    proj_.resize(np_);
+    maps_.resize(np_ * nf_);
+    strides_.resize(np_ * nf_);
+    for (size_t p = 0; p < np_; ++p) {
+      TallyProjection& tp = projections[p];
+      proj_[p].first_row = tp.first_row;
+      proj_[p].case_a = tp.fast_path;
+      proj_[p].realization = tp.realization.data();
+      for (int i = 0; i < nf_; ++i) {
+        maps_[p * nf_ + i] = tp.maps[i].empty() ? nullptr : tp.maps[i].data();
+        strides_[p * nf_ + i] = tp.strides[i];
+      }
+      // Realization offset of each fine bin of the last filter (its
+      // projected-row part times the score bins), or DROPPED.
+      proj_[p].last_off.resize(n_bins_[nf_ - 1]);
+      for (int64_t b = 0; b < n_bins_[nf_ - 1]; ++b) {
+        const int64_t c = part(p, nf_ - 1, b);
+        proj_[p].last_off[b] = c < 0 ? DROPPED : c * s_;
+      }
+      if (tp.fast_path) {
+        any_case_a = true;
+      } else {
+        // One private realization per thread; kept between batches (they
+        // are zero after each reduce), resized if the thread count grew.
+        const size_t len = tp.realization.size();
+        if (tp.thread_partials.size() < static_cast<size_t>(nt))
+          tp.thread_partials.resize(nt);
+        for (auto& part : tp.thread_partials)
+          part.resize(len, 0.0);
+        proj_[p].partials = &tp.thread_partials;
+      }
+    }
+
+    if (any_case_a) {
+      // Whole outer rows per block, and at least FOLD_CHUNK_BINS bins when
+      // an outer row is shorter; the lead block runs to the first outer-row
+      // boundary at or after first_bin.
+      const int64_t outer = n_bins_[nf_ - 1] * s_;
+      block_bins_ = std::max<int64_t>(1, FOLD_CHUNK_BINS / outer) * outer;
+      lead_bins_ = (outer - first_bin_ % outer) % outer;
+    } else {
+      block_bins_ = FOLD_CHUNK_BINS;
+      lead_bins_ = 0;
+    }
+  }
+
+  int64_t block_bins() const { return block_bins_; }
+  int64_t lead_bins() const { return lead_bins_; }
+
+  //! One thread's cursor: the fine-bin odometer and, per projection, the
+  //! realization offset of the current tally row (negative when the row is
+  //! dropped). Only a carry out of the last filter recomputes the projected
+  //! row part of the other filters.
+  class Thread {
+  public:
+    explicit Thread(const ProjectionFold& fold)
+      : f_(fold), b_(fold.nf_), base_(fold.np_), drop_(fold.np_),
+        off_(fold.np_), last_off_(fold.np_), dst_(fold.np_)
+    {
+      const int t = thread_num();
+      for (size_t p = 0; p < f_.np_; ++p) {
+        const Proj& pr = f_.proj_[p];
+        dst_[p] = pr.case_a ? pr.realization : (*pr.partials)[t].data();
+        last_off_[p] = pr.last_off.data();
+      }
+    }
+
+    //! Position the cursor at plane bin k (the first bin of a dense chunk).
+    void begin(int64_t k)
+    {
+      j_ = f_.decompose(k, b_.data());
+      set_bases();
+      set_rows();
+    }
+
+    //! Add the cursor bin's value to every projection, then advance one bin.
+    void dense(double val)
+    {
+      for (size_t p = 0; p < f_.np_; ++p) {
+        if (off_[p] >= 0)
+          dst_[p][off_[p] + j_] += val;
+      }
+      if (++j_ == f_.s_) {
+        j_ = 0;
+        next_row();
+      }
+    }
+
+    //! Add the value of plane bin k (a bin of a sparse chunk).
+    void sparse(int64_t k, double val)
+    {
+      int64_t* b = b_.data();
+      const int64_t j = f_.decompose(k, b);
+      for (size_t p = 0; p < f_.np_; ++p) {
+        const int64_t outer = f_.outer_part(p, b);
+        const int64_t last = f_.last_part(p, b[f_.nf_ - 1]);
+        if (outer >= 0 && last >= 0)
+          dst_[p][(outer + last - f_.proj_[p].first_row) * f_.s_ + j] += val;
+      }
+    }
+
+  private:
+    //! Recompute each projection's part of filters 0..nf-2 (as an offset).
+    void set_bases()
+    {
+      for (size_t p = 0; p < f_.np_; ++p) {
+        const int64_t outer = f_.outer_part(p, b_.data());
+        drop_[p] = outer < 0;
+        base_[p] = (outer - f_.proj_[p].first_row) * f_.s_;
+      }
+    }
+
+    //! Set every projection's realization offset for the current row.
+    void set_rows()
+    {
+      const int64_t b_last = b_[f_.nf_ - 1];
+      for (size_t p = 0; p < f_.np_; ++p) {
+        const int64_t last = last_off_[p][b_last];
+        off_[p] = (drop_[p] || last < 0) ? DROPPED : base_[p] + last;
+      }
+    }
+
+    //! Advance the odometer one filter-bin row (last filter fastest).
+    void next_row()
+    {
+      const int last = f_.nf_ - 1;
+      if (++b_[last] == f_.n_bins_[last]) {
+        b_[last] = 0;
+        for (int i = last - 1; i >= 0; --i) {
+          if (++b_[i] < f_.n_bins_[i])
+            break;
+          b_[i] = 0;
+        }
+        set_bases();
+      }
+      set_rows();
+    }
+
+    const ProjectionFold& f_;
+    vector<int64_t> b_;    //!< fine bin of each tally filter
+    int64_t j_ {0};        //!< score bin
+    vector<int64_t> base_; //!< [p]: offset part of filters 0..nf-2
+    vector<char> drop_;    //!< [p]: filters 0..nf-2 drop the row
+    vector<int64_t> off_;  //!< [p]: realization offset of the current row
+    vector<const int64_t*> last_off_; //!< [p]: Proj::last_off
+    vector<double*> dst_; //!< [p]: realization or this thread's partial
+  };
+
+  //! Sum the case-B thread partials into the realizations and zero them, in
+  //! thread order (deterministic for a given thread count).
+  void reduce_thread_partials()
+  {
+    for (size_t p = 0; p < np_; ++p) {
+      if (proj_[p].case_a)
+        continue;
+      auto& parts = *proj_[p].partials;
+      double* y = proj_[p].realization;
+      const int64_t len = parts.empty() ? 0 : parts[0].size();
+#pragma omp parallel for schedule(static)
+      for (int64_t x = 0; x < len; ++x) {
+        double sum = 0.0;
+        for (auto& part : parts) {
+          sum += part[x];
+          part[x] = 0.0;
+        }
+        y[x] += sum;
+      }
+    }
+  }
+
+private:
+  //! Decompose plane bin k into the fine bin of each tally filter (into b)
+  //! and return its score bin.
+  int64_t decompose(int64_t k, int64_t* b) const
+  {
+    const int64_t g = first_bin_ + k;
+    int64_t row = g / s_;
+    const int64_t j = g - row * s_;
+    for (int i = nf_ - 1; i >= 0; --i) {
+      const int64_t q = row / n_bins_[i];
+      b[i] = row - q * n_bins_[i];
+      row = q;
+    }
+    return j;
+  }
+
+  //! Projected-row contribution of filter i's fine bin `bin` for projection
+  //! p, or a negative value when the bin is dropped.
+  int64_t part(size_t p, int i, int64_t bin) const
+  {
+    const size_t pi = p * nf_ + i;
+    const int32_t* map = maps_[pi];
+    const int64_t v = map ? map[bin] : bin;
+    return v < 0 ? DROPPED : v * strides_[pi];
+  }
+
+  //! Projected-row part of filters 0..nf-2 (negative: dropped).
+  int64_t outer_part(size_t p, const int64_t* b) const
+  {
+    int64_t sum = 0;
+    for (int i = 0; i < nf_ - 1; ++i) {
+      const int64_t c = part(p, i, b[i]);
+      if (c < 0)
+        return DROPPED;
+      sum += c;
+    }
+    return sum;
+  }
+
+  //! Projected-row part of the last filter (negative: dropped).
+  int64_t last_part(size_t p, int64_t bin) const
+  {
+    return part(p, nf_ - 1, bin);
+  }
+
+  static constexpr int64_t DROPPED {-1};
+
+  struct Proj {
+    int64_t first_row {0};
+    bool case_a {false};
+    double* realization {nullptr};
+    vector<vector<double>>* partials {nullptr};
+    vector<int64_t> last_off; //!< last filter bin -> offset, or DROPPED
+  };
+
+  int nf_;                 //!< tally filters
+  size_t np_;              //!< projections
+  int s_;                  //!< score bins
+  int64_t first_bin_;      //!< tally bin of plane bin 0
+  vector<int64_t> n_bins_; //!< bins per tally filter
+  vector<Proj> proj_;
+  vector<const int32_t*> maps_; //!< [p, i]: bin map, nullptr = identity
+  vector<int64_t> strides_;     //!< [p, i]: projected stride
+  int64_t block_bins_ {FOLD_CHUNK_BINS};
+  int64_t lead_bins_ {0};
+};
 
 //! \brief Fold one batch's accumulator into the moments and zero the folded
 //! bins.
 //!
-//! The n bins are folded in chunks of FOLD_CHUNK_BINS. A dense chunk folds
-//! every bin, exactly as a plain loop, and counts its nonzero bins on the way;
-//! a sparse chunk first lists its nonzero bins, then folds only those, so the
-//! moments of an empty bin are neither read nor written. Each thread folds a
-//! chunk sparse when its previous chunk was sparse. Skipping a zero bin is
-//! exact: folding it would add +0.0 to each moment, and no moment is ever -0.0
-//! (they start at +0.0 and +0.0 + -0.0 == +0.0); a NaN or Inf bin is not ==
-//! 0.0 and is folded. A skipped bin holds +0.0 or -0.0, which gives the next
-//! batch the same moments as a zeroed bin. Per-bin listing alone would make a
-//! moderately occupied plane slower to fold than the plain loop (scattered
-//! moment accesses defeat prefetching), hence the dense mode.
+//! The n bins are folded in chunks of FOLD_CHUNK_BINS (fold_chunk()); each
+//! thread folds a chunk sparse when its previous chunk was sparse. Skipping a
+//! zero bin is exact: folding it would add +0.0 to each moment, and no moment
+//! is ever -0.0 (they start at +0.0 and +0.0 + -0.0 == +0.0); a NaN or Inf bin
+//! is not == 0.0 and is folded. A skipped bin holds +0.0 or -0.0, which gives
+//! the next batch the same moments as a zeroed bin. Per-bin listing alone
+//! would make a moderately occupied plane slower to fold than the plain loop
+//! (scattered moment accesses defeat prefetching), hence the dense mode.
+//!
+//! With projections (PROJ::ENABLED) the parallel unit is a block of
+//! proj.block_bins() bins after a lead block of proj.lead_bins(), each folded
+//! as consecutive chunks by one thread (see ProjectionFold); without them the
+//! unit is one chunk and this compiles to the plain chunked fold.
 //! \param acc   Accumulator plane (private, shared, or rma private), n bins
 //! \param win   rma window block of the same shape (two planes only)
 //! \param mom   Moments, fold_n_moments() contiguous values per bin
 //! \param n     Number of bins (filter-bin rows x score bins)
 //! \param norm  Per-batch normalization
-template<bool TWO_PLANES, FoldKind KIND>
-void fold_bins(double* acc, double* win, double* mom, int64_t n, double norm)
+//! \param proj  Projection arm (NoProjection or ProjectionFold)
+template<bool TWO_PLANES, FoldKind KIND, class PROJ>
+void fold_bins(
+  double* acc, double* win, double* mom, int64_t n, double norm, PROJ& proj)
 {
-  const int64_t n_chunks = (n + FOLD_CHUNK_BINS - 1) / FOLD_CHUNK_BINS;
+  constexpr int NM = fold_n_moments<KIND>();
+  if constexpr (!PROJ::ENABLED) {
+    const int64_t n_chunks = (n + FOLD_CHUNK_BINS - 1) / FOLD_CHUNK_BINS;
 #pragma omp parallel
-  {
-    int nonzero[FOLD_CHUNK_BINS]; // offsets of a sparse chunk's nonzero bins
-    bool sparse = false;
+    {
+      int nonzero[FOLD_CHUNK_BINS]; // offsets of a sparse chunk's nonzero bins
+      bool sparse = false;
 #pragma omp for schedule(static)
-    for (int64_t c = 0; c < n_chunks; ++c) {
-      const int64_t first = c * FOLD_CHUNK_BINS;
-      const int len =
-        static_cast<int>(std::min<int64_t>(FOLD_CHUNK_BINS, n - first));
-      double* a = acc + first;
-      double* w = nullptr;
-      if constexpr (TWO_PLANES)
-        w = win + first;
-      double* m = mom + first * fold_n_moments<KIND>();
-
-      int n_nonzero = 0;
-      if (sparse) {
-        for (int q = 0; q < len; ++q) {
-          nonzero[n_nonzero] = q;
-          n_nonzero += fold_bin_nonzero<TWO_PLANES>(a, w, q);
+      for (int64_t c = 0; c < n_chunks; ++c) {
+        const int64_t first = c * FOLD_CHUNK_BINS;
+        const int len =
+          static_cast<int>(std::min<int64_t>(FOLD_CHUNK_BINS, n - first));
+        double* w = nullptr;
+        if constexpr (TWO_PLANES)
+          w = win + first;
+        fold_chunk<TWO_PLANES, KIND>(
+          acc + first, w, mom + first * NM, len, norm, nonzero, sparse,
+          [](double) {}, [](int, double) {});
+      }
+    }
+  } else {
+    const int64_t block = proj.block_bins();
+    const int64_t lead = std::min(proj.lead_bins(), n);
+    const int64_t n_blocks =
+      (lead > 0 ? 1 : 0) + (n - lead + block - 1) / block;
+#pragma omp parallel
+    {
+      int nonzero[FOLD_CHUNK_BINS];
+      bool sparse = false;
+      typename PROJ::Thread cursor(proj);
+#pragma omp for schedule(static)
+      for (int64_t blk = 0; blk < n_blocks; ++blk) {
+        int64_t start, end;
+        if (lead > 0 && blk == 0) {
+          start = 0;
+          end = lead;
+        } else {
+          start = lead + (blk - (lead > 0 ? 1 : 0)) * block;
+          end = std::min(n, start + block);
         }
-        for (int i = 0; i < n_nonzero; ++i)
-          fold_bin<TWO_PLANES, KIND>(a, w, m, nonzero[i], norm);
-      } else {
-        for (int q = 0; q < len; ++q) {
-          n_nonzero += fold_bin_nonzero<TWO_PLANES>(a, w, q);
-          fold_bin<TWO_PLANES, KIND>(a, w, m, q, norm);
+        for (int64_t first = start; first < end; first += FOLD_CHUNK_BINS) {
+          const int len =
+            static_cast<int>(std::min<int64_t>(FOLD_CHUNK_BINS, end - first));
+          double* w = nullptr;
+          if constexpr (TWO_PLANES)
+            w = win + first;
+          if (!sparse)
+            cursor.begin(first);
+          fold_chunk<TWO_PLANES, KIND>(
+            acc + first, w, mom + first * NM, len, norm, nonzero, sparse,
+            [&cursor](double val) { cursor.dense(val); },
+            [&cursor, first](
+              int q, double val) { cursor.sparse(first + q, val); });
         }
       }
-      sparse = n_nonzero * FOLD_SPARSE_DIVISOR <= len;
     }
+    proj.reduce_thread_partials();
   }
 }
 
@@ -237,19 +585,23 @@ void fold_bins(double* acc, double* win, double* mom, int64_t n, double norm)
 //!
 //! The mean moments mode keeps the sum only; otherwise higher moments add the
 //! third and fourth. moments must hold n bins of the kind's moment count.
-template<bool TWO_PLANES>
+template<bool TWO_PLANES, class PROJ>
 void fold_planes(MomentsMode mode, bool higher_moments, double* acc,
-  double* win, tensor::Tensor<double>& moments, int64_t n, double norm)
+  double* win, tensor::Tensor<double>& moments, int64_t n, double norm,
+  PROJ& proj)
 {
   if (mode == MomentsMode::MEAN) {
     assert(moments.size() == static_cast<size_t>(n) * 1);
-    fold_bins<TWO_PLANES, FoldKind::MEAN>(acc, win, moments.data(), n, norm);
+    fold_bins<TWO_PLANES, FoldKind::MEAN>(
+      acc, win, moments.data(), n, norm, proj);
   } else if (higher_moments) {
     assert(moments.size() == static_cast<size_t>(n) * 4);
-    fold_bins<TWO_PLANES, FoldKind::HIGHER>(acc, win, moments.data(), n, norm);
+    fold_bins<TWO_PLANES, FoldKind::HIGHER>(
+      acc, win, moments.data(), n, norm, proj);
   } else {
     assert(moments.size() == static_cast<size_t>(n) * 2);
-    fold_bins<TWO_PLANES, FoldKind::FULL>(acc, win, moments.data(), n, norm);
+    fold_bins<TWO_PLANES, FoldKind::FULL>(
+      acc, win, moments.data(), n, norm, proj);
   }
 }
 
@@ -260,8 +612,16 @@ void Tally::fold_moments()
   // accum_ is stored contiguously as [n_filter_bins, n_score_bins] and
   // moments_ as [n_filter_bins, n_score_bins, n_moments], so bin k of the
   // plane owns moments [k * n_moments, (k + 1) * n_moments).
+  if (projections_.empty()) {
+    NoProjection none;
+    fold_planes<false>(exatally_.moments, higher_moments_, accum_, nullptr,
+      moments_, accum_size_, tally_normalization(), none);
+    return;
+  }
+  ProjectionFold proj(projections_, filters_, n_score_bins_, 0);
   fold_planes<false>(exatally_.moments, higher_moments_, accum_, nullptr,
-    moments_, accum_size_, tally_normalization());
+    moments_, accum_size_, tally_normalization(), proj);
+  fold_projection_moments();
 }
 
 #ifdef OPENMC_MPI
@@ -980,8 +1340,20 @@ void Tally::rma_fold()
   // is rank-identical: it depends only on global model data and rma requires
   // reduce_tallies. n_realizations_ was incremented on all ranks in
   // accumulate().
-  fold_planes<true>(exatally_.moments, higher_moments_, accum_, rma_win_base_,
-    moments_, rma_plane_size_, tally_normalization());
+  if (projections_.empty()) {
+    NoProjection none;
+    fold_planes<true>(exatally_.moments, higher_moments_, accum_, rma_win_base_,
+      moments_, rma_plane_size_, tally_normalization(), none);
+  } else {
+    // Each rank projects its owned rows (plane bin 0 is tally bin
+    // rma_first_row_ * n_score_bins_); the master sums the partials and
+    // folds the projected moments.
+    ProjectionFold proj(
+      projections_, filters_, n_score_bins_, rma_first_row_ * n_score_bins_);
+    fold_planes<true>(exatally_.moments, higher_moments_, accum_, rma_win_base_,
+      moments_, rma_plane_size_, tally_normalization(), proj);
+    combine_rma_projections();
+  }
   // Publish the zeroed window block before the next batch accumulates.
   rma_resume();
 }
@@ -1008,6 +1380,351 @@ void Tally::shared_batch_end()
   // Publish the zeroed plane before the next batch scores into it. Every node
   // rank participates in the barrier inside shared_resume().
   shared_resume();
+}
+#endif
+
+//==============================================================================
+// Tally member functions: projected moments
+//==============================================================================
+
+namespace {
+
+//! \brief Map the bins of a fine energy filter onto a coarser energy filter
+//! nested in it.
+//!
+//! Every boundary of the coarse filter must be a boundary of the fine filter
+//! (to a relative 1e-12, since both come from input text), and the coarse
+//! range must lie within the fine range. Fine bins outside the coarse range
+//! map to -1 (dropped).
+//! \param fine    The tally's energy filter
+//! \param coarse  The projection's energy filter
+//! \param where   "Tally N projection 'name'", for error text
+//! \return Coarse bin of each fine bin, or -1
+vector<int32_t> nested_energy_map(const EnergyFilter& fine,
+  const EnergyFilter& coarse, const std::string& where)
+{
+  const auto& e = fine.bins();
+  const auto& c = coarse.bins();
+  auto close = [](double a, double b) {
+    return std::abs(a - b) <= 1e-12 * std::max(std::abs(a), std::abs(b));
+  };
+  if ((c.front() < e.front() && !close(c.front(), e.front())) ||
+      (c.back() > e.back() && !close(c.back(), e.back()))) {
+    fatal_error(fmt::format(
+      "{}: energy filter {} ([{}, {}] eV) extends outside the range of the "
+      "tally's energy filter {} ([{}, {}] eV).",
+      where, coarse.id(), c.front(), c.back(), fine.id(), e.front(), e.back()));
+  }
+
+  // Fine boundary index of each coarse boundary.
+  vector<int64_t> index(c.size());
+  for (size_t m = 0; m < c.size(); ++m) {
+    const auto it = std::lower_bound(e.begin(), e.end(), c[m]);
+    int64_t k = it - e.begin();
+    if (k < static_cast<int64_t>(e.size()) && close(e[k], c[m])) {
+      index[m] = k;
+    } else if (k > 0 && close(e[k - 1], c[m])) {
+      index[m] = k - 1;
+    } else {
+      fatal_error(fmt::format(
+        "{}: boundary {} eV of energy filter {} is not a boundary of the "
+        "tally's energy filter {}, so the coarse groups are not unions of "
+        "fine groups.",
+        where, c[m], coarse.id(), fine.id()));
+    }
+  }
+
+  vector<int32_t> map(e.size() - 1, -1);
+  for (size_t m = 0; m + 1 < c.size(); ++m) {
+    for (int64_t g = index[m]; g < index[m + 1]; ++g)
+      map[g] = static_cast<int32_t>(m);
+  }
+  return map;
+}
+
+} // namespace
+
+vector<std::pair<std::string, vector<int32_t>>> parse_projections(
+  pugi::xml_node node, const std::string& context)
+{
+  vector<std::pair<std::string, vector<int32_t>>> result;
+  pugi::xml_node block = node.child("exatally");
+  if (!block)
+    return result;
+  for (pugi::xml_node p : block.children("projection")) {
+    if (!p.attribute("name")) {
+      throw std::runtime_error {
+        fmt::format("A <projection> of {} has no 'name' attribute.", context)};
+    }
+    std::string name = get_node_value(p, "name", false, true);
+    if (!p.attribute("filters")) {
+      throw std::runtime_error {
+        fmt::format("Projection '{}' of {} has no 'filters' attribute (give "
+                    "an empty list to sum over every filter).",
+          name, context)};
+    }
+    result.emplace_back(name, get_node_array<int32_t>(p, "filters"));
+  }
+  return result;
+}
+
+void Tally::init_projections()
+{
+  if (projections_.empty())
+    return;
+
+  const int nf = filters_.size();
+  const int64_t n_score = n_score_bins_;
+  for (auto& proj : projections_) {
+    const std::string where =
+      fmt::format("Tally {} projection '{}'", id_, proj.name);
+
+    // The name is an HDF5 group name in the statepoint.
+    if (proj.name.empty() || proj.name == "." ||
+        proj.name.find('/') != std::string::npos) {
+      fatal_error(fmt::format("{}: a projection name must be non-empty, not "
+                              "'.', and contain no '/'.",
+        where));
+    }
+    for (const auto& other : projections_) {
+      if (&other != &proj && other.name == proj.name) {
+        fatal_error(fmt::format("{} is declared more than once.", where));
+      }
+    }
+
+    // Match each projected filter to a tally filter, in the tally's order: the
+    // filter itself (kept) or an energy filter nested in it (collapsed).
+    proj.maps.assign(nf, {});
+    proj.strides.assign(nf, 0);
+    vector<char> kept(nf, 0);
+    vector<int> axis_filter; // tally filter of each projected axis
+    vector<int64_t> axis_size;
+    int next = 0;
+    for (int32_t i_filt : proj.filters) {
+      const Filter* pf = model::tally_filters[i_filt].get();
+      const auto it = std::find(filters_.begin(), filters_.end(), i_filt);
+      int j;
+      if (it != filters_.end()) {
+        j = static_cast<int>(it - filters_.begin());
+        kept[j] = 1;
+      } else if (dynamic_cast<const MeshFilter*>(pf)) {
+        fatal_error(fmt::format(
+          "{}: filter {} is a mesh filter that is not one of the tally's "
+          "filters; projections onto a coarser mesh are not supported yet "
+          "(only energy filters can be collapsed).",
+          where, pf->id()));
+      } else {
+        const auto* coarse = dynamic_cast<const EnergyFilter*>(pf);
+        vector<int> candidates;
+        if (coarse) {
+          for (int k = 0; k < nf; ++k) {
+            if (model::tally_filters[filters_[k]]->type() == pf->type())
+              candidates.push_back(k);
+          }
+        }
+        if (candidates.empty()) {
+          fatal_error(fmt::format(
+            "{}: filter {} is neither one of the tally's filters nor an "
+            "energy filter nested in the tally's energy filter.",
+            where, pf->id()));
+        }
+        if (candidates.size() > 1) {
+          fatal_error(fmt::format(
+            "{}: energy filter {} could collapse any of the tally's {} "
+            "filters of its type; a tally with more than one such energy "
+            "filter cannot collapse one.",
+            where, pf->id(), candidates.size()));
+        }
+        j = candidates[0];
+        const auto* fine = dynamic_cast<const EnergyFilter*>(
+          model::tally_filters[filters_[j]].get());
+        proj.maps[j] = nested_energy_map(*fine, *coarse, where);
+      }
+      if (j < next) {
+        fatal_error(fmt::format(
+          "{}: its filters must follow the tally's filter order, each tally "
+          "filter at most once.",
+          where));
+      }
+      next = j + 1;
+      axis_filter.push_back(j);
+      axis_size.push_back(pf->n_bins());
+    }
+    if (std::count(kept.begin(), kept.end(), 1) == nf) {
+      fatal_error(fmt::format(
+        "{} is identical to the tally (it keeps every filter).", where));
+    }
+
+    // Projected strides, last projected filter fastest (as set_strides()).
+    int64_t stride = 1;
+    for (int k = static_cast<int>(axis_filter.size()) - 1; k >= 0; --k) {
+      proj.strides[axis_filter[k]] = stride;
+      stride *= axis_size[k];
+    }
+    proj.n_bins = stride;
+
+    // Case A: every filter but the last kept, the last collapsed or summed.
+    proj.fast_path = nf >= 2 && !kept[nf - 1] &&
+                     std::count(kept.begin(), kept.end() - 1, 1) == nf - 1;
+
+    // Storage: the moments live where the fold runs (the master, or every rank
+    // without tally reduction); the realization on every rank that folds
+    // bins, under rma as this rank's partial (case A: the projected rows its
+    // owned rows reach; case B: dense).
+    const bool holds_moments = mpi::master || !settings::reduce_tallies;
+    proj.moments = tensor::Tensor<double>();
+    proj.thread_partials.clear();
+    proj.first_row = 0;
+    proj.last_row = -1;
+    if (holds_moments) {
+      proj.moments =
+        tensor::Tensor<double>({static_cast<size_t>(proj.n_bins),
+                                 static_cast<size_t>(n_score), size_t {2}},
+          0.0);
+      proj.last_row = proj.n_bins - 1;
+    }
+#ifdef OPENMC_MPI
+    if (rma_distributed() && !mpi::master && rma_n_rows_ > 0) {
+      if (proj.fast_path) {
+        const int64_t n_last = model::tally_filters[filters_[nf - 1]]->n_bins();
+        const int64_t g = proj.maps[nf - 1].empty() ? 1 : axis_size.back();
+        proj.first_row = (rma_first_row_ / n_last) * g;
+        proj.last_row =
+          ((rma_first_row_ + rma_n_rows_ - 1) / n_last) * g + g - 1;
+      } else {
+        proj.last_row = proj.n_bins - 1;
+      }
+    }
+#endif
+    proj.realization.assign(
+      (proj.last_row - proj.first_row + 1) * n_score, 0.0);
+
+    const double mib = 1.0 / (1024.0 * 1024.0);
+    const double plane = static_cast<double>(proj.n_bins) * n_score * 8 * mib;
+    std::string extra;
+    if (!proj.fast_path) {
+      extra = fmt::format(
+        "; case B, {:.3g} MiB of per-thread realizations on each folding rank",
+        plane * num_threads());
+    } else {
+      extra = "; case A, threads add in place";
+    }
+#ifdef OPENMC_MPI
+    if (rma_distributed()) {
+      double received = 0.0;
+      for (int r = 1; r < mpi::n_procs; ++r) {
+        const int64_t rows = rma_rows_owned(r);
+        if (rows == 0)
+          continue;
+        if (proj.fast_path) {
+          const int64_t n_last =
+            model::tally_filters[filters_[nf - 1]]->n_bins();
+          const int64_t g = proj.maps[nf - 1].empty() ? 1 : axis_size.back();
+          const int64_t lo = (rma_first_row(r) / n_last) * g;
+          const int64_t hi = ((rma_first_row(r) + rows - 1) / n_last) * g + g;
+          received += static_cast<double>(hi - lo) * n_score * 8 * mib;
+        } else {
+          received += plane;
+        }
+      }
+      extra +=
+        fmt::format("; {:.3g} MiB received by the master per batch", received);
+    }
+#endif
+    write_message(8,
+      "tally {} projection '{}': {} projected filter bins x {} score bins, "
+      "{:.3g} MiB on the master (sum, sum of squares, realization){}",
+      id_, proj.name, proj.n_bins, n_score, 3.0 * plane, extra);
+  }
+}
+
+void Tally::reset_projections()
+{
+  for (auto& proj : projections_) {
+    if (proj.moments.size() != 0)
+      proj.moments.fill(0.0);
+    std::fill(proj.realization.begin(), proj.realization.end(), 0.0);
+    for (auto& part : proj.thread_partials)
+      std::fill(part.begin(), part.end(), 0.0);
+  }
+}
+
+void Tally::fold_projection_moments()
+{
+  constexpr int SUM = static_cast<int>(TallyMoment::SUM);
+  constexpr int SUM_SQ = static_cast<int>(TallyMoment::SUM_SQ);
+  for (auto& proj : projections_) {
+    if (proj.moments.size() == 0)
+      continue;
+    const int64_t n = proj.n_bins * n_score_bins_;
+    assert(static_cast<int64_t>(proj.realization.size()) == n);
+    double* mom = proj.moments.data();
+    double* y = proj.realization.data();
+#pragma omp parallel for schedule(static)
+    for (int64_t x = 0; x < n; ++x) {
+      const double v = y[x];
+      mom[2 * x + SUM] += v;
+      mom[2 * x + SUM_SQ] += v * v;
+      y[x] = 0.0;
+    }
+  }
+}
+
+#ifdef OPENMC_MPI
+void Tally::combine_rma_projections()
+{
+  // Single rank: the master's realization already holds the whole batch.
+  if (!rma_distributed()) {
+    fold_projection_moments();
+    return;
+  }
+
+  // Every non-master sends, per projection in declaration order, one header
+  // {first_row, last_row} (first_row > last_row for an empty slice) and then
+  // its slice in chunks of at most MAX_MPI_CHUNK_DOUBLES; the master receives
+  // from ranks 1..n-1 in rank order and adds each slice into its
+  // realization, so a projected row straddling two owners sums both partials
+  // before it is squared. Called for the same tallies in the same order on
+  // every rank (accumulate() over the active tallies), and messages between
+  // two ranks with one tag do not overtake, so the pairing is exact.
+  const int64_t n_score = n_score_bins_;
+  for (auto& proj : projections_) {
+    if (mpi::master) {
+      vector<double> buf;
+      for (int r = 1; r < mpi::n_procs; ++r) {
+        int64_t header[2];
+        MPI_Recv(header, 2, MPI_INT64_T, r, TAG_RMA_PROJECTION, mpi::intracomm,
+          MPI_STATUS_IGNORE);
+        if (header[0] > header[1])
+          continue;
+        assert(header[0] >= 0 && header[1] < proj.n_bins);
+        double* dst = proj.realization.data() + header[0] * n_score;
+        const int64_t n = (header[1] - header[0] + 1) * n_score;
+        for (int64_t off = 0; off < n; off += MAX_MPI_CHUNK_DOUBLES) {
+          const int64_t count = std::min(n - off, MAX_MPI_CHUNK_DOUBLES);
+          buf.resize(count);
+          MPI_Recv(buf.data(), static_cast<int>(count), MPI_DOUBLE, r,
+            TAG_RMA_PROJECTION, mpi::intracomm, MPI_STATUS_IGNORE);
+          double* d = dst + off;
+#pragma omp parallel for schedule(static)
+          for (int64_t x = 0; x < count; ++x)
+            d[x] += buf[x];
+        }
+      }
+    } else {
+      int64_t header[2] {proj.first_row, proj.last_row};
+      MPI_Send(header, 2, MPI_INT64_T, 0, TAG_RMA_PROJECTION, mpi::intracomm);
+      const int64_t n = proj.realization.size();
+      for (int64_t off = 0; off < n; off += MAX_MPI_CHUNK_DOUBLES) {
+        const int64_t count = std::min(n - off, MAX_MPI_CHUNK_DOUBLES);
+        MPI_Send(proj.realization.data() + off, static_cast<int>(count),
+          MPI_DOUBLE, 0, TAG_RMA_PROJECTION, mpi::intracomm);
+      }
+      std::fill(proj.realization.begin(), proj.realization.end(), 0.0);
+    }
+  }
+  if (mpi::master)
+    fold_projection_moments();
 }
 #endif
 

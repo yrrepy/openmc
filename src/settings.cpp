@@ -1098,6 +1098,11 @@ void read_settings_xml(pugi::xml_node root)
   } catch (const std::runtime_error& e) {
     fatal_error(e.what());
   }
+  if (root.child("exatally").child("projection")) {
+    fatal_error("A <projection> appears in the settings.xml <exatally> block; "
+                "projections are declared per tally, in the tally's "
+                "<exatally> block in tallies.xml.");
+  }
 
   // Check if the user has specified to use confidence intervals for
   // uncertainties rather than standard deviations

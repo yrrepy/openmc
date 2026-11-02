@@ -332,6 +332,7 @@ constexpr int64_t MAX_MPI_CHUNK_DOUBLES {int64_t {1} << 27};
 // MPI point-to-point tags used by the distributed (rma) tally paths.
 constexpr int TAG_RMA_TRIGGER {42}; // limiting-trigger info to the master
 constexpr int TAG_RMA_GATHER {43};  // statepoint owned-rows gather
+constexpr int TAG_RMA_PROJECTION {44}; // per-batch projection partials
 
 enum class TallyType { VOLUME, MESH_SURFACE, SURFACE, PULSE_HEIGHT };
 

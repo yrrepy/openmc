@@ -145,6 +145,121 @@ void read_owned_rows_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
   H5Sclose(filespace);
 }
 
+// Projected moments of a tally (written by the master; master-homed in every
+// accumulator mode): group "projections" with attribute n_projections, and per
+// projection a group <name> with attributes filters (filter ids, projected
+// order) and n_filter_bins, and the dataset results [F_p, n_score_bins, 2]
+// (SUM, SUM_SQ). Nothing is written for a tally without projections, so its
+// statepoint is unchanged. data[p] points at projection p's moments (its own,
+// or a reduced copy).
+void write_tally_projections(
+  hid_t tally_group, const Tally& tally, const vector<const double*>& data)
+{
+  const auto& projections = tally.projections();
+  if (projections.empty())
+    return;
+  hid_t group = create_group(tally_group, "projections");
+  write_attribute(group, "n_projections", static_cast<int>(projections.size()));
+  for (size_t p = 0; p < projections.size(); ++p) {
+    const auto& proj = projections[p];
+    hid_t proj_group = create_group(group, proj.name);
+    vector<int32_t> ids;
+    for (auto i_filt : proj.filters)
+      ids.push_back(model::tally_filters[i_filt]->id());
+    // A projection summing over every filter has an empty list; HDF5 refuses
+    // a null buffer even for a zero-size attribute.
+    int32_t none = 0;
+    hsize_t dims[] {ids.size()};
+    write_attr(proj_group, 1, dims, "filters", H5T_NATIVE_INT,
+      ids.empty() ? &none : ids.data());
+    write_attribute(proj_group, "n_filter_bins", proj.n_bins);
+    write_tally_results(
+      proj_group, proj.n_bins, tally.n_score_bins(), 2, data[p]);
+    close_group(proj_group);
+  }
+  close_group(group);
+}
+
+// Restart read of a tally's projections, on every rank that reads the tally
+// group (all ranks under Parallel HDF5, the master alone otherwise; all ranks
+// for a distributed rma tally). The model must declare the same projections
+// as the file -- by count, name, filters and shape -- or the restart stops; a
+// statepoint without a projections group matches a tally without projections.
+// The master reads the moments; a rank holding none joins each collective
+// read with an empty selection, as for the tally results.
+void read_tally_projections(hid_t tally_group, Tally& tally)
+{
+  auto& projections = tally.projections();
+  const bool present = object_exists(tally_group, "projections");
+  hid_t group = -1;
+  int n_file = 0;
+  if (present) {
+    group = open_group(tally_group, "projections");
+    read_attribute(group, "n_projections", n_file);
+  }
+  if (n_file != static_cast<int>(projections.size())) {
+    fatal_error(fmt::format(
+      "Tally {} declares {} projection(s), but the statepoint holds {}; a "
+      "restart model must declare the same projections as the run that "
+      "wrote the statepoint.",
+      tally.id_, projections.size(), n_file));
+  }
+  if (!present)
+    return;
+
+  const auto n_score = static_cast<hsize_t>(tally.n_score_bins());
+  for (auto& proj : projections) {
+    if (!object_exists(group, proj.name.c_str())) {
+      fatal_error(fmt::format(
+        "Tally {} projection '{}' is not in the statepoint; a restart model "
+        "must declare the same projections as the run that wrote it.",
+        tally.id_, proj.name));
+    }
+    hid_t proj_group = open_group(group, proj.name.c_str());
+    vector<int32_t> ids;
+    if (attribute_shape(proj_group, "filters")[0] > 0)
+      read_attribute(proj_group, "filters", ids);
+    vector<int32_t> want;
+    for (auto i_filt : proj.filters)
+      want.push_back(model::tally_filters[i_filt]->id());
+    int64_t n_bins = 0;
+    read_attribute(proj_group, "n_filter_bins", n_bins);
+    if (ids != want || n_bins != proj.n_bins) {
+      auto list = [](const vector<int32_t>& v) {
+        std::string text;
+        for (auto id : v)
+          text += (text.empty() ? "" : ", ") + std::to_string(id);
+        return text;
+      };
+      fatal_error(fmt::format(
+        "Tally {} projection '{}' in the statepoint has filters [{}] ({} "
+        "bins), but the model's projection has filters [{}] ({} bins).",
+        tally.id_, proj.name, list(ids), n_bins, list(want), proj.n_bins));
+    }
+    const auto n_proj = static_cast<hsize_t>(proj.n_bins);
+    check_tally_results_shape(proj_group, n_proj, n_score, 2);
+    if (proj.moments.size() != 0) {
+      read_tally_results(proj_group, n_proj, n_score, 2, proj.moments.data());
+    } else {
+      hid_t dset = open_dataset(proj_group, "results");
+      read_owned_rows_hyperslab(dset, 0, 0, n_score, 2, nullptr);
+      close_dataset(dset);
+    }
+    close_group(proj_group);
+  }
+  close_group(group);
+}
+
+// The data pointers of a tally's own projection moments, for
+// write_tally_projections().
+vector<const double*> projection_moments(const Tally& tally)
+{
+  vector<const double*> data;
+  for (const auto& proj : tally.projections())
+    data.push_back(proj.moments.data());
+  return data;
+}
+
 #ifdef OPENMC_MPI
 // Master side of the statepoint write: create the full results dataset, write
 // the master's own owned rows, then receive each other rank's owned rows in
@@ -284,8 +399,10 @@ void read_distributed_rma_tally_results(hid_t file_id)
     }
     read_owned_rows_hyperslab(dset, tally->rma_first_row(mpi::rank),
       tally->rma_n_rows(), n_score, n_moments, tally->moments().data());
-
     close_dataset(dset);
+
+    // Projections are master-homed; the other ranks join with empty reads.
+    read_tally_projections(tally_group, *tally);
     close_group(tally_group);
   }
   close_group(tallies_group);
@@ -560,6 +677,10 @@ extern "C" int openmc_statepoint_write(const char* filename, bool* write_source)
           // Write results for each bin
           std::string name = "tally " + std::to_string(tally->id_);
           hid_t tally_group = open_group(tallies_group, name.c_str());
+
+          // Projected moments live on the master in every accumulator mode.
+          write_tally_projections(
+            tally_group, *tally, projection_moments(*tally));
 #ifdef OPENMC_MPI
           // Under multi-rank rma the master holds only its own owned rows, so
           // gather every rank's rows into the full dataset. The matching sends
@@ -886,6 +1007,7 @@ extern "C" int openmc_statepoint_load(const char* filename)
           }
 
           read_dataset(tally_group, "n_realizations", tally->n_realizations_);
+          read_tally_projections(tally_group, *tally);
         }
         close_group(tally_group);
       }
@@ -1362,6 +1484,34 @@ void write_tally_results_nr(hid_t file_id)
       mpi::reduce<double>(
         values.data(), nullptr, values.size(), MPI_SUM, 0, mpi::intracomm);
 #endif
+    }
+
+    // Without tally reduction every rank folds its own projected moments;
+    // reduce copies onto the master exactly as the tally's moments above.
+    if (!t->projections().empty()) {
+      vector<tensor::Tensor<double>> reduced;
+      for (const auto& proj : t->projections()) {
+        reduced.push_back(proj.moments);
+#ifdef OPENMC_MPI
+        auto& v = reduced.back();
+        if (mpi::master) {
+          mpi::reduce(
+            MPI_IN_PLACE, v.data(), v.size(), MPI_SUM, 0, mpi::intracomm);
+        } else {
+          mpi::reduce<double>(
+            v.data(), nullptr, v.size(), MPI_SUM, 0, mpi::intracomm);
+        }
+#endif
+      }
+      if (mpi::master) {
+        vector<const double*> data;
+        for (const auto& v : reduced)
+          data.push_back(v.data());
+        std::string groupname {"tally " + std::to_string(t->id_)};
+        hid_t tally_group = open_group(tallies_group, groupname.c_str());
+        write_tally_projections(tally_group, *t, data);
+        close_group(tally_group);
+      }
     }
   }
 
