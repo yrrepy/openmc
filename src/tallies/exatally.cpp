@@ -19,6 +19,15 @@
 #include <cstdlib>   // for getenv, atoll
 #include <stdexcept> // for runtime_error
 
+#if defined(OPENMC_MPI) && defined(__linux__)
+#include <array>
+#include <bitset>
+#include <climits> // for CHAR_BIT
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace openmc {
 
 //==============================================================================
@@ -79,6 +88,22 @@ const char* moments_mode_name(MomentsMode mode)
     return "full";
   }
 }
+
+#ifdef OPENMC_MPI
+void reduce_accum_to_master(double* accum, int64_t n, MPI_Comm comm)
+{
+  // World rank 0 is rank 0 of both intracomm and internode_comm, so the master
+  // is the root on either communicator.
+  for (int64_t offset = 0; offset < n; offset += MAX_MPI_CHUNK_DOUBLES) {
+    const int64_t count = std::min(n - offset, MAX_MPI_CHUNK_DOUBLES);
+    if (mpi::master) {
+      mpi::reduce(MPI_IN_PLACE, accum + offset, count, MPI_SUM, 0, comm);
+    } else {
+      mpi::reduce<double>(accum + offset, nullptr, count, MPI_SUM, 0, comm);
+    }
+  }
+}
+#endif
 
 //==============================================================================
 // Tally member functions: accumulator modes
@@ -307,6 +332,65 @@ void Tally::free_accum_window()
   rma_win_base_ = nullptr;
 }
 
+namespace {
+
+//! Interleave the calling task's memory policy for the duration of an
+//! allocation, so pages an MPI library pre-faults inside
+//! MPI_Win_allocate_shared (registration pinning on some fabrics) spread over
+//! all NUMA domains the task may use instead of landing on the allocating
+//! rank's domain. Restores the previous policy on exit. Engages only when the
+//! task runs the default policy, so an explicit user policy (numactl
+//! --membind/--interleave) is honoured as is. Best effort: any failed call
+//! leaves the policy alone. A no-op outside Linux.
+class InterleaveDuringAlloc {
+public:
+  explicit InterleaveDuringAlloc(bool engage)
+  {
+#ifdef __linux__
+    if (!engage)
+      return;
+    int mode;
+    if (syscall(SYS_get_mempolicy, &mode, nullptr, 0UL, nullptr, 0UL) != 0 ||
+        mode != MPOL_DEFAULT)
+      return;
+    std::array<unsigned long, 64> mask {};
+    const unsigned long maxnode =
+      mask.size() * sizeof(unsigned long) * CHAR_BIT;
+    // Variadic syscall(): pass unsigned long where the kernel takes one.
+    if (syscall(SYS_get_mempolicy, nullptr, mask.data(), maxnode, nullptr,
+          static_cast<unsigned long>(MPOL_F_MEMS_ALLOWED)) != 0)
+      return;
+    int n = 0;
+    for (unsigned long word : mask)
+      n += std::bitset<sizeof(unsigned long) * CHAR_BIT>(word).count();
+    if (n <= 1)
+      return;
+    if (syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, mask.data(), maxnode) != 0)
+      return;
+    n_domains_ = n;
+#endif
+  }
+
+  ~InterleaveDuringAlloc()
+  {
+#ifdef __linux__
+    if (n_domains_ > 0)
+      syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL);
+#endif
+  }
+
+  InterleaveDuringAlloc(const InterleaveDuringAlloc&) = delete;
+  InterleaveDuringAlloc& operator=(const InterleaveDuringAlloc&) = delete;
+
+  //! \return Number of NUMA domains interleaved over, 0 if not engaged
+  int n_domains() const { return n_domains_; }
+
+private:
+  int n_domains_ {0}; //!< NUMA domains interleaved over; 0 if not engaged
+};
+
+} // namespace
+
 void Tally::init_shared_accum()
 {
   // Re-init (e.g. openmc.lib re-runs): drop any previous window first. This is
@@ -326,8 +410,19 @@ void Tally::init_shared_accum()
   MPI_Aint bytes =
     mpi::node_leader ? static_cast<MPI_Aint>(accum_size_) * sizeof(double) : 0;
   void* base = nullptr;
-  MPI_Win_allocate_shared(
-    bytes, sizeof(double), MPI_INFO_NULL, mpi::node_comm, &base, &accum_win_);
+  int n_interleaved = 0;
+  {
+    InterleaveDuringAlloc policy(mpi::node_leader);
+    MPI_Win_allocate_shared(
+      bytes, sizeof(double), MPI_INFO_NULL, mpi::node_comm, &base, &accum_win_);
+    n_interleaved = policy.n_domains();
+  }
+  if (n_interleaved > 0) {
+    write_message(8,
+      "shared tally {}: node plane allocated under an interleave memory "
+      "policy over {} NUMA domains (restored after allocation)",
+      id_, n_interleaved);
+  }
 
   MPI_Aint seg_bytes;
   int seg_disp;
@@ -351,11 +446,13 @@ void Tally::init_shared_accum()
   MPI_Win_lock_all(MPI_MODE_NOCHECK, accum_win_);
 
   // Every node rank zeroes its own page-aligned slice, then the plane is
-  // published so every rank sees all-zeros before the first score. The MPI
-  // library does not touch the pages at allocation, so this fill is their
-  // first touch: Linux places each page on the NUMA domain of the rank that
-  // zeroes it, which spreads the plane over the node instead of putting it all
-  // on the leader's domain.
+  // published so every rank sees all-zeros before the first score. If the MPI
+  // library does not touch the pages at allocation, this fill is their first
+  // touch: Linux places each page on the NUMA domain of the rank that zeroes
+  // it, which spreads the plane over the node instead of putting it all on the
+  // leader's domain. If the library pre-faults them during allocation
+  // (registration pinning on some fabrics), the interleave policy around the
+  // allocation has already spread them over the domains.
   int64_t begin, end;
   shared_slice(begin, end);
   std::fill(accum_ + begin, accum_ + end, 0.0);
@@ -390,15 +487,10 @@ void Tally::shared_publish()
   // Step 2 -- combine the per-node planes onto the world master. A single-node
   // run skips this: the one plane already holds the global sum and the master
   // folds it directly. World rank 0 is rank 0 of internode_comm, so the
-  // reduction roots on the master; mpi::reduce chunks the count for MPI.
+  // reduction roots on the master; it runs in 1 GiB chunks
+  // (reduce_accum_to_master).
   if (mpi::n_nodes > 1 && mpi::node_leader) {
-    if (mpi::master) {
-      mpi::reduce(
-        MPI_IN_PLACE, accum_, accum_size_, MPI_SUM, 0, mpi::internode_comm);
-    } else {
-      mpi::reduce<double>(
-        accum_, nullptr, accum_size_, MPI_SUM, 0, mpi::internode_comm);
-    }
+    reduce_accum_to_master(accum_, accum_size_, mpi::internode_comm);
   }
 }
 
@@ -506,28 +598,39 @@ void Tally::init_rma_staging()
   // otherwise K comes from a fixed per-rank budget split across threads,
   // targets, and the two buffers, so total staging stays near the budget.
   const int nt = num_threads();
+  const int64_t np = mpi::n_procs;
+
+  // Bytes one thread holds per unit of K: per target and buffer, K staged rows
+  // plus their displacements; plus one buffer's worth of compaction scratch
+  // (comp_data row, perm index, comp_disp entry).
+  const int64_t row_bytes =
+    static_cast<int64_t>(n_score_bins_) * sizeof(double);
+  const int64_t disp_bytes =
+    sizeof(decltype(RmaThreadStaging::disp)::value_type);
+  const int64_t perm_bytes =
+    sizeof(decltype(RmaThreadStaging::perm)::value_type);
+  const int64_t bytes_per_k =
+    np * 2 * (row_bytes + disp_bytes) + (row_bytes + perm_bytes + disp_bytes);
+
   if (const char* env = std::getenv("OPENMC_RMA_STAGING_ROWS")) {
     rma_k_ = std::max<int64_t>(1, std::atoll(env));
   } else {
     // Fixed per-rank budget covering ALL rma tallies (each carries its own
-    // staging), split across tallies, threads, targets, and the two buffers.
+    // staging), split across tallies and threads. It covers the staged rows,
+    // their displacements and the per-thread compaction scratch.
     constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank, total
     int64_t n_rma = 0;
     for (const auto& t : model::tallies) {
       if (t->accumulator() == AccumulatorMode::RMA)
         ++n_rma;
     }
-    const int64_t row_bytes =
-      static_cast<int64_t>(n_score_bins_) * sizeof(double);
-    const int64_t denom = std::max<int64_t>(1, n_rma) *
-                          static_cast<int64_t>(nt) * mpi::n_procs * 2 *
-                          std::max<int64_t>(1, row_bytes);
+    const int64_t denom =
+      std::max<int64_t>(1, n_rma) * static_cast<int64_t>(nt) * bytes_per_k;
     rma_k_ = std::clamp<int64_t>(BUDGET / std::max<int64_t>(1, denom), 8, 4096);
   }
 
   // One slot per thread; self-target slots are allocated but never used (the
   // local arm handles owned bins). Every per-thread buffer starts empty.
-  const int64_t np = mpi::n_procs;
   rma_merged_rows_ = 0;
   rma_staging_.resize(nt);
   for (auto& ts : rma_staging_) {
@@ -545,12 +648,10 @@ void Tally::init_rma_staging()
   }
 
   write_message(8,
-    "rma tally {}: staging K={} rows/buffer, {:.1f} MiB/rank "
-    "({} threads x {} targets x 2 buffers)",
+    "rma tally {}: staging K={} rows/buffer, {:.1f} MiB/rank incl. "
+    "displacements and scratch ({} threads x {} targets x 2 buffers)",
     id_, rma_k_,
-    static_cast<double>(nt) * np * 2 * rma_k_ * n_score_bins_ * sizeof(double) /
-      (1024.0 * 1024.0),
-    nt, np);
+    static_cast<double>(nt) * rma_k_ * bytes_per_k / (1024.0 * 1024.0), nt, np);
 }
 
 void Tally::rma_publish()
@@ -735,12 +836,8 @@ void Tally::collect_none()
     // Replicated: reduce the run totals in place onto the master. Non-master
     // ranks then restart from zero, so a later collect adds only their new
     // scores (the same running-total pattern as above).
-    if (mpi::master) {
-      mpi::reduce(
-        MPI_IN_PLACE, accum_, accum_size_, MPI_SUM, 0, mpi::intracomm);
-    } else {
-      mpi::reduce<double>(
-        accum_, nullptr, accum_size_, MPI_SUM, 0, mpi::intracomm);
+    reduce_accum_to_master(accum_, accum_size_, mpi::intracomm);
+    if (!mpi::master) {
       std::fill(accum_, accum_ + accum_size_, 0.0);
     }
   }

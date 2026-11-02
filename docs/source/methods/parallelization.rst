@@ -675,7 +675,9 @@ for ``rma``, the moments) live:
   :math:`(1 + n_\text{moments}) / N` minimum -- though it still falls as
   :math:`1/N`. Users sizing runs against this memory model should budget for the
   extra plane, and for the staging buffers of the remote scoring path, which
-  take a fixed budget of 64 MiB per rank shared by all ``rma`` tallies.
+  take a fixed budget of 64 MiB per rank shared by all ``rma`` tallies; the
+  budget covers the staged rows, their displacements and the per-thread
+  compaction scratch.
 
 The ``<moments>`` sub-element (the moments mode) selects which cross-batch
 moments are kept, independently of the accumulator mode. ``full`` keeps
@@ -694,7 +696,9 @@ statistics make the mean independent of how the histories are grouped into
 batches [Romano2012]_. The random ray solver scales its tally scores in place
 every batch and therefore cannot use ``none``. The table gives the tally memory
 in planes of :math:`F \times S` doubles (:math:`F` filter bins, :math:`S` score
-bins) on :math:`N` ranks; :math:`M` is 2, or 4 with higher moments.
+bins) on :math:`N` ranks; :math:`M` is 2, or 4 with higher moments. The same
+per-mode accounting is given for MCNP's ``batch`` and ``rma_batch`` tally modes
+in [Rising2025]_ (slide 03-19).
 
 .. list-table:: Tally memory by accumulator and moments mode (planes)
    :header-rows: 1
@@ -725,6 +729,15 @@ broadcasts its moments to every rank, so each rank then holds :math:`M` planes
 (1 for ``mean`` and ``none``); ``shared`` and ``rma`` tallies skip this
 broadcast and are read from the statepoint. Under ``no_reduce`` every rank
 folds its own moments and holds :math:`M` planes throughout the run.
+
+The table is the steady state between batches; transients add a bounded amount.
+Every per-batch reduction (``replicated``, the internode step of ``shared``,
+and the ``none`` collection) runs in 1 GiB chunks, so the MPI library's
+reduction scratch stays within about 1 GiB per participating rank however many
+planes the tally holds. The ``rma`` statepoint write holds up to 1 GiB of
+receive scratch on the master. Restart adds nothing on a rank that holds no
+moments, and the ``rma`` remote-scoring staging is the fixed 64 MiB per rank
+described above.
 
 All three modes preserve the statistical semantics of the ``replicated``
 default. Because scores accumulate locally within a batch and are reduced or
@@ -774,7 +787,8 @@ Neither requires a Parallel HDF5 build. Collective tally I/O can be very
 sensitive to the underlying filesystem -- it performs well on parallel
 filesystems such as Lustre but can stall on NFS -- so a collective or chunked
 statepoint write, should one be added, would be an opt-in rather than the
-default [Rising2025]_.
+default [Rising2025]_. The collective read of an ``rma`` restart under Parallel
+HDF5 is subject to the same filesystem sensitivity [Rising2025]_.
 
 .. only:: html
 
@@ -823,7 +837,8 @@ default [Rising2025]_.
    the MCNP 6.3 Code," LA-UR-21-26363, 2021 MCNP User Symposium (2021).
 
 .. [Rising2025] M. E. Rising, A. Sood, et al., MCNP6 workshop materials,
-   LA-UR-25-23947 Rev. 1, Los Alamos National Laboratory (2025).
+   LA-UR-25-23947 Rev. 1, Los Alamos National Laboratory (2025); per-mode
+   tally memory on slide 03-19.
 
 .. _first paper: https://doi.org/10.2307/2280232
 

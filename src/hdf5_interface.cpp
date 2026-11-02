@@ -532,14 +532,9 @@ void read_complex(
   H5Tclose(complex_id);
 }
 
-void read_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
-  hsize_t n_moments, double* moments)
+void check_tally_results_shape(
+  hid_t group_id, hsize_t n_filter, hsize_t n_score, hsize_t n_moments)
 {
-  // read_dataset_lowlevel passes H5S_ALL for the memory space, so HDF5 reads
-  // the full on-disk extent of "results" into the caller's buffer with no
-  // bounds check. Validate that the stored shape matches the current model's
-  // tally shape first; otherwise a restart against a differently-shaped
-  // statepoint would overflow the (current-model-sized) buffer.
   hid_t dset = open_dataset(group_id, "results");
   auto shape = object_shape(dset);
   close_dataset(dset);
@@ -557,6 +552,17 @@ void read_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
       "the moments mode and higher_moments must match too.",
       object_name(group_id), n_filter, n_score, n_moments, found));
   }
+}
+
+void read_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
+  hsize_t n_moments, double* moments)
+{
+  // read_dataset_lowlevel passes H5S_ALL for the memory space, so HDF5 reads
+  // the full on-disk extent of "results" into the caller's buffer with no
+  // bounds check. Validate that the stored shape matches the current model's
+  // tally shape first; otherwise a restart against a differently-shaped
+  // statepoint would overflow the (current-model-sized) buffer.
+  check_tally_results_shape(group_id, n_filter, n_score, n_moments);
 
   // The moments array is exactly the on-disk "results" dataset layout, so the
   // read is a plain contiguous read (no hyperslab). Passing H5S_ALL for the

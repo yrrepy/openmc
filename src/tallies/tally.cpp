@@ -1303,14 +1303,8 @@ void reduce_tally_results()
       }
 
       // The accumulator is contiguous, so it reduces in place onto the master
-      // with no scratch buffer; mpi::reduce chunks the count for MPI.
-      if (mpi::master) {
-        mpi::reduce(MPI_IN_PLACE, tally->accum_, tally->accum_size_, MPI_SUM, 0,
-          mpi::intracomm);
-      } else {
-        mpi::reduce<double>(tally->accum_, nullptr, tally->accum_size_, MPI_SUM,
-          0, mpi::intracomm);
-      }
+      // with no scratch buffer, in 1 GiB chunks (reduce_accum_to_master).
+      reduce_accum_to_master(tally->accum_, tally->accum_size_, mpi::intracomm);
 
       // The fold that zeroes accum_ only runs on the master, so non-master
       // ranks must clear their (now already-summed) accumulator here to avoid

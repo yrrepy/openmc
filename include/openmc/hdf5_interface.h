@@ -99,6 +99,14 @@ void read_llong(hid_t obj_id, const char* name, long long* buffer, bool indep);
 void read_string(
   hid_t obj_id, const char* name, size_t slen, char* buffer, bool indep);
 
+//! \brief Stop with a fatal error unless a tally group's "results" dataset
+//! has the shape [n_filter, n_score, n_moments] of the current model.
+//! \param group_id   Tally group in the statepoint
+//! \param n_filter   Number of filter bins
+//! \param n_score    Number of score bins
+//! \param n_moments  Number of moment planes
+void check_tally_results_shape(
+  hid_t group_id, hsize_t n_filter, hsize_t n_score, hsize_t n_moments);
 void read_tally_results(hid_t group_id, hsize_t n_filter, hsize_t n_score,
   hsize_t n_moments, double* moments);
 void write_attr_double(hid_t obj_id, int ndim, const hsize_t* dims,

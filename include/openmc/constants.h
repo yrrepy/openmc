@@ -324,7 +324,9 @@ enum class TallyResult { VALUE, SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
 enum class TallyMoment { SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
 
 // Maximum doubles moved per MPI/HDF5 call by the chunked tally paths (1 GiB);
-// keeps element counts below the int limit of the MPI C interface.
+// keeps element counts below the int limit of the MPI C interface and bounds
+// the MPI library's internal reduction temporaries, which scale with the count
+// of one call.
 constexpr int64_t MAX_MPI_CHUNK_DOUBLES {int64_t {1} << 27};
 
 // MPI point-to-point tags used by the distributed (rma) tally paths.

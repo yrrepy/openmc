@@ -100,6 +100,8 @@ void write_results_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
   H5Sclose(filespace);
 }
 
+#endif // OPENMC_MPI
+
 // Read this rank's owned block of n_rows filter-bin rows (starting at global
 // row first_row) from a tally "results" dataset straight into buffer. Every
 // rank reads a disjoint hyperslab, so under Parallel HDF5 the reads run
@@ -107,7 +109,8 @@ void write_results_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
 // master-scatter: a lone rank's independent read on a collectively-opened MPIO
 // file does not complete on all fabrics. With a serial build each rank reads
 // independently from its own file handle. A rank owning zero rows issues an
-// empty collective read.
+// empty collective read; the reduce-path restart uses the same empty read for
+// a rank that holds no moments.
 void read_owned_rows_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
   hsize_t n_score, hsize_t n_moments, double* buffer)
 {
@@ -142,6 +145,7 @@ void read_owned_rows_hyperslab(hid_t dset, int64_t first_row, int64_t n_rows,
   H5Sclose(filespace);
 }
 
+#ifdef OPENMC_MPI
 // Master side of the statepoint write: create the full results dataset, write
 // the master's own owned rows, then receive each other rank's owned rows in
 // chunks and write them into their hyperslab.
@@ -861,28 +865,27 @@ extern "C" int openmc_statepoint_load(const char* filename)
         } else {
           check_restart_moments(tally_group, tally->id_);
 
-          // Under Parallel HDF5 every rank collectively opens, reads, and
-          // closes the results dataset, so a rank that dropped its moments
-          // (owner-only reduced mode) allocates a receiving buffer for the read
-          // and releases it again afterward. Only the master's copy needs to
-          // survive the restart; the others stay empty for the resumed run and
-          // are refilled by the end-of-run broadcast.
-          bool owns_moments = tally->has_moments();
-          if (!owns_moments) {
-            tally->moments() = tensor::Tensor<double>(
-              {static_cast<size_t>(tally->n_filter_bins()),
-                static_cast<size_t>(tally->n_score_bins()),
-                static_cast<size_t>(tally->n_moments())});
+          // Every rank checks the stored shape, so a mismatch stops the run
+          // the same way on every rank. Under Parallel HDF5 every rank joins
+          // the collective read of the results dataset; a rank that dropped
+          // its moments (owner-only reduced mode) joins with an empty
+          // selection and allocates nothing. Only the master's copy survives
+          // the restart; the other ranks are refilled by the end-of-run
+          // broadcast.
+          const auto n_filter = static_cast<hsize_t>(tally->n_filter_bins());
+          const auto n_score = static_cast<hsize_t>(tally->n_score_bins());
+          const auto n_moments = static_cast<hsize_t>(tally->n_moments());
+          check_tally_results_shape(tally_group, n_filter, n_score, n_moments);
+          if (tally->has_moments()) {
+            read_tally_results(tally_group, n_filter, n_score, n_moments,
+              tally->moments().data());
+          } else {
+            hid_t dset = open_dataset(tally_group, "results");
+            read_owned_rows_hyperslab(dset, 0, 0, n_score, n_moments, nullptr);
+            close_dataset(dset);
           }
-          auto& moments = tally->moments();
-          read_tally_results(tally_group, moments.shape(0), moments.shape(1),
-            moments.shape(2), moments.data());
 
           read_dataset(tally_group, "n_realizations", tally->n_realizations_);
-
-          if (!owns_moments) {
-            tally->moments() = tensor::Tensor<double>();
-          }
         }
         close_group(tally_group);
       }

@@ -151,6 +151,13 @@ ranks each. The full memory model is in :ref:`methods_parallel_exatallies`.
      - two accumulator planes, each distributed, no moment plane during the
        run
 
+The table shows the memory held between batches. Short transients come on top
+of it: + up to 1 GB per rank during each reduction (the per-batch reduction of
+``replicated``, the reduction between nodes of ``shared``, and the collection
+of a ``none`` tally), + up to 1 GB on rank 0 during an ``rma`` statepoint
+write, and, for ``rma``, a fixed 64 MiB per rank for staging remote scores.
+Restart from a statepoint adds nothing on a rank that holds no moments.
+
 **Choosing the accumulator mode.**
 
 - Use ``shared`` whenever several MPI ranks run on each node and one plane

@@ -4,7 +4,12 @@
 //! \file exatally.h
 //! \brief ExaTallies accumulator/moments mode switch
 
+#include <cstdint>
 #include <string>
+
+#ifdef OPENMC_MPI
+#include <mpi.h>
+#endif
 
 #include "pugixml.hpp"
 
@@ -51,6 +56,19 @@ ExaTally parse_exatally(
 //! The input word of a moments mode ("none", "mean" or "full"), as written to
 //! the statepoint and used in messages.
 const char* moments_mode_name(MomentsMode mode);
+
+#ifdef OPENMC_MPI
+//! \brief Sum a contiguous accumulator onto the master (rank 0 of `comm`) in
+//! place, in chunks of at most MAX_MPI_CHUNK_DOUBLES.
+//!
+//! The chunking also bounds the MPI library's own reduction temporaries, which
+//! otherwise scale with the whole plane. Non-master ranks pass their buffer as
+//! the send side; only the master's buffer holds the sum afterwards.
+//! \param accum  Accumulator of n doubles (in place on the master)
+//! \param n      Number of doubles
+//! \param comm   Communicator whose rank 0 is the world master
+void reduce_accum_to_master(double* accum, int64_t n, MPI_Comm comm);
+#endif
 
 } // namespace openmc
 
