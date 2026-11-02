@@ -203,8 +203,9 @@ void send_rma_tally_results(const Tally& tally)
 // Restart read for the distributed rma moments (all ranks). Every rank has the
 // statepoint open, so the group/dataset opens are collective under Parallel
 // HDF5; each rank then reads only the moment rows it owns straight into its
-// (owned-rows) moments. No rank allocates the full moments, so the PR-2.B
-// temp-alloc idiom is avoided; and because every rank reads a disjoint owned
+// (owned-rows) moments. No rank allocates the full moments, so the replicated
+// path's temporary full allocation is avoided; and because every rank reads a
+// disjoint owned
 // hyperslab the reads compose into a single collective transfer rather than a
 // master-scatter (a lone rank's independent read on a collectively-opened MPIO
 // file does not complete on all fabrics).

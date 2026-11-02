@@ -692,7 +692,7 @@ void Tally::collect_none()
   if (exatally_.accumulator == AccumulatorMode::RMA) {
     // Complete every rank's accumulates (drain, flush_all, barrier, win_sync).
     // The window is only read here, never zeroed or written by the CPU, so it
-    // keeps accumulating the run total (the E0 invariant: the CPU writes the
+    // keeps accumulating the run total (the invariant that the CPU writes the
     // window only inside the collective per-batch fold).
     rma_publish();
     moments_ = tensor::Tensor<double>({static_cast<size_t>(rma_n_rows_),
