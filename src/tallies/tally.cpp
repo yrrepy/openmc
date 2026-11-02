@@ -1102,53 +1102,10 @@ void Tally::accumulate()
   }
 #endif
 
-  if (mpi::master || !settings::reduce_tallies) {
-    double norm = tally_normalization();
-
-    // Fold the per-batch accumulator into the moments, then zero it. accum_ is
-    // stored contiguously as [n_filter_bins, n_score_bins].
-    if (exatally_.moments == MomentsMode::MEAN) {
-      // The mean moments mode keeps the sum only.
-#pragma omp parallel for
-      for (int64_t i = 0; i < n_filter_bins_; ++i) {
-        for (int j = 0; j < n_score_bins_; ++j) {
-          double& acc = accum_[i * n_score_bins_ + j];
-          double val = acc * norm;
-          acc = 0.0;
-          moments_(i, j, TallyMoment::SUM) += val;
-        }
-      }
-    } else if (higher_moments_) {
-#pragma omp parallel for
-      // filter bins (specific cell, energy bins)
-      for (int64_t i = 0; i < n_filter_bins_; ++i) {
-        // score bins (flux, total reaction rate, fission reaction rate, etc.)
-        for (int j = 0; j < n_score_bins_; ++j) {
-          double& acc = accum_[i * n_score_bins_ + j];
-          double val = acc * norm;
-          double val2 = val * val;
-          acc = 0.0;
-          moments_(i, j, TallyMoment::SUM) += val;
-          moments_(i, j, TallyMoment::SUM_SQ) += val2;
-          moments_(i, j, TallyMoment::SUM_THIRD) += val2 * val;
-          moments_(i, j, TallyMoment::SUM_FOURTH) += val2 * val2;
-        }
-      }
-    } else {
-#pragma omp parallel for
-      // filter bins (specific cell, energy bins)
-      for (int64_t i = 0; i < n_filter_bins_; ++i) {
-        // score bins (flux, total reaction rate, fission reaction rate, etc.)
-        for (int j = 0; j < n_score_bins_; ++j) {
-          double& acc = accum_[i * n_score_bins_ + j];
-          double val = acc * norm;
-          acc = 0.0;
-          moments_(i, j, TallyMoment::SUM) += val;
-          moments_(i, j, TallyMoment::SUM_SQ) += val * val;
-        }
-      }
-    }
-  }
+  // Fold the per-batch accumulator into the moments and zero it (only the
+  // master holds the reduced sum unless reduction is off).
+  if (mpi::master || !settings::reduce_tallies)
+    fold_moments();
 
 #ifdef OPENMC_MPI
   if (exatally_.accumulator == AccumulatorMode::SHARED)

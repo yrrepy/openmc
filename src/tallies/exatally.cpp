@@ -7,6 +7,8 @@
 
 #include "openmc/error.h"
 #include "openmc/message_passing.h"
+#include "openmc/settings.h"
+#include "openmc/simulation.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/tallies/trigger.h"
 #include "openmc/xml_interface.h"
@@ -106,6 +108,196 @@ void reduce_accum_to_master(double* accum, int64_t n, MPI_Comm comm)
 #endif
 
 //==============================================================================
+// Batch fold kernel
+//==============================================================================
+
+namespace {
+
+//! Which moments a batch fold updates.
+enum class FoldKind {
+  MEAN,  //!< SUM only (the mean moments mode)
+  FULL,  //!< SUM and SUM_SQ
+  HIGHER //!< SUM through SUM_FOURTH (higher moments)
+};
+
+//! Number of moments per bin a fold kind keeps (the moments_ inner extent).
+template<FoldKind KIND>
+constexpr int fold_n_moments()
+{
+  return KIND == FoldKind::MEAN ? 1 : (KIND == FoldKind::FULL ? 2 : 4);
+}
+
+//! Bins per chunk of the batch fold, the unit of its dense/sparse choice, and
+//! the divisor of the sparse threshold: a chunk with at most 1/16 of its bins
+//! nonzero is sparse. Measured on a 4 GiB plane, this split is never slower
+//! than folding every bin, at one thread or four.
+constexpr int FOLD_CHUNK_BINS = 2048;
+constexpr int FOLD_SPARSE_DIVISOR = 16;
+
+//! Whether bin q of a chunk received any score this batch.
+template<bool TWO_PLANES>
+inline bool fold_bin_nonzero(const double* acc, const double* win, int q)
+{
+  if constexpr (TWO_PLANES) {
+    return (win[q] != 0.0) | (acc[q] != 0.0);
+  } else {
+    return acc[q] != 0.0;
+  }
+}
+
+//! Fold bin q of a chunk into its moments (mom, fold_n_moments() per bin) and
+//! zero its accumulator. One plane: the batch value is acc * norm. Two planes
+//! (rma): it is (win + acc) * norm, the window block plus the private plane,
+//! and both are zeroed.
+template<bool TWO_PLANES, FoldKind KIND>
+inline void fold_bin(double* acc, double* win, double* mom, int q, double norm)
+{
+  double val;
+  if constexpr (TWO_PLANES) {
+    val = (win[q] + acc[q]) * norm;
+    win[q] = 0.0;
+  } else {
+    val = acc[q] * norm;
+  }
+  acc[q] = 0.0;
+  double* m = mom + static_cast<int64_t>(q) * fold_n_moments<KIND>();
+  if constexpr (KIND == FoldKind::MEAN) {
+    m[static_cast<int>(TallyMoment::SUM)] += val;
+  } else if constexpr (KIND == FoldKind::HIGHER) {
+    double val2 = val * val;
+    m[static_cast<int>(TallyMoment::SUM)] += val;
+    m[static_cast<int>(TallyMoment::SUM_SQ)] += val2;
+    m[static_cast<int>(TallyMoment::SUM_THIRD)] += val2 * val;
+    m[static_cast<int>(TallyMoment::SUM_FOURTH)] += val2 * val2;
+  } else {
+    m[static_cast<int>(TallyMoment::SUM)] += val;
+    m[static_cast<int>(TallyMoment::SUM_SQ)] += val * val;
+  }
+}
+
+//! \brief Fold one batch's accumulator into the moments and zero the folded
+//! bins.
+//!
+//! The n bins are folded in chunks of FOLD_CHUNK_BINS. A dense chunk folds
+//! every bin, exactly as a plain loop, and counts its nonzero bins on the way;
+//! a sparse chunk first lists its nonzero bins, then folds only those, so the
+//! moments of an empty bin are neither read nor written. Each thread folds a
+//! chunk sparse when its previous chunk was sparse. Skipping a zero bin is
+//! exact: folding it would add +0.0 to each moment, and no moment is ever -0.0
+//! (they start at +0.0 and +0.0 + -0.0 == +0.0); a NaN or Inf bin is not ==
+//! 0.0 and is folded. A skipped bin holds +0.0 or -0.0, which gives the next
+//! batch the same moments as a zeroed bin. Per-bin listing alone would make a
+//! moderately occupied plane slower to fold than the plain loop (scattered
+//! moment accesses defeat prefetching), hence the dense mode.
+//! \param acc   Accumulator plane (private, shared, or rma private), n bins
+//! \param win   rma window block of the same shape (two planes only)
+//! \param mom   Moments, fold_n_moments() contiguous values per bin
+//! \param n     Number of bins (filter-bin rows x score bins)
+//! \param norm  Per-batch normalization
+template<bool TWO_PLANES, FoldKind KIND>
+void fold_bins(double* acc, double* win, double* mom, int64_t n, double norm)
+{
+  const int64_t n_chunks = (n + FOLD_CHUNK_BINS - 1) / FOLD_CHUNK_BINS;
+#pragma omp parallel
+  {
+    int nonzero[FOLD_CHUNK_BINS]; // offsets of a sparse chunk's nonzero bins
+    bool sparse = false;
+#pragma omp for schedule(static)
+    for (int64_t c = 0; c < n_chunks; ++c) {
+      const int64_t first = c * FOLD_CHUNK_BINS;
+      const int len =
+        static_cast<int>(std::min<int64_t>(FOLD_CHUNK_BINS, n - first));
+      double* a = acc + first;
+      double* w = nullptr;
+      if constexpr (TWO_PLANES)
+        w = win + first;
+      double* m = mom + first * fold_n_moments<KIND>();
+
+      int n_nonzero = 0;
+      if (sparse) {
+        for (int q = 0; q < len; ++q) {
+          nonzero[n_nonzero] = q;
+          n_nonzero += fold_bin_nonzero<TWO_PLANES>(a, w, q);
+        }
+        for (int i = 0; i < n_nonzero; ++i)
+          fold_bin<TWO_PLANES, KIND>(a, w, m, nonzero[i], norm);
+      } else {
+        for (int q = 0; q < len; ++q) {
+          n_nonzero += fold_bin_nonzero<TWO_PLANES>(a, w, q);
+          fold_bin<TWO_PLANES, KIND>(a, w, m, q, norm);
+        }
+      }
+      sparse = n_nonzero * FOLD_SPARSE_DIVISOR <= len;
+    }
+  }
+}
+
+//! \brief Fold a tally's accumulator plane(s) into its moments: dispatch
+//! fold_bins() on the moments kind once per fold.
+//!
+//! The mean moments mode keeps the sum only; otherwise higher moments add the
+//! third and fourth. moments must hold n bins of the kind's moment count.
+template<bool TWO_PLANES>
+void fold_planes(MomentsMode mode, bool higher_moments, double* acc,
+  double* win, tensor::Tensor<double>& moments, int64_t n, double norm)
+{
+  if (mode == MomentsMode::MEAN) {
+    assert(moments.size() == static_cast<size_t>(n) * 1);
+    fold_bins<TWO_PLANES, FoldKind::MEAN>(acc, win, moments.data(), n, norm);
+  } else if (higher_moments) {
+    assert(moments.size() == static_cast<size_t>(n) * 4);
+    fold_bins<TWO_PLANES, FoldKind::HIGHER>(acc, win, moments.data(), n, norm);
+  } else {
+    assert(moments.size() == static_cast<size_t>(n) * 2);
+    fold_bins<TWO_PLANES, FoldKind::FULL>(acc, win, moments.data(), n, norm);
+  }
+}
+
+} // namespace
+
+void Tally::fold_moments()
+{
+  // accum_ is stored contiguously as [n_filter_bins, n_score_bins] and
+  // moments_ as [n_filter_bins, n_score_bins, n_moments], so bin k of the
+  // plane owns moments [k * n_moments, (k + 1) * n_moments).
+  fold_planes<false>(exatally_.moments, higher_moments_, accum_, nullptr,
+    moments_, accum_size_, tally_normalization());
+}
+
+#ifdef OPENMC_MPI
+void report_rma_statistics()
+{
+  // The verbosity is rank-identical, so every rank skips the collective alike.
+  if (settings::verbosity < 8)
+    return;
+
+  // Batches whose scores the counters cover: the active batches simulated in
+  // this run. The counters start at zero at simulation init, so a restart
+  // counts from the restart batch, not from the first active batch.
+  int first = settings::n_inactive;
+  if (settings::restart_run)
+    first = std::max(first, simulation::restart_batch);
+  const int n_batches = simulation::current_batch - first;
+  const double n_source = static_cast<double>(settings::n_particles) *
+                          n_batches * settings::gen_per_batch;
+
+  for (const auto& t : model::tallies) {
+    if (!t->rma_distributed())
+      continue;
+    int64_t local[3] {
+      t->rma_rows_issued(), t->rma_accumulates(), t->rma_merged_rows()};
+    int64_t total[3] {0, 0, 0};
+    MPI_Reduce(local, total, 3, MPI_INT64_T, MPI_SUM, 0, mpi::intracomm);
+    write_message(8,
+      "rma tally {}: {} remote rows issued in {} accumulates ({} merged) "
+      "over {} batches; {:.2f} remote rows per source particle",
+      t->id_, total[0], total[1], total[2], n_batches,
+      n_source > 0.0 ? total[0] / n_source : 0.0);
+  }
+}
+#endif
+
+//==============================================================================
 // Tally member functions: accumulator modes
 //==============================================================================
 
@@ -119,6 +311,18 @@ bool Tally::rma_distributed() const
 }
 
 #ifdef OPENMC_MPI
+namespace {
+
+// Issue-time sort of a staging buffer by displacement (rma_sort_by_disp()):
+// LSD radix digits of 9 bits, and the buffer size below which std::sort is
+// faster than several 512-bucket passes (measured break-even at 32 rows for a
+// three-pass key).
+constexpr int RADIX_DIGIT_BITS = 9;
+constexpr int RADIX_BUCKETS = 1 << RADIX_DIGIT_BITS;
+constexpr int RADIX_MIN_ROWS = 32;
+
+} // namespace
+
 void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
 {
   // rma_k_ > 0 exactly when a remote bin is possible (a multi-rank run), and
@@ -152,12 +356,19 @@ void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
     // previous one to its target's staging buffer for a batched
     // MPI_Accumulate to the owning rank. Design follows Dun et al. (2015):
     // origin-side buffering of one-sided accumulates cuts the per-score RMA
-    // cost. The owner division runs only here -- once per coalesced row, not
-    // once per score.
+    // cost. The owner lookup runs only here -- once per coalesced row, not
+    // once per score -- and the division only when the row leaves the block
+    // of the last owner (the same unsigned range test as the local arm).
     if (ts.coalesce_bin >= 0)
       rma_coalescer_flush(ts);
+    if (static_cast<uint64_t>(filter_index - ts.owner_lo) >=
+        static_cast<uint64_t>(ts.owner_hi - ts.owner_lo)) {
+      ts.owner_rank = rma_owner(filter_index);
+      ts.owner_lo = static_cast<int64_t>(ts.owner_rank) * rma_bins_per_rank_;
+      ts.owner_hi = ts.owner_lo + rma_bins_per_rank_;
+    }
     ts.coalesce_bin = filter_index;
-    ts.coalesce_owner = rma_owner(filter_index);
+    ts.coalesce_owner = ts.owner_rank;
     std::fill(ts.row.begin(), ts.row.end(), 0.0);
     ts.row[score_index] += val;
     return;
@@ -254,14 +465,11 @@ void Tally::rma_stage_issue(RmaThreadStaging& ts, int target, int buf)
   // compaction scratch, then write the unique rows back to the front of this
   // buffer -- keeping the accumulate origin inside the double-buffered storage
   // whose in-flight liveness we track.
-  for (int i = 0; i < f; ++i)
-    ts.perm[i] = i;
-  std::sort(ts.perm.begin(), ts.perm.begin() + f,
-    [disp](int a, int b) { return disp[a] < disp[b]; });
+  const int* order = rma_sort_by_disp(ts, disp, f);
 
   int u = 0;
   for (int i = 0; i < f; ++i) {
-    const int src = ts.perm[i];
+    const int src = order[i];
     const double* srow = &data[static_cast<int64_t>(src) * n_score_bins_];
     if (u > 0 && disp[src] == ts.comp_disp[u - 1]) {
       double* drow = &ts.comp_data[static_cast<int64_t>(u - 1) * n_score_bins_];
@@ -295,6 +503,48 @@ void Tally::rma_stage_issue(RmaThreadStaging& ts, int target, int buf)
     MPI_Type_free(&dt);
   }
   ts.in_flight[slot] = 1;
+  ts.rows_issued += u;
+  ++ts.accumulates;
+}
+
+const int* Tally::rma_sort_by_disp(
+  RmaThreadStaging& ts, const MPI_Aint* disp, int f) const
+{
+  for (int i = 0; i < f; ++i)
+    ts.perm[i] = i;
+
+  if (f < RADIX_MIN_ROWS) {
+    std::sort(ts.perm.begin(), ts.perm.begin() + f,
+      [disp](int a, int b) { return disp[a] < disp[b]; });
+    return ts.perm.data();
+  }
+
+  // Stable LSD radix sort on the key disp / 8 (every displacement is a whole
+  // number of doubles), 9 bits per pass, scattering the index between perm and
+  // perm2. Being stable, it keeps equal displacements in staging order, so the
+  // merge sums duplicate rows in the order they were staged.
+  int* src = ts.perm.data();
+  int* dst = ts.perm2.data();
+  int* hist = ts.hist.data();
+  for (int pass = 0; pass < rma_radix_passes_; ++pass) {
+    const int shift = 3 + pass * RADIX_DIGIT_BITS;
+    auto digit = [disp, shift](int row) {
+      return (static_cast<uint64_t>(disp[row]) >> shift) & (RADIX_BUCKETS - 1);
+    };
+    std::fill(hist, hist + RADIX_BUCKETS, 0);
+    for (int i = 0; i < f; ++i)
+      ++hist[digit(i)];
+    int offset = 0;
+    for (int b = 0; b < RADIX_BUCKETS; ++b) {
+      const int count = hist[b];
+      hist[b] = offset;
+      offset += count;
+    }
+    for (int i = 0; i < f; ++i)
+      dst[hist[digit(src[i])]++] = src[i];
+    std::swap(src, dst);
+  }
+  return src;
 }
 
 void Tally::rma_drain()
@@ -595,43 +845,68 @@ void Tally::init_rma_staging()
 
   // Choose the staging depth K (rows per buffer). The test seam
   // OPENMC_RMA_STAGING_ROWS forces a tiny K to exercise buffer wrap + flush;
-  // otherwise K comes from a fixed per-rank budget split across threads,
-  // targets, and the two buffers, so total staging stays near the budget.
+  // otherwise K comes from a fixed per-rank budget split across tallies,
+  // threads, targets, and the two buffers, so total staging stays near the
+  // budget.
   const int nt = num_threads();
   const int64_t np = mpi::n_procs;
 
   // Bytes one thread holds per unit of K: per target and buffer, K staged rows
-  // plus their displacements; plus one buffer's worth of compaction scratch
-  // (comp_data row, perm index, comp_disp entry).
+  // plus their displacements; plus one buffer's worth of issue scratch
+  // (comp_data row, the perm and perm2 index entries, comp_disp entry). The
+  // fixed RADIX_BUCKETS-int histogram per thread (2 KiB) is not counted.
   const int64_t row_bytes =
     static_cast<int64_t>(n_score_bins_) * sizeof(double);
   const int64_t disp_bytes =
     sizeof(decltype(RmaThreadStaging::disp)::value_type);
   const int64_t perm_bytes =
     sizeof(decltype(RmaThreadStaging::perm)::value_type);
-  const int64_t bytes_per_k =
-    np * 2 * (row_bytes + disp_bytes) + (row_bytes + perm_bytes + disp_bytes);
+  const int64_t bytes_per_k = np * 2 * (row_bytes + disp_bytes) +
+                              (row_bytes + 2 * perm_bytes + disp_bytes);
+
+  // Fixed per-rank budget covering ALL rma tallies (each carries its own
+  // staging), shared in proportion to plane size (filter bins x score bins),
+  // so a small companion tally does not halve a large tally's K. Later tallies
+  // have not run set_strides() and init_results() yet, so their plane size
+  // comes from their filters, scores and nuclides. The share of a lone rma
+  // tally is the whole budget, exactly.
+  constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank, total
+  double total_bins = 0.0;
+  for (const auto& t : model::tallies) {
+    if (t->accumulator() != AccumulatorMode::RMA)
+      continue;
+    double bins = static_cast<double>(t->scores_.size() * t->nuclides_.size());
+    for (int32_t i_filt : t->filters())
+      bins *= model::tally_filters[i_filt]->n_bins();
+    total_bins += bins;
+  }
+  const double own_bins = static_cast<double>(n_filter_bins_) * n_score_bins_;
+  const double share = total_bins > 0.0
+                         ? static_cast<double>(BUDGET) * (own_bins / total_bins)
+                         : static_cast<double>(BUDGET);
 
   if (const char* env = std::getenv("OPENMC_RMA_STAGING_ROWS")) {
     rma_k_ = std::max<int64_t>(1, std::atoll(env));
   } else {
-    // Fixed per-rank budget covering ALL rma tallies (each carries its own
-    // staging), split across tallies and threads. It covers the staged rows,
-    // their displacements and the per-thread compaction scratch.
-    constexpr int64_t BUDGET = int64_t {64} << 20; // 64 MiB / rank, total
-    int64_t n_rma = 0;
-    for (const auto& t : model::tallies) {
-      if (t->accumulator() == AccumulatorMode::RMA)
-        ++n_rma;
-    }
-    const int64_t denom =
-      std::max<int64_t>(1, n_rma) * static_cast<int64_t>(nt) * bytes_per_k;
-    rma_k_ = std::clamp<int64_t>(BUDGET / std::max<int64_t>(1, denom), 8, 4096);
+    const double per_k = static_cast<double>(nt) * bytes_per_k;
+    rma_k_ = std::clamp<int64_t>(static_cast<int64_t>(share / per_k), 8, 4096);
   }
+
+  // Radix passes for the issue-time sort: the key disp / 8 is below the
+  // largest block a rank owns (rma_bins_per_rank_ rows x n_score_bins_
+  // doubles), so ceil(log2) of that bounds the key width.
+  const uint64_t max_key = static_cast<uint64_t>(rma_bins_per_rank_) *
+                           static_cast<uint64_t>(n_score_bins_);
+  int key_bits = 1;
+  while (key_bits < 64 && (uint64_t {1} << key_bits) < max_key)
+    ++key_bits;
+  rma_radix_passes_ = (key_bits + RADIX_DIGIT_BITS - 1) / RADIX_DIGIT_BITS;
 
   // One slot per thread; self-target slots are allocated but never used (the
   // local arm handles owned bins). Every per-thread buffer starts empty.
   rma_merged_rows_ = 0;
+  rma_rows_issued_ = 0;
+  rma_accumulates_ = 0;
   rma_staging_.resize(nt);
   for (auto& ts : rma_staging_) {
     ts.row.assign(n_score_bins_, 0.0);
@@ -640,18 +915,24 @@ void Tally::init_rma_staging()
     ts.fill.assign(np * 2, 0);
     ts.in_flight.assign(np * 2, 0);
     ts.cur.assign(np, 0);
-    // Per-thread compaction scratch (one buffer's worth), reused at each issue.
+    // Per-thread issue scratch (one buffer's worth), reused at each issue.
     ts.perm.assign(rma_k_, 0);
+    ts.perm2.assign(rma_k_, 0);
+    ts.hist.assign(RADIX_BUCKETS, 0);
     ts.comp_disp.assign(rma_k_, 0);
     ts.comp_data.assign(rma_k_ * n_score_bins_, 0.0);
     ts.merged = 0;
+    ts.rows_issued = 0;
+    ts.accumulates = 0;
   }
 
   write_message(8,
     "rma tally {}: staging K={} rows/buffer, {:.1f} MiB/rank incl. "
-    "displacements and scratch ({} threads x {} targets x 2 buffers)",
+    "displacements and scratch ({} threads x {} targets x 2 buffers; "
+    "budget share {:.1f} MiB)",
     id_, rma_k_,
-    static_cast<double>(nt) * rma_k_ * bytes_per_k / (1024.0 * 1024.0), nt, np);
+    static_cast<double>(nt) * rma_k_ * bytes_per_k / (1024.0 * 1024.0), nt, np,
+    share / (1024.0 * 1024.0));
 }
 
 void Tally::rma_publish()
@@ -670,7 +951,11 @@ void Tally::rma_publish()
     std::fill(ts.cur.begin(), ts.cur.end(), 0);
     ts.coalesce_bin = -1;
     rma_merged_rows_ += ts.merged;
+    rma_rows_issued_ += ts.rows_issued;
+    rma_accumulates_ += ts.accumulates;
     ts.merged = 0;
+    ts.rows_issued = 0;
+    ts.accumulates = 0;
   }
   // Step 3 -- after this barrier no accumulate is in flight anywhere.
   MPI_Barrier(mpi::intracomm);
@@ -690,51 +975,13 @@ void Tally::rma_fold()
 {
   // Every rank folds its owned rows. The batch sum for a bin is its window
   // block (remote contributions, zero while scoring is local) plus the
-  // private plane (this rank's own scores); both planes are then zeroed. norm
+  // private plane (this rank's own scores); the folded bins of both planes are
+  // then zeroed (bins zero in both may be skipped, see fold_bins()). norm
   // is rank-identical: it depends only on global model data and rma requires
   // reduce_tallies. n_realizations_ was incremented on all ranks in
   // accumulate().
-  const double norm = tally_normalization();
-  if (exatally_.moments == MomentsMode::MEAN) {
-    // The mean moments mode keeps the sum only.
-#pragma omp parallel for
-    for (int64_t i = 0; i < rma_n_rows_; ++i) {
-      for (int j = 0; j < n_score_bins_; ++j) {
-        const int64_t k = i * n_score_bins_ + j;
-        double val = (rma_win_base_[k] + accum_[k]) * norm;
-        rma_win_base_[k] = 0.0;
-        accum_[k] = 0.0;
-        moments_(i, j, TallyMoment::SUM) += val;
-      }
-    }
-  } else if (higher_moments_) {
-#pragma omp parallel for
-    for (int64_t i = 0; i < rma_n_rows_; ++i) {
-      for (int j = 0; j < n_score_bins_; ++j) {
-        const int64_t k = i * n_score_bins_ + j;
-        double val = (rma_win_base_[k] + accum_[k]) * norm;
-        rma_win_base_[k] = 0.0;
-        accum_[k] = 0.0;
-        double val2 = val * val;
-        moments_(i, j, TallyMoment::SUM) += val;
-        moments_(i, j, TallyMoment::SUM_SQ) += val2;
-        moments_(i, j, TallyMoment::SUM_THIRD) += val2 * val;
-        moments_(i, j, TallyMoment::SUM_FOURTH) += val2 * val2;
-      }
-    }
-  } else {
-#pragma omp parallel for
-    for (int64_t i = 0; i < rma_n_rows_; ++i) {
-      for (int j = 0; j < n_score_bins_; ++j) {
-        const int64_t k = i * n_score_bins_ + j;
-        double val = (rma_win_base_[k] + accum_[k]) * norm;
-        rma_win_base_[k] = 0.0;
-        accum_[k] = 0.0;
-        moments_(i, j, TallyMoment::SUM) += val;
-        moments_(i, j, TallyMoment::SUM_SQ) += val * val;
-      }
-    }
-  }
+  fold_planes<true>(exatally_.moments, higher_moments_, accum_, rma_win_base_,
+    moments_, rma_plane_size_, tally_normalization());
   // Publish the zeroed window block before the next batch accumulates.
   rma_resume();
 }

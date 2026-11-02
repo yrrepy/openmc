@@ -205,6 +205,9 @@ int openmc_simulation_finalize()
   }
 
 #ifdef OPENMC_MPI
+  // Collective on all ranks; prints the rma traffic counters at verbosity 8.
+  report_rma_statistics();
+
   broadcast_results();
 #endif
 

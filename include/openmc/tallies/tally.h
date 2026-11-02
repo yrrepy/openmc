@@ -132,6 +132,12 @@ public:
 
   //! Duplicate rma staging rows merged so far (remote-coalescing diagnostic).
   int64_t rma_merged_rows() const { return rma_merged_rows_; }
+
+  //! Remote rows issued so far (unique rows after merging, all threads).
+  int64_t rma_rows_issued() const { return rma_rows_issued_; }
+
+  //! MPI_Accumulate calls issued so far (all threads).
+  int64_t rma_accumulates() const { return rma_accumulates_; }
 #endif
 
   //! \brief Add a contribution to the per-batch accumulator. This is the ONLY
@@ -371,6 +377,10 @@ private:
   //! Zero when this tally never scores remotely (single-rank runs).
   int64_t rma_k_ {0};
 
+  //! Number of 9-bit radix passes that sort a staging buffer by displacement:
+  //! enough digits for the largest key (disp / 8) in any rank's block.
+  int rma_radix_passes_ {0};
+
   //! Per-thread state for the rma remote-scoring arm (C2): a row coalescer plus
   //! per-target double-buffered staging feeding batched MPI_Accumulate calls.
   //! Sized num_threads(); each element is written by one thread alone, so the
@@ -383,6 +393,13 @@ private:
     int64_t coalesce_bin {-1}; //!< global filter bin held open, -1 == none
     int coalesce_owner {-1};   //!< owner rank of coalesce_bin
     vector<double> row;        //!< n_score_bins_ coalesced score values
+
+    //! Owner-block cache for a coalescer miss: the owner of the last remote
+    //! row opened and its global rows [owner_lo, owner_hi). Empty until the
+    //! first miss, so the first lookup always computes the owner.
+    int owner_rank {-1};
+    int64_t owner_lo {0};
+    int64_t owner_hi {0};
 
     // clang-format off
     //! Per-target double buffers. For target rank t and buffer b in {0, 1}, with
@@ -399,12 +416,18 @@ private:
     vector<char> in_flight;
     vector<int> cur;
 
-    //! Reusable scratch used when a buffer is issued: an index permutation
-    //! sorted by displacement (perm, rma_k_ ints) and the compacted,
-    //! duplicate-free rows (comp_disp / comp_data) merged before the
-    //! MPI_Accumulate so its target datatype never has overlapping entries.
-    //! Written back into the buffer.
+    // clang-format off
+    //! Reusable scratch used when a buffer is issued, so the MPI_Accumulate
+    //! target datatype never has overlapping entries:
+    //!   perm, perm2 : index permutation sorted by displacement (rma_k_ ints
+    //!                 each; the radix sort scatters between the two)
+    //!   hist        : 512-entry digit histogram of the radix sort
+    //!   comp_disp, comp_data : compacted, duplicate-free rows, written back
+    //!                 into the buffer
+    // clang-format on
     vector<int> perm;
+    vector<int> perm2;
+    vector<int> hist;
     vector<MPI_Aint> comp_disp;
     vector<double> comp_data;
 
@@ -413,6 +436,11 @@ private:
     //! non-consecutively and would otherwise have produced an overlapping
     //! accumulate).
     int64_t merged {0};
+
+    //! Run statistics, folded into the tally totals at each publish: unique
+    //! rows issued and MPI_Accumulate calls made.
+    int64_t rows_issued {0};
+    int64_t accumulates {0};
   };
   vector<RmaThreadStaging> rma_staging_;
 
@@ -420,6 +448,11 @@ private:
   //! from the per-thread counters at each publish). A remote-coalescing quality
   //! metric, also asserted by the unit tests.
   int64_t rma_merged_rows_ {0};
+
+  //! Cumulative remote rows issued and MPI_Accumulate calls (folded like
+  //! rma_merged_rows_) for the end-of-run statistics line.
+  int64_t rma_rows_issued_ {0};
+  int64_t rma_accumulates_ {0};
 
   //! Out-of-line handler for the rma accumulator mode; only reached when
   //! exatally_.accumulator == RMA. Local bins score into the private plane;
@@ -440,6 +473,12 @@ private:
   //! Issue one hindexed-block MPI_Accumulate for a (target, buffer) staging
   //! buffer under critical(openmc_rma). No-op if the buffer is empty.
   void rma_stage_issue(RmaThreadStaging& ts, int target, int buf);
+
+  //! \brief Sort the index of a staging buffer's f rows by displacement:
+  //! std::sort for a few rows, else a stable 9-bit LSD radix sort on disp / 8.
+  //! \return The sorted index (ts.perm or ts.perm2)
+  const int* rma_sort_by_disp(
+    RmaThreadStaging& ts, const MPI_Aint* disp, int f) const;
 
   //! End-of-batch: flush every thread's open coalescer row and partial staging
   //! buffer so all of this rank's contributions become outstanding accumulates.
@@ -485,6 +524,12 @@ private:
   //! Per-batch normalization applied in the fold (source strength divided by
   //! contributing particles per generation; 1 for the random ray solver).
   double tally_normalization() const;
+
+  //! \brief Fold this batch's accumulator plane (the private plane, or the
+  //! shared node plane) into the moments and zero the folded bins. Sparse
+  //! stretches of the plane skip their zero bins, which is exact. Called by
+  //! accumulate() on the ranks that hold the batch sum.
+  void fold_moments();
 
   //! Master side of collect_none() for the replicated and shared accumulator
   //! modes: allocate moments_ as [F, S, 1] and fill SUM = accum_ x norm.

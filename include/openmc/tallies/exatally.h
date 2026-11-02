@@ -68,6 +68,14 @@ const char* moments_mode_name(MomentsMode mode);
 //! \param n      Number of doubles
 //! \param comm   Communicator whose rank 0 is the world master
 void reduce_accum_to_master(double* accum, int64_t n, MPI_Comm comm);
+
+//! \brief Print the run statistics of every distributed rma tally at
+//! verbosity 8: remote rows issued, MPI_Accumulate calls, merged rows, and
+//! remote rows per source particle, summed over all ranks.
+//!
+//! Collective on all ranks (one MPI_Reduce per distributed rma tally, in tally
+//! order); a no-op below verbosity 8. Called at the end of the run.
+void report_rma_statistics();
 #endif
 
 } // namespace openmc
