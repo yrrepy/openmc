@@ -226,12 +226,19 @@ struct NoProjection {
 //! (all bins, or an rma rank's owned rows), bin g = row * S + score bin, and a
 //! row's projected row is sum_i map_i(b_i) * stride_i over the tally filters
 //! (b_i its fine bin of filter i, map_i the identity for a kept or summed
-//! filter, the coarse map for a collapsed one). A dense chunk walks the bins
-//! with an odometer over (b_0, ..., b_{nf-1}, score bin); a row step looks up
-//! the last filter only, and the other filters' part is recomputed on a carry
-//! out of the last filter. A sparse chunk's bins are decomposed by division,
-//! once per bin for all projections. Zero-skipped bins add nothing to y,
-//! which is exact.
+//! filter, the coarse map for a collapsed one). A dense chunk is folded first,
+//! keeping its values; then each projection adds them per score bin, summing
+//! each run of consecutive rows with the same projected row in registers and
+//! adding the run to y once (Thread::add_dense()). A sparse chunk's bins are
+//! decomposed by division, once per bin for all projections, and added one by
+//! one. Zero-skipped bins add nothing to y, which is exact.
+//!
+//! Summation order of y: within a thread, chunks in plane order; within a
+//! dense chunk, runs in row order, each run summed as four interleaved partial
+//! sums from zero before it is added to y. The order depends only on the plane,
+//! the block and chunk boundaries, and (case B) the thread count, so results
+//! are deterministic; they differ from a bin-by-bin sum only by floating-point
+//! association.
 //!
 //! Threads: a case-A projection (every filter but the last kept) maps whole
 //! outer rows (row / n_last) to disjoint projected rows, so its threads add
@@ -269,12 +276,19 @@ public:
         maps_[p * nf_ + i] = tp.maps[i].empty() ? nullptr : tp.maps[i].data();
         strides_[p * nf_ + i] = tp.strides[i];
       }
-      // Realization offset of each fine bin of the last filter (its
-      // projected-row part times the score bins), or DROPPED.
-      proj_[p].last_off.resize(n_bins_[nf_ - 1]);
+      // Runs of consecutive last-filter bins with the same realization
+      // offset (the last filter's projected-row part times the score bins).
+      auto& runs = proj_[p].runs;
+      proj_[p].run_of.resize(n_bins_[nf_ - 1]);
       for (int64_t b = 0; b < n_bins_[nf_ - 1]; ++b) {
         const int64_t c = part(p, nf_ - 1, b);
-        proj_[p].last_off[b] = c < 0 ? DROPPED : c * s_;
+        const int64_t off = c < 0 ? DROPPED : c * s_;
+        if (runs.empty() || runs.back().off != off) {
+          runs.push_back({b, b + 1, off});
+        } else {
+          runs.back().hi = b + 1;
+        }
+        proj_[p].run_of[b] = static_cast<int32_t>(runs.size() - 1);
       }
       if (tp.fast_path) {
         any_case_a = true;
@@ -306,42 +320,86 @@ public:
   int64_t block_bins() const { return block_bins_; }
   int64_t lead_bins() const { return lead_bins_; }
 
-  //! One thread's cursor: the fine-bin odometer and, per projection, the
-  //! realization offset of the current tally row (negative when the row is
-  //! dropped). Only a carry out of the last filter recomputes the projected
-  //! row part of the other filters.
+  //! One thread's state: the folded values of the current dense chunk, the
+  //! fine-bin odometer that walks its rows, and each projection's offset part
+  //! of filters 0..nf-2 for the current stretch.
   class Thread {
   public:
     explicit Thread(const ProjectionFold& fold)
       : f_(fold), b_(fold.nf_), base_(fold.np_), drop_(fold.np_),
-        off_(fold.np_), last_off_(fold.np_), dst_(fold.np_)
+        dst_(fold.np_), values_(FOLD_CHUNK_BINS), row_begin_(fold.s_),
+        row_end_(fold.s_)
     {
       const int t = thread_num();
       for (size_t p = 0; p < f_.np_; ++p) {
         const Proj& pr = f_.proj_[p];
         dst_[p] = pr.case_a ? pr.realization : (*pr.partials)[t].data();
-        last_off_[p] = pr.last_off.data();
       }
     }
 
-    //! Position the cursor at plane bin k (the first bin of a dense chunk).
-    void begin(int64_t k)
-    {
-      j_ = f_.decompose(k, b_.data());
-      set_bases();
-      set_rows();
-    }
+    //! Buffer for the values of a dense chunk, in bin order.
+    double* values() { return values_.data(); }
 
-    //! Add the cursor bin's value to every projection, then advance one bin.
-    void dense(double val)
+    //! \brief Add the values() of a dense chunk to every projection.
+    //!
+    //! The chunk is walked in stretches of rows whose filters 0..nf-2 are
+    //! constant (at most one bin cycle of the last filter). In a stretch, each
+    //! run of the last filter's bins with one projected bin (Proj::runs) is,
+    //! per score bin, summed in registers (run_sum()) and added to y once, so
+    //! consecutive fine bins of one projected bin form no chain through
+    //! memory and need no per-row work.
+    //! \param first  Plane bin of the chunk's first value
+    //! \param len    Number of values
+    void add_dense(int64_t first, int len)
     {
-      for (size_t p = 0; p < f_.np_; ++p) {
-        if (off_[p] >= 0)
-          dst_[p][off_[p] + j_] += val;
+      const int64_t s = f_.s_;
+      const int64_t j0 = f_.decompose(first, b_.data());
+      const int64_t n_rows = (j0 + len + s - 1) / s;
+      const int last = f_.nf_ - 1;
+      const int64_t n_last = f_.n_bins_[last];
+      const double* v = values_.data();
+      // Rows holding score bin j: [row_begin_[j], row_end_[j]) (the first
+      // row starts at score bin j0, the last ends at bin len - 1).
+      for (int64_t j = 0; j < s; ++j) {
+        row_begin_[j] = j < j0 ? 1 : 0;
+        row_end_[j] = (len + j0 - j + s - 1) / s;
       }
-      if (++j_ == f_.s_) {
-        j_ = 0;
-        next_row();
+      for (int64_t r = 0; r < n_rows;) {
+        // Stretch: chunk rows [r, r + seg) = last-filter bins [b0, b0 + seg).
+        const int64_t b0 = b_[last];
+        const int64_t seg = std::min(n_rows - r, n_last - b0);
+        set_bases();
+        for (size_t p = 0; p < f_.np_; ++p) {
+          if (drop_[p])
+            continue;
+          const Proj& pr = f_.proj_[p];
+          double* y = dst_[p] + base_[p];
+          for (int64_t k = pr.run_of[b0];
+               k < static_cast<int64_t>(pr.runs.size()) &&
+               pr.runs[k].lo < b0 + seg;
+               ++k) {
+            const Run& run = pr.runs[k];
+            if (run.off < 0)
+              continue;
+            // Chunk rows of this run within the stretch.
+            const int64_t lo = r + std::max(run.lo, b0) - b0;
+            const int64_t hi = r + std::min(run.hi, b0 + seg) - b0;
+            for (int64_t j = 0; j < s; ++j) {
+              const int64_t rl = std::max(lo, row_begin_[j]);
+              const int64_t rh = std::min(hi, row_end_[j]);
+              if (rh > rl)
+                y[run.off + j] += run_sum(v + rl * s + j - j0, rh - rl, s);
+            }
+          }
+        }
+        r += seg;
+        // Carry out of the last filter into filters nf-2..0.
+        b_[last] = 0;
+        for (int i = last - 1; i >= 0; --i) {
+          if (++b_[i] < f_.n_bins_[i])
+            break;
+          b_[i] = 0;
+        }
       }
     }
 
@@ -359,6 +417,30 @@ public:
     }
 
   private:
+    //! \brief Sum of m values x[0], x[s], ..., x[(m - 1) s].
+    //!
+    //! Four interleaved partial sums, so the additions of a long run do not
+    //! form one dependency chain, combined as (s0 + s1) + (s2 + s3): a fixed
+    //! order, hence deterministic.
+    //! \param x  First value
+    //! \param m  Number of values
+    //! \param s  Stride between values (the score bins)
+    //! \return The sum
+    static double run_sum(const double* x, int64_t m, int64_t s)
+    {
+      double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+      int64_t i = 0;
+      for (; i + 4 <= m; i += 4) {
+        s0 += x[i * s];
+        s1 += x[(i + 1) * s];
+        s2 += x[(i + 2) * s];
+        s3 += x[(i + 3) * s];
+      }
+      for (; i < m; ++i)
+        s0 += x[i * s];
+      return (s0 + s1) + (s2 + s3);
+    }
+
     //! Recompute each projection's part of filters 0..nf-2 (as an offset).
     void set_bases()
     {
@@ -369,40 +451,14 @@ public:
       }
     }
 
-    //! Set every projection's realization offset for the current row.
-    void set_rows()
-    {
-      const int64_t b_last = b_[f_.nf_ - 1];
-      for (size_t p = 0; p < f_.np_; ++p) {
-        const int64_t last = last_off_[p][b_last];
-        off_[p] = (drop_[p] || last < 0) ? DROPPED : base_[p] + last;
-      }
-    }
-
-    //! Advance the odometer one filter-bin row (last filter fastest).
-    void next_row()
-    {
-      const int last = f_.nf_ - 1;
-      if (++b_[last] == f_.n_bins_[last]) {
-        b_[last] = 0;
-        for (int i = last - 1; i >= 0; --i) {
-          if (++b_[i] < f_.n_bins_[i])
-            break;
-          b_[i] = 0;
-        }
-        set_bases();
-      }
-      set_rows();
-    }
-
     const ProjectionFold& f_;
-    vector<int64_t> b_;    //!< fine bin of each tally filter
-    int64_t j_ {0};        //!< score bin
-    vector<int64_t> base_; //!< [p]: offset part of filters 0..nf-2
-    vector<char> drop_;    //!< [p]: filters 0..nf-2 drop the row
-    vector<int64_t> off_;  //!< [p]: realization offset of the current row
-    vector<const int64_t*> last_off_; //!< [p]: Proj::last_off
-    vector<double*> dst_; //!< [p]: realization or this thread's partial
+    vector<int64_t> b_;         //!< fine bin of each tally filter
+    vector<int64_t> base_;      //!< [p]: offset part of filters 0..nf-2
+    vector<char> drop_;         //!< [p]: filters 0..nf-2 drop the row
+    vector<double*> dst_;       //!< [p]: realization or this thread's partial
+    vector<double> values_;     //!< values of the current dense chunk
+    vector<int64_t> row_begin_; //!< [j]: first chunk row with score bin j
+    vector<int64_t> row_end_;   //!< [j]: end of the rows with score bin j
   };
 
   //! Sum the case-B thread partials into the realizations and zero them, in
@@ -474,12 +530,22 @@ private:
 
   static constexpr int64_t DROPPED {-1};
 
+  //! Last-filter bins [lo, hi) that share one projected bin: realization
+  //! offset off (the last filter's projected-row part times the score bins),
+  //! or DROPPED.
+  struct Run {
+    int64_t lo;
+    int64_t hi;
+    int64_t off;
+  };
+
   struct Proj {
     int64_t first_row {0};
     bool case_a {false};
     double* realization {nullptr};
     vector<vector<double>>* partials {nullptr};
-    vector<int64_t> last_off; //!< last filter bin -> offset, or DROPPED
+    vector<Run> runs;       //!< runs of the last filter's bins, in order
+    vector<int32_t> run_of; //!< last filter bin -> index of its run
   };
 
   int nf_;                 //!< tally filters
@@ -566,13 +632,18 @@ void fold_bins(
           double* w = nullptr;
           if constexpr (TWO_PLANES)
             w = win + first;
-          if (!sparse)
-            cursor.begin(first);
+          // A dense chunk keeps its values and adds them to the projections
+          // afterwards (add_dense()); a sparse chunk adds bin by bin.
+          const bool dense = !sparse;
+          double* values = cursor.values();
+          int k = 0;
           fold_chunk<TWO_PLANES, KIND>(
             acc + first, w, mom + first * NM, len, norm, nonzero, sparse,
-            [&cursor](double val) { cursor.dense(val); },
+            [values, &k](double val) { values[k++] = val; },
             [&cursor, first](
               int q, double val) { cursor.sparse(first + q, val); });
+          if (dense)
+            cursor.add_dense(first, len);
         }
       }
     }

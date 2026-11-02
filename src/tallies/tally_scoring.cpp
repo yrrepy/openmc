@@ -168,7 +168,7 @@ void score_fission_delayed_dg(int i_tally, int d_bin, double score,
     filter_weight *= match.weights_[i_bin];
   }
 
-// Update the tally result
+  // Update the tally result
   tally.score_add(filter_index, score_index, score * filter_weight);
 
   // Reset the original delayed group bin
@@ -457,7 +457,7 @@ void score_fission_eout(Particle& p, int i_tally, int i_score, int score_bin)
         filter_weight *= match.weights_[i_bin];
       }
 
-// Update tally results
+      // Update tally results
       tally.score_add(filter_index, i_score, score * filter_weight);
 
     } else if (score_bin == SCORE_DELAYED_NU_FISSION && g != 0) {
@@ -503,7 +503,7 @@ void score_fission_eout(Particle& p, int i_tally, int i_score, int score_bin)
           filter_weight *= match.weights_[i_bin];
         }
 
-// Update tally results
+        // Update tally results
         tally.score_add(filter_index, i_score, score * filter_weight);
       }
     }
@@ -1093,7 +1093,7 @@ void score_general_ce_nonanalog(Particle& p, int i_tally, int start_index,
       apply_derivative_to_score(
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
-// Update tally results
+    // Update tally results
     tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
@@ -1595,7 +1595,7 @@ void score_general_ce_analog(Particle& p, int i_tally, int start_index,
       apply_derivative_to_score(
         p, i_tally, i_nuclide, atom_density, score_bin, score);
 
-// Update tally results
+    // Update tally results
     tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
@@ -2289,7 +2289,7 @@ void score_general_mg(Particle& p, int i_tally, int start_index,
       continue;
     }
 
-// Update tally results
+    // Update tally results
     tally.score_add(filter_index, score_index, score * filter_weight);
   }
 }
