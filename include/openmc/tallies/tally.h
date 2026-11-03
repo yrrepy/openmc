@@ -148,8 +148,11 @@ public:
   //! way transport writes a tally, and it is on the hot path.
   //!
   //! For the local accumulator modes (replicated/shared) accum_ points at an
-  //! owned or shared plane and the add is a single atomic RMW. The rma branch
-  //! (predicted-not-taken) routes remote bins through an out-of-line handler.
+  //! owned or shared plane and the add is a single atomic RMW. With one OpenMP
+  //! thread a rank-private plane (replicated, and the rma private plane) takes
+  //! a plain add instead (plain_add_); the shared plane, which other processes
+  //! update too, keeps the atomic. The rma branch (predicted-not-taken) routes
+  //! remote bins through an out-of-line handler.
   void score_add(int64_t filter_index, int score_index, double val)
   {
 #ifdef OPENMC_MPI
@@ -158,7 +161,30 @@ public:
       return;
     }
 #endif
-    atomic_score_add(&accum_[filter_index * n_score_bins_ + score_index], val);
+    double* cell = &accum_[filter_index * n_score_bins_ + score_index];
+    if (plain_add_)
+      *cell += val;
+    else
+      atomic_score_add(cell, val);
+  }
+
+  //! \brief Prefetch the accumulator row of a filter bin for writing, so the
+  //! score_add() calls that follow find the line in cache. A hint only: no
+  //! value changes. Under rma only rows of the private plane (bins this rank
+  //! owns) are prefetched; remote bins go through the staging buffers.
+  void prefetch_row(int64_t filter_index) const
+  {
+#if defined(__GNUC__) || defined(__clang__)
+#ifdef OPENMC_MPI
+    if (exatally_.accumulator == AccumulatorMode::RMA) {
+      filter_index -= rma_first_row_;
+      if (static_cast<uint64_t>(filter_index) >=
+          static_cast<uint64_t>(rma_n_rows_))
+        return;
+    }
+#endif
+    __builtin_prefetch(accum_ + filter_index * n_score_bins_, 1, 0);
+#endif
   }
 
   //! \brief Direct (non-atomic) accumulator element access. Used by random ray
@@ -306,8 +332,12 @@ public:
   //! modes can re-home the storage (an MPI window) without changing the hot
   //! path; in replicated mode it points at accum_buffer_ below.
   double* accum_ {nullptr};
-  int64_t accum_size_ {0};      //!< n_filter_bins * n_score_bins
-  vector<double> accum_buffer_; //!< backing storage for accum_ (replicated)
+  int64_t accum_size_ {0}; //!< n_filter_bins * n_score_bins
+
+  //! Backing storage for accum_ (replicated, and the rma private plane).
+  //! Allocated without initialisation and zeroed by parallel_fill(), so the
+  //! pages are first-touched by the threads that later fold them.
+  unique_ptr<double[]> accum_buffer_;
 
 #ifdef OPENMC_MPI
   //! Shared-memory window backing accum_ in the shared accumulator mode (one
@@ -363,6 +393,12 @@ private:
   //! which moments are kept. Set through set_exatally(), which validates the
   //! distributed modes' prerequisites.
   ExaTally exatally_;
+
+  //! Use a plain add instead of the atomic in score_add() (and the rma local
+  //! arms). Set by init_results() when this rank runs one OpenMP thread and
+  //! the plane is rank-private (not shared): every parallel region then has a
+  //! single thread, so no other writer exists.
+  bool plain_add_ {false};
 
 #ifdef OPENMC_MPI
   //! Distributed-window state for the rma accumulator mode. accum_win_ (reused

@@ -29,15 +29,8 @@ KTrigger keff_trigger;
 //==============================================================================
 
 std::pair<double, double> get_tally_uncertainty(
-  int i_tally, int score_index, int64_t filter_index)
+  double sum, double sum_sq, int n)
 {
-  const auto& tally {model::tallies[i_tally]};
-
-  auto sum = tally->moments()(filter_index, score_index, TallyMoment::SUM);
-  auto sum_sq =
-    tally->moments()(filter_index, score_index, TallyMoment::SUM_SQ);
-
-  int n = tally->n_realizations_;
   auto mean = sum / n;
 
   // if the result has no contributions, return an invalid pair
@@ -90,24 +83,44 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
       if (trigger.metric == TriggerMetric::not_active)
         continue;
 
-      for (int64_t filter_index = 0; filter_index < n_rows; ++filter_index) {
-        // Compute the tally uncertainty metrics.
-        auto uncert_pair =
-          get_tally_uncertainty(i_tally, trigger.score_index, filter_index);
+      // Walk the rows on all threads. Each thread keeps the largest ratio of
+      // its rows; the maximum is order-independent, so the result is the
+      // serial walk's. A non-ignored zero bin anywhere gives the same result
+      // as the first one the serial walk stops at, so once any thread finds
+      // one, every thread skips its remaining rows. The raw moments pointer
+      // and strides avoid indexing through the tensor per bin; the doubles
+      // read are the same.
+      const double* m = t.moments().data();
+      const int64_t n_mom = static_cast<int64_t>(t.moments().shape(2));
+      const int64_t row_stride = t.n_score_bins() * n_mom;
+      const int64_t col = trigger.score_index * n_mom;
+      const int n = t.n_realizations_;
+      double best = ratio;
+      bool zero_bin = false;
 
-        // If there is a score without contributions, skip it when zero
-        // scores are ignored for this trigger; otherwise force the maximum
-        // ratio. Record it and stop scanning -- but fall through to the
-        // cross-rank reduction rather than returning, so a collective rma
-        // check is still reached on every rank.
+#pragma omp parallel for schedule(static) reduction(max : best)
+      for (int64_t filter_index = 0; filter_index < n_rows; ++filter_index) {
+        bool stop;
+#pragma omp atomic read
+        stop = zero_bin;
+        if (stop)
+          continue;
+
+        // Compute the tally uncertainty metrics.
+        const double* cell = m + filter_index * row_stride + col;
+        auto uncert_pair =
+          get_tally_uncertainty(cell[static_cast<int>(TallyMoment::SUM)],
+            cell[static_cast<int>(TallyMoment::SUM_SQ)], n);
+
+        // A score without contributions is skipped when zero scores are
+        // ignored for this trigger; otherwise it forces the maximum ratio
+        // (handled after the loop).
         if (uncert_pair.first == -1) {
-          if (trigger.ignore_zeros)
-            continue;
-          ratio = INFINITY;
-          score = t.scores_[trigger.score_index];
-          tally_id = t.id_;
-          found_no_contribution = true;
-          break;
+          if (!trigger.ignore_zeros) {
+#pragma omp atomic write
+            zero_bin = true;
+          }
+          continue;
         }
 
         double std_dev = uncert_pair.first;
@@ -139,15 +152,28 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
           this_ratio = std::sqrt(this_ratio);
         }
 
-        // If this is the most uncertain value, set the output variables.
-        if (this_ratio > ratio) {
-          ratio = this_ratio;
-          score = t.scores_[trigger.score_index];
-          tally_id = t.id_;
-        }
+        if (this_ratio > best)
+          best = this_ratio;
       }
-      if (found_no_contribution)
+
+      // A score without contributions forces the maximum ratio. Record it and
+      // stop scanning -- but fall through to the cross-rank reduction rather
+      // than returning, so a collective rma check is still reached on every
+      // rank.
+      if (zero_bin) {
+        ratio = INFINITY;
+        score = t.scores_[trigger.score_index];
+        tally_id = t.id_;
+        found_no_contribution = true;
         break;
+      }
+
+      // If this is the most uncertain value, set the output variables.
+      if (best > ratio) {
+        ratio = best;
+        score = t.scores_[trigger.score_index];
+        tally_id = t.id_;
+      }
     }
   }
 

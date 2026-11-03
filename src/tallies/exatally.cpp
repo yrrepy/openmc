@@ -24,7 +24,7 @@
 #include <cstdlib>   // for getenv, atoll
 #include <stdexcept> // for runtime_error
 
-#if defined(OPENMC_MPI) && defined(__linux__)
+#ifdef __linux__
 #include <array>
 #include <bitset>
 #include <climits> // for CHAR_BIT
@@ -92,6 +92,46 @@ const char* moments_mode_name(MomentsMode mode)
   default:
     return "full";
   }
+}
+
+//==============================================================================
+// NUMA placement of large tally planes
+//==============================================================================
+
+InterleaveDuringAlloc::InterleaveDuringAlloc(bool engage)
+{
+#ifdef __linux__
+  if (!engage)
+    return;
+  int mode;
+  if (syscall(SYS_get_mempolicy, &mode, nullptr, 0UL, nullptr, 0UL) != 0 ||
+      mode != MPOL_DEFAULT)
+    return;
+  std::array<unsigned long, 64> mask {};
+  const unsigned long maxnode = mask.size() * sizeof(unsigned long) * CHAR_BIT;
+  // Variadic syscall(): pass unsigned long where the kernel takes one.
+  if (syscall(SYS_get_mempolicy, nullptr, mask.data(), maxnode, nullptr,
+        static_cast<unsigned long>(MPOL_F_MEMS_ALLOWED)) != 0)
+    return;
+  int n = 0;
+  for (unsigned long word : mask)
+    n += std::bitset<sizeof(unsigned long) * CHAR_BIT>(word).count();
+  if (n <= 1)
+    return;
+  if (syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, mask.data(), maxnode) != 0)
+    return;
+  n_domains_ = n;
+#else
+  (void)engage;
+#endif
+}
+
+InterleaveDuringAlloc::~InterleaveDuringAlloc()
+{
+#ifdef __linux__
+  if (n_domains_ > 0)
+    syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL);
+#endif
 }
 
 #ifdef OPENMC_MPI
@@ -779,7 +819,11 @@ void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
     // rma_first_row_ <= filter_index < rma_first_row_ + rma_n_rows_.
     const int64_t local_row = filter_index - rma_first_row_;
     if (static_cast<uint64_t>(local_row) < static_cast<uint64_t>(rma_n_rows_)) {
-      atomic_score_add(&accum_[local_row * n_score_bins_ + score_index], val);
+      double* cell = &accum_[local_row * n_score_bins_ + score_index];
+      if (plain_add_)
+        *cell += val;
+      else
+        atomic_score_add(cell, val);
       return;
     }
 
@@ -806,7 +850,11 @@ void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
   }
 
   // Single-rank run: every bin is local (rma_first_row_ == 0).
-  atomic_score_add(&accum_[filter_index * n_score_bins_ + score_index], val);
+  double* cell = &accum_[filter_index * n_score_bins_ + score_index];
+  if (plain_add_)
+    *cell += val;
+  else
+    atomic_score_add(cell, val);
 }
 
 int Tally::rma_owner(int64_t filter_index) const
@@ -1013,65 +1061,6 @@ void Tally::free_accum_window()
   rma_win_base_ = nullptr;
 }
 
-namespace {
-
-//! Interleave the calling task's memory policy for the duration of an
-//! allocation, so pages an MPI library pre-faults inside
-//! MPI_Win_allocate_shared (registration pinning on some fabrics) spread over
-//! all NUMA domains the task may use instead of landing on the allocating
-//! rank's domain. Restores the previous policy on exit. Engages only when the
-//! task runs the default policy, so an explicit user policy (numactl
-//! --membind/--interleave) is honoured as is. Best effort: any failed call
-//! leaves the policy alone. A no-op outside Linux.
-class InterleaveDuringAlloc {
-public:
-  explicit InterleaveDuringAlloc(bool engage)
-  {
-#ifdef __linux__
-    if (!engage)
-      return;
-    int mode;
-    if (syscall(SYS_get_mempolicy, &mode, nullptr, 0UL, nullptr, 0UL) != 0 ||
-        mode != MPOL_DEFAULT)
-      return;
-    std::array<unsigned long, 64> mask {};
-    const unsigned long maxnode =
-      mask.size() * sizeof(unsigned long) * CHAR_BIT;
-    // Variadic syscall(): pass unsigned long where the kernel takes one.
-    if (syscall(SYS_get_mempolicy, nullptr, mask.data(), maxnode, nullptr,
-          static_cast<unsigned long>(MPOL_F_MEMS_ALLOWED)) != 0)
-      return;
-    int n = 0;
-    for (unsigned long word : mask)
-      n += std::bitset<sizeof(unsigned long) * CHAR_BIT>(word).count();
-    if (n <= 1)
-      return;
-    if (syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, mask.data(), maxnode) != 0)
-      return;
-    n_domains_ = n;
-#endif
-  }
-
-  ~InterleaveDuringAlloc()
-  {
-#ifdef __linux__
-    if (n_domains_ > 0)
-      syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0UL);
-#endif
-  }
-
-  InterleaveDuringAlloc(const InterleaveDuringAlloc&) = delete;
-  InterleaveDuringAlloc& operator=(const InterleaveDuringAlloc&) = delete;
-
-  //! \return Number of NUMA domains interleaved over, 0 if not engaged
-  int n_domains() const { return n_domains_; }
-
-private:
-  int n_domains_ {0}; //!< NUMA domains interleaved over; 0 if not engaged
-};
-
-} // namespace
-
 void Tally::init_shared_accum()
 {
   // Re-init (e.g. openmc.lib re-runs): drop any previous window first. This is
@@ -1081,8 +1070,7 @@ void Tally::init_shared_accum()
 
   // The shared plane replaces the private buffer entirely -- that is the RAM
   // win, so make sure no per-rank copy lingers.
-  accum_buffer_.clear();
-  accum_buffer_.shrink_to_fit();
+  accum_buffer_.reset();
 
   // The node leader allocates the whole plane; everyone else contributes 0
   // bytes. The default (contiguous) layout means querying the leader's segment
@@ -1209,9 +1197,13 @@ void Tally::init_rma_accum()
 
   // Private owned-rows plane for this rank's own scores to bins it owns. Reuses
   // accum_buffer_ so the hot path writes it exactly like replicated mode, just
-  // sized to the owned block and locally indexed.
-  accum_buffer_.assign(rma_plane_size_, 0.0);
-  accum_ = accum_buffer_.data();
+  // sized to the owned block and locally indexed. Any previous plane is
+  // released first; the new one is zeroed by this rank's threads (its first
+  // touch).
+  accum_buffer_.reset();
+  accum_buffer_.reset(new double[rma_plane_size_]);
+  parallel_fill(accum_buffer_.get(), rma_plane_size_, 0.0);
+  accum_ = accum_buffer_.get();
 
   // Distributed window: each rank contributes its owned block. same_op (every
   // accumulate is MPI_SUM; MPI_NO_OP is never used) + no ordering lets the
@@ -1221,6 +1213,9 @@ void Tally::init_rma_accum()
   MPI_Info_create(&info);
   MPI_Info_set(info, "accumulate_ops", "same_op");
   MPI_Info_set(info, "accumulate_ordering", "none");
+  // Every rank's displacement unit is sizeof(double). (same_size is not set:
+  // trailing ranks own fewer or zero rows.)
+  MPI_Info_set(info, "same_disp_unit", "true");
   MPI_Aint bytes = static_cast<MPI_Aint>(rma_plane_size_) * sizeof(double);
   void* base = nullptr;
   MPI_Win_allocate(
@@ -1246,7 +1241,7 @@ void Tally::init_rma_accum()
   // Zero this rank's window block (MPI_Win_allocate memory is uninitialized)
   // and publish it so remote accumulates land on all-zeros.
   if (rma_plane_size_ > 0)
-    std::fill(rma_win_base_, rma_win_base_ + rma_plane_size_, 0.0);
+    parallel_fill(rma_win_base_, rma_plane_size_, 0.0);
   MPI_Win_sync(accum_win_);
   MPI_Barrier(mpi::intracomm);
   MPI_Win_sync(accum_win_);
@@ -1873,7 +1868,7 @@ void Tally::collect_none()
     // scores (the same running-total pattern as above).
     reduce_accum_to_master(accum_, accum_size_, mpi::intracomm);
     if (!mpi::master) {
-      std::fill(accum_, accum_ + accum_size_, 0.0);
+      parallel_fill(accum_, accum_size_, 0.0);
     }
   }
 #endif
@@ -1887,9 +1882,13 @@ void Tally::collect_none()
 void Tally::materialise_none_sum(double norm)
 {
   // Master side of collect_none() for the full-plane accumulator modes
-  // (replicated, shared): accum_ holds the global run total.
-  moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
-    static_cast<size_t>(n_score_bins_), size_t {1}});
+  // (replicated, shared): accum_ holds the global run total. The constructor's
+  // zero pass first-touches the plane under the interleave policy.
+  {
+    InterleaveDuringAlloc policy(true);
+    moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
+      static_cast<size_t>(n_score_bins_), size_t {1}});
+  }
 #pragma omp parallel for
   for (int64_t i = 0; i < n_filter_bins_; ++i) {
     for (int j = 0; j < n_score_bins_; ++j) {

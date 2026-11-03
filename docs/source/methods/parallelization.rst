@@ -626,7 +626,10 @@ for ``rma``, the moments) live:
 * **shared** -- one accumulator plane per shared-memory node, held in an MPI-3
   shared-memory window. Cross-process scores use hardware atomics on the shared
   window, so per-node tally memory no longer scales with the number of ranks on
-  the node.
+  the node. A rank-private plane (the ``replicated`` accumulator and the
+  ``rma`` private plane) is updated with plain adds instead of atomics when the
+  rank runs one OpenMP thread; the ``shared`` plane keeps the atomic at any
+  thread count, because other processes update it too.
 
   Linux places each page of the node plane on the NUMA domain of the core that
   first touches it. Every rank on the node therefore zeroes its own
@@ -734,8 +737,9 @@ The table is the steady state between batches; transients add a bounded amount.
 Every per-batch reduction (``replicated``, the internode step of ``shared``,
 and the ``none`` collection) runs in 1 GiB chunks, so the MPI library's
 reduction scratch stays within about 1 GiB per participating rank however many
-planes the tally holds. The ``rma`` statepoint write holds up to 1 GiB of
-receive scratch on the master. Restart adds nothing on a rank that holds no
+planes the tally holds. The ``rma`` statepoint write holds two 64 MiB receive
+buffers on the master: it receives the next chunk of owned rows while it writes
+the current one. Restart adds nothing on a rank that holds no
 moments, and the ``rma`` remote-scoring staging is the fixed 64 MiB per rank
 described above.
 

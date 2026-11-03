@@ -329,6 +329,11 @@ enum class TallyMoment { SUM, SUM_SQ, SUM_THIRD, SUM_FOURTH };
 // of one call.
 constexpr int64_t MAX_MPI_CHUNK_DOUBLES {int64_t {1} << 27};
 
+// Maximum doubles per chunk of the rma statepoint gather (64 MiB). The master
+// receives the next chunk into a second buffer while it writes the current one,
+// so the gather holds two such buffers.
+constexpr int64_t MAX_RMA_GATHER_DOUBLES {int64_t {1} << 23};
+
 // MPI point-to-point tags used by the distributed (rma) tally paths.
 constexpr int TAG_RMA_TRIGGER {42};    // limiting-trigger info to the master
 constexpr int TAG_RMA_GATHER {43};     // statepoint owned-rows gather

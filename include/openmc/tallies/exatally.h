@@ -120,6 +120,36 @@ struct TallyProjection {
 vector<std::pair<std::string, vector<int32_t>>> parse_projections(
   pugi::xml_node node, const std::string& context);
 
+//==============================================================================
+// NUMA placement of large tally planes
+//==============================================================================
+
+//! Interleave the calling task's memory policy for the lifetime of the object,
+//! so pages first touched meanwhile -- by a full-plane moments construction,
+//! or pre-faulted by an MPI library inside MPI_Win_allocate_shared
+//! (registration pinning on some fabrics) -- spread over all NUMA domains the
+//! task may use instead of landing on the allocating thread's domain.
+//! Rank-private planes that one rank's threads fold (the rma owned rows) are
+//! not wrapped: their first touch belongs on those threads' domain. Restores
+//! the default policy on exit. Engages only when `engage` is true, the task
+//! runs the default policy and more than one domain is allowed, so an explicit
+//! user policy from numactl (--membind or --interleave) is honoured as is.
+//! Best effort: any failed call leaves the policy alone. A no-op outside Linux.
+class InterleaveDuringAlloc {
+public:
+  explicit InterleaveDuringAlloc(bool engage);
+  ~InterleaveDuringAlloc();
+
+  InterleaveDuringAlloc(const InterleaveDuringAlloc&) = delete;
+  InterleaveDuringAlloc& operator=(const InterleaveDuringAlloc&) = delete;
+
+  //! \return Number of NUMA domains interleaved over, 0 if not engaged
+  int n_domains() const { return n_domains_; }
+
+private:
+  int n_domains_ {0}; //!< NUMA domains interleaved over; 0 if not engaged
+};
+
 #ifdef OPENMC_MPI
 //! \brief Sum a contiguous accumulator onto the master (rank 0 of `comm`) in
 //! place, in chunks of at most MAX_MPI_CHUNK_DOUBLES.

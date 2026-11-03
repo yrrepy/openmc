@@ -965,8 +965,10 @@ void broadcast_results()
     // receiving buffer before the broadcast. This restores the end-of-run
     // contract that every rank can serve results (openmc.lib .mean on any rank,
     // coupled depletion). The shape comes from the tally's own dimensions so it
-    // matches the master's array exactly.
+    // matches the master's array exactly. It is constructed under the
+    // interleave memory policy, like the master's moments.
     if (!t->has_moments()) {
+      InterleaveDuringAlloc policy(true);
       t->moments() =
         tensor::Tensor<double>({static_cast<size_t>(t->n_filter_bins()),
           static_cast<size_t>(t->n_score_bins()),

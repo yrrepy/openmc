@@ -23,8 +23,21 @@
 
 #include <numeric>
 #include <string>
+#include <utility>
 
 namespace openmc {
+
+namespace {
+
+//! Per-thread list of the (filter index, weight) combinations of one event,
+//! reused across events so that collecting them allocates nothing.
+vector<std::pair<int64_t, double>>& event_filter_bins()
+{
+  thread_local vector<std::pair<int64_t, double>> bins;
+  return bins;
+}
+
+} // namespace
 
 //==============================================================================
 // FilterBinIter implementation
@@ -2312,11 +2325,18 @@ void score_analog_tally_ce(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
+    // Pass 1: collect the valid filter bin combinations of this event and
+    // prefetch their accumulator rows, so the adds of pass 2 find them in
+    // cache.
+    auto& bins = event_filter_bins();
+    bins.clear();
     for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
+      tally.prefetch_row(filter_iter.index_);
+    }
 
+    // Pass 2: loop over filter bins.
+    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];
@@ -2356,11 +2376,18 @@ void score_analog_tally_mg(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
+    // Pass 1: collect the valid filter bin combinations of this event and
+    // prefetch their accumulator rows, so the adds of pass 2 find them in
+    // cache.
+    auto& bins = event_filter_bins();
+    bins.clear();
     for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
+      tally.prefetch_row(filter_iter.index_);
+    }
 
+    // Pass 2: loop over filter bins.
+    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];
@@ -2410,11 +2437,18 @@ void score_tracklength_tally_general(
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
+    // Pass 1: collect the valid filter bin combinations of this event and
+    // prefetch their accumulator rows, so the adds of pass 2 find them in
+    // cache.
+    auto& bins = event_filter_bins();
+    bins.clear();
     for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
+      tally.prefetch_row(filter_iter.index_);
+    }
 
+    // Pass 2: loop over filter bins.
+    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];
@@ -2540,11 +2574,18 @@ void score_collision_tally(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Loop over filter bins.
+    // Pass 1: collect the valid filter bin combinations of this event and
+    // prefetch their accumulator rows, so the adds of pass 2 find them in
+    // cache.
+    auto& bins = event_filter_bins();
+    bins.clear();
     for (; filter_iter != end; ++filter_iter) {
-      auto filter_index = filter_iter.index_;
-      auto filter_weight = filter_iter.weight_;
+      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
+      tally.prefetch_row(filter_iter.index_);
+    }
 
+    // Pass 2: loop over filter bins.
+    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];

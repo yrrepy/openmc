@@ -966,6 +966,13 @@ void Tally::init_results()
   n_score_bins_ = scores_.size() * nuclides_.size();
   accum_size_ = n_filter_bins_ * n_score_bins_;
 
+  // With one OpenMP thread nothing else writes a rank-private plane, so the
+  // hot path can skip the atomic. Re-evaluated at every simulation init, so a
+  // changed thread count between runs is honoured. The shared node plane is
+  // written by other processes and always needs the atomic.
+  plain_add_ =
+    (num_threads() == 1) && exatally_.accumulator != AccumulatorMode::SHARED;
+
 #ifdef OPENMC_MPI
   // A tally read on all ranks (weight-window generation) cannot use a
   // distributed mode, which homes moments on the master alone (shared) or on
@@ -991,9 +998,12 @@ void Tally::init_results()
 #endif
   {
     // Per-batch accumulator plane. In replicated mode every rank owns a private
-    // contiguous buffer.
-    accum_buffer_.assign(accum_size_, 0.0);
-    accum_ = accum_buffer_.data();
+    // contiguous buffer. Any previous plane is released first; the new one is
+    // allocated uninitialised and zeroed by all threads (its first touch).
+    accum_buffer_.reset();
+    accum_buffer_.reset(new double[accum_size_]);
+    parallel_fill(accum_buffer_.get(), accum_size_, 0.0);
+    accum_ = accum_buffer_.get();
   }
 
   // Projected moments and realizations (after the rma block map is known).
@@ -1013,6 +1023,11 @@ void Tally::init_results()
   // A 'none' tally keeps no moments during the run on any rank;
   // collect_none() materialises its one SUM plane for a statepoint and at the
   // end of the run.
+  //
+  // A full-plane moments array is constructed under the interleave memory
+  // policy, so the constructor's zero pass spreads its pages over the NUMA
+  // domains. The rma owned-rows array is rank-private and small; it stays on
+  // the constructing thread's domain, where this rank's threads fold it.
   none_materialised_ = false;
   if (exatally_.moments == MomentsMode::NONE) {
     moments_ = tensor::Tensor<double>();
@@ -1027,6 +1042,7 @@ void Tally::init_results()
   } else
 #endif
     if (mpi::master || !settings::reduce_tallies || moments_all_ranks_) {
+    InterleaveDuringAlloc policy(true);
     moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
       static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
   } else {
@@ -1066,10 +1082,10 @@ void Tally::reset()
     // collective after, would discard them. Only the private plane, written
     // solely by this rank's threads, is this rank's to reset.
     if (rma_plane_size_ > 0) {
-      std::fill(accum_, accum_ + rma_plane_size_, 0.0);
+      parallel_fill(accum_, rma_plane_size_, 0.0);
     }
     if (moments_.size() != 0) {
-      moments_.fill(0.0);
+      parallel_fill(moments_.data(), moments_.size(), 0.0);
     }
     return;
   }
@@ -1083,11 +1099,11 @@ void Tally::reset()
     if (exatally_.accumulator != AccumulatorMode::SHARED)
 #endif
     {
-      std::fill(accum_, accum_ + accum_size_, 0.0);
+      parallel_fill(accum_, accum_size_, 0.0);
     }
   }
   if (moments_.size() != 0) {
-    moments_.fill(0.0);
+    parallel_fill(moments_.data(), moments_.size(), 0.0);
   }
 }
 
@@ -1302,7 +1318,7 @@ void reduce_tally_results()
       // ranks must clear their (now already-summed) accumulator here to avoid
       // double-counting into the next batch.
       if (!mpi::master) {
-        std::fill(tally->accum_, tally->accum_ + tally->accum_size_, 0.0);
+        parallel_fill(tally->accum_, tally->accum_size_, 0.0);
       }
     }
   }

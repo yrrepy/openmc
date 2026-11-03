@@ -75,12 +75,13 @@ inline int64_t results_row_len(const Tally& tally)
   return static_cast<int64_t>(tally.n_score_bins()) * tally.n_moments();
 }
 
-// Filter-bin rows moved per MPI/HDF5 chunk: the shared 1 GiB cap applied at
-// row granularity (at least one row).
+// Filter-bin rows moved per chunk of the rma statepoint gather: the 64 MiB cap
+// applied at row granularity (at least one row). Sender and receiver both size
+// their chunks here, so they stay in lock-step.
 inline int64_t results_rows_per_chunk(int64_t row_len)
 {
   return std::max<int64_t>(
-    1, MAX_MPI_CHUNK_DOUBLES / std::max<int64_t>(1, row_len));
+    1, MAX_RMA_GATHER_DOUBLES / std::max<int64_t>(1, row_len));
 }
 
 // Write a contiguous block of n_rows filter-bin rows, starting at global row
@@ -261,9 +262,22 @@ vector<const double*> projection_moments(const Tally& tally)
 }
 
 #ifdef OPENMC_MPI
+// One chunk of the rma statepoint gather: crows filter-bin rows of rank `rank`,
+// starting at global row first_row.
+struct GatherChunk {
+  int rank;
+  int64_t first_row;
+  int64_t crows;
+};
+
 // Master side of the statepoint write: create the full results dataset, write
 // the master's own owned rows, then receive each other rank's owned rows in
-// chunks and write them into their hyperslab.
+// chunks and write them into their hyperslab. The receives are pipelined over
+// two buffers: the receive of the next chunk is posted before the current
+// chunk is written, so the network and the disk work at the same time. Only
+// one receive is outstanding at a time, and chunks are received in the order
+// each sender sends them, so MPI's non-overtaking order for messages from one
+// source with one tag matches every chunk to its buffer.
 void gather_rma_tally_results(hid_t tally_group, const Tally& tally)
 {
   const hsize_t n_filter = static_cast<hsize_t>(tally.n_filter_bins());
@@ -277,26 +291,53 @@ void gather_rma_tally_results(hid_t tally_group, const Tally& tally)
   const int64_t row_len = results_row_len(tally);
   const int64_t rows_per_chunk = results_rows_per_chunk(row_len);
 
-  // One receive buffer reused for every chunk (chunks share a common size
-  // except tails), instead of a fresh up-to-1-GiB allocation per chunk.
-  vector<double> buf;
-  for (int r = 0; r < mpi::n_procs; ++r) {
+  // Master owns rows [0, nrows); its moments are locally indexed from 0 and
+  // are written directly.
+  const int64_t n_master = tally.rma_rows_owned(0);
+  for (int64_t off = 0; off < n_master; off += rows_per_chunk) {
+    const int64_t crows = std::min(rows_per_chunk, n_master - off);
+    write_results_hyperslab(dset, tally.rma_first_row(0) + off, crows, n_score,
+      n_moments, tally.moments().data() + off * row_len);
+  }
+
+  // The other ranks' chunks, rank ascending and offset ascending: the order
+  // each sender issues them in.
+  vector<GatherChunk> chunks;
+  int64_t max_crows = 0;
+  for (int r = 1; r < mpi::n_procs; ++r) {
     const int64_t first = tally.rma_first_row(r);
     const int64_t nrows = tally.rma_rows_owned(r);
     for (int64_t off = 0; off < nrows; off += rows_per_chunk) {
       const int64_t crows = std::min(rows_per_chunk, nrows - off);
-      const int64_t count = crows * row_len;
-      if (r == 0) {
-        // Master owns rows [0, nrows); its moments are locally indexed from 0.
-        write_results_hyperslab(dset, first + off, crows, n_score, n_moments,
-          tally.moments().data() + off * row_len);
-      } else {
-        buf.resize(count);
-        MPI_Recv(buf.data(), static_cast<int>(count), MPI_DOUBLE, r,
-          TAG_RMA_GATHER, mpi::intracomm, MPI_STATUS_IGNORE);
-        write_results_hyperslab(
-          dset, first + off, crows, n_score, n_moments, buf.data());
-      }
+      chunks.push_back({r, first + off, crows});
+      max_crows = std::max(max_crows, crows);
+    }
+  }
+
+  if (!chunks.empty()) {
+    // Two receive buffers of at most one chunk each (64 MiB, or one row if a
+    // row is longer). Chunk k lands in buf[k % 2].
+    const int64_t buf_len = max_crows * row_len;
+    vector<double> buf[2];
+    buf[0].resize(buf_len);
+    if (chunks.size() > 1)
+      buf[1].resize(buf_len);
+
+    auto post = [&](size_t k) {
+      MPI_Request req;
+      MPI_Irecv(buf[k % 2].data(), static_cast<int>(chunks[k].crows * row_len),
+        MPI_DOUBLE, chunks[k].rank, TAG_RMA_GATHER, mpi::intracomm, &req);
+      return req;
+    };
+
+    MPI_Request req = post(0);
+    for (size_t k = 0; k < chunks.size(); ++k) {
+      MPI_Wait(&req, MPI_STATUS_IGNORE);
+      // Receive chunk k+1 into the other buffer while chunk k is written.
+      if (k + 1 < chunks.size())
+        req = post(k + 1);
+      write_results_hyperslab(dset, chunks[k].first_row, chunks[k].crows,
+        n_score, n_moments, buf[k % 2].data());
     }
   }
   H5Dclose(dset);
