@@ -9,6 +9,7 @@
 #include "openmc/message_passing.h"
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
+#include "openmc/tallies/exatally_profile.h"
 #include "openmc/tallies/filter_energy.h"
 #include "openmc/tallies/filter_mesh.h"
 #include "openmc/tallies/tally.h"
@@ -824,6 +825,7 @@ void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
         *cell += val;
       else
         atomic_score_add(cell, val);
+      ++ts.scores_local;
       return;
     }
 
@@ -846,6 +848,7 @@ void Tally::rma_score_add(int64_t filter_index, int score_index, double val)
     ts.coalesce_owner = ts.owner_rank;
     std::fill(ts.row.begin(), ts.row.end(), 0.0);
     ts.row[score_index] += val;
+    ++ts.scores_remote;
     return;
   }
 
@@ -920,6 +923,7 @@ void Tally::rma_coalescer_flush(RmaThreadStaging& ts)
     {
       MPI_Win_flush_local(t, accum_win_);
     }
+    ++ts.flush_local;
     ts.in_flight[t * 2] = 0;
     ts.in_flight[t * 2 + 1] = 0;
   }
@@ -984,6 +988,17 @@ void Tally::rma_stage_issue(RmaThreadStaging& ts, int target, int buf)
   ts.in_flight[slot] = 1;
   ts.rows_issued += u;
   ++ts.accumulates;
+
+  // Profiling: rows and plain value sum issued to this target (the origin
+  // buffer is only read while the accumulate is in flight, which is legal).
+  if (profile::enabled) {
+    double sum = 0.0;
+    const int64_t n = static_cast<int64_t>(u) * n_score_bins_;
+    for (int64_t i = 0; i < n; ++i)
+      sum += data[i];
+    ts.prof_rows_to[target] += u;
+    ts.prof_mass_to[target] += sum;
+  }
 }
 
 const int* Tally::rma_sort_by_disp(
@@ -1149,9 +1164,11 @@ void Tally::shared_publish()
   // Step 1 -- publish every node-local atomic score. The symmetric
   // win_sync/barrier/win_sync is the MPI-3 shared-memory idiom: the first sync
   // flushes writers, the barrier orders, the second refreshes the reader.
+  profile::phase_begin(profile::Phase::SHARED_NODE_SYNC);
   MPI_Win_sync(accum_win_);
   MPI_Barrier(mpi::node_comm);
   MPI_Win_sync(accum_win_);
+  profile::phase_end(profile::Phase::SHARED_NODE_SYNC);
 
   // Step 2 -- combine the per-node planes onto the world master. A single-node
   // run skips this: the one plane already holds the global sum and the master
@@ -1159,6 +1176,7 @@ void Tally::shared_publish()
   // reduction roots on the master; it runs in 1 GiB chunks
   // (reduce_accum_to_master).
   if (mpi::n_nodes > 1 && mpi::node_leader) {
+    profile::ScopedPhase timer(profile::Phase::SHARED_INTERNODE_REDUCE);
     reduce_accum_to_master(accum_, accum_size_, mpi::internode_comm);
   }
 }
@@ -1263,6 +1281,8 @@ void Tally::init_rma_staging()
 {
   rma_staging_.clear();
   rma_k_ = 0;
+  rma_staging_bytes_ = 0.0;
+  rma_profile_ = RmaProfile {};
 
   // A single-rank run owns every bin, so score_add never reaches the remote arm
   // -- no staging is needed and the 3.A local path is preserved untouched.
@@ -1356,6 +1376,11 @@ void Tally::init_rma_staging()
   rma_merged_rows_ = 0;
   rma_rows_issued_ = 0;
   rma_accumulates_ = 0;
+  rma_staging_bytes_ = static_cast<double>(nt) * rma_k_ * bytes_per_k;
+  if (profile::enabled) {
+    rma_profile_.rows_to.assign(np, 0);
+    rma_profile_.mass_to.assign(np, 0.0);
+  }
   rma_staging_.resize(nt);
   for (auto& ts : rma_staging_) {
     ts.row.assign(n_score_bins_, 0.0);
@@ -1373,14 +1398,20 @@ void Tally::init_rma_staging()
     ts.merged = 0;
     ts.rows_issued = 0;
     ts.accumulates = 0;
+    ts.scores_local = 0;
+    ts.scores_remote = 0;
+    ts.flush_local = 0;
+    if (profile::enabled) {
+      ts.prof_rows_to.assign(np, 0);
+      ts.prof_mass_to.assign(np, 0.0);
+    }
   }
 
   write_message(8,
     "rma tally {}: staging K={} rows/buffer, {:.1f} MiB/rank incl. "
     "displacements and scratch ({} threads x {} targets x 2 buffers; "
     "budget share {:.1f} MiB)",
-    id_, rma_k_,
-    static_cast<double>(nt) * rma_k_ * bytes_per_k / (1024.0 * 1024.0), nt, np,
+    id_, rma_k_, rma_staging_bytes_ / (1024.0 * 1024.0), nt, np,
     share / (1024.0 * 1024.0));
 }
 
@@ -1388,10 +1419,14 @@ void Tally::rma_publish()
 {
   // Step 1 -- drain thread-local staging: issue every open coalescer row and
   // partial buffer so all of this rank's contributions become accumulates.
+  profile::phase_begin(profile::Phase::RMA_DRAIN);
   rma_drain();
+  profile::phase_end(profile::Phase::RMA_DRAIN);
   // Step 2 -- complete this rank's outstanding accumulates at every target
   // (both locally and remotely). All origin buffers are now retired.
+  profile::phase_begin(profile::Phase::RMA_FLUSH_ALL);
   MPI_Win_flush_all(accum_win_);
+  profile::phase_end(profile::Phase::RMA_FLUSH_ALL);
   // The next batch starts from empty staging; reset the per-thread bookkeeping
   // and fold the per-thread merge counts into the run-level diagnostic.
   for (auto& ts : rma_staging_) {
@@ -1402,12 +1437,31 @@ void Tally::rma_publish()
     rma_merged_rows_ += ts.merged;
     rma_rows_issued_ += ts.rows_issued;
     rma_accumulates_ += ts.accumulates;
+    rma_profile_.merged += ts.merged;
+    rma_profile_.rows_issued += ts.rows_issued;
+    rma_profile_.accumulates += ts.accumulates;
+    rma_profile_.scores_local += ts.scores_local;
+    rma_profile_.scores_remote += ts.scores_remote;
+    rma_profile_.flush_local += ts.flush_local;
     ts.merged = 0;
     ts.rows_issued = 0;
     ts.accumulates = 0;
+    ts.scores_local = 0;
+    ts.scores_remote = 0;
+    ts.flush_local = 0;
+    if (profile::enabled) {
+      for (int t = 0; t < mpi::n_procs; ++t) {
+        rma_profile_.rows_to[t] += ts.prof_rows_to[t];
+        rma_profile_.mass_to[t] += ts.prof_mass_to[t];
+      }
+      std::fill(ts.prof_rows_to.begin(), ts.prof_rows_to.end(), 0);
+      std::fill(ts.prof_mass_to.begin(), ts.prof_mass_to.end(), 0.0);
+    }
   }
   // Step 3 -- after this barrier no accumulate is in flight anywhere.
+  profile::phase_begin(profile::Phase::RMA_BARRIER);
   MPI_Barrier(mpi::intracomm);
+  profile::phase_end(profile::Phase::RMA_BARRIER);
   // Step 4 -- local memory barrier before the fold reads this rank's own block.
   MPI_Win_sync(accum_win_);
 }
@@ -1429,6 +1483,21 @@ void Tally::rma_fold()
   // is rank-identical: it depends only on global model data and rma requires
   // reduce_tallies. n_realizations_ was incremented on all ranks in
   // accumulate().
+  if (profile::enabled) {
+    // Profiling: the E0 conservation check compares this rank's received
+    // window mass with the mass every rank issued to it this batch.
+    double recv = 0.0;
+    double priv = 0.0;
+#pragma omp parallel for reduction(+ : recv, priv)
+    for (int64_t k = 0; k < rma_plane_size_; ++k) {
+      recv += rma_win_base_[k];
+      priv += accum_[k];
+    }
+    rma_profile_.recv_sum = recv;
+    rma_profile_.priv_sum = priv;
+    rma_profile_.sums_valid = true;
+  }
+  profile::phase_begin(profile::Phase::RMA_FOLD);
   if (projections_.empty()) {
     NoProjection none;
     fold_planes<true>(exatally_.moments, higher_moments_, accum_, rma_win_base_,
@@ -1443,6 +1512,7 @@ void Tally::rma_fold()
       moments_, rma_plane_size_, tally_normalization(), proj);
     combine_rma_projections();
   }
+  profile::phase_end(profile::Phase::RMA_FOLD);
   // Publish the zeroed window block before the next batch accumulates.
   rma_resume();
 }
@@ -1461,9 +1531,11 @@ void Tally::shared_batch_end()
     MPI_Barrier(mpi::node_comm);
     int64_t begin, end;
     shared_slice(begin, end);
+    profile::phase_begin(profile::Phase::SHARED_ZERO);
 #pragma omp parallel for
     for (int64_t i = begin; i < end; ++i)
       accum_[i] = 0.0;
+    profile::phase_end(profile::Phase::SHARED_ZERO);
   }
 
   // Publish the zeroed plane before the next batch scores into it. Every node

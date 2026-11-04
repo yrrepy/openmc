@@ -12,6 +12,7 @@
 #include "openmc/reaction.h"
 #include "openmc/settings.h"
 #include "openmc/simulation.h"
+#include "openmc/tallies/exatally_profile.h"
 #include "openmc/tallies/tally.h"
 
 namespace openmc {
@@ -57,6 +58,7 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
   score = 0;
   bool found_no_contribution = false;
 
+  profile::phase_begin(profile::Phase::TRIGGER_WALK);
   for (auto i_tally = 0;
        i_tally < model::tallies.size() && !found_no_contribution; ++i_tally) {
     const Tally& t {*model::tallies[i_tally]};
@@ -177,9 +179,13 @@ void check_tally_triggers(double& ratio, int& tally_id, int& score)
     }
   }
 
+  profile::phase_end(profile::Phase::TRIGGER_WALK);
+
 #ifdef OPENMC_MPI
-  if (has_rma_triggers())
+  if (has_rma_triggers()) {
+    profile::ScopedPhase timer(profile::Phase::TRIGGER_REDUCE);
     rma_reduce_trigger(ratio, tally_id, score);
+  }
 #endif
 }
 

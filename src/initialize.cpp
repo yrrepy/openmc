@@ -32,6 +32,7 @@
 #include "openmc/simulation.h"
 #include "openmc/string_utils.h"
 #include "openmc/summary.h"
+#include "openmc/tallies/exatally_profile.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/thermal.h"
 #include "openmc/timer.h"
@@ -62,6 +63,10 @@ int openmc_init(int argc, char* argv[], const void* intracomm)
   // Initialize MPI for C++
   initialize_mpi(comm);
 #endif
+
+  // Profiling environment (after MPI init, so the master checks the output
+  // directory; also in builds without MPI).
+  profile::init();
 
   // Parse command-line arguments
   int err = parse_command_line(argc, argv);

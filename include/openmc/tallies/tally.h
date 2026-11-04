@@ -142,6 +142,30 @@ public:
 
   //! MPI_Accumulate calls issued so far (all threads).
   int64_t rma_accumulates() const { return rma_accumulates_; }
+
+  //! Rows per rma staging buffer (0 on single-rank runs).
+  int64_t rma_k() const { return rma_k_; }
+
+  //! Bytes of rma staging this rank holds for this tally (all threads).
+  double rma_staging_bytes() const { return rma_staging_bytes_; }
+
+  //! Per-batch rma profiling record (exatally_profile.h). The counters are
+  //! folded from the threads at each publish and the plane sums are taken at
+  //! the fold; profile::batch_end() reads and clears it.
+  struct RmaProfile {
+    int64_t scores_local {0};  //!< scores to owned bins (local arm)
+    int64_t scores_remote {0}; //!< remote rows opened (coalescer misses)
+    int64_t flush_local {0};   //!< MPI_Win_flush_local calls
+    int64_t rows_issued {0};   //!< unique remote rows issued
+    int64_t accumulates {0};   //!< MPI_Accumulate calls
+    int64_t merged {0};        //!< duplicate staging rows merged
+    vector<int64_t> rows_to;   //!< rows issued per target (profiling only)
+    vector<double> mass_to;    //!< sum of issued values per target
+    double recv_sum {0.0};     //!< sum of the window block before the fold
+    double priv_sum {0.0};     //!< sum of the private plane before the fold
+    bool sums_valid {false};   //!< a fold took the two sums this batch
+  };
+  RmaProfile& rma_profile() { return rma_profile_; }
 #endif
 
   //! \brief Add a contribution to the per-batch accumulator. This is the ONLY
@@ -473,8 +497,22 @@ private:
     //! rows issued and MPI_Accumulate calls made.
     int64_t rows_issued {0};
     int64_t accumulates {0};
+
+    //! Profiling counters, folded into rma_profile_ at each publish: scores to
+    //! owned bins, remote rows opened, MPI_Win_flush_local calls; and, sized
+    //! n_procs only when profiling, the rows and the plain sum of the values
+    //! issued to each target.
+    int64_t scores_local {0};
+    int64_t scores_remote {0};
+    int64_t flush_local {0};
+    vector<int64_t> prof_rows_to;
+    vector<double> prof_mass_to;
   };
   vector<RmaThreadStaging> rma_staging_;
+
+  //! Per-batch profiling record (see RmaProfile) and the staging size.
+  RmaProfile rma_profile_;
+  double rma_staging_bytes_ {0.0};
 
   //! Cumulative count of duplicate staging rows merged across the run (folded
   //! from the per-thread counters at each publish). A remote-coalescing quality

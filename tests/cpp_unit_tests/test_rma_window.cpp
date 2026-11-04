@@ -23,7 +23,8 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib> // for setenv, unsetenv
+#include <cstdio>  // for fprintf
+#include <cstdlib> // for getenv, atoll, setenv, unsetenv
 #include <string>
 #include <vector>
 
@@ -45,7 +46,9 @@ using namespace openmc;
 // real seam, publish + fold, and verify each owned moment row holds the exact
 // cross-rank sum 1 + 2 + ... + n_procs. Returns whether every owned row
 // matched; the tally (and its collective window) is torn down before returning.
-static bool run_rma_cycle(int64_t n_bins, int n_scores)
+// With `timed`, each rank prints one HAMMER line to stderr: the scoring loop
+// plus rma_publish() timed with MPI_Wtime (init and fold excluded).
+static bool run_rma_cycle(int64_t n_bins, int n_scores, bool timed = false)
 {
   // The Tally rma paths read these globals; initialize_mpi would set them in a
   // real run, but this test drives Tally directly.
@@ -91,6 +94,9 @@ static bool run_rma_cycle(int64_t n_bins, int n_scores)
   MPI_Query_thread(&provided);
   const int nt = (provided >= MPI_THREAD_SERIALIZED) ? num_threads() : 1;
   const double contrib = static_cast<double>(mpi::rank + 1);
+  if (timed)
+    MPI_Barrier(MPI_COMM_WORLD);
+  const double t0 = MPI_Wtime();
 #pragma omp parallel for num_threads(nt) schedule(static, 1)
   for (int64_t bin = 0; bin < n_bins; ++bin)
     for (int s = 0; s < n_scores; ++s)
@@ -98,7 +104,19 @@ static bool run_rma_cycle(int64_t n_bins, int n_scores)
 
   // End of batch: drain staging + complete accumulates, then fold owned rows.
   tally->rma_publish();
+  const double seconds = MPI_Wtime() - t0;
   tally->accumulate();
+
+  if (timed) {
+    std::fprintf(stderr,
+      "HAMMER rank=%d n_procs=%d threads=%d K=%lld rows=%lld scores=%d "
+      "seconds=%.6f rows_per_s=%.6g accumulates=%lld merged=%lld\n",
+      mpi::rank, mpi::n_procs, nt, static_cast<long long>(tally->rma_k()),
+      static_cast<long long>(n_bins), n_scores, seconds,
+      seconds > 0.0 ? n_bins / seconds : 0.0,
+      static_cast<long long>(tally->rma_accumulates()),
+      static_cast<long long>(tally->rma_merged_rows()));
+  }
 
   // Each rank added (rank + 1) to every bin; the owning rank's fold sums them.
   const int64_t P = mpi::n_procs;
@@ -206,6 +224,12 @@ static bool run_rma_revisit(int64_t n_bins, int n_scores, int revisits)
 
 TEST_CASE("rma remote-scoring hammer", "[rma][hammer]")
 {
+  // Timed pre-flight mode (profiling branch): OPENMC_RMA_HAMMER_ROWS=<N> rows,
+  // two scores, the staging depth from OPENMC_RMA_STAGING_ROWS when set.
+  if (const char* rows = std::getenv("OPENMC_RMA_HAMMER_ROWS")) {
+    REQUIRE(run_rma_cycle(std::atoll(rows), /*n_scores=*/2, /*timed=*/true));
+    return;
+  }
   // Default staging depth: end-to-end correctness through the real seam.
   unsetenv("OPENMC_RMA_STAGING_ROWS");
   REQUIRE(run_rma_cycle(/*n_bins=*/200, /*n_scores=*/2));

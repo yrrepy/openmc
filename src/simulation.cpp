@@ -22,6 +22,7 @@
 #include "openmc/source.h"
 #include "openmc/state_point.h"
 #include "openmc/tallies/derivative.h"
+#include "openmc/tallies/exatally_profile.h"
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/tally.h"
 #include "openmc/tallies/trigger.h"
@@ -204,6 +205,9 @@ int openmc_simulation_finalize()
       t->collect_none();
   }
 
+  // Write this rank's profile (OPENMC_PROFILE only).
+  profile::finalize();
+
 #ifdef OPENMC_MPI
   // Collective on all ranks; prints the rma traffic counters at verbosity 8.
   report_rma_statistics();
@@ -273,6 +277,7 @@ int openmc_next_batch(int* status)
     return OPENMC_E_ALLOCATE;
   }
 
+  profile::batch_begin();
   initialize_batch();
 
   // =======================================================================
@@ -283,6 +288,7 @@ int openmc_next_batch(int* status)
 
     // Start timer for transport
     simulation::time_transport.start();
+    profile::phase_begin(profile::Phase::TRANSPORT);
 
     // Transport loop
     if (settings::event_based) {
@@ -300,12 +306,14 @@ int openmc_next_batch(int* status)
     }
 
     // Accumulate time for transport
+    profile::phase_end(profile::Phase::TRANSPORT);
     simulation::time_transport.stop();
 
     finalize_generation();
   }
 
   finalize_batch();
+  profile::batch_end();
 
   // Check simulation ending criteria
   if (status) {
@@ -585,6 +593,7 @@ void finalize_batch()
   // a CMFD run instance
   if (contains(settings::statepoint_batch, simulation::current_batch) &&
       !settings::cmfd_run) {
+    profile::ScopedPhase timer(profile::Phase::STATEPOINT);
     if (contains(settings::sourcepoint_batch, simulation::current_batch) &&
         settings::source_write && !settings::source_separate) {
       bool b = (settings::run_mode == RunMode::EIGENVALUE);
@@ -1022,13 +1031,21 @@ void transport_history_based_single_particle(Particle& p)
 
 void transport_history_based()
 {
+  // Profiling branch: an optional MPI progress poke every `poke` particles per
+  // thread (OPENMC_RMA_PROGRESS_POKE; 0 = off, see exatally_profile.h).
+  const int poke = profile::poke_every();
 #pragma omp parallel
   {
     Particle p;
+    int until_poke = poke;
 #pragma omp for schedule(runtime)
     for (int64_t i_work = 1; i_work <= simulation::work_per_rank; ++i_work) {
       initialize_particle_track(p, i_work, false);
       transport_history_based_single_particle(p);
+      if (poke > 0 && --until_poke == 0) {
+        profile::rma_progress_poke();
+        until_poke = poke;
+      }
     }
   }
 }

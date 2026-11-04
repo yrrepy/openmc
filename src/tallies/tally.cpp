@@ -18,6 +18,7 @@
 #include "openmc/simulation.h"
 #include "openmc/source.h"
 #include "openmc/tallies/derivative.h"
+#include "openmc/tallies/exatally_profile.h"
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/filter_cell.h"
 #include "openmc/tallies/filter_cellborn.h"
@@ -1142,8 +1143,10 @@ void Tally::accumulate()
 
   // Fold the per-batch accumulator into the moments and zero it (only the
   // master holds the reduced sum unless reduction is off).
-  if (mpi::master || !settings::reduce_tallies)
+  if (mpi::master || !settings::reduce_tallies) {
+    profile::ScopedPhase timer(profile::Phase::FOLD);
     fold_moments();
+  }
 
 #ifdef OPENMC_MPI
   if (exatally_.accumulator == AccumulatorMode::SHARED)
@@ -1299,7 +1302,9 @@ void reduce_tally_results()
 
       // The accumulator is contiguous, so it reduces in place onto the master
       // with no scratch buffer, in 1 GiB chunks (reduce_accum_to_master).
+      profile::phase_begin(profile::Phase::REPLICATED_REDUCE);
       reduce_accum_to_master(tally->accum_, tally->accum_size_, mpi::intracomm);
+      profile::phase_end(profile::Phase::REPLICATED_REDUCE);
 
       // The fold that zeroes accum_ only runs on the master, so non-master
       // ranks must clear their (now already-summed) accumulator here to avoid

@@ -16,6 +16,7 @@
 #include "openmc/string_utils.h"
 #include "openmc/surface.h"
 #include "openmc/tallies/derivative.h"
+#include "openmc/tallies/exatally_profile.h"
 #include "openmc/tallies/filter.h"
 #include "openmc/tallies/filter_cell.h"
 #include "openmc/tallies/filter_delayedgroup.h"
@@ -2353,10 +2354,14 @@ void score_analog_tally_ce(Particle& p)
     // prefetched) by collect_filter_bins(), or walk the iterator lazily.
     const bool replay = collect_filter_bins(tally, filter_iter, end);
     const auto& bins = event_filter_bins();
+    if (replay)
+      profile::add_scores(bins.size() * tally.n_score_bins());
     for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
          replay ? void(++k) : void(++filter_iter)) {
       auto filter_index = replay ? bins[k].first : filter_iter.index_;
       auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
+      if (!replay)
+        profile::add_scores(tally.n_score_bins());
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2401,10 +2406,14 @@ void score_analog_tally_mg(Particle& p)
     // prefetched) by collect_filter_bins(), or walk the iterator lazily.
     const bool replay = collect_filter_bins(tally, filter_iter, end);
     const auto& bins = event_filter_bins();
+    if (replay)
+      profile::add_scores(bins.size() * tally.n_score_bins());
     for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
          replay ? void(++k) : void(++filter_iter)) {
       auto filter_index = replay ? bins[k].first : filter_iter.index_;
       auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
+      if (!replay)
+        profile::add_scores(tally.n_score_bins());
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2459,10 +2468,14 @@ void score_tracklength_tally_general(
     // prefetched) by collect_filter_bins(), or walk the iterator lazily.
     const bool replay = collect_filter_bins(tally, filter_iter, end);
     const auto& bins = event_filter_bins();
+    if (replay)
+      profile::add_scores(bins.size() * tally.n_score_bins());
     for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
          replay ? void(++k) : void(++filter_iter)) {
       auto filter_index = replay ? bins[k].first : filter_iter.index_;
       auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
+      if (!replay)
+        profile::add_scores(tally.n_score_bins());
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
@@ -2593,10 +2606,14 @@ void score_collision_tally(Particle& p)
     // prefetched) by collect_filter_bins(), or walk the iterator lazily.
     const bool replay = collect_filter_bins(tally, filter_iter, end);
     const auto& bins = event_filter_bins();
+    if (replay)
+      profile::add_scores(bins.size() * tally.n_score_bins());
     for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
          replay ? void(++k) : void(++filter_iter)) {
       auto filter_index = replay ? bins[k].first : filter_iter.index_;
       auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
+      if (!replay)
+        profile::add_scores(tally.n_score_bins());
 
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
