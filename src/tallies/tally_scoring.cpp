@@ -37,6 +37,30 @@ vector<std::pair<int64_t, double>>& event_filter_bins()
   return bins;
 }
 
+//! Collect the valid filter bin combinations of the current event, from
+//! filter_iter to end, into event_filter_bins() and prefetch their accumulator
+//! rows, so that the scoring loop which replays them finds the rows in cache.
+//
+//! Returns false and collects nothing for a tally with a delayed-group or
+//! energyout filter: score_fission_delayed_dg() and score_fission_eout()
+//! rebuild the filter index from the live bin cursors of the filter matches,
+//! which must stand at the combination being scored, so such a tally walks the
+//! iterator lazily while it scores.
+bool collect_filter_bins(
+  const Tally& tally, FilterBinIter& filter_iter, const FilterBinIter& end)
+{
+  if (tally.delayedgroup_filter_ != C_NONE || tally.energyout_filter_ != C_NONE)
+    return false;
+
+  auto& bins = event_filter_bins();
+  bins.clear();
+  for (; filter_iter != end; ++filter_iter) {
+    bins.emplace_back(filter_iter.index_, filter_iter.weight_);
+    tally.prefetch_row(filter_iter.index_);
+  }
+  return true;
+}
+
 } // namespace
 
 //==============================================================================
@@ -2325,18 +2349,15 @@ void score_analog_tally_ce(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Pass 1: collect the valid filter bin combinations of this event and
-    // prefetch their accumulator rows, so the adds of pass 2 find them in
-    // cache.
-    auto& bins = event_filter_bins();
-    bins.clear();
-    for (; filter_iter != end; ++filter_iter) {
-      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
-      tally.prefetch_row(filter_iter.index_);
-    }
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
-    // Pass 2: loop over filter bins.
-    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];
@@ -2376,18 +2397,15 @@ void score_analog_tally_mg(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Pass 1: collect the valid filter bin combinations of this event and
-    // prefetch their accumulator rows, so the adds of pass 2 find them in
-    // cache.
-    auto& bins = event_filter_bins();
-    bins.clear();
-    for (; filter_iter != end; ++filter_iter) {
-      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
-      tally.prefetch_row(filter_iter.index_);
-    }
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
-    // Pass 2: loop over filter bins.
-    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];
@@ -2437,18 +2455,15 @@ void score_tracklength_tally_general(
     if (filter_iter == end)
       continue;
 
-    // Pass 1: collect the valid filter bin combinations of this event and
-    // prefetch their accumulator rows, so the adds of pass 2 find them in
-    // cache.
-    auto& bins = event_filter_bins();
-    bins.clear();
-    for (; filter_iter != end; ++filter_iter) {
-      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
-      tally.prefetch_row(filter_iter.index_);
-    }
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
-    // Pass 2: loop over filter bins.
-    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];
@@ -2574,18 +2589,15 @@ void score_collision_tally(Particle& p)
     if (filter_iter == end)
       continue;
 
-    // Pass 1: collect the valid filter bin combinations of this event and
-    // prefetch their accumulator rows, so the adds of pass 2 find them in
-    // cache.
-    auto& bins = event_filter_bins();
-    bins.clear();
-    for (; filter_iter != end; ++filter_iter) {
-      bins.emplace_back(filter_iter.index_, filter_iter.weight_);
-      tally.prefetch_row(filter_iter.index_);
-    }
+    // Loop over filter bins: replay the combinations collected (rows
+    // prefetched) by collect_filter_bins(), or walk the iterator lazily.
+    const bool replay = collect_filter_bins(tally, filter_iter, end);
+    const auto& bins = event_filter_bins();
+    for (std::size_t k = 0; replay ? k < bins.size() : filter_iter != end;
+         replay ? void(++k) : void(++filter_iter)) {
+      auto filter_index = replay ? bins[k].first : filter_iter.index_;
+      auto filter_weight = replay ? bins[k].second : filter_iter.weight_;
 
-    // Pass 2: loop over filter bins.
-    for (const auto& [filter_index, filter_weight] : bins) {
       // Loop over nuclide bins.
       for (auto i = 0; i < tally.nuclides_.size(); ++i) {
         auto i_nuclide = tally.nuclides_[i];

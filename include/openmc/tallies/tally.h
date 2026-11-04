@@ -351,14 +351,6 @@ public:
   //! dataset.
   tensor::Tensor<double> moments_;
 
-  //! Keep moments_ allocated on every rank, not just the master. In reduced
-  //! mode non-master ranks never fold, so their moments_ holds nothing until
-  //! the end-of-run broadcast; this flag keeps the array but does not fill it.
-  //! Set for tallies read on every rank during the run (weight-window
-  //! generation), which stay 'replicated': see the warning in
-  //! WeightWindowsGenerator::create_tally() and the fatal in init_results().
-  bool moments_all_ranks_ {false};
-
   //! True if this tally should be written to statepoint files
   bool writable_ {true};
 

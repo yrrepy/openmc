@@ -1315,7 +1315,30 @@ void Tally::init_rma_staging()
     rma_k_ = std::max<int64_t>(1, std::atoll(env));
   } else {
     const double per_k = static_cast<double>(nt) * bytes_per_k;
-    rma_k_ = std::clamp<int64_t>(static_cast<int64_t>(share / per_k), 8, 4096);
+    const int64_t k_budget = static_cast<int64_t>(share / per_k);
+    rma_k_ = std::clamp<int64_t>(k_budget, 1, 4096);
+
+    // Below eight rows per buffer remote scores go out in small accumulates;
+    // below one row the budget cannot be met at all. Every rank computes the
+    // same K, so the master alone reports it.
+    if (k_budget < 8 && mpi::master) {
+      const double staging_mib = per_k * rma_k_ / (1024.0 * 1024.0);
+      const double share_mib = share / (1024.0 * 1024.0);
+      const std::string fit =
+        k_budget < 1 ? fmt::format("needs {:.1f} MiB of staging per rank, "
+                                   "more than its {:.1f} MiB budget share: "
+                                   "the budget cannot be met",
+                         staging_mib, share_mib)
+                     : fmt::format("fits only {} rows per buffer in its "
+                                   "{:.1f} MiB budget share ({:.1f} MiB of "
+                                   "staging per rank)",
+                         rma_k_, share_mib, staging_mib);
+      warning(
+        fmt::format("rma tally {} {} ({} ranks x {} threads, {} bytes per "
+                    "row). Use fewer threads per rank or fewer ranks "
+                    "per rma tally.",
+          id_, fit, np, nt, row_bytes));
+    }
   }
 
   // Radix passes for the issue-time sort: the key disp / 8 is below the

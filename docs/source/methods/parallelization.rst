@@ -678,9 +678,11 @@ for ``rma``, the moments) live:
   :math:`(1 + n_\text{moments}) / N` minimum -- though it still falls as
   :math:`1/N`. Users sizing runs against this memory model should budget for the
   extra plane, and for the staging buffers of the remote scoring path, which
-  take a fixed budget of 64 MiB per rank shared by all ``rma`` tallies; the
+  are sized from a 64 MiB per-rank budget shared by all ``rma`` tallies; the
   budget covers the staged rows, their displacements and the per-thread
-  compaction scratch.
+  compaction scratch. A warning is printed when the minimum staging (one row
+  per buffer) does not fit the budget, and when the budget allows fewer than
+  eight rows per buffer.
 
 The ``<moments>`` sub-element (the moments mode) selects which cross-batch
 moments are kept, independently of the accumulator mode. ``full`` keeps
@@ -740,8 +742,8 @@ reduction scratch stays within about 1 GiB per participating rank however many
 planes the tally holds. The ``rma`` statepoint write holds two 64 MiB receive
 buffers on the master: it receives the next chunk of owned rows while it writes
 the current one. Restart adds nothing on a rank that holds no
-moments, and the ``rma`` remote-scoring staging is the fixed 64 MiB per rank
-described above.
+moments, and the ``rma`` remote-scoring staging stays within the 64 MiB
+per-rank budget described above unless a warning says otherwise.
 
 A tally may also declare *projections*: coarser views of its filter bins in
 which an energy filter is collapsed onto a nested coarser grid or a filter is

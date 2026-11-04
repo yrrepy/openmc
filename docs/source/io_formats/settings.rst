@@ -529,11 +529,10 @@ attributes/sub-elements:
       One accumulator plane is shared per shared-memory node, cutting per-node
       tally memory from one plane per rank to one plane per node. Results are
       read on rank 0. Requires an MPI- and OpenMP-enabled build and the Monte
-      Carlo solver, and is not compatible with ``no_reduce`` or CMFD. A tally
-      whose moments are required on all ranks (the weight-window-generation
-      tally) always keeps the ``replicated`` accumulator mode; the global
-      ``<exatally>`` accumulator default does not apply to it, and the run
-      proceeds.
+      Carlo solver, and is not compatible with ``no_reduce`` or CMFD. The
+      weight-window-generation tally always keeps the ``replicated``
+      accumulator mode; the global ``<exatally>`` accumulator default does not
+      apply to it, and the run proceeds.
 
     :rma:
       Both the per-batch accumulator and its cross-batch moments are
@@ -549,10 +548,10 @@ attributes/sub-elements:
       available for ``rma`` tallies (a single-rank ``rma`` tally holds its full
       results and serves them normally). Requires an MPI- and OpenMP-enabled build and the Monte Carlo
       solver, and is not compatible with ``no_reduce``, CMFD, or event-based
-      transport. A tally whose moments are required on all ranks (the
-      weight-window-generation tally) always keeps the ``replicated``
-      accumulator mode; the global ``<exatally>`` accumulator default does not
-      apply to it, and the run proceeds. See :ref:`methods_parallel_exatallies`
+      transport, and on more than one rank it cannot drive a weight-window
+      update. The weight-window-generation tally always keeps the
+      ``replicated`` accumulator mode; the global ``<exatally>`` accumulator
+      default does not apply to it, and the run proceeds. See :ref:`methods_parallel_exatallies`
       for the memory model and performance notes.
 
     *Default*: replicated
@@ -588,9 +587,8 @@ attributes/sub-elements:
       ``rma`` accumulator the tally cannot be reset through the C API while a
       simulation is running.
 
-    A tally whose moments are required on all ranks (the tally that generates
-    weight windows) always keeps ``full``; the global ``<exatally>`` moments
-    default does not apply to it.
+    The tally that generates weight windows always keeps ``full``; the global
+    ``<exatally>`` moments default does not apply to it.
 
     With ``mean`` the projections of the tally (see the ``exatally`` entry of
     :ref:`io_tallies`) can provide the standard deviations of the collapsed

@@ -477,9 +477,10 @@ class _TallyMapping(Mapping):
     def __delitem__(self, key):
         """Delete a tally from tally vector and remove the ID,index pair from tally
 
-        .. note:: Deleting a tally that uses the ``shared`` accumulator mode
-                  frees an MPI shared-memory window and is collective: every MPI rank must
-                  delete the same tally.
+        .. note:: Deleting a tally that uses the ``shared`` or ``rma``
+                  accumulator mode frees an MPI window and is collective on
+                  all ranks (the node communicator for ``shared``, all ranks
+                  for ``rma``): every MPI rank must delete the same tally.
         """
         _dll.openmc_remove_tally(self[key]._index)
 

@@ -94,6 +94,10 @@ private:
 
   void check_tally_update_compatibility(const Tally* tally);
 
+  //! Compute the bounds of update_weights() from this rank's tally moments
+  void compute_bounds(const Tally* tally, const std::string& value,
+    double threshold, double ratio, WeightWindowUpdateMethod method);
+
 public:
   //! Set the weight window ID
   void set_id(int32_t id = -1);
@@ -119,6 +123,10 @@ public:
   //! \param[in] threshold Relative error threshold. Results over this
   //! threshold will be ignored \param[in] ratio Ratio of upper to lower
   //! weight window bounds
+  //!
+  //! Collective when tallies are reduced over more than one MPI rank: rank 0,
+  //! which holds the tally's folded moments, computes the bounds and
+  //! broadcasts them, so every rank must call this function.
   void update_weights(const Tally* tally, const std::string& value = "mean",
     double threshold = 1.0, double ratio = 5.0,
     WeightWindowUpdateMethod method = WeightWindowUpdateMethod::MAGIC);

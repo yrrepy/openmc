@@ -974,18 +974,6 @@ void Tally::init_results()
     (num_threads() == 1) && exatally_.accumulator != AccumulatorMode::SHARED;
 
 #ifdef OPENMC_MPI
-  // A tally read on all ranks (weight-window generation) cannot use a
-  // distributed mode, which homes moments on the master alone (shared) or on
-  // the owning rank (rma). This flag is set after construction, so the check
-  // lives here rather than in the XML ctor.
-  if (exatally_.accumulator != AccumulatorMode::REPLICATED &&
-      moments_all_ranks_) {
-    fatal_error(
-      fmt::format("Tally {} cannot use a distributed accumulator mode "
-                  "because its moments are required on all ranks.",
-        id_));
-  }
-
   if (exatally_.accumulator == AccumulatorMode::SHARED) {
     // The per-batch accumulator is one shared plane per node rather than a
     // per-rank buffer.
@@ -1017,8 +1005,7 @@ void Tally::init_results()
   // the other ranks receive a copy at the final broadcast. They therefore skip
   // the allocation here, cutting their per-tally footprint to just the
   // accumulator plane. The moments live on every rank when tallies are not
-  // reduced (each rank is its own owner) or when a consumer reads them off the
-  // master mid-run (moments_all_ranks_).
+  // reduced (each rank is its own owner).
   //
   // A 'none' tally keeps no moments during the run on any rank;
   // collect_none() materialises its one SUM plane for a statepoint and at the
@@ -1041,7 +1028,7 @@ void Tally::init_results()
       static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
   } else
 #endif
-    if (mpi::master || !settings::reduce_tallies || moments_all_ranks_) {
+    if (mpi::master || !settings::reduce_tallies) {
     InterleaveDuringAlloc policy(true);
     moments_ = tensor::Tensor<double>({static_cast<size_t>(n_filter_bins_),
       static_cast<size_t>(n_score_bins_), static_cast<size_t>(n_moments())});
@@ -1874,6 +1861,11 @@ extern "C" int openmc_tally_results(
     if (t->moments_mode() == MomentsMode::NONE) {
       set_errmsg("In-memory results of a tally using the <exatally> moments "
                  "mode 'none' are available only at the end of the run.");
+    } else if (t->accumulator() == AccumulatorMode::SHARED &&
+               mpi::n_procs > 1) {
+      set_errmsg("In-memory results of a tally using the 'shared' "
+                 "accumulator mode live on rank 0 of each run; read them "
+                 "there or from the statepoint file.");
     } else {
       set_errmsg("Tally results have not been allocated yet.");
     }
@@ -1908,8 +1900,9 @@ extern "C" size_t tallies_size()
 }
 
 // given a tally ID, remove it from the tallies vector. For a tally in the
-// shared accumulator mode this destroys an MPI window and is therefore
-// collective on node_comm -- every rank must call it for the same index.
+// shared or rma accumulator mode this frees an MPI window and is therefore
+// collective on all ranks (node_comm for shared, intracomm for rma) -- every
+// rank must remove the same tally.
 extern "C" int openmc_remove_tally(int32_t index)
 {
   // check that id is in the map

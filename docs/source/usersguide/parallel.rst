@@ -159,8 +159,9 @@ The table shows the memory held between batches. Short transients come on top
 of it: + up to 1 GB per rank during each reduction (the per-batch reduction of
 ``replicated``, the reduction between nodes of ``shared``, and the collection
 of a ``none`` tally), + two 64 MiB receive buffers on rank 0 during an ``rma``
-statepoint write, and, for ``rma``, a fixed 64 MiB per rank for staging remote
-scores.
+statepoint write, and, for ``rma``, the staging of remote scores, sized from
+a 64 MiB per-rank budget; a warning is printed when the budget holds fewer
+than eight rows per buffer, or not even the minimum of one.
 Restart from a statepoint adds nothing on a rank that holds no moments.
 
 **Choosing the accumulator mode.**
@@ -182,7 +183,11 @@ Restart from a statepoint adds nothing on a rank that holds no moments.
   statepoint file, not in ``tallies.out`` or through :mod:`openmc.lib`.
 - Global tallies, including :math:`k_\text{eff}`, always stay replicated, and
   the tally that generates weight windows always keeps ``replicated`` and
-  ``full``, whatever the global default.
+  ``full``, whatever the global default. Under MPI the weight-window update
+  runs on rank 0, which broadcasts the new bounds to all ranks. A tally passed
+  to :meth:`openmc.lib.WeightWindows.update_magic` needs moments ``full`` and,
+  on more than one rank, the ``replicated`` or ``shared`` accumulator mode;
+  every rank must make the call.
 
 **Choosing the moments mode.**
 
@@ -224,7 +229,11 @@ the node. ``rma`` needs MPI initialized with at least
 ``MPI_THREAD_SERIALIZED`` when more than one OpenMP thread is used; OpenMC
 requests this itself, and a program that initializes MPI before OpenMC (for
 example through ``mpi4py``) must do the same. Results are read as always with
-:class:`openmc.StatePoint`. For a tally with moments ``mean`` or ``none``,
+:class:`openmc.StatePoint`. On more than one rank the in-memory results of a
+``shared`` tally live on rank 0 only, so a consumer that reads tally results
+on every rank, such as the coupled operator of :mod:`openmc.deplete` under MPI
+or any :mod:`openmc.lib` reader on another rank, needs ``replicated`` or a
+statepoint readout. For a tally with moments ``mean`` or ``none``,
 :attr:`openmc.Tally.std_dev` is NaN, :attr:`openmc.Tally.sum_sq` is None, and
 ``tallies.out`` prints the mean without an uncertainty. The statepoint records
 the moments mode of each tally, and :class:`openmc.StatePoint` sets

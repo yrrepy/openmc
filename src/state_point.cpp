@@ -414,7 +414,6 @@ void read_distributed_rma_tally_results(hid_t file_id)
     // otherwise has its own serial file handle), so it must not be master-only.
     read_dataset(tally_group, "n_realizations", tally->n_realizations_);
 
-    hid_t dset = open_dataset(tally_group, "results");
     const hsize_t n_filter = static_cast<hsize_t>(tally->n_filter_bins());
     const hsize_t n_score = static_cast<hsize_t>(tally->n_score_bins());
     const hsize_t n_moments = static_cast<hsize_t>(tally->n_moments());
@@ -423,21 +422,8 @@ void read_distributed_rma_tally_results(hid_t file_id)
     // every rank with no collective divergence. Validate the full extent before
     // selecting each rank's owned-row hyperslab; the read otherwise assumes the
     // statepoint layout matches the current model.
-    auto shape = object_shape(dset);
-    if (shape.size() != 3 || shape[0] != n_filter || shape[1] != n_score ||
-        shape[2] != n_moments) {
-      std::string found;
-      for (auto d : shape)
-        found += (found.empty() ? "" : ", ") + std::to_string(d);
-      fatal_error(fmt::format(
-        "Tally {} results shape mismatch on rma restart: the current model "
-        "expects [{}, {}, {}] but the statepoint \"results\" dataset is [{}]. "
-        "The restart model's tally layout must match the statepoint; the last "
-        "dimension is the number of moment planes (2 or 4 for the moments mode "
-        "'full' without or with higher moments, 1 for 'mean'), so the moments "
-        "mode and higher_moments must match too.",
-        tally->id_, n_filter, n_score, n_moments, found));
-    }
+    check_tally_results_shape(tally_group, n_filter, n_score, n_moments);
+    hid_t dset = open_dataset(tally_group, "results");
     read_owned_rows_hyperslab(dset, tally->rma_first_row(mpi::rank),
       tally->rma_n_rows(), n_score, n_moments, tally->moments().data());
     close_dataset(dset);
