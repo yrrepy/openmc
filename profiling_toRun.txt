@@ -1,0 +1,63 @@
+ExaTallies E9 cluster campaign -- what to run with the profiling binary
+=======================================================================
+Branch ExaTallies/profiling = ExaTallies/master + one instrumentation commit.
+Full runbook (rules, phases, caveats): workspace claude/ExaTallies_E9_campaign-protocol_2026-11-03.md
+Analysis scripts: workspace claude/exatallies-profiling_2026-11-03/{profile_report,preflight_hammer,off_state_cost}.py
+
+Model: mr2s vx5 neutron stage, with its weight windows. Same seed, same particles per batch
+per NODE at every node count (weak scaling), <verbosity>8</verbosity> in settings.xml.
+
+Two binaries
+------------
+  master     -> every quoted number (rates, memory, scaling); 3 repeats where cheap
+  profiling  -> one run per point for attribution; needs a FRESH, EMPTY directory per run:
+                  mkdir -p $PWD/prof && OPENMC_PROFILE=$PWD/prof <mpiexec ...> openmc
+                It writes prof/profile_rank<R>.json at the end of the run.
+Other profiling env vars (default off):
+  OPENMC_RMA_PROGRESS_POKE=<N>   MPI progress poke every N particles per thread (rma only)
+  OPENMC_RMA_STAGING_ROWS=<K>    force the rma staging depth (also understood by master)
+  OPENMC_RMA_HAMMER_ROWS=<N>     timed mode of test_rma_window (prints one HAMMER line per rank)
+
+Every job: exclusive nodes, pinned (OMP_PROC_BIND=close OMP_PLACES=cores, I_MPI_PIN_DOMAIN=omp),
+threads x ranks <= cores. Do NOT set I_MPI_ASYNC_PROGRESS=1 (needs the hammer gate on the cluster first).
+
+Check first: one node holds the model replicated at 48 ranks (48 copies of the tally plane x (2 + moments)).
+If not, start replicated at fewer ranks per node and say so.
+
+Runs, in order of value
+-----------------------
+0. Pre-flight, 1 node (minutes)
+   a. build/bin/test_rma_window at 48 ranks (mpiexec -n 48, OMP 4): must pass.
+   b. preflight_hammer.py grid: threads {1, 4} x K {2, 64, default} (OPENMC_RMA_HAMMER_ROWS=200000).
+   c. the model once with master and once with profiling, shared 48x4: statepoints must match
+      (h5diff on /tallies, or claude/exatallies-s4_2026-11-01/cmp_statepoints.py).
+
+1. 1 node -- decomposition and per-mode cost
+   replicated 48x4, shared 48x4, rma 48x4          (master x3 + profiling x1 each)
+   shared 192x1, rma 192x1                         (master x3 + profiling x1 each)
+
+2. 2 nodes -- first internode rma since the E0 fix
+   shared 48x4, rma 48x4                           (master x3 + profiling x1 each)
+   profile_report.py on the rma profiling dir must print "conservation ... PASS".
+
+3. 6 nodes -- the baseline (memory crossover)
+   shared 48x4, rma 48x4                           (master x3 + profiling x1 each)
+   rma at the better thin decomposition from step 1 (master x3 + profiling x1)
+
+4. 6 nodes -- attribution (profiling binary only, x1 each)
+   rma 48x4 with OPENMC_RMA_PROGRESS_POKE=128
+   rma 48x4 with OPENMC_RMA_STAGING_ROWS=512   (skip if step-3 report shows RMA_DRAIN+RMA_FLUSH_ALL small)
+
+5. Optional
+   rma 48x4 with <moments>none</moments> at 6 nodes (master x1 + profiling x1)
+   step 3 repeated on MPICH if the cluster has it
+
+Send back per job
+-----------------
+  - the OPENMC_PROFILE directory (tar it)
+  - stdout (verbosity 8 prints window MiB/rank, staging K, and the end-of-run rma statistics line)
+  - the job script, including `git rev-parse HEAD` of both branches and `mpiexec --version`
+  - env | grep -E 'I_MPI|OMP|MPIR|FI_|OPENMC'
+  - scheduler elapsed and peak memory (e.g. sacct -o JobID,Elapsed,MaxRSS,NNodes)
+  - the statepoint checksum (md5sum statepoint.*.h5)
+Quick look yourself: python3 profile_report.py <prof dir>   (exit code 1 = conservation FAIL = stop and report)
